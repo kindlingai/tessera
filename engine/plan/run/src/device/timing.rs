@@ -17,6 +17,28 @@ use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
 
 impl<D: Device> Runner<D> {
+    pub(super) fn override_launch(&self, step: usize) -> Option<&overrides::LaunchOverride> {
+        let files = self.overrides.as_ref()?;
+        let idx = *self.uses.get(step)?;
+        files.launch(&self.entries[idx].0)
+    }
+
+    /// Passes profiling state and resident overrides to the grid.
+    pub(super) fn sync_grid(&mut self) {
+        let Some(grid) = self.grid.get_mut().as_mut() else {
+            return;
+        };
+        grid.profiling(self.base.profile.is_some());
+        let Some(files) = &self.overrides else {
+            return;
+        };
+        for (entry, step) in &self.entries {
+            if self.resident[*step] {
+                grid.replace(entry, files.text(entry).map(str::to_string));
+            }
+        }
+    }
+
     /// Retains owned handles when teardown cannot quiesce.
     pub(crate) fn retain(&mut self) {
         std::mem::forget(std::mem::replace(&mut self.graphs, Lru::new(0)));
@@ -287,7 +309,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let mut pending = Vec::new();
         for (entry, step) in &self.entries {
             let planned = || overrides::text(&plan.steps[*step], D::BACKEND);
-            if let Some(change) = files.scan(entry, planned) {
+            if let Some(change) = files.scan(entry, self.resident[*step], planned) {
                 pending.push(change);
             }
         }
@@ -307,18 +329,30 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     changed = true;
                     ready.push(Ready::reverted(entry, path, seen));
                 }
+                Pending::Failed {
+                    entry,
+                    path,
+                    seen,
+                    why,
+                } => ready.push(Ready::failed(entry, path, seen, why)),
                 Pending::Compile {
                     entry,
                     path,
                     seen,
                     text,
-                } => match ctx.compile(&format!("{}{text}", marks::OFF), &entry) {
-                    Ok(kernel) => {
-                        changed = true;
-                        ready.push(Ready::loaded(entry, path, seen, kernel, text));
+                    launch,
+                } => {
+                    let flags = launch
+                        .as_ref()
+                        .map_or_else(Vec::new, overrides::LaunchOverride::flags);
+                    match ctx.compile_with(&format!("{}{text}", marks::OFF), &entry, &flags) {
+                        Ok(kernel) => {
+                            changed = true;
+                            ready.push(Ready::loaded(entry, path, seen, kernel, text, launch));
+                        }
+                        Err(e) => ready.push(Ready::failed(entry, path, seen, e.to_string())),
                     }
-                    Err(e) => ready.push(Ready::failed(entry, path, seen, e.to_string())),
-                },
+                }
             }
         }
         if changed {
@@ -341,7 +375,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         if changed {
             self.apply();
-            self.attrs = kernels::step_attrs(ctx, &self.base.plan, &self.kernels, &self.resident);
+            self.attrs = kernels::step_attrs(
+                ctx,
+                &self.base.plan,
+                &self.kernels,
+                &self.resident,
+                self.overrides.as_ref(),
+            );
             self.sync_grid();
         }
         Ok(reloads)

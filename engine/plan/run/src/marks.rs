@@ -164,18 +164,22 @@ pub(crate) fn step_marks<D: Device>(
     ctx: &D,
     marked: &mut std::collections::HashMap<String, D::Kernel>,
     ledger: &mut Option<DeviceBuffer<D>>,
-    (entry, text): (&str, &str),
+    (entry, text, flags): (&str, &str, &[&str]),
     mut run: impl FnMut(&D::Kernel) -> Result<(), Error>,
 ) -> Result<Option<Marks>, Error> {
     if !text.contains("TS_MARK") {
         return Ok(Some(Marks::default()));
     }
     let src = format!("{ON}{text}");
-    let kernel = match marked.get(&src) {
+    let key = match flags.is_empty() {
+        true => src.clone(),
+        false => format!("{}\0{src}", flags.join("\x1f")),
+    };
+    let kernel = match marked.get(&key) {
         Some(k) => k.clone(),
         None => {
-            let k = ctx.compile(&src, entry)?;
-            marked.insert(src, k.clone());
+            let k = ctx.compile_with(&src, entry, flags)?;
+            marked.insert(key, k.clone());
             k
         }
     };

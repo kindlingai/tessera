@@ -265,9 +265,20 @@ pub fn pull(
     layers: u64,
     rules: &[&[Rule]],
 ) -> Result<(Vec<Weight>, Pins), Box<dyn Error + Send + Sync>> {
+    pull_shared(graph, offer, layers, rules, &|_| None)
+}
+
+/// As `pull`, reading only each rank's slice when `shares` says.
+pub(crate) fn pull_shared(
+    graph: &Graph,
+    offer: &dyn Offer,
+    layers: u64,
+    rules: &[&[Rule]],
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+) -> Result<(Vec<Weight>, Pins), Box<dyn Error + Send + Sync>> {
     let mut weights = Vec::with_capacity(graph.weights.len());
     let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(graph.weights.len());
-    each(graph, offer, rules, &|_| None, |weight, form| {
+    each(graph, offer, rules, shares, |weight, form| {
         weights.push(weight);
         forms.push(form);
         Ok(())

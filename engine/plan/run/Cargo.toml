@@ -23,7 +23,9 @@ tessera-jit = { workspace = true }
 tessera-lower = { workspace = true }
 tessera-mem = { workspace = true }
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tessera-interp = { workspace = true }

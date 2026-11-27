@@ -272,6 +272,15 @@ impl Api for Runtime {
     }
 
     fn compile(ctx: &Context, name: &str, source: &str) -> Result<Vec<u8>, Error> {
+        Self::compile_with(ctx, name, source, &[])
+    }
+
+    fn compile_with(
+        ctx: &Context,
+        name: &str,
+        source: &str,
+        flags: &[&str],
+    ) -> Result<Vec<u8>, Error> {
         ctx.set_current()?;
         let arch = ctx.arch();
         let compiler = hip::HIPRTC.version_tag();
@@ -280,13 +289,15 @@ impl Api for Runtime {
             false if name.contains('.') => name.to_string(),
             false => format!("{name}.hip"),
         };
+        let mut opts = vec!["-std=c++17"];
+        opts.extend_from_slice(flags);
         // Without --offload-arch, hiprtc targets the current device.
         let key = cache::CacheKey {
             backend: "rocm",
             compiler: &compiler,
             arch: &arch,
             unit: &unit,
-            base: &["-std=c++17"],
+            base: &opts,
             source,
         };
         cache::current().load_or(key, "hsaco", |opts| {

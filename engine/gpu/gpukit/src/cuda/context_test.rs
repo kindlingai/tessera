@@ -1,5 +1,5 @@
 use super::context::compute_arch;
-use super::{compile_ptx, nvrtc_version};
+use super::{compile_ptx_with, nvrtc_version};
 
 #[test]
 fn normalizes_cuda_targets() {
@@ -24,12 +24,12 @@ fn compiles_ptx_offline() {
         return;
     }
     let good = "extern \"C\" __global__ void ok_kernel(float* y) { y[0] = 1.0f; }\n";
-    let ptx = compile_ptx("sm_121", "ok_kernel", good).unwrap();
+    let ptx = compile_ptx_with("sm_121", "ok_kernel", good, &[]).unwrap();
     let text = String::from_utf8_lossy(&ptx);
     assert!(text.contains(".entry ok_kernel"), "{text}");
 
     let bad = "extern \"C\" __global__ void bad_kernel(float* y) {\n    y[0] = missing_sym;\n}\n";
-    let err = compile_ptx("sm_121", "bad_kernel", bad)
+    let err = compile_ptx_with("sm_121", "bad_kernel", bad, &[])
         .unwrap_err()
         .to_string();
     assert!(err.contains("bad_kernel.cu"), "{err}");

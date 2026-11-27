@@ -94,18 +94,23 @@ impl Ranks {
         self.rank != 0 && !tessera_engine::sizer::counting()
     }
 
+    /// This rank's zero-based index.
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
     /// Whether routed experts split along inner width.
-    pub(crate) fn moe_tp(&self) -> bool {
+    pub fn moe_tp(&self) -> bool {
         self.moe_tp
     }
 
     /// The dtype unpinned sums' parts cross as, from `--sum-wire`.
-    pub(crate) fn sum_wire(&self) -> Option<DType> {
+    pub fn sum_wire(&self) -> Option<DType> {
         self.sum_wire
     }
 
     /// Each rank's share of split weights, from `--parts`.
-    pub(crate) fn parts(&self) -> &[u32] {
+    pub fn parts(&self) -> &[u32] {
         &self.parts
     }
 

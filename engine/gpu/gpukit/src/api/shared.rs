@@ -501,4 +501,8 @@ impl<A: Api> Device for Context<A> {
     fn compile(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
         self.compile_kernel(source, entry)
     }
+
+    fn compile_with(&self, source: &str, entry: &str, flags: &[&str]) -> Result<Kernel<A>, Error> {
+        self.compile_kernel_with(source, entry, flags)
+    }
 }

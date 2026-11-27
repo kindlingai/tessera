@@ -2,27 +2,31 @@
 
 use crate::grid::{bounded, codes};
 use crate::routing::{DEFAULT_SKEW, extract_router, prefill_kept, routed_feeds};
+use crate::watch_args::{
+    ServeDims, USAGE, WatchArgs, build_options, build_recipe, parse_watch, user_rules,
+};
+use crate::watch_report::{
+    Meta, Report, Row, build_report, format_diff, format_table, load_report, write_json,
+};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use tessera_bundle::parts;
+use tessera_bundle::names::Rule as NameRule;
+use tessera_bundle::parts::{self, Part, Spec};
+use tessera_engine::comm::{Error as CommError, Transport};
 use tessera_graph::DimName::{self, Context, Rows, Seqs};
-use tessera_graph::{Graph, Op, PathSeg, Region, Size};
+use tessera_graph::{DType, Graph, Op, Parts, PathSeg, Region, Size, shard_mode};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, Load, named};
 use tessera_lower::{
-    Device, Pins, Plan, Settings, Source, Step, Tensor, View, Weight, cut_region, lower,
+    Cluster, Device, Launching, Pins, Plan, Recipe, Settings, Source, Step, Tensor, View, Weight,
+    Wires, ZoneKind, cut_region, lower,
 };
-use tessera_run::{Outcome, Reload, Run, open};
+use tessera_run::{Outcome, Rank, Reload, Run, open};
+use tessera_serve::start::Options;
 use tessera_testkit::graphs::{attention, gqa_attend_rows, linear, mla_attend_rows, moe_routed};
 use tessera_testkit::{Noise, weights};
 
-const USAGE: &str = "usage: tessera-calibrate watch <dir> \
-    gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
-    mla <heads> <rows> <context> [--kv f32|bf16|fp8] | \
-    gqa <heads> <kv heads> <rows> <context> [--kv f32|bf16|fp8] | \
-    moe <experts> <top k> <hidden> <ffn> <rows> [--form <name>] [--skew <n>] [--plain] | \
-    model <model dir> [<part>] [--region <kind>.<n>] [--list] [--skew <n>] [<Dim>=<n> ...]";
 /// Time between checks for changed files.
 const POLL: Duration = Duration::from_millis(20);
 /// Device seconds to spend timing one step.
@@ -90,9 +94,9 @@ fn label(g: &Graph, r: &Region) -> String {
 type Failed = Box<dyn Error + Send + Sync>;
 
 /// Prints each part's dims and regions.
-fn list(dir: &Path, names: &[String], size: &dyn Fn(DimName) -> Option<u64>) -> Result<(), Failed> {
+fn list_parts(dir: &Path, names: &[String], spec: &Spec<'_>) -> Result<(), Failed> {
     for name in names {
-        let g = parts::open(dir, name, size)?.graph;
+        let g = parts::open_with(dir, name, spec)?.graph;
         println!(
             "{name}: {} weights, {} nodes",
             g.weights.len(),
@@ -114,62 +118,170 @@ fn list(dir: &Path, names: &[String], size: &dyn Fn(DimName) -> Option<u64>) -> 
     Ok(())
 }
 
-/// A part of the model in `args[0]`, or one region.
-fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
-    let (dir, rest) = args.split_first().ok_or(USAGE)?;
-    let dir = Path::new(dir);
+/// Pins unpinned sums in `g` using recipe wires and `--sum-wire`.
+fn resolve_wires(g: Graph, wires: &Wires, wire: Option<DType>) -> Graph {
+    let g = wires.pin(g);
+    g.wired(wire.unwrap_or(DType::F32))
+}
+
+/// Applies recipe, rank topology and shares to `base`.
+fn configure_device(base: Device, recipe: &Recipe, parts: &Parts, rank: u32, gpu: bool) -> Device {
+    let mut d = base.with(recipe);
+    if parts.ranks() > 1 {
+        let kind = if gpu { ZoneKind::Gpu } else { ZoneKind::Cpu };
+        let ranks = parts.ranks() as u32;
+        d = d
+            .zoned(Cluster::mesh(ranks as usize, kind))
+            .ranked((0..ranks).collect())
+            .uneven(parts.0.clone())
+            .as_rank(rank);
+    }
+    d
+}
+
+/// A prepared watch target ready to lower and load weights.
+pub(crate) struct Target {
+    pub(crate) g: Graph,
+    pub(crate) sizes: Vec<(DimName, u64)>,
+    pub(crate) recipe: Recipe,
+    part: Option<Part>,
+    loads: Option<Vec<Weight>>,
+    skew: f64,
+    region: Option<String>,
+}
+
+/// Parses model args into a sharded, region-cut target.
+pub(crate) fn model_target(
+    dir: &Path,
+    rest: &[String],
+    options: &Options,
+    dims: ServeDims,
+    user: &[NameRule],
+    args: &WatchArgs,
+    parts: &Parts,
+) -> Result<Option<Target>, Failed> {
     let (mut part, mut region, mut listed, mut given) = (None, None, false, Vec::new());
     let mut skew = DEFAULT_SKEW;
-    let mut rest = rest.iter();
-    while let Some(arg) = rest.next() {
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--list" => listed = true,
-            "--region" => region = Some(rest.next().ok_or(USAGE)?),
-            "--skew" => {
-                skew = rest
-                    .next()
-                    .ok_or(USAGE)?
-                    .parse::<f64>()
-                    .map_err(|_| USAGE)?
-            }
+            "--region" => region = Some(it.next().ok_or(USAGE)?.clone()),
+            "--skew" => skew = it.next().ok_or(USAGE)?.parse::<f64>().map_err(|_| USAGE)?,
             _ if arg.contains('=') => given.push(sized(arg).ok_or(USAGE)?),
             _ if part.is_none() => part = Some(arg.clone()),
             _ => return Err(USAGE.into()),
         }
     }
-    let size = |n: DimName| given.iter().find(|(d, _)| *d == n).map(|(_, v)| *v);
-    let all = parts::names(dir)?;
+    // Precedence: positional Dim=value > CLI serve flags > recipe serve flags.
+    let mut resolved: Vec<(DimName, u64)> = Vec::new();
+    if let Some(slots) = dims.slots {
+        resolved.push((Seqs, slots));
+    }
+    if let Some(context) = dims.context {
+        resolved.push((Context, context));
+    }
+    for &(d, v) in &given {
+        if let Some(entry) = resolved.iter_mut().find(|(k, _)| *k == d) {
+            entry.1 = v;
+        } else {
+            resolved.push((d, v));
+        }
+    }
+    let size = |n: DimName| resolved.iter().find(|(d, _)| *d == n).map(|(_, v)| *v);
+    let spec = Spec {
+        overrides: &options.config,
+        user,
+        manifest: options.manifest(),
+        module: options.module.as_deref(),
+        size: &size,
+    };
+    let all = parts::names_with(dir, &options.config, options.module.as_deref())?;
     if listed {
-        list(dir, &part.map_or(all, |p| vec![p]), &size)?;
+        list_parts(dir, &part.map_or(all, |p| vec![p]), &spec)?;
         return Ok(None);
     }
-    let part = match (part, all.as_slice()) {
-        (Some(part), _) => part,
+    let part_name = match (part, all.as_slice()) {
+        (Some(p), _) => p,
         (None, [one]) => one.clone(),
         _ => return Err(format!("pick a part: {}", all.join(", ")).into()),
     };
-    let p = parts::open(dir, &part, &size)?;
-    let g = match region {
-        Some(name) => {
-            let at = regions(&p.graph).iter().position(|n| n == name);
-            let at = at.ok_or_else(|| format!("{part} has no region {name}; see --list"))?;
-            cut_region(&p.graph, &p.graph.regions[at])
-        }
-        None => p.graph.clone(),
+    let opened = parts::open_with(dir, &part_name, &spec)?;
+    let mut recipe = build_recipe(options, opened.pins.clone(), opened.config.clone(), args);
+    // Shard the full model graph before cutting one region.
+    let whole = if parts.ranks() > 1 {
+        let shares = recipe.pins.shares(&opened.graph);
+        let sharded = shard_mode(&opened.graph, parts, &shares, options.ranks.moe_tp())?;
+        resolve_wires(sharded.graph, &recipe.sums, options.ranks.sum_wire())
+    } else {
+        opened.graph.clone()
     };
-    let (loads, pins) = p.weights(&g)?;
-    let mut sizes = given.clone();
+    let g = match &region {
+        Some(name) => {
+            let at = regions(&whole).iter().position(|n| n == name);
+            let at = at.ok_or_else(|| format!("{part_name} has no region {name}; see --list"))?;
+            cut_region(&whole, &whole.regions[at])
+        }
+        None => whole,
+    };
+    let (loads, part_holder) = if opened.pins.is_some() {
+        (None, Some(opened))
+    } else {
+        let (weights, pins) = opened.weights(&g)?;
+        recipe = build_recipe(options, Some(pins), opened.config.clone(), args);
+        (Some(weights), None)
+    };
+    let mut sizes = resolved;
     for d in &g.dims {
-        if let (Size::Bounded(n), None) = (d.size, size(d.name)) {
-            sizes.push((d.name, n));
+        if let Size::Bounded(n) = d.size
+            && !sizes.iter().any(|(k, _)| *k == d.name)
+        {
+            let value = match (d.name, dims.max_batch_rows) {
+                (Rows, Some(limit)) => limit.min(n),
+                _ => n,
+            };
+            sizes.push((d.name, value));
         }
     }
-    Ok(Some(Subject {
+    Ok(Some(Target {
         g,
         sizes,
+        recipe,
+        part: part_holder,
+        loads,
+        skew,
+        region,
+    }))
+}
+
+/// A part of the model in `args[0]`, or one region.
+fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
+    let (dir, rest) = args.split_first().ok_or(USAGE)?;
+    let options = Options::default();
+    let empty = WatchArgs::default();
+    let Some(t) = model_target(
+        Path::new(dir),
+        rest,
+        &options,
+        ServeDims::default(),
+        &[],
+        &empty,
+        &Parts::even(1),
+    )?
+    else {
+        return Ok(None);
+    };
+    let (loads, pins) = match (t.loads, t.part) {
+        (Some(w), _) => (w, t.recipe.pins),
+        (None, Some(p)) => p.weights(&t.g)?,
+        (None, None) => unreachable!(),
+    };
+    Ok(Some(Subject {
+        g: t.g,
+        sizes: t.sizes,
         pins,
         loads: Some(loads),
-        skew,
+        skew: t.skew,
     }))
 }
 
@@ -300,17 +412,6 @@ pub(crate) fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>
     }))
 }
 
-/// One kernel entry: its steps and what they cost.
-struct Row {
-    entry: String,
-    steps: Vec<usize>,
-    seconds: f64,
-    planned: f64,
-    bound: Option<f64>,
-    /// Whether a kernel file runs in place of the plan's.
-    loaded: bool,
-}
-
 fn entry(step: &Step) -> String {
     match step.kernel.source() {
         Source::Fixed { entry, .. } => entry.to_string(),
@@ -328,11 +429,13 @@ fn rows(plan: &Plan, device: &Device) -> Vec<Row> {
             None => {
                 rows.push(Row {
                     entry: name,
+                    rule: step.rule,
                     steps: Vec::new(),
                     seconds: 0.0,
                     planned: 0.0,
                     bound: Some(0.0),
                     loaded: false,
+                    attrs: None,
                 });
                 rows.len() - 1
             }
@@ -346,17 +449,70 @@ fn rows(plan: &Plan, device: &Device) -> Vec<Row> {
     rows
 }
 
+/// Single-device loopback transport for timing one sharded rank.
+struct DryRank {
+    rank: u32,
+    ranks: u32,
+}
+
+impl Transport for DryRank {
+    fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    fn ranks(&self) -> u32 {
+        self.ranks
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        Ok(vec![mine.to_vec(); self.ranks as usize])
+    }
+}
+
+/// Populates paged KV tables with valid sequential page ids.
+fn init_tables(runner: &mut dyn Run, plan: &Plan) -> Result<(), Box<dyn Error>> {
+    for (slot, pool) in [
+        (plan.table, plan.pool_pages),
+        (plan.index_table, plan.index_pool_pages),
+    ] {
+        let Some(slot) = slot else { continue };
+        let cap = if pool > 0 { pool } else { slot.len }.max(1);
+        let ids: Vec<u32> = (0..slot.len).map(|i| (i % cap) as u32).collect();
+        let tensor = Tensor::u32(vec![slot.len], ids);
+        runner.write(slot, tensor.view())?;
+    }
+    Ok(())
+}
+
+/// Opens a single-rank or dry-ranked runner and loads weights.
+fn open_runner(
+    plan: Plan,
+    loads: &[Weight],
+    settings: &Settings,
+    launch: Launching,
+) -> Result<Box<dyn Run>, Box<dyn Error>> {
+    let (rank, ranks) = (plan.rank, plan.ranks);
+    let mut runner: Box<dyn Run> = if ranks > 1 {
+        Box::new(Rank::open(plan, settings, DryRank { rank, ranks })?)
+    } else {
+        open(plan, settings)?
+    };
+    runner.launching(launch);
+    for (at, w) in loads.iter().enumerate() {
+        runner.load_weight(at as u32, w)?;
+    }
+    let current = runner.plan().clone();
+    init_tables(&mut *runner, &current)?;
+    Ok(runner)
+}
+
 /// A runner for `plan` with `loads` as its weights.
 pub(crate) fn opened(
     plan: Plan,
     loads: &[Weight],
     settings: &Settings,
 ) -> Result<Box<dyn Run>, Box<dyn Error>> {
-    let mut runner = open(plan, settings)?;
-    for (at, w) in loads.iter().enumerate() {
-        runner.load_weight(at as u32, w)?;
-    }
-    Ok(runner)
+    open_runner(plan, loads, settings, Launching::default())
 }
 
 /// Each output's values, as floats.
@@ -408,14 +564,21 @@ struct Watch {
     feeds: Vec<Tensor>,
     want: Vec<Vec<f32>>,
     rows: Vec<Row>,
+    meta: Meta,
+    json: Option<PathBuf>,
+    baseline: Option<Report>,
 }
 
 impl Watch {
     /// Notes what each reload runs. Returns the rows to time.
-    fn note(&mut self, reloads: &[Reload]) -> Vec<usize> {
+    fn note(&mut self, reloads: &[Reload], to_stderr: bool) -> Vec<usize> {
         let mut changed = Vec::new();
         for reload in reloads {
-            println!("{reload}");
+            if to_stderr {
+                eprintln!("{reload}");
+            } else {
+                println!("{reload}");
+            }
             let stem = reload.path.file_stem().map(|s| s.to_string_lossy());
             for (at, row) in self.rows.iter_mut().enumerate() {
                 if stem.as_deref() != Some(row.entry.as_str()) {
@@ -455,22 +618,11 @@ impl Watch {
         let clocked = runner.clocked(all)?;
         let whole = clocked.unwrap_or_else(|| start.elapsed().as_secs_f64());
         let (worst, most) = gap(&outputs(runner, &self.plan)?, &self.want);
-        let mut order: Vec<&Row> = self.rows.iter().collect();
-        order.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
-        println!(
-            "{:>9} {:>9} {:>9} {:>5}  kernel",
-            "us", "planned", "bound", "steps"
-        );
-        for r in order {
-            let bound = r.bound.map_or("-".into(), |b| format!("{:.1}", b * 1e6));
-            let mark = if r.loaded { "*" } else { " " };
-            let (us, planned) = (r.seconds * 1e6, r.planned * 1e6);
-            let steps = r.steps.len();
-            println!(
-                "{us:>9.1} {planned:>9.1} {bound:>9} {steps:>5} {mark}{}",
-                r.entry
-            );
+        for row in &mut self.rows {
+            row.attrs = runner.step_attrs(row.steps[0]);
         }
+        let report = build_report(&self.meta, &self.rows, whole, worst, most);
+        let mut text = format_table(&report);
         for &at in which {
             let row = &self.rows[at];
             let Some(found) = runner.marks(row.steps[0])? else {
@@ -479,85 +631,198 @@ impl Watch {
             for region in &found.regions {
                 let (middle, most) = region.spread();
                 let (from, to, times) = (region.from, region.to, region.seconds.len());
-                println!(
-                    "    {} lines {from}-{to}: {:.2} us middle, {:.2} us most, {times} times",
+                text.push_str(&format!(
+                    "    {} lines {from}-{to}: {:.2} us middle, {:.2} us most, {times} times\n",
                     row.entry,
                     middle * 1e6,
                     most * 1e6
-                );
+                ));
             }
             if found.lost > 0 {
-                println!(
-                    "    {}: {} marks past room, not kept",
+                text.push_str(&format!(
+                    "    {}: {} marks past room, not kept\n",
                     row.entry, found.lost
-                );
+                ));
             }
         }
-        let alone: f64 = self.rows.iter().map(|r| r.seconds).sum();
-        println!(
-            "plan {:.1} us, steps alone {:.1} us, error {worst:.3e} of {most:.3e}",
-            whole * 1e6,
-            alone * 1e6
-        );
+        if let Some(base) = &self.baseline {
+            text.push_str(&format_diff(base, &report));
+        }
+        if self.json.as_deref() == Some(Path::new("-")) {
+            eprint!("{text}");
+        } else {
+            print!("{text}");
+        }
+        if let Some(path) = &self.json {
+            write_json(path, &report)?;
+        }
         Ok(())
     }
 }
 
+/// Resolves the watch target from CLI args and recipe options.
+fn resolve_target(
+    args: &WatchArgs,
+    options: &Options,
+    dims: ServeDims,
+    recipe_weights: Option<&Path>,
+    user: &[NameRule],
+    parts: &Parts,
+) -> Result<Option<Target>, Box<dyn Error>> {
+    let first = args.subject_args.first().map(String::as_str);
+    if first == Some("model") {
+        let (dir, rest) = args.subject_args[1..].split_first().ok_or(USAGE)?;
+        return model_target(Path::new(dir), rest, options, dims, user, args, parts)
+            .map_err(|e| e as Box<dyn Error>);
+    }
+    let known = matches!(first, Some("gemm" | "attend" | "mla" | "gqa" | "moe"));
+    if !known && let Some(dir) = recipe_weights {
+        return model_target(dir, &args.subject_args, options, dims, user, args, parts)
+            .map_err(|e| e as Box<dyn Error>);
+    }
+    let Some(s) = subject(&args.subject_args)? else {
+        return Ok(None);
+    };
+    let recipe = build_recipe(options, Some(s.pins), None, args);
+    let g = if parts.ranks() > 1 {
+        let shares = recipe.pins.shares(&s.g);
+        let sharded = shard_mode(&s.g, parts, &shares, options.ranks.moe_tp())?;
+        resolve_wires(sharded.graph, &recipe.sums, options.ranks.sum_wire())
+    } else {
+        s.g
+    };
+    Ok(Some(Target {
+        g,
+        sizes: s.sizes,
+        recipe,
+        part: None,
+        loads: s.loads,
+        skew: s.skew,
+        region: None,
+    }))
+}
+
 /// Plans `args`, writes its kernel files, then reruns on change.
 pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (dir, rest) = args.split_first().ok_or(USAGE)?;
-    let Some(mut s) = subject(rest)? else {
+    tessera_engine::flatten_overrides();
+    let parsed = parse_watch(args)?;
+    let to_stderr = parsed.json.as_deref() == Some(Path::new("-"));
+    let has_model = parsed.subject_args.first().map(String::as_str) == Some("model");
+    let (options, dims, recipe_weights) = build_options(&parsed, settings, has_model)?;
+    let parts = match parsed.parts.clone() {
+        Some(p) => p,
+        None if !options.ranks.parts().is_empty() => Parts(options.ranks.parts().to_vec()),
+        None => Parts::even(1),
+    };
+    if parts.0.is_empty() || parts.0.contains(&0) {
+        return Err("--parts shares must be > 0".into());
+    }
+    let rank = parsed.rank.unwrap_or_else(|| options.ranks.rank());
+    if rank as usize >= parts.ranks() {
+        return Err(format!("--rank {rank} out of range for {} parts", parts.ranks()).into());
+    }
+    let baseline = match &parsed.against {
+        Some(path) => Some(load_report(path)?),
+        None => None,
+    };
+    let user = user_rules(&options, settings)?;
+    let Some(mut target) = resolve_target(
+        &parsed,
+        &options,
+        dims,
+        recipe_weights.as_deref(),
+        &user,
+        &parts,
+    )?
+    else {
         return Ok(());
     };
+    let gpu = settings.gpu().is_some();
+    let guess = configure_device(Device::guess(settings), &target.recipe, &parts, rank, gpu);
+    let initial = lower(&target.g, 0, &target.sizes, &guess)?;
     let mut noise = Noise(7);
-    let loads: Vec<Weight> = match s.loads.take() {
-        Some(loads) => loads,
-        None => make_loads(&s.g, &s.pins, &mut noise),
+    let loads: Vec<Weight> = match (target.loads.take(), target.part.take()) {
+        (Some(w), _) => w,
+        (None, Some(part)) => {
+            part.weights_shared(&target.g, &|at| initial.share(at))
+                .map_err(|e| e as Box<dyn Error>)?
+                .0
+        }
+        (None, None) => make_loads(&target.g, &target.recipe.pins, &mut noise),
     };
-    let router = extract_router(&s.g, &loads);
+    let router = extract_router(&target.g, &loads);
     let prefill_seed = 19u64;
     // The reference runs the plan's own kernels.
     let plain = Settings {
         kernels: None,
         ..settings.clone()
     };
-    let guess = Device::guess(settings).pinned(s.pins.clone());
-    let mut runner = opened(lower(&s.g, 0, &s.sizes, &guess)?, &loads, &plain)?;
-    let stored = Device::stored(runner.platform(), settings);
-    let device = stored.map_or(guess, |d| d.pinned(s.pins.clone()));
+    let mut runner = open_runner(initial, &loads, &plain, target.recipe.launch)?;
+    let stored =
+        Device::stored(runner.platform(), settings).unwrap_or_else(|_| Device::guess(settings));
+    let device = configure_device(stored, &target.recipe, &parts, rank, gpu);
     let mut p_noise = Noise(prefill_seed);
-    let pos_offset = prefill_kept(&mut *runner, &s.g, &s.sizes, &device, &mut p_noise)?;
+    let pos_offset = prefill_kept(
+        &mut *runner,
+        &target.g,
+        &target.sizes,
+        &device,
+        &mut p_noise,
+    )?;
     let (fed, route_stats) = routed_feeds(
-        &s.g,
-        &s.sizes,
+        &target.g,
+        &target.sizes,
         router.as_deref(),
-        s.skew,
+        target.skew,
         pos_offset,
         &mut noise,
     )?;
     if let Some(stats) = route_stats {
-        println!("routing: {stats}");
+        if to_stderr {
+            eprintln!("routing: {stats}");
+        } else {
+            println!("routing: {stats}");
+        }
     }
     let views: Vec<View> = fed.iter().map(Tensor::view).collect();
-    let plan = lower(&s.g, 0, &s.sizes, &device)?;
+    let plan = lower(&target.g, 0, &target.sizes, &device)?;
     runner.replan(&plan)?;
+    init_tables(&mut *runner, &plan)?;
     runner.feed(&views)?;
     runner.submit(0..plan.steps.len())?;
     let want = outputs(&*runner, &plan)?;
     drop(runner);
     let files = Settings {
-        kernels: Some(PathBuf::from(dir)),
+        kernels: Some(parsed.dir.clone()),
         ..settings.clone()
     };
-    let mut runner = opened(plan.clone(), &loads, &files)?;
+    let mut runner = open_runner(plan.clone(), &loads, &files, target.recipe.launch)?;
     // A checkpoint's weights now live on the device.
     drop(loads);
     let mut p_noise = Noise(prefill_seed);
-    let _ = prefill_kept(&mut *runner, &s.g, &s.sizes, &device, &mut p_noise)?;
+    let _ = prefill_kept(
+        &mut *runner,
+        &target.g,
+        &target.sizes,
+        &device,
+        &mut p_noise,
+    )?;
     runner.replan(&plan)?;
+    init_tables(&mut *runner, &plan)?;
     for path in runner.dump()? {
-        println!("wrote {}", path.display());
+        if to_stderr {
+            eprintln!("wrote {}", path.display());
+        } else {
+            println!("wrote {}", path.display());
+        }
     }
+    let meta = Meta {
+        device: runner.device(),
+        parts: parts.0.clone(),
+        rank,
+        region: target.region,
+        recipe: options.name.or(parsed.recipe),
+    };
     let rows = rows(&plan, &device);
     let mut watch = Watch {
         runner,
@@ -565,16 +830,34 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
         feeds: fed,
         want,
         rows,
+        meta,
+        json: parsed.json,
+        baseline,
     };
     let reloads = watch.runner.refresh()?;
-    watch.note(&reloads);
-    println!(
+    watch.note(&reloads, to_stderr);
+    if parsed.once {
+        for r in &reloads {
+            if let Outcome::Failed(why) = &r.outcome {
+                return Err(format!("override failed ({}): {why}", r.path.display()).into());
+            }
+        }
+    }
+    let msg = format!(
         "timing {} kernels on {}",
         watch.rows.len(),
         watch.runner.device()
     );
+    if to_stderr {
+        eprintln!("{msg}");
+    } else {
+        println!("{msg}");
+    }
     let all: Vec<usize> = (0..watch.rows.len()).collect();
     watch.report(&all)?;
+    if parsed.once {
+        return Ok(());
+    }
     loop {
         let reloads = watch.runner.refresh()?;
         if reloads.is_empty() {
@@ -582,11 +865,16 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
             continue;
         }
         let start = Instant::now();
-        let changed = watch.note(&reloads);
+        let changed = watch.note(&reloads, to_stderr);
         if changed.is_empty() {
             continue;
         }
         watch.report(&changed)?;
-        println!("in {:.0} ms", start.elapsed().as_secs_f64() * 1e3);
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        if to_stderr {
+            eprintln!("in {ms:.0} ms");
+        } else {
+            println!("in {ms:.0} ms");
+        }
     }
 }

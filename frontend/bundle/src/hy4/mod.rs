@@ -5,6 +5,7 @@ mod hy4_test;
 
 use crate::arch::{Arch, Ask, Built, Spot, arch, open_streamed, parse_keys, push_routed_mlp};
 use crate::names::Rule;
+use crate::parts::{Cut, Part, from_streamed};
 use std::error::Error;
 use tessera_engine::hy4::{Config, PlainLatent, RotatedLatent, program, stepper};
 
@@ -19,6 +20,7 @@ arch!(
     ],
     step: step,
     forward: forward,
+    part: part,
 );
 
 const MLP: [(&str, &str); 3] = [
@@ -50,6 +52,18 @@ fn step(_: &Arch, ask: &Ask) -> Result<Built> {
 
 fn forward(_: &Arch, ask: &Ask) -> Result<Built> {
     build(ask, false)
+}
+
+fn part(_: &Arch, cut: &Cut) -> Result<Part> {
+    let cfg = parse_config(cut.json, cut.sized(256))?;
+    let layers = cfg.stack.layers;
+    from_streamed(
+        cut,
+        cfg,
+        layers,
+        rules,
+        [stepper::<PlainLatent>, stepper::<RotatedLatent>],
+    )
 }
 
 pub(crate) fn parse_config(json: &str, [seqs, context]: [u64; 2]) -> Result<Config> {

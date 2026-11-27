@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -172,6 +172,9 @@ struct Collected {
     rule: String,
     kind: &'static str,
     source: String,
+    flags: Vec<String>,
+    prep_error: Option<String>,
+    resident: bool,
     dynamic_shared: usize,
     threads: usize,
 }
@@ -190,6 +193,11 @@ thread_local! {
     static ACTIVE: RefCell<Option<Arc<Mutex<Captured>>>> = const { RefCell::new(None) };
 }
 
+fn slot_is(slot: &Option<Arc<Mutex<Captured>>>, id: u64) -> bool {
+    slot.as_ref()
+        .is_some_and(|c| c.lock().is_ok_and(|g| g.id == id))
+}
+
 /// Check session handle forwarded to an intended loader thread.
 #[derive(Clone)]
 pub struct Scope(Arc<Mutex<Captured>>);
@@ -203,10 +211,7 @@ impl Drop for ScopeGuard {
     fn drop(&mut self) {
         let _ = ACTIVE.try_with(|cell| {
             let mut slot = cell.borrow_mut();
-            let same = slot
-                .as_ref()
-                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
-            if same {
+            if slot_is(&slot, self.id) {
                 *slot = self.prev.take();
             }
         });
@@ -228,8 +233,7 @@ pub fn current_scope() -> Option<Scope> {
     ACTIVE.with(|cell| {
         let slot = cell.borrow();
         let arc = slot.as_ref()?;
-        let guard = arc.lock().ok()?;
-        (!guard.closed).then(|| Scope(arc.clone()))
+        (!arc.lock().ok()?.closed).then(|| Scope(arc.clone()))
     })
 }
 
@@ -246,15 +250,11 @@ impl Session {
         self.live = false;
         let owned = ACTIVE.with(|cell| {
             let mut slot = cell.borrow_mut();
-            let same = slot
-                .as_ref()
-                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
+            let same = slot_is(&slot, self.id);
             if same {
                 slot.take();
-                true
-            } else {
-                false
             }
+            same
         });
         let mut captured = self.handle.lock().expect("check session");
         let was_closed = captured.closed;
@@ -283,10 +283,7 @@ impl Drop for Session {
         }
         let _ = ACTIVE.try_with(|cell| {
             let mut slot = cell.borrow_mut();
-            let same = slot
-                .as_ref()
-                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
-            if same {
+            if slot_is(&slot, self.id) {
                 *slot = None;
             }
         });
@@ -378,12 +375,19 @@ fn unit_key(name: &str) -> String {
     }
 }
 
-/// Groups entries by exact `(unit_name, source)` compile inputs.
-fn compile_groups(entries: &[Collected]) -> BTreeMap<(String, &str), Vec<usize>> {
-    let mut groups: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
+type GroupKey<'a> = (String, &'a str, &'a [String], Option<&'a str>);
+
+/// Groups entries by compile unit, source, flags and error.
+fn compile_groups(entries: &[Collected]) -> BTreeMap<GroupKey<'_>, Vec<usize>> {
+    let mut groups: BTreeMap<GroupKey<'_>, Vec<usize>> = BTreeMap::new();
     for (idx, item) in entries.iter().enumerate() {
         groups
-            .entry((unit_key(&item.entry), item.source.as_str()))
+            .entry((
+                unit_key(&item.entry),
+                item.source.as_str(),
+                item.flags.as_slice(),
+                item.prep_error.as_deref(),
+            ))
             .or_default()
             .push(idx);
     }
@@ -402,6 +406,7 @@ fn collect_step(step: &Step, out: &mut BTreeMap<(String, String), Collected>) {
         return;
     }
     let key = (entry.clone(), source.clone());
+    let resident = step.kernel.resident().is_some();
     let dynamic_shared = step
         .kernel
         .resident()
@@ -412,6 +417,7 @@ fn collect_step(step: &Step, out: &mut BTreeMap<(String, String), Collected>) {
         .map_or_else(|| group(step), |r| r.threads as usize);
     out.entry(key)
         .and_modify(|item| {
+            item.resident |= resident;
             item.dynamic_shared = item.dynamic_shared.max(dynamic_shared);
             item.threads = item.threads.max(threads);
         })
@@ -420,6 +426,9 @@ fn collect_step(step: &Step, out: &mut BTreeMap<(String, String), Collected>) {
             rule: step.rule.to_string(),
             kind,
             source,
+            flags: Vec::new(),
+            prep_error: None,
+            resident,
             dynamic_shared,
             threads,
         });
@@ -431,19 +440,62 @@ fn collect_plan(plan: &Plan, out: &mut BTreeMap<(String, String), Collected>) {
     }
 }
 
+fn file_error_report(
+    entry: String,
+    arch: String,
+    nvrtc: Option<String>,
+    ptxas: Option<String>,
+    ptx_bytes: usize,
+    err: String,
+) -> CheckReport {
+    let k = KernelResult {
+        entry,
+        rule: "file".into(),
+        kind: "file",
+        dynamic_shared: 0,
+        threads: 0,
+        ptx_bytes,
+        stats: None,
+        error: Some(err),
+    };
+    CheckReport {
+        arch,
+        nvrtc,
+        ptxas,
+        kernels: vec![k],
+    }
+}
+
 /// Verifies one standalone CUDA file offline.
 pub fn check_file(
     path: &Path,
     entry: Option<&str>,
     cfg: &CheckConfig,
 ) -> Result<CheckReport, Error> {
-    let source =
-        std::fs::read_to_string(path).map_err(|e| Error::KernelFile(path.to_path_buf(), e))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("kernel.cu");
-    check_source(name, entry, &source, cfg)
+    if !path.exists() {
+        return Err(Error::KernelFile(
+            path.to_path_buf(),
+            std::fs::read_to_string(path).unwrap_err(),
+        ));
+    }
+    match overrides::load_file(path, Backend::Cuda) {
+        Ok((source, launch)) => {
+            let flags = launch.as_ref().map_or_else(Vec::new, |l| l.flags());
+            check_source(name, entry, &source, &flags, cfg)
+        }
+        Err(err) => Ok(file_error_report(
+            entry.unwrap_or(name).to_string(),
+            sm_target(&cfg.arch)?,
+            nvrtc_tag(),
+            resolve_ptxas(cfg)?.map(|p| p.display().to_string()),
+            0,
+            err,
+        )),
+    }
 }
 
 /// Verifies one standalone CUDA source string offline.
@@ -451,75 +503,51 @@ fn check_source(
     name: &str,
     entry: Option<&str>,
     source: &str,
+    flags: &[&str],
     cfg: &CheckConfig,
 ) -> Result<CheckReport, Error> {
-    let sm = sm_target(&cfg.arch)?;
-    let ptxas = resolve_ptxas(cfg)?;
-    let nvrtc = nvrtc_tag();
+    let (sm, ptxas, nvrtc) = (sm_target(&cfg.arch)?, resolve_ptxas(cfg)?, nvrtc_tag());
     let ptxas_str = ptxas.as_ref().map(|p| p.display().to_string());
-    let mut kernels = Vec::new();
-    let unit = match nvrtc_compile(&cfg.arch, name, source) {
+    let unit = match nvrtc_compile(&cfg.arch, name, source, flags) {
         Ok(ptx) => ptx,
         Err(err) => {
-            kernels.push(KernelResult {
-                entry: entry.unwrap_or(name).to_string(),
+            let want = entry.unwrap_or(name).to_string();
+            return Ok(file_error_report(want, sm, nvrtc, ptxas_str, 0, err));
+        }
+    };
+    let found = ptx_entries(&String::from_utf8_lossy(&unit));
+    if entry.is_none() && found.is_empty() {
+        let msg = format!("missing `.entry` kernel in PTX for `{name}`");
+        return Ok(file_error_report(
+            name.into(),
+            sm,
+            nvrtc,
+            ptxas_str,
+            unit.len(),
+            msg,
+        ));
+    }
+    let wanted = entry.map_or_else(|| found.clone(), |e| vec![e.to_string()]);
+    let asm = ptxas
+        .as_deref()
+        .map(|b| run_ptxas(b, &sm, &unit, cfg.temp.as_deref()));
+    let kernels = wanted
+        .into_iter()
+        .map(|want| {
+            let missing = entry.is_some() && !found.iter().any(|e| e == &want);
+            let (stats, error) = eval_entry(&want, missing, &found, asm.as_ref(), cfg.max_spills);
+            KernelResult {
+                entry: want,
                 rule: "file".into(),
                 kind: "file",
                 dynamic_shared: 0,
                 threads: 0,
-                ptx_bytes: 0,
-                stats: None,
-                error: Some(err),
-            });
-            return Ok(CheckReport {
-                arch: sm,
-                nvrtc,
-                ptxas: ptxas_str,
-                kernels,
-            });
-        }
-    };
-    let ptx_text = String::from_utf8_lossy(&unit);
-    let found = ptx_entries(&ptx_text);
-    if entry.is_none() && found.is_empty() {
-        kernels.push(KernelResult {
-            entry: name.to_string(),
-            rule: "file".into(),
-            kind: "file",
-            dynamic_shared: 0,
-            threads: 0,
-            ptx_bytes: unit.len(),
-            stats: None,
-            error: Some(format!("missing `.entry` kernel in PTX for `{name}`")),
-        });
-        return Ok(CheckReport {
-            arch: sm,
-            nvrtc,
-            ptxas: ptxas_str,
-            kernels,
-        });
-    }
-    let wanted: Vec<String> = match entry {
-        Some(e) => vec![e.to_string()],
-        None => found.clone(),
-    };
-    let assembled = ptxas
-        .as_deref()
-        .map(|bin| run_ptxas(bin, &sm, &unit, cfg.temp.as_deref()));
-    for want in wanted {
-        let missing = entry.is_some() && !found.iter().any(|e| e == &want);
-        let (stats, err) = eval_entry(&want, missing, &found, assembled.as_ref(), cfg.max_spills);
-        kernels.push(KernelResult {
-            entry: want,
-            rule: "file".into(),
-            kind: "file",
-            dynamic_shared: 0,
-            threads: 0,
-            ptx_bytes: unit.len(),
-            stats,
-            error: err,
-        });
-    }
+                ptx_bytes: unit.len(),
+                stats,
+                error,
+            }
+        })
+        .collect();
     Ok(CheckReport {
         arch: sm,
         nvrtc,
@@ -529,16 +557,29 @@ fn check_source(
 }
 
 fn verify_collected(mut entries: Vec<Collected>, cfg: &CheckConfig) -> Result<CheckReport, Error> {
-    let sm = sm_target(&cfg.arch)?;
-    let ptxas = resolve_ptxas(cfg)?;
-    let nvrtc = nvrtc_tag();
+    let (sm, ptxas, nvrtc) = (sm_target(&cfg.arch)?, resolve_ptxas(cfg)?, nvrtc_tag());
     let ptxas_str = ptxas.as_ref().map(|p| p.display().to_string());
     if let Some(dir) = &cfg.overrides {
         for item in &mut entries {
-            let path = dir.join(format!("{}.cu", item.entry));
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                item.source = text;
-                item.kind = "override";
+            let planned = item.source.clone();
+            match overrides::load_entry(dir, Backend::Cuda, &item.entry, item.resident, || planned)
+            {
+                Ok(Some(prep)) => {
+                    item.source = prep.source;
+                    item.kind = "override";
+                    if let Some(launch) = prep.launch {
+                        item.flags = launch.nvrtc_flags;
+                        item.threads = launch.threads.map_or(item.threads, |t| t as usize);
+                        item.dynamic_shared = launch
+                            .dynamic_shared
+                            .map_or(item.dynamic_shared, |s| s as usize);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    item.kind = "override";
+                    item.prep_error = Some(err);
+                }
             }
         }
     }
@@ -578,6 +619,24 @@ fn verify_collected(mut entries: Vec<Collected>, cfg: &CheckConfig) -> Result<Ch
     })
 }
 
+fn item_result(
+    item: &Collected,
+    ptx_bytes: usize,
+    stats: Option<PtxStats>,
+    error: Option<String>,
+) -> KernelResult {
+    KernelResult {
+        entry: item.entry.clone(),
+        rule: item.rule.clone(),
+        kind: item.kind,
+        dynamic_shared: item.dynamic_shared,
+        threads: item.threads,
+        ptx_bytes,
+        stats,
+        error,
+    }
+}
+
 fn verify_group(
     entries: &[Collected],
     indices: &[usize],
@@ -586,28 +645,20 @@ fn verify_group(
     ptxas: Option<&Path>,
 ) -> Vec<(usize, KernelResult)> {
     let first = &entries[indices[0]];
-    if first.source.is_empty() {
+    let pre_err = first.prep_error.clone().or_else(|| {
+        first
+            .source
+            .is_empty()
+            .then(|| format!("kernel `{}` has empty CUDA source", first.entry))
+    });
+    if let Some(err) = pre_err {
         return indices
             .iter()
-            .map(|&idx| {
-                let item = &entries[idx];
-                (
-                    idx,
-                    KernelResult {
-                        entry: item.entry.clone(),
-                        rule: item.rule.clone(),
-                        kind: item.kind,
-                        dynamic_shared: item.dynamic_shared,
-                        threads: item.threads,
-                        ptx_bytes: 0,
-                        stats: None,
-                        error: Some(format!("kernel `{}` has empty CUDA source", item.entry)),
-                    },
-                )
-            })
+            .map(|&idx| (idx, item_result(&entries[idx], 0, None, Some(err.clone()))))
             .collect();
     }
-    let unit = nvrtc_compile(&cfg.arch, &first.entry, &first.source);
+    let flags: Vec<&str> = first.flags.iter().map(String::as_str).collect();
+    let unit = nvrtc_compile(&cfg.arch, &first.entry, &first.source, &flags);
     let (ptx_bytes, found, assembled, nvrtc_err) = match unit {
         Ok(ptx) => {
             let found = ptx_entries(&String::from_utf8_lossy(&ptx));
@@ -633,19 +684,7 @@ fn verify_group(
                     )
                 }
             };
-            (
-                idx,
-                KernelResult {
-                    entry: item.entry.clone(),
-                    rule: item.rule.clone(),
-                    kind: item.kind,
-                    dynamic_shared: item.dynamic_shared,
-                    threads: item.threads,
-                    ptx_bytes,
-                    stats,
-                    error,
-                },
-            )
+            (idx, item_result(item, ptx_bytes, stats, error))
         })
         .collect()
 }
@@ -691,46 +730,47 @@ fn eval_entry(
             );
         };
         let Some(spill) = s.spill_bytes() else {
-            return (
-                Some(s),
-                Some(format!(
-                    "ptxas reported partial spill stats for `{entry}` under --max-spills {limit} B"
-                )),
+            let msg = format!(
+                "ptxas reported partial spill stats for `{entry}` under --max-spills {limit} B"
             );
+            return (Some(s), Some(msg));
         };
         if spill > limit {
-            return (
-                Some(s),
-                Some(format!(
-                    "spill {spill} B exceeds --max-spills {limit} B (stack={} B, stores={} B, loads={} B)",
-                    s.stack_bytes.unwrap_or(0),
-                    s.spill_stores.unwrap_or(0),
-                    s.spill_loads.unwrap_or(0)
-                )),
+            let (st, wr, rd) = (
+                s.stack_bytes.unwrap_or(0),
+                s.spill_stores.unwrap_or(0),
+                s.spill_loads.unwrap_or(0),
             );
+            let msg = format!(
+                "spill {spill} B exceeds --max-spills {limit} B (stack={st} B, stores={wr} B, loads={rd} B)"
+            );
+            return (Some(s), Some(msg));
         }
     }
     (stats, None)
 }
 
-#[cfg(feature = "cuda")]
 fn nvrtc_tag() -> Option<String> {
-    tessera_gpukit::cuda::nvrtc_version().map(|(maj, min)| format!("{maj}.{min}"))
+    #[cfg(feature = "cuda")]
+    {
+        tessera_gpukit::cuda::nvrtc_version().map(|(maj, min)| format!("{maj}.{min}"))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
 }
 
-#[cfg(not(feature = "cuda"))]
-fn nvrtc_tag() -> Option<String> {
-    None
-}
-
-#[cfg(feature = "cuda")]
-fn nvrtc_compile(arch: &str, name: &str, source: &str) -> Result<Vec<u8>, String> {
-    tessera_gpukit::cuda::compile_ptx(arch, name, source).map_err(|e| e.to_string())
-}
-
-#[cfg(not(feature = "cuda"))]
-fn nvrtc_compile(_arch: &str, _name: &str, _source: &str) -> Result<Vec<u8>, String> {
-    Err("this build has no CUDA support (enable feature `cuda`)".into())
+fn nvrtc_compile(arch: &str, name: &str, source: &str, flags: &[&str]) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "cuda")]
+    {
+        tessera_gpukit::cuda::compile_ptx_with(arch, name, source, flags).map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (arch, name, source, flags);
+        Err("this build has no CUDA support (enable feature `cuda`)".into())
+    }
 }
 
 /// Extracts `.entry <name>` symbols from compiled PTX text.
@@ -816,11 +856,9 @@ impl TempDir {
     fn create(base: &Path) -> Result<Self, String> {
         let pid = std::process::id();
         for attempt in 0..64u32 {
-            let mut h = RandomState::new().build_hasher();
-            pid.hash(&mut h);
-            NEXT_TMP.fetch_add(1, Ordering::Relaxed).hash(&mut h);
-            attempt.hash(&mut h);
-            let dir = base.join(format!("tessera-check-{pid}-{:016x}", h.finish()));
+            let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+            let tag = RandomState::new().hash_one((pid, seq, attempt));
+            let dir = base.join(format!("tessera-check-{pid}-{tag:016x}"));
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
@@ -861,10 +899,7 @@ fn run_ptxas(
         .and_then(|mut file| file.write_all(&ptx[..end]))
         .map_err(|e| format!("write ptx temp: {e}"))?;
     let output = Command::new(ptxas)
-        .arg("--gpu-name")
-        .arg(sm_arch)
-        .arg("-v")
-        .arg("-o")
+        .args(["--gpu-name", sm_arch, "-v", "-o"])
         .arg(&cubin_path)
         .arg(&ptx_path)
         .output()
@@ -872,16 +907,23 @@ fn run_ptxas(
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let msg = format!("{stderr}{stdout}").trim().to_string();
-        return Err(format!("ptxas ({sm_arch}) failed: {msg}"));
+        return Err(format!(
+            "ptxas ({sm_arch}) failed: {}",
+            format!("{stderr}{stdout}").trim()
+        ));
     }
     Ok(parse_ptxas(&stderr))
 }
 
 /// Extracts the unsigned integer directly before `marker` in `segment`.
 fn num_before(segment: &str, marker: &str) -> Option<u32> {
-    let head = segment.split(marker).next()?;
-    head.split_whitespace().last()?.parse().ok()
+    segment
+        .split(marker)
+        .next()?
+        .split_whitespace()
+        .last()?
+        .parse()
+        .ok()
 }
 
 fn merge_max(slot: &mut Option<u32>, value: u32) {
@@ -899,10 +941,11 @@ fn parse_ptxas(stderr: &str) -> HashMap<String, PtxStats> {
             map.insert(name, stats);
         }
     };
-    for line in stderr.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.split("Compiling entry function '").nth(1)
-            && let Some(name) = rest.split('\'').next()
+    for line in stderr.lines().map(str::trim) {
+        if let Some(name) = line
+            .split("Compiling entry function '")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
         {
             flush(&mut current, &mut map);
             current = Some((name.to_string(), PtxStats::default(), false));
@@ -912,27 +955,27 @@ fn parse_ptxas(stderr: &str) -> HashMap<String, PtxStats> {
         let Some((ref entry, ref mut stats, ref mut seen)) = current else {
             continue;
         };
-        if let Some(prop_fn) = trimmed.split("Function properties for ").nth(1) {
+        if let Some(prop_fn) = line.split("Function properties for ").nth(1) {
             in_props = prop_fn.trim() == entry;
             continue;
         }
-        if in_props && trimmed.contains("stack frame") {
-            for part in trimmed.split(',') {
-                if let Some(n) = num_before(part, "bytes stack frame") {
-                    merge_max(&mut stats.stack_bytes, n);
-                    *seen = true;
-                } else if let Some(n) = num_before(part, "bytes spill stores") {
-                    merge_max(&mut stats.spill_stores, n);
-                    *seen = true;
-                } else if let Some(n) = num_before(part, "bytes spill loads") {
-                    merge_max(&mut stats.spill_loads, n);
-                    *seen = true;
+        if in_props && line.contains("stack frame") {
+            for part in line.split(',') {
+                for (tag, dst) in [
+                    ("bytes stack frame", &mut stats.stack_bytes),
+                    ("bytes spill stores", &mut stats.spill_stores),
+                    ("bytes spill loads", &mut stats.spill_loads),
+                ] {
+                    if let Some(n) = num_before(part, tag) {
+                        merge_max(dst, n);
+                        *seen = true;
+                    }
                 }
             }
             in_props = false;
             continue;
         }
-        if let Some(rest) = trimmed.split("Used ").nth(1) {
+        if let Some(rest) = line.split("Used ").nth(1) {
             for part in rest.split(',') {
                 if let Some(n) = num_before(part, "registers") {
                     stats.regs = Some(n);

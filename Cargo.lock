@@ -2195,6 +2195,7 @@ name = "tessera-calibrate"
 version = "0.1.0"
 dependencies = [
  "naga",
+ "serde",
  "serde_json",
  "tessera-bundle",
  "tessera-codegen",
@@ -2203,8 +2204,10 @@ dependencies = [
  "tessera-graph",
  "tessera-lower",
  "tessera-models",
+ "tessera-recipe",
  "tessera-rules",
  "tessera-run",
+ "tessera-serve",
  "tessera-sim",
  "tessera-testkit",
  "tessera-trace",
@@ -2737,6 +2740,7 @@ name = "tessera-run"
 version = "0.1.0"
 dependencies = [
  "rayon",
+ "serde",
  "serde_json",
  "tessera-codegen",
  "tessera-engine-comm",
@@ -2752,6 +2756,7 @@ dependencies = [
  "tessera-testkit",
  "tessera-trace",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

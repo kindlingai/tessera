@@ -1,7 +1,7 @@
 //! Compiled kernels, shared by the GPU runners.
 
 use crate::Error;
-use crate::overrides;
+use crate::overrides::{self, Overrides};
 use crate::profile::format_attrs;
 use crate::run::{Outcome, Reload};
 use std::collections::{HashMap, HashSet};
@@ -47,16 +47,23 @@ pub(crate) fn step_attrs<D: Device>(
     plan: &Plan,
     kernels: &[D::Kernel],
     resident: &[bool],
+    files: Option<&Overrides<D::Kernel>>,
 ) -> Vec<Option<KernelAttrs>> {
     let mut out = Vec::with_capacity(plan.steps.len());
     for i in 0..plan.steps.len() {
         let step = &plan.steps[i];
         let (threads, shared) = match step.kernel.resident().filter(|_| resident[i]) {
             Some(r) => (r.threads, r.shared),
-            None => (
-                launch_threads(step),
-                u32::try_from(step.kernel.needs().dynamic_shared).unwrap_or(u32::MAX),
-            ),
+            None => {
+                let over = files.and_then(|f| f.launch(overrides::entry(&step.kernel.source())));
+                let threads = over
+                    .and_then(|l| l.threads)
+                    .unwrap_or_else(|| launch_threads(step));
+                let shared = over.and_then(|l| l.dynamic_shared).unwrap_or(
+                    u32::try_from(step.kernel.needs().dynamic_shared).unwrap_or(u32::MAX),
+                );
+                (threads, shared)
+            }
         };
         out.push(ctx.attrs(&kernels[i], threads, shared));
     }

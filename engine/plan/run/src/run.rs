@@ -268,6 +268,10 @@ pub trait Run {
     fn marks(&mut self, _step: usize) -> Result<Option<crate::Marks>, Error> {
         Ok(None)
     }
+    /// Compiled resource counts and occupancy for `step`, if known.
+    fn step_attrs(&self, _step: usize) -> Option<tessera_gpukit::device::KernelAttrs> {
+        None
+    }
     /// Runs these steps as `submit` does, timed by the device.
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
         self.submit(steps).map(|_| None)

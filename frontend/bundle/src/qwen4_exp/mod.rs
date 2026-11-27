@@ -3,6 +3,7 @@
 use crate::Weights;
 use crate::arch::{Arch, Ask, Built, Spot, arch, open_streamed, parse_keys, push_routed_mlp};
 use crate::names::Rule;
+use crate::parts::{Cut, Part, from_streamed};
 use serde::Deserialize;
 use std::error::Error;
 use tessera_engine::PleConfig;
@@ -31,10 +32,23 @@ fn step(_: &Arch, ask: &Ask) -> Result<Built> {
     )
 }
 
+fn part(_: &Arch, cut: &Cut) -> Result<Part> {
+    let cfg = parse_config(cut.json, cut.sized(256))?;
+    let layers = cfg.stack.layers;
+    from_streamed(
+        cut,
+        cfg,
+        layers,
+        rules,
+        [stepper::<Moe>, stepper::<RotatedMoe>],
+    )
+}
+
 arch!(
     "qwen4_exp",
     [Spot::Type("qwen4_exp"), Spot::Class(CLASS)],
     step: step,
+    part: part,
     ple: ple,
 );
 

@@ -1,11 +1,15 @@
 use super::{
-    ACTIVE, CheckConfig, Collected, PtxStats, TempDir, check_source, compile_groups, eval_entry,
-    find_ptxas, parse_ptxas, ptx_entries, sm_target, start, target_platform, verify_collected,
+    ACTIVE, CheckConfig, Collected, PtxStats, TempDir, check_file, check_source, compile_groups,
+    eval_entry, find_ptxas, parse_ptxas, ptx_entries, sm_target, start, target_platform,
+    verify_collected,
 };
 use crate::Run;
+use crate::overrides::Overrides;
+use crate::run::Outcome;
 use std::collections::HashMap;
 use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_engine_settings::{Backend, Pick, Settings};
+use tessera_gpukit::backend::Backend as GpuBackend;
 use tessera_lower::Plan;
 
 struct DummyRank;
@@ -99,7 +103,7 @@ fn checks_platform_and_config() {
         max_spills: Some(0),
         ..CheckConfig::default()
     };
-    assert!(check_source("k.cu", None, "", &bad).is_err());
+    assert!(check_source("k.cu", None, "", &[], &bad).is_err());
     let ptx = ".visible .entry alpha(\n)\n.entry beta (\n)\n";
     assert_eq!(ptx_entries(ptx), vec!["alpha", "beta"]);
 }
@@ -167,18 +171,18 @@ fn checks_sources_offline() {
         ..CheckConfig::default()
     };
     let good = "extern \"C\" __global__ void good_k(float* y) { y[0] = 2.0f; }\n";
-    let report = check_source("good_k.cu", Some("good_k"), good, &cfg).unwrap();
+    let report = check_source("good_k.cu", Some("good_k"), good, &[], &cfg).unwrap();
     if report.nvrtc.is_none() {
         return;
     }
     assert!(report.ok() && report.kernels[0].ptx_bytes > 0);
 
     let no_entry = "__device__ int helper(int x) { return x + 1; }\n";
-    let empty_rep = check_source("helper.cu", None, no_entry, &cfg).unwrap();
+    let empty_rep = check_source("helper.cu", None, no_entry, &[], &cfg).unwrap();
     assert!(!empty_rep.ok() && empty_rep.failed() == 1);
 
     let bad = "extern \"C\" __global__ void bad_k(float* y) {\n    y[0] = no_such_var;\n}\n";
-    let err = check_source("bad_k.cu", Some("bad_k"), bad, &cfg)
+    let err = check_source("bad_k.cu", Some("bad_k"), bad, &[], &cfg)
         .unwrap()
         .kernels[0]
         .error
@@ -186,7 +190,7 @@ fn checks_sources_offline() {
         .unwrap_or_default();
     assert!(err.contains("bad_k.cu") && err.contains("(2)"), "{err}");
 
-    let miss = check_source("good_k.cu", Some("wrong_name"), good, &cfg).unwrap();
+    let miss = check_source("good_k.cu", Some("wrong_name"), good, &[], &cfg).unwrap();
     assert!(!miss.ok());
 
     if find_ptxas().is_some() {
@@ -195,7 +199,7 @@ fn checks_sources_offline() {
             run_ptxas: true,
             ..CheckConfig::default()
         };
-        let clean = check_source("good_k.cu", Some("good_k"), good, &strict).unwrap();
+        let clean = check_source("good_k.cu", Some("good_k"), good, &[], &strict).unwrap();
         assert!(clean.ok(), "{:?}", clean.kernels);
         assert_eq!(clean.kernels[0].stats.unwrap().spill_bytes(), Some(0));
 
@@ -204,7 +208,7 @@ fn checks_sources_offline() {
             for (int i = 0; i < 64; i++) buf[i] = (float)(i + idx);\n\
             y[0] = buf[idx & 63];\n\
         }\n";
-        let rep = check_source("spill_k.cu", Some("spill_k"), spill, &strict).unwrap();
+        let rep = check_source("spill_k.cu", Some("spill_k"), spill, &[], &strict).unwrap();
         assert!(!rep.ok() && rep.spilling() == 1);
     }
 }
@@ -215,6 +219,9 @@ fn collected(entry: &str, source: &str) -> Collected {
         rule: "test".into(),
         kind: "fixed",
         source: source.into(),
+        flags: Vec::new(),
+        prep_error: None,
+        resident: false,
         dynamic_shared: 0,
         threads: 32,
     }
@@ -234,8 +241,11 @@ extern \"C\" __global__ void beta(float* y) { y[0] = 2.0f; }
     ];
     let groups = compile_groups(&items);
     assert_eq!(groups.len(), 2);
-    assert_eq!(groups[&("alpha.cu".into(), shared)], vec![0, 1]);
-    assert_eq!(groups[&("beta.cu".into(), shared)], vec![2]);
+    assert_eq!(
+        groups[&("alpha.cu".into(), shared, &[][..], None)],
+        vec![0, 1]
+    );
+    assert_eq!(groups[&("beta.cu".into(), shared, &[][..], None)], vec![2]);
 
     if !cfg!(feature = "cuda") {
         return;
@@ -260,4 +270,95 @@ extern \"C\" __global__ void beta(float* y) { y[0] = 2.0f; }
         "{err}"
     );
     assert!(!report.ok());
+}
+
+#[test]
+fn checks_override_headers_flags() {
+    let (mut a, mut b) = (collected("flag_k", "src"), collected("flag_k", "src"));
+    a.flags = vec!["-DMY_SCALE=4".into()];
+    b.flags = vec!["-DMY_SCALE=8".into()];
+    assert_eq!(compile_groups(&[a, b]).len(), 2);
+
+    let dir = tessera_testkit::scratch(&format!("check-ov-flags-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cu = dir.join("flag_k.cu");
+    let cfg_path = dir.join("flag_k.launch.toml");
+    std::fs::write(
+        dir.join("scale.cuh"),
+        "#pragma once\n__device__ int get_scale() { return MY_SCALE; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &cu,
+        "#include \"scale.cuh\"\nextern \"C\" __global__ void flag_k(int* y) { y[0] = get_scale(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &cfg_path,
+        "threads = 128\ndynamic_shared = 2048\nnvrtc_flags = [\"-DMY_SCALE=4\"]\n",
+    )
+    .unwrap();
+
+    // Runtime overrides path prepares the exact same source and flags.
+    let mut ov = Overrides::new(dir.clone(), GpuBackend::Cuda);
+    let (mut seen_src, mut seen_flags) = (String::new(), Vec::new());
+    let res = ov
+        .check(
+            "flag_k",
+            false,
+            || "planned".into(),
+            |src, flags| {
+                seen_src = src.to_string();
+                seen_flags = flags.iter().map(|s| (*s).to_string()).collect();
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(res.outcome, Outcome::Loaded);
+    assert!(seen_src.contains("get_scale") && seen_flags == vec!["-DMY_SCALE=4"]);
+
+    // Resident override with launch.toml fails offline check explicitly.
+    let mut res_item = collected("flag_k", "planned");
+    res_item.resident = true;
+    let cfg = CheckConfig {
+        run_ptxas: false,
+        overrides: Some(dir.clone()),
+        ..CheckConfig::default()
+    };
+    let res_rep = verify_collected(vec![res_item], &cfg).unwrap();
+    assert!(
+        !res_rep.ok()
+            && res_rep.kernels[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("resident")
+    );
+
+    if cfg!(feature = "cuda") {
+        let rep = verify_collected(vec![collected("flag_k", "planned")], &cfg).unwrap();
+        if rep.nvrtc.is_some() {
+            let k = &rep.kernels[0];
+            assert!(
+                rep.ok()
+                    && k.kind == "override"
+                    && k.threads == 128
+                    && k.dynamic_shared == 2048
+                    && k.ptx_bytes > 0
+            );
+            assert!(check_file(&cu, Some("flag_k"), &cfg).unwrap().ok());
+            std::fs::remove_file(&cfg_path).unwrap();
+            let miss = verify_collected(vec![collected("flag_k", "planned")], &cfg).unwrap();
+            assert!(
+                !miss.ok()
+                    && miss.kernels[0]
+                        .error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("MY_SCALE")
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -164,7 +164,7 @@ pub(super) fn dtyped(options: &Options, mut recipe: Recipe) -> Recipe {
 }
 
 /// The lowering choices, with the model's pins by default.
-pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
+pub(crate) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     let mut recipe = options.lower.clone().unwrap_or_default();
     let base = pins.unwrap_or_else(|| Pins::all(tessera_engine::form::BF16_FORM));
     if recipe.pins == Pins::default() {

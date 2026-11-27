@@ -142,6 +142,16 @@ impl Options {
         filed.unwrap_or_default().then(&self.shapes)
     }
 
+    /// Lowering choices from recipe, flags and model `pins`.
+    pub fn lowering(&self, pins: Option<tessera_engine::Pins>) -> Recipe {
+        crate::task::lowering(self, pins)
+    }
+
+    /// Optional `--manifest` value from recipe or flags.
+    pub fn manifest(&self) -> Option<&str> {
+        self.given.get("--manifest").map(String::as_str)
+    }
+
     /// Takes a flag with no value. `false` if unknown.
     pub fn switch(&mut self, flag: &str) -> bool {
         match flag {

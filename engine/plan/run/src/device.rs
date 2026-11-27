@@ -104,7 +104,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
         ctx.bind_numa();
-        let files = |dir: &PathBuf| Overrides::new(dir.clone(), Dialect::of(D::BACKEND));
+        let files = |dir: &PathBuf| Overrides::new(dir.clone(), D::BACKEND);
         let mut base = Base::new(settings.memory, &ctx.platform());
         base.streams = settings.weight_streaming;
         if settings.memory == Memory::Device {
@@ -244,12 +244,22 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.gated.set(left.saturating_sub(1));
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
         self.ctx.programmatic(overlap && !self.resident[step]);
-        let shared = self.base.plan.steps[step].kernel.needs().dynamic_shared as u32;
         let fired = match self.resident[step] {
-            true => self.persistent(step, launch),
+            true => {
+                if self.override_launch(step).is_some_and(|o| !o.is_empty()) {
+                    Err(Error::Grid(
+                        "launch.toml overrides are unsupported on resident kernels".into(),
+                    ))
+                } else {
+                    self.persistent(step, launch)
+                }
+            }
             false => {
+                let base_shared = self.base.plan.steps[step].kernel.needs().dynamic_shared as u32;
+                let (shape, shared) =
+                    overrides::apply_launch(launch.shape, base_shared, self.override_launch(step));
                 let mut args = self.bound(&launch.args)?;
-                self.fire(&self.kernels[step], launch.shape, shared, &mut args)
+                self.fire(&self.kernels[step], shape, shared, &mut args)
             }
         };
         fired.map_err(|e| {
@@ -485,22 +495,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         Ok(())
     }
 
-    /// Passes profiling state and resident overrides to the grid.
-    fn sync_grid(&mut self) {
-        let Some(grid) = self.grid.get_mut().as_mut() else {
-            return;
-        };
-        grid.profiling(self.base.profile.is_some());
-        let Some(files) = &self.overrides else {
-            return;
-        };
-        for (entry, step) in &self.entries {
-            if self.resident[*step] {
-                grid.replace(entry, files.text(entry).map(str::to_string));
-            }
-        }
-    }
-
     /// Collects mark regions from a resident step launch.
     fn resident_marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
         if self.grid.get_mut().is_none() {
@@ -669,7 +663,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         if plan.id != 0 && plan.id == self.base.plan.id && self.kernels.len() == plan.steps.len() {
             self.apply();
             if self.overrides.is_some() {
-                self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+                self.attrs = kernels::step_attrs(
+                    ctx,
+                    plan,
+                    &self.kernels,
+                    &self.resident,
+                    self.overrides.as_ref(),
+                );
             }
             self.sync_grid();
             self.ready(plan)?;
@@ -683,7 +683,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             self.restore_plan(cached);
             self.apply();
             if self.overrides.is_some() {
-                self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+                self.attrs = kernels::step_attrs(
+                    ctx,
+                    plan,
+                    &self.kernels,
+                    &self.resident,
+                    self.overrides.as_ref(),
+                );
             }
             self.sync_grid();
             self.ready(plan)?;
@@ -724,7 +730,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.resident = resident;
         self.index(plan);
         self.apply();
-        self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+        self.attrs = kernels::step_attrs(
+            ctx,
+            plan,
+            &self.kernels,
+            &self.resident,
+            self.overrides.as_ref(),
+        );
         if self.log_attrs || self.base.profile.is_some() {
             kernels::log_spills(plan, &self.attrs, &mut self.spills);
         }
@@ -784,6 +796,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         }
         let source = self.base.plan.steps[step].kernel.source();
         let entry = overrides::entry(&source).to_string();
+        let over = self
+            .overrides
+            .as_ref()
+            .and_then(|f| f.launch(&entry))
+            .cloned();
+        let flags = over
+            .as_ref()
+            .map_or_else(Vec::new, overrides::LaunchOverride::flags);
         let loaded = self.overrides.as_ref().and_then(|f| f.text(&entry));
         let planned = || overrides::text(&self.base.plan.steps[step], D::BACKEND);
         let text = loaded.map_or_else(planned, str::to_string);
@@ -795,28 +815,21 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         let shared = self.base.plan.steps[step].kernel.needs().dynamic_shared as u32;
         let mut ran = false;
         for (launch, a) in launches.iter().zip(&mut args) {
+            let (shape, sh) = overrides::apply_launch(launch.shape, shared, over.as_ref());
             let one = marks::step_marks(
                 ctx,
                 &mut self.marked,
                 &mut self.ledger,
-                (&entry, &text),
+                (&entry, &text, &flags),
                 |k| {
                     ctx.programmatic(false);
-                    match launch.shape {
+                    match shape {
                         Shape::Line(n) => Ok(launch_1d(ctx, k, n, a)?),
                         Shape::Grid {
                             across,
                             down,
                             threads,
-                        } => Ok(launch_grid(
-                            ctx,
-                            k,
-                            across,
-                            down,
-                            threads as u32,
-                            shared,
-                            a,
-                        )?),
+                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, sh, a)?),
                         Shape::Runtime(_) => Err(tessera_lower::Error::Unbound.into()),
                     }
                 },
@@ -829,6 +842,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             found.regions.extend(one.regions);
         }
         Ok(ran.then_some(found).or_else(|| Some(Marks::default())))
+    }
+
+    fn step_attrs(&self, step: usize) -> Option<KernelAttrs> {
+        self.attrs.get(step).copied().flatten()
     }
 
     fn dump(&self) -> Result<Vec<PathBuf>, Error> {

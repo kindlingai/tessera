@@ -241,5 +241,6 @@ pub(crate) fn pick(options: &Options) -> Result<&'static Entry, String> {
     ))
 }
 
+pub(crate) use generate::lowering;
 #[cfg(test)]
 pub(crate) use generate::warm_rows;

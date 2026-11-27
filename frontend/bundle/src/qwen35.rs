@@ -2,7 +2,7 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::{Rule, repo};
-use crate::parts::{Cut, Part};
+use crate::parts::{Cut, Part, from_offer};
 use crate::{Overrides, Stream, Weights, numbered, pins, pull};
 use std::error::Error;
 use std::path::Path;
@@ -44,9 +44,16 @@ fn forward(_: &Arch, ask: &Ask) -> Result<Built> {
 }
 
 fn part(_: &Arch, cut: &Cut) -> Result<Part> {
-    let c = config(&cut.dir, cut.sized(256), &Overrides::default())?;
-    let (dir, layers) = (cut.dir.clone(), c.stack.layers);
-    Ok(Part::new(program(&c), move |g| weights(&dir, layers, g)))
+    let c = config(&cut.dir, cut.sized(256), cut.overrides)?;
+    from_offer(
+        stepper(&c),
+        cut.dir.clone(),
+        cut.manifest,
+        c.stack.layers,
+        rules(),
+        cut.user.to_vec(),
+        cut.json.to_string(),
+    )
 }
 
 arch!(

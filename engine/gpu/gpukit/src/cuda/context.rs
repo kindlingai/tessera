@@ -352,8 +352,17 @@ impl Api for Driver {
     }
 
     fn compile(ctx: &Context, name: &str, source: &str) -> Result<Vec<u8>, Error> {
+        Self::compile_with(ctx, name, source, &[])
+    }
+
+    fn compile_with(
+        ctx: &Context,
+        name: &str,
+        source: &str,
+        flags: &[&str],
+    ) -> Result<Vec<u8>, Error> {
         let (major, minor) = ctx.compute_capability();
-        compile_ptx(&format!("sm_{major}{minor}"), name, source)
+        compile_ptx_with(&format!("sm_{major}{minor}"), name, source, flags)
     }
 }
 
@@ -368,11 +377,17 @@ pub fn nvrtc_version() -> Option<(i32, i32)> {
     driver::NVRTC.version()
 }
 
-/// Compiles CUDA `source` to PTX without a GPU context.
-pub fn compile_ptx(target: &str, name: &str, source: &str) -> Result<Vec<u8>, Error> {
+/// Compiles CUDA `source` to PTX with extra NVRTC flags.
+pub fn compile_ptx_with(
+    target: &str,
+    name: &str,
+    source: &str,
+    extra: &[&str],
+) -> Result<Vec<u8>, Error> {
     let arch = compute_arch(target)?;
     let gpu_arch = format!("--gpu-architecture={arch}");
-    let base = [gpu_arch.as_str(), "--std=c++17", "--diag-suppress=177"];
+    let mut opts = vec![gpu_arch.as_str(), "--std=c++17", "--diag-suppress=177"];
+    opts.extend_from_slice(extra);
     let compiler = driver::NVRTC.version_tag();
     let unit = match name.is_empty() {
         true => "kernel.cu".into(),
@@ -384,7 +399,7 @@ pub fn compile_ptx(target: &str, name: &str, source: &str) -> Result<Vec<u8>, Er
         compiler: &compiler,
         arch: &arch,
         unit: &unit,
-        base: &base,
+        base: &opts,
         source,
     };
     cache::current().load_or(key, "ptx", |opts| {

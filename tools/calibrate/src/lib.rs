@@ -9,6 +9,10 @@ pub mod probe;
 mod routing;
 pub mod sweep;
 pub mod watch;
+mod watch_args;
+mod watch_report;
+#[cfg(test)]
+mod watch_test;
 
 // Linking the crates registers their rules.
 use tessera_rules as _;

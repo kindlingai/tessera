@@ -676,7 +676,41 @@ impl<T: Transport> Run for Rank<T> {
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
+        let name = self.runner.run().plan().steps[step].kernel.name();
+        if crosses(name) {
+            let start = Instant::now();
+            for _ in 0..times {
+                self.submit(step..step + 1)?;
+            }
+            return Ok(start.elapsed().as_secs_f64() / times.max(1) as f64);
+        }
         self.runner.run_mut().repeat(step, times)
+    }
+
+    fn refresh(&mut self) -> Result<Vec<crate::Reload>, Error> {
+        self.runner.run_mut().refresh()
+    }
+
+    fn dump(&self) -> Result<Vec<std::path::PathBuf>, Error> {
+        self.runner.run().dump()
+    }
+
+    fn marks(&mut self, step: usize) -> Result<Option<crate::Marks>, Error> {
+        self.runner.run_mut().marks(step)
+    }
+
+    fn step_attrs(&self, step: usize) -> Option<tessera_gpukit::device::KernelAttrs> {
+        self.runner.run().step_attrs(step)
+    }
+
+    fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
+        let has_cross = steps
+            .clone()
+            .any(|i| crosses(self.runner.run().plan().steps[i].kernel.name()));
+        if !has_cross {
+            return self.runner.run_mut().clocked(steps);
+        }
+        self.submit(steps).map(|_| None)
     }
 
     fn device(&self) -> String {

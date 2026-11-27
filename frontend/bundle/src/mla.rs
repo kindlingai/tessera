@@ -2,6 +2,7 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
+use crate::parts::{Cut, Part, from_streamed};
 use crate::{Stream, Weights, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
@@ -24,7 +25,20 @@ fn step(_: &Arch, ask: &Ask) -> Result<Built, Box<dyn Error + Send + Sync>> {
     Ok((graph, Weights::Streamed(Box::new(release)), pins))
 }
 
-arch!("mla", [Spot::Probe(probe)], step: step);
+fn part(_: &Arch, cut: &Cut) -> Result<Part, Box<dyn Error + Send + Sync>> {
+    let [seqs, context] = cut.sized(256);
+    let cfg = config(cut.json, seqs, context)?;
+    let layers = cfg.stack.layers;
+    from_streamed(
+        cut,
+        cfg,
+        layers,
+        rules,
+        [stepper::<Moe>, stepper::<RotatedMoe>],
+    )
+}
+
+arch!("mla", [Spot::Probe(probe)], step: step, part: part);
 
 /// The `config.json` keys a DeepSeek-V3 release sets.
 #[derive(Deserialize)]

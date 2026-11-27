@@ -376,6 +376,24 @@ pub(crate) fn launch_of(
     (sizes, [filled, wanted])
 }
 
+/// Flattens raw recipe kernel overrides with `<tessera/...>` imports.
+fn flatten_override(
+    backend: tessera_device::Backend,
+    name: &str,
+    text: &str,
+    load: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let opts = tessera_device::Options::plain(backend);
+    tessera_device::flatten(name, text, load, &opts)
+        .map(|flat| flat.text)
+        .map_err(|e| e.to_string())
+}
+
+/// Registers the `<tessera/...>` flattener for kernel override files.
+pub fn flatten_overrides() {
+    tessera_run::set_flattener(flatten_override);
+}
+
 impl Engine {
     /// Opens a runner for `graph` with room for `context` rows.
     pub fn open(
@@ -398,6 +416,7 @@ impl Engine {
         run: impl FnOnce(tessera_lower::Plan) -> Result<Box<dyn Run>, Error>,
     ) -> Result<Self, Error> {
         tessera_run::configure(settings);
+        flatten_overrides();
         tessera_wasm::configure(settings.dump_sites.clone());
         let (full, sparse) = steps(&graph)?;
         let Some(full) = full else {

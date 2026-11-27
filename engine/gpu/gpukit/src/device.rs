@@ -96,6 +96,16 @@ pub trait Device: Clone + Send + Sync + 'static {
         self.upload(dst, &tmp)
     }
     fn compile(&self, source: &str, entry: &str) -> Result<Self::Kernel, Error>;
+    /// Compiles `source` with extra backend compiler flags.
+    fn compile_with(
+        &self,
+        source: &str,
+        entry: &str,
+        flags: &[&str],
+    ) -> Result<Self::Kernel, Error> {
+        let _ = flags;
+        self.compile(source, entry)
+    }
     /// Waits for every launch. Returns the device's own seconds.
     fn finish(&self) -> Result<Option<f64>, Error>;
 
