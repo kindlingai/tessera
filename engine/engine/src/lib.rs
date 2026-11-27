@@ -3,10 +3,11 @@
 // Linking the crates registers their rules.
 use tessera_rules as _;
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
+use tessera_engine_hooks::{Head, context_bucket, row_bucket, stored_device};
+use tessera_engine_hooks::{guide, kept, lanes, sample};
 use tessera_graph::DimName::{
     Candidates, Context, EditWords, Picks, Rows, Segments, Seqs, VocabWords,
 };
@@ -17,23 +18,16 @@ use tessera_run::{Run, open};
 mod batch_dual;
 mod batch_spec;
 mod dual;
-mod guide;
-mod kept;
-#[cfg(test)]
-mod kept_test;
-mod lanes;
 mod model;
 mod mtp_draft;
 mod ple;
 mod probe;
 mod ranks;
-mod sample;
-#[cfg(test)]
-mod sample_test;
 mod schedule;
 mod spec_len;
 mod spec_loop;
 mod speculate;
+mod target;
 
 pub use batch_dual::BatchDFlash;
 pub use batch_spec::BatchMtp;
@@ -47,11 +41,12 @@ pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
 pub use probe::{Launch, Lowered, Probe};
-pub use ranks::Place;
 pub use sample::{Sampling, Target, Weights, accept};
-pub use schedule::{Batch, Fair, Parked, Policy, Seq, Sink};
+pub use schedule::{Batch, Fair, Parked, Policy, Seq};
 pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate};
+pub(crate) use tessera_engine_hooks::Hooks;
+pub use tessera_engine_hooks::{Error, Event, Place, Read, Reason, Request, Row, Sink};
 
 // The front end reaches the engine crates only through these.
 pub use tessera_device::{arx, p2p, sums, whole};
@@ -90,99 +85,6 @@ pub use tessera_run::{Grid, Ranks, check, gpu, pinning, select, sizer};
 pub use tessera_trace::{Linear, Norm, Vector};
 pub use tessera_turns as turns;
 pub use tessera_wasm as wasm;
-
-/// Tokens to continue, and when to stop.
-#[derive(Default, Serialize, Deserialize)]
-pub struct Request {
-    pub tokens: Vec<u32>,
-    pub max_tokens: usize,
-    /// Minimum tokens before stop ids end the answer.
-    #[serde(default)]
-    pub min_tokens: usize,
-    /// Ids that end the answer, excluded from its text.
-    pub stop: Vec<u32>,
-    /// Rules on each token. Masks need a mask port.
-    #[serde(skip)]
-    pub guide: Option<Box<dyn Guide>>,
-    /// Prompt rows to score. Any reads replace decoding.
-    #[serde(default)]
-    pub reads: Vec<Read>,
-    /// Sampling parameters. Default is greedy argmax.
-    #[serde(default)]
-    pub sampling: Sampling,
-}
-
-/// The logits after prompt row `row`, over `ids`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Read {
-    pub row: u32,
-    pub ids: Vec<u32>,
-}
-
-/// Why an answer ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Reason {
-    Stop,
-    Length,
-    /// The context filled before a stop.
-    Context,
-    /// The guide failed. Other answers go on.
-    Guide,
-}
-
-/// One decoded token, or the end.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Event {
-    /// Prompt rows that kept rows cover. Sent before any token.
-    Kept(usize),
-    Token(u32),
-    /// Each read's logits, in the request's order.
-    Scores(Vec<Vec<f32>>),
-    Done(Reason),
-}
-
-/// A failure while planning, loading or running.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Lower(#[from] tessera_lower::Error),
-    #[error(transparent)]
-    Run(#[from] tessera_run::Error),
-    #[error("interpreter: {0}")]
-    Interp(#[from] tessera_interp::Error),
-    #[error("the rows do not fit the engine")]
-    Rows,
-    #[error("a row's slot or position is out of range")]
-    RowPlace,
-    #[error("an input has no axis for a bounded dimension")]
-    InputAxis,
-    #[error(transparent)]
-    Graph(#[from] tessera_graph::VerifyError),
-    #[error("the masks do not fit the graph's mask port")]
-    Mask,
-    #[error("kept rows: {0}")]
-    Kept(#[from] tessera_kv::Error),
-    #[error("kv store: {0}")]
-    Store(std::io::Error),
-    #[error("a slot's next row is in another run's page")]
-    SharedPage,
-    #[error("the graph has no entry that scores these ids")]
-    Scores,
-    #[error("a bucketed dimension sits inside a larger axis")]
-    BucketAxis,
-    #[error("the graph has no tap output")]
-    Taps,
-    #[error("entry {entry} has an input the engine does not fill: {role:?}")]
-    Port { entry: usize, role: Role },
-    #[error("the graph has no step entry without candidates")]
-    Full,
-    #[error("ple store: {0}")]
-    Ple(#[from] std::io::Error),
-    #[error("drafts rewind slot state that the graph cannot restore")]
-    Stateful,
-    #[error("guides need a single-rank speculative loop")]
-    Guided,
-}
 
 /// Row width of `entry`'s `role` output, if any.
 fn width(g: &Graph, entry: usize, role: Role) -> Option<usize> {
@@ -277,16 +179,6 @@ pub struct Engine {
     profiled: Option<Box<dyn FnMut(Ranks) + Send>>,
 }
 
-/// Inputs a launch feeds before its picks.
-pub(crate) enum Head {
-    /// The full entry. Per-pick mask words, or None for all.
-    Full(Option<Vec<u32>>),
-    /// The sparse entry, with `k` candidate ids per pick.
-    Sparse(Vec<u32>, usize),
-    /// Full entry: masks, and `k` edits per pick.
-    Edited(Vec<u32>, Vec<u32>, usize),
-}
-
 /// Packs `k` edits: ids, adds, reps. Pads are neutral.
 fn pack(edits: &[Edit], k: usize, out: &mut Vec<u32>) {
     let sorted = guide::merged(edits.to_vec());
@@ -303,24 +195,11 @@ fn pack(edits: &[Edit], k: usize, out: &mut Vec<u32>) {
     debug_assert_eq!(out.len(), at + 3 * k);
 }
 
-/// A token at a position, in a slot's sequence.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Row {
-    pub slot: u32,
-    pub token: u32,
-    pub position: u32,
-}
-
 /// Each slot's last row in `rows`, in order.
 pub(crate) fn ends(rows: &[Row]) -> Vec<u32> {
     let last = |(i, r): (usize, &Row)| !rows[i + 1..].iter().any(|o| o.slot == r.slot);
     let at = rows.iter().enumerate().filter(|&p| last(p));
     at.map(|(i, _)| i as u32).collect()
-}
-
-/// Rounds a causal context length up to a power-of-two bucket.
-pub(crate) fn context_bucket(needed: usize, cap: usize) -> u64 {
-    needed.max(256).next_power_of_two().min(cap) as u64
 }
 
 /// Pads each non-empty candidate list to power-of-two width `k`.
@@ -337,19 +216,6 @@ fn pad_candidates(lists: &[Vec<u32>]) -> (Vec<u32>, usize) {
         flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
     }
     (flat, k)
-}
-
-/// Rounds a launch row count up to compact buckets.
-pub(crate) fn row_bucket(n: usize) -> usize {
-    if n <= 24 {
-        n.max(1)
-    } else if n <= 64 {
-        n.div_ceil(8) * 8
-    } else if n <= tessera_device::FAST_MAX_ROWS {
-        n.div_ceil(64) * 64
-    } else {
-        n.next_power_of_two()
-    }
 }
 
 /// Sizes and padded counts for `rows` returning `picks`.
@@ -457,7 +323,7 @@ impl Engine {
             }
         });
         let mut runner = run(plan)?;
-        let device = ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
+        let device = stored_device(runner.as_mut(), recipe, settings, place, true)?;
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
         let edit_cap = graph.dims.iter().find(|d| d.name == EditWords);
@@ -550,14 +416,6 @@ impl Engine {
             *by.entry(step.kernel.name()).or_default() += step.launches().len();
         }
         by
-    }
-
-    /// Floats per tapped row, if drafts may rewind slots.
-    pub(crate) fn draft_taps(&self) -> Result<usize, Error> {
-        if self.stateful {
-            return Err(Error::Stateful);
-        }
-        self.taps.ok_or(Error::Taps)
     }
 
     /// Mask words per pick, if the graph takes masks.
@@ -995,5 +853,25 @@ impl Engine {
         }
         taken.try_iter().for_each(emit);
         Ok(())
+    }
+
+    /// Picks guided ids from full logits without a mask port.
+    pub(crate) fn pick_unmasked(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        allowed: &[Allowed],
+    ) -> Result<Vec<u32>, Error> {
+        let vocab = self.vocab.ok_or(Error::Mask)?;
+        let wants = Wants::role(&self.graph, self.full, Role::Logits);
+        let outputs = self.run(rows, picks, Head::Full(None), wants)?;
+        let floats = self.read_floats(outputs[0], picks.len() * vocab)?;
+        let out = floats
+            .chunks_exact(vocab)
+            .zip(allowed)
+            .map(|(row, allow)| sample::argmax(row, Some(allow)))
+            .collect();
+        self.report();
+        Ok(out)
     }
 }

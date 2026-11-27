@@ -1,19 +1,18 @@
 //! Finished answers' rows, kept for follow-up prompts to reuse.
 
 use crate::Error;
-use crate::lanes::{EVICT_COLD, EVICT_PINNED};
-use tessera_kv::{Oldest, Pool, Prefixes, RunId, Spot, Stats, Tag};
+use tessera_kv::{EVICT_COLD, EVICT_PINNED, Oldest, Pool, Prefixes, RunId, Spot, Stats, Tag};
 
 const TAG: Tag = Tag(0);
 
-crate::metric_registry!(KV = "kv");
-crate::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows in the kept-row pool.");
-crate::metric!(ACTIVE in KV = Gauge "vllm:kv_active_tokens", "Rows in pages live answers hold.");
-crate::metric!(WORST in KV = Gauge "tessera:kv_worst_tokens", "Rows live answers may grow to.");
-crate::metric!(LIVE in KV = Gauge "tessera:kv_live_runs", "Answers that hold kept rows.");
-crate::metric!(RETAINED in KV = Gauge "tessera:kv_kept_runs", "Finished answers whose rows stay.");
-crate::metric!(HITS in KV = Counter "tessera:kv_hits_total", "Prompts that started on kept rows.");
-crate::metric!(MISSES in KV = Counter "tessera:kv_misses_total", "Prompts that started with no rows.");
+tessera_engine_settings::declare_registry!(KV = "kv");
+tessera_engine_settings::declare_metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows in the kept-row pool.");
+tessera_engine_settings::declare_metric!(ACTIVE in KV = Gauge "vllm:kv_active_tokens", "Rows in pages live answers hold.");
+tessera_engine_settings::declare_metric!(WORST in KV = Gauge "tessera:kv_worst_tokens", "Rows live answers may grow to.");
+tessera_engine_settings::declare_metric!(LIVE in KV = Gauge "tessera:kv_live_runs", "Answers that hold kept rows.");
+tessera_engine_settings::declare_metric!(RETAINED in KV = Gauge "tessera:kv_kept_runs", "Finished answers whose rows stay.");
+tessera_engine_settings::declare_metric!(HITS in KV = Counter "tessera:kv_hits_total", "Prompts that started on kept rows.");
+tessera_engine_settings::declare_metric!(MISSES in KV = Counter "tessera:kv_misses_total", "Prompts that started with no rows.");
 
 /// The kept rows' pool statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,7 +25,7 @@ pub struct Totals {
 }
 
 /// Dense: each slot is one page of `context` rows.
-pub(crate) struct Kept {
+pub struct Kept {
     pool: Pool,
     index: Prefixes,
     context: usize,

@@ -1,11 +1,13 @@
 //! Native MTP speculative decoding: one-layer MLA drafter and loop.
 
-use crate::ranks::open_rank;
+use crate::SpecStats;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{D2dCopy, SpecReq, TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::spec_loop::{D2dCopy, SpecReq, run_speculate, spec_entry};
 use crate::speculate::{DraftCore, draft_methods};
-use crate::{Engine, Error, Event, Place, SpecStats};
 use tessera_engine_comm::Transport;
+use tessera_engine_hooks::{
+    Error, Event, Hooks, Lanes, Place, TapsBuf, TapsIn, context_bucket, open_rank, row_bucket,
+};
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs};
 use tessera_graph::{Graph, Role};
 use tessera_interp::Tensor;
@@ -126,11 +128,11 @@ impl MtpDrafter {
         self.hidden
     }
 
-    pub(crate) fn lanes(&self) -> Option<&crate::lanes::Lanes> {
+    pub(crate) fn lanes(&self) -> Option<&Lanes> {
         self.core.lanes.as_ref()
     }
 
-    pub(crate) fn lanes_mut(&mut self) -> Option<&mut crate::lanes::Lanes> {
+    pub(crate) fn lanes_mut(&mut self) -> Option<&mut Lanes> {
         self.core.lanes.as_mut()
     }
 
@@ -155,7 +157,7 @@ impl MtpDrafter {
         let sizes = [
             (Seqs, self.core.slots as u64),
             (Rows, filled as u64),
-            (Context, crate::context_bucket(max_end, self.core.context)),
+            (Context, context_bucket(max_end, self.core.context)),
             (Segments, segments as u64),
         ];
         self.core.exec_tap(&feeds, d2d, &sizes, wants, wait)
@@ -201,7 +203,7 @@ impl MtpDrafter {
             }
             max_end = max_end.max(end);
         }
-        let filled = crate::row_bucket(m).min(self.core.context);
+        let filled = row_bucket(m).min(self.core.context);
         let mut tok_buf = Vec::with_capacity(filled);
         let mut pos_buf = Vec::with_capacity(filled);
         let mut slot_buf = Vec::with_capacity(filled);
@@ -310,7 +312,7 @@ impl MtpDrafter {
             }
             max_end = max_end.max(pos as usize + 1);
         }
-        let filled = crate::row_bucket(m).min(self.core.context);
+        let filled = row_bucket(m).min(self.core.context);
         let mut pos_buf = Vec::with_capacity(filled);
         let mut slot_buf = Vec::with_capacity(filled);
         let mut scale_buf = Vec::with_capacity(filled);
@@ -445,7 +447,7 @@ impl ChainHid {
 
 /// Runs batched first-form MTP plus shared chain steps for `jobs`.
 pub(crate) fn draft_mtp_batch(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     drafter: &mut MtpDrafter,
     jobs: &[MtpJob<'_>],
     taps: &TapsBuf,
@@ -528,7 +530,7 @@ pub(crate) fn draft_mtp_batch(
             let mut positions = Vec::with_capacity(n);
             for (i, j) in jobs.iter().enumerate() {
                 let off = ((step - 1) * n + i) * 4;
-                target.runner.copy_from(tap_slot, off, tok_addrs[i], 4)?;
+                target.copy_from(tap_slot, off, tok_addrs[i], 4)?;
                 saved_addrs.push(tap_addr + off as u64);
                 positions.push((j.new_start - 1 + step) as u32);
             }
@@ -556,7 +558,7 @@ pub(crate) fn draft_mtp_batch(
             }
         }
         let saved = target
-            .runner
+            .runner()
             .held()
             .read_u32s(tap_slot, (chain_n - 1) * n)?;
         let final_ids = drafter.ids(last_out)?;
@@ -605,7 +607,7 @@ pub(crate) fn draft_mtp_batch(
 /// Runs an MTP first-form pass plus adaptive chain steps.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draft_mtp(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     drafter: &mut MtpDrafter,
     spec: &SpecLen,
     slot: u32,
@@ -633,7 +635,7 @@ pub(crate) fn draft_mtp(
 
 /// Native MTP speculative decoding over a target and MTP pair.
 pub struct MtpSpeculate<'a> {
-    target: &'a mut Engine,
+    target: &'a mut dyn Hooks,
     drafter: &'a mut MtpDrafter,
     depth: usize,
     spec_len: SpecLen,
@@ -643,7 +645,7 @@ pub struct MtpSpeculate<'a> {
 impl<'a> MtpSpeculate<'a> {
     /// Pairs a tapped target engine with its MTP drafter.
     pub fn new(
-        target: &'a mut Engine,
+        target: &'a mut dyn Hooks,
         drafter: &'a mut MtpDrafter,
         depth: usize,
     ) -> Result<Self, Error> {
@@ -665,23 +667,17 @@ impl<'a> MtpSpeculate<'a> {
             prefill_chunk: None,
         })
     }
-
-    /// Configures adaptive or truncated draft length selection.
-    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
-        self.spec_len = spec_len;
-        self
-    }
 }
 
 spec_entry!(
     MtpSpeculate<'a>,
     SpecLen,
-    spec_len,
+    spec_len => with_spec_len,
     |s, target, req, spec, emit| run_mtp_req(target, s.drafter, s.depth, req, spec, emit)
 );
 
 fn run_mtp_req(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     drafter: &mut MtpDrafter,
     depth: usize,
     req: SpecReq,

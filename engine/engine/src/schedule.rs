@@ -5,7 +5,9 @@ use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
 use crate::ranks::ParkedProfile;
 use crate::sample::{Sampler, Target, Weights, accept, take};
-use crate::{Allowed, Engine, Error, Event, Launch, Reason, Request, Row, ends, launch_of};
+use crate::{
+    Allowed, Engine, Error, Event, Hooks, Launch, Reason, Request, Row, Sink, ends, launch_of,
+};
 use std::collections::VecDeque;
 use tessera_graph::DimName::{Context, Segments};
 use tessera_graph::Role;
@@ -16,9 +18,6 @@ crate::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers 
 crate::metric!(RUNNING in REQUESTS = Gauge "tessera:requests_running", "Answers that hold a slot.");
 crate::metric!(PROMPT in REQUESTS = Counter "tessera:prompt_tokens_total", "Prompt tokens of admitted answers.");
 crate::metric!(MADE in REQUESTS = Counter "tessera:generation_tokens_total", "Tokens the answers made.");
-
-/// Takes each event. `false` ends the answer early.
-pub type Sink = Box<dyn FnMut(Event) -> bool + Send>;
 
 /// An answer in flight, in its slot.
 pub struct Seq {

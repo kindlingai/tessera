@@ -141,7 +141,7 @@ layers = [
     ["engine/plan/jit/"],
     ["engine/plan/run/"],
     ["engine/rules/"],
-    ["engine/engine/", "engine/models/"],
+    ["engine/engine/", "engine/hooks/", "engine/models/"],
     ["frontend/"],
     ["tools/"],
     ["examples/"],

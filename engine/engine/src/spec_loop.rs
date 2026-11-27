@@ -1,37 +1,21 @@
 //! Shared SPMD speculative decode loop and device tap helpers.
 
-use crate::guide::{MinTokens, Rules, Stacked, settle, walk};
-use crate::lanes::{decode_patches, encode_patches};
-use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::spec_len::SpecStats;
-use crate::{Allowed, Edit, Engine, Error, Event, Guide, Head, Reason, Request, Row};
-use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::Role;
-use tessera_lower::{Slot, Wants};
-use tessera_run::{Error as RunError, Profile, Run};
+use tessera_engine_comm::{Reader, Writer};
+use tessera_engine_hooks::guide::{MinTokens, Rules, Stacked, settle, walk};
+use tessera_engine_hooks::lanes::{Lanes, decode_patches, encode_patches};
+use tessera_engine_hooks::sample::{Sampler, Sampling, Target, accept, take};
+use tessera_engine_hooks::{
+    Allowed, Error, Event, Guide, Head, Hooks, Reason, Request, Row, TapsBuf,
+};
+use tessera_lower::Slot;
+use tessera_run::{Error as RunError, Run};
 
 /// Wire tag identifying an SPMD speculative request header.
 const SPEC_REQ_TAG: u32 = 1;
 
 /// Rounds between cross-rank FNV-1a determinism and stop checks.
 const SYNC_EVERY: usize = 64;
-
-/// Tapped states on device or host, row-major f32.
-pub(crate) enum TapsBuf {
-    Device { slot: Slot, addr: u64, rows: usize },
-    Host(Vec<f32>),
-}
-
-/// Borrowed tap rows on device or host.
-#[derive(Clone, Copy)]
-pub(crate) enum TapsIn<'a> {
-    Device {
-        addr: u64,
-        rows: usize,
-        stride: usize,
-    },
-    Host(&'a [f32]),
-}
 
 /// Device-to-device copy descriptor for one drafter input span.
 #[derive(Clone, Copy)]
@@ -42,44 +26,6 @@ pub(crate) struct D2dCopy {
     pub rows: usize,
     pub pad_to: usize,
     pub width: usize,
-}
-
-impl TapsBuf {
-    pub(crate) fn as_in(&self) -> TapsIn<'_> {
-        self.as_in_from(0, 0)
-    }
-
-    pub(crate) fn as_in_from(&self, skip: usize, width: usize) -> TapsIn<'_> {
-        match self {
-            TapsBuf::Device { addr, rows, .. } => {
-                let (s, off) = (skip.min(*rows), (skip.min(*rows) * width * 4) as u64);
-                TapsIn::Device {
-                    addr: *addr + off,
-                    rows: *rows - s,
-                    stride: 0,
-                }
-            }
-            TapsBuf::Host(v) => TapsIn::Host(&v[(skip * width).min(v.len())..]),
-        }
-    }
-
-    pub(crate) fn keep_rows(&mut self, keep: usize, width: usize) {
-        match self {
-            TapsBuf::Device { rows, .. } => *rows = keep,
-            TapsBuf::Host(v) => v.truncate(keep * width),
-        }
-    }
-
-    pub(crate) fn into_host(self, runner: &dyn Run, width: usize) -> Result<Vec<f32>, Error> {
-        match self {
-            TapsBuf::Host(v) => Ok(v),
-            TapsBuf::Device { slot, rows, .. } => {
-                let raw = runner.read(slot)?;
-                let floats = raw.floats().map_err(RunError::from)?;
-                Ok(floats[..rows * width].to_vec())
-            }
-        }
-    }
 }
 
 /// Copies `rows` at `dst_row` and pads tail to `pad_to`.
@@ -112,36 +58,6 @@ pub(crate) fn fnv_u32(h: &mut u32, v: u32) {
     }
 }
 
-/// Checks FNV-1a determinism across ranks and propagates early stop.
-fn sync_ranks(target: &mut Engine, stopped: bool, hash: u32) -> Result<bool, Error> {
-    let Some(control) = &mut target.control else {
-        return Ok(stopped);
-    };
-    let lead = control.rank() == 0;
-    let mut mine = Vec::with_capacity(5);
-    mine.push(u8::from(lead && stopped));
-    mine.extend_from_slice(&hash.to_le_bytes());
-    if !lead && let Some((_, p)) = target.held.take() {
-        mine.extend_from_slice(&p.to_bytes());
-    }
-    let parts = control.exchange(&mine).map_err(RunError::from)?;
-    let first = parts.first().ok_or(RunError::OutputsDisagree)?;
-    if first.len() < 5 {
-        return Err(RunError::OutputsDisagree.into());
-    }
-    let stop = first[0] != 0;
-    let want = u32::from_le_bytes(first[1..5].try_into().unwrap());
-    for p in &parts[1..] {
-        if p.len() < 5 || u32::from_le_bytes(p[1..5].try_into().unwrap()) != want {
-            return Err(RunError::OutputsDisagree.into());
-        }
-    }
-    if lead {
-        target.gather(parts[1..].iter().map(|p| Profile::from_bytes(&p[5..])));
-    }
-    Ok(stop)
-}
-
 /// Speculative request paired with an optional prefill chunk limit.
 pub(crate) struct SpecReq {
     pub request: Request,
@@ -149,9 +65,9 @@ pub(crate) struct SpecReq {
 }
 
 /// Maps slot zero for a shared paged pool.
-pub(crate) fn solo_cap(target: &mut Engine) -> usize {
+pub(crate) fn solo_cap(target: &mut dyn Hooks) -> usize {
     let ctx = target.context();
-    match &mut target.lanes {
+    match target.lanes_mut() {
         Some(lanes) if lanes.shared() => ctx.min(lanes.map_solo()),
         Some(lanes) => ctx.min(lanes.pages() * lanes.page),
         None => ctx,
@@ -160,14 +76,14 @@ pub(crate) fn solo_cap(target: &mut Engine) -> usize {
 
 /// Validates a request and broadcasts its header once to followers.
 pub(crate) fn start_req(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     spec_req: &mut SpecReq,
     emit: &mut dyn FnMut(Event) -> bool,
     extra: impl FnOnce(&mut Writer),
 ) -> Result<bool, Error> {
     spec_req.request.sampling = spec_req.request.sampling.seeded();
     let request = &spec_req.request;
-    if (request.guide.is_some() || request.min_tokens > 0) && target.control.is_some() {
+    if (request.guide.is_some() || request.min_tokens > 0) && target.rank().is_some() {
         return Err(Error::Guided);
     }
     let cap = solo_cap(target);
@@ -179,12 +95,8 @@ pub(crate) fn start_req(
         let _ = emit(Event::Done(Reason::Length));
         return Ok(false);
     }
-    if target.control.as_ref().is_some_and(|c| c.rank() == 0) {
-        let patches = target
-            .lanes
-            .as_ref()
-            .map(crate::lanes::Lanes::pending)
-            .unwrap_or_default();
+    if target.rank() == Some(0) {
+        let patches = target.lanes().map(Lanes::pending).unwrap_or_default();
         let mut w = Writer(Vec::new());
         w.u32(SPEC_REQ_TAG)
             .u32(request.max_tokens as u32)
@@ -231,22 +143,19 @@ fn decode_req<T>(
 
 /// Shared follower outer loop receiving SPMD speculative requests.
 pub(crate) fn follow_loop<T>(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     mut decode: impl FnMut(&mut Reader) -> Option<T>,
-    mut run: impl FnMut(&mut Engine, SpecReq, T) -> Result<(), Error>,
+    mut run: impl FnMut(&mut dyn Hooks, SpecReq, T) -> Result<(), Error>,
 ) -> Result<(), Error> {
     loop {
-        let mine = target
-            .held
-            .take()
-            .map_or_else(Vec::new, |(_, p)| p.to_bytes());
+        let mine = target.take_held().map_or_else(Vec::new, |p| p.to_bytes());
         let Some(told) = target.told(&mine)? else {
             return Ok(());
         };
         let Some((req, patches, policy)) = decode_req(&told, &mut decode) else {
             return Ok(());
         };
-        if let Some(lanes) = &mut target.lanes
+        if let Some(lanes) = target.lanes_mut()
             && !patches.is_empty()
         {
             lanes.apply(&patches);
@@ -259,10 +168,18 @@ macro_rules! spec_entry {
     (
         $ty:ty,
         $policy:ty,
-        $field:ident,
+        $field:ident $(=> $setter:ident)?,
         |$this:ident, $target:ident, $req:ident, $p:ident, $emit:ident| $body:expr
     ) => {
         impl<'a> $ty {
+            $(
+                /// Configures adaptive or truncated draft length selection.
+                pub fn $setter(mut self, $field: $policy) -> Self {
+                    self.$field = $field;
+                    self
+                }
+            )?
+
             /// Sets the maximum prompt rows per prefill step.
             pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
                 self.prefill_chunk = Some(rows.max(1));
@@ -270,18 +187,19 @@ macro_rules! spec_entry {
             }
 
             /// Starts or flushes dynamic profiling on the target engine.
-            pub fn settle(&mut self) -> Result<(), $crate::Error> {
+            pub fn settle(&mut self) -> Result<(), tessera_engine_hooks::Error> {
                 self.target.settle()
             }
 
             /// Follows rank 0's speculative requests until dismissed.
-            pub fn follow(&mut self) -> Result<(), $crate::Error> {
+            pub fn follow(&mut self) -> Result<(), tessera_engine_hooks::Error> {
                 let $this = self;
                 $crate::spec_loop::follow_loop(
                     $this.target,
                     <$policy>::decode,
                     |$target, $req, $p| {
-                        let $emit: &mut dyn FnMut($crate::Event) -> bool = &mut |_| true;
+                        let $emit: &mut dyn FnMut(tessera_engine_hooks::Event) -> bool =
+                            &mut |_| true;
                         $body?;
                         Ok(())
                     },
@@ -291,9 +209,9 @@ macro_rules! spec_entry {
             /// Greedy speculative decoding matching target output token-for-token.
             pub fn generate(
                 &mut self,
-                request: $crate::Request,
-                emit: &mut dyn FnMut($crate::Event) -> bool,
-            ) -> Result<$crate::SpecStats, $crate::Error> {
+                request: tessera_engine_hooks::Request,
+                emit: &mut dyn FnMut(tessera_engine_hooks::Event) -> bool,
+            ) -> Result<$crate::SpecStats, tessera_engine_hooks::Error> {
                 let $this = self;
                 let $p = $this.$field.fresh();
                 let mut $req = $crate::spec_loop::SpecReq {
@@ -367,14 +285,14 @@ fn accept_token(
 /// Shared SPMD greedy speculative decode loop for all drafters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_speculate<D, S>(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     drafter: &mut D,
     spec_req: SpecReq,
     emit: &mut dyn FnMut(Event) -> bool,
-    mut on_chunk: impl FnMut(&mut Engine, &mut D, usize, &[u32], usize, TapsBuf) -> Result<(), Error>,
-    init: impl FnOnce(&mut Engine, &mut D, usize, &[u32], u32, TapsBuf) -> Result<S, Error>,
+    mut on_chunk: impl FnMut(&mut dyn Hooks, &mut D, usize, &[u32], usize, TapsBuf) -> Result<(), Error>,
+    init: impl FnOnce(&mut dyn Hooks, &mut D, usize, &[u32], u32, TapsBuf) -> Result<S, Error>,
     mut draft: impl FnMut(
-        &mut Engine,
+        &mut dyn Hooks,
         &mut D,
         &mut S,
         usize,
@@ -382,7 +300,7 @@ pub(crate) fn run_speculate<D, S>(
         usize,
     ) -> Result<Option<Vec<u32>>, Error>,
     mut advance: impl FnMut(
-        &mut Engine,
+        &mut dyn Hooks,
         &mut D,
         &mut S,
         usize,
@@ -393,8 +311,8 @@ pub(crate) fn run_speculate<D, S>(
         &mut SpecStats,
     ) -> Result<(), Error>,
 ) -> Result<SpecStats, Error> {
-    let ranked = target.control.is_some();
-    let lead = target.control.as_ref().is_none_or(|c| c.rank() == 0);
+    let ranked = target.rank().is_some();
+    let lead = target.rank().is_none_or(|r| r == 0);
     let mut st = LoopState {
         stats: SpecStats::default(),
         sim_emitted: 0,
@@ -427,7 +345,7 @@ pub(crate) fn run_speculate<D, S>(
             }
             prompt.append(&mut g.queue);
         }
-        let cap = target.lanes.as_ref().map_or(target.context(), |l| {
+        let cap = target.lanes().map_or(target.context(), |l| {
             target.context().min(l.pages() * l.page)
         });
         if prompt.len() > cap {
@@ -500,13 +418,13 @@ pub(crate) fn run_speculate<D, S>(
             let remaining = request.max_tokens - st.sim_emitted;
             let speculate = guided
                 .as_ref()
-                .is_none_or(|g| g.forks && device(target, &g.next));
+                .is_none_or(|g| g.forks && target.on_device(&g.next));
             let drafts = match speculate {
                 true => draft(target, drafter, &mut state, start, anchor, remaining)?,
                 false => None,
             };
             let (drafted, block, rules) = match &guided {
-                Some(g) => g.block(target, drafts),
+                Some(g) => g.block(&*target, drafts),
                 None => (drafts.is_some(), drafts.unwrap_or_default(), Vec::new()),
             };
             let mut verify = Vec::with_capacity(block.len() + 1);
@@ -546,7 +464,7 @@ pub(crate) fn run_speculate<D, S>(
                     }
                     _ => {
                         let all: Vec<u32> = (0..verify.len() as u32).collect();
-                        let head = head(target, &rules)?;
+                        let head = target.head_of(&rules)?;
                         // A drafted verify leaves its state for `commit`.
                         target.launch_local(&verify, &all, head, drafted, drafted)?
                     }
@@ -588,10 +506,7 @@ pub(crate) fn run_speculate<D, S>(
             if !ranked && st.stopped {
                 return Ok(st.stats);
             }
-            if ranked
-                && round.is_multiple_of(SYNC_EVERY)
-                && sync_ranks(target, st.stopped, st.hash)?
-            {
+            if ranked && round.is_multiple_of(SYNC_EVERY) && target.sync(st.stopped, st.hash)? {
                 return Ok(st.stats);
             }
             if let Some(block_taps) = block_taps {
@@ -621,7 +536,7 @@ pub(crate) fn run_speculate<D, S>(
     if lead && !st.stopped {
         let _ = emit(Event::Done(done.unwrap_or(Reason::Length)));
     }
-    sync_ranks(target, st.stopped, st.hash)?;
+    target.sync(st.stopped, st.hash)?;
     Ok(st.stats)
 }
 
@@ -663,7 +578,7 @@ impl Guided {
     }
 
     /// Whether the round drafts, its block, and each row's rules.
-    fn block(&self, target: &Engine, drafts: Option<Vec<u32>>) -> (bool, Vec<u32>, Vec<Rules>) {
+    fn block(&self, target: &dyn Hooks, drafts: Option<Vec<u32>>) -> (bool, Vec<u32>, Vec<Rules>) {
         let fixed = self.queue.len();
         // A queue replaces the drafts when it fits in them.
         if fixed > 0 {
@@ -676,7 +591,7 @@ impl Guided {
             return (false, Vec::new(), vec![self.next.clone()]);
         };
         let rules = walk(&*self.guide, self.next.clone(), &drafts, |r| {
-            device(target, r)
+            target.on_device(r)
         });
         drafts.truncate(rules.len() - 1);
         (true, drafts, rules)
@@ -699,256 +614,4 @@ fn take_one(
         return Some(Reason::Guide);
     }
     accept_token(request, st, id, lead, emit).or_else(|| g.settle(request, st, lead, emit))
-}
-
-/// Whether the device head can apply `rules`.
-fn device(target: &Engine, rules: &Rules) -> bool {
-    match rules.1.is_empty() {
-        true => rules.0 == Allowed::Any || target.words().is_some(),
-        false => target.edits_fit(rules.1.len()),
-    }
-}
-
-/// A full head with each pick's mask and edits.
-fn head(target: &Engine, rules: &[Rules]) -> Result<Head, Error> {
-    if rules.iter().any(|r| !r.1.is_empty()) {
-        let allowed: Vec<&Allowed> = rules.iter().map(|r| &r.0).collect();
-        let edits: Vec<&[Edit]> = rules.iter().map(|r| &r.1[..]).collect();
-        return target.edited(&allowed, &edits);
-    }
-    Ok(match target.words() {
-        Some(words) if rules.iter().any(|r| r.0 != Allowed::Any) => {
-            Head::Full(Some(rules.iter().flat_map(|r| r.0.bits(words)).collect()))
-        }
-        _ => Head::Full(None),
-    })
-}
-
-/// Batched verify outputs: device ids or host logits.
-pub(crate) enum VerifyOut {
-    Ids(Vec<u32>),
-    Logits(Vec<f32>, usize),
-}
-
-#[cfg(test)]
-mod vote_test;
-
-/// Plan availability and preference bits exchanged across ranks.
-const CAN_OFF: u8 = 1;
-const CAN_ON: u8 = 2;
-const PREF_ON: u8 = 4;
-
-/// Coordinates `(headless, with_head)` plan selection across ranks before launch.
-fn decide_plan(
-    control: Option<&mut (dyn Transport + '_)>,
-    off: Result<usize, Error>,
-    on: Result<usize, Error>,
-) -> Result<bool, Error> {
-    let (vote, err) = match (off, on) {
-        (Ok(h), Ok(w)) => (CAN_OFF | CAN_ON | if h > w { PREF_ON } else { 0 }, None),
-        (Ok(_), Err(e @ Error::Lower(_))) => (CAN_OFF, Some(e)),
-        (Err(e @ Error::Lower(_)), Ok(_)) => (CAN_ON, Some(e)),
-        (Err(Error::Lower(_)), Err(e)) | (Err(e), _) | (_, Err(e)) => (0, Some(e)),
-    };
-    let votes = match control {
-        Some(c) => c
-            .exchange(&[vote])
-            .map_err(RunError::from)?
-            .iter()
-            .map(|p| (p.len() == 1).then(|| p[0]))
-            .collect::<Option<Vec<u8>>>()
-            .unwrap_or_default(),
-        None => vec![vote],
-    };
-    let all = |bit| !votes.is_empty() && votes.iter().all(|v| v & bit != 0);
-    match (all(CAN_OFF), all(CAN_ON)) {
-        (true, true) => Ok(votes.iter().any(|v| v & PREF_ON != 0)),
-        (false, true) => Ok(true),
-        (true, false) => Ok(false),
-        (false, false) => Err(err.unwrap_or_else(|| RunError::OutputsDisagree.into())),
-    }
-}
-
-impl Engine {
-    /// A local launch picking after every row, with taps.
-    pub(crate) fn step_taps_local(&mut self, rows: &[Row]) -> Result<(Vec<u32>, TapsBuf), Error> {
-        let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let (ids, taps) = self.launch_local(rows, &all, Head::Full(None), true, false)?;
-        Ok((ids, taps.expect("taps were asked for")))
-    }
-
-    /// Local prefill step appending kept state only.
-    pub(crate) fn fill_local(&mut self, rows: &[Row]) -> Result<(), Error> {
-        self.check_rows(rows)?;
-        let tokens = Wants::role(&self.graph, self.full, Role::Tokens);
-        let last = [rows.len() as u32 - 1];
-        if self.prefer_head(rows, &last, Wants::NONE, tokens)? {
-            self.launch_local(rows, &last, Head::Full(None), false, false)?;
-            return Ok(());
-        }
-        self.run_local(rows, &[], Head::Full(None), Wants::NONE, false)?;
-        self.report();
-        Ok(())
-    }
-
-    /// Local launch returning only taps without the head.
-    pub(crate) fn step_taps_only(&mut self, rows: &[Row]) -> Result<TapsBuf, Error> {
-        self.check_rows(rows)?;
-        let width = self.taps.ok_or(Error::Taps)?;
-        let wants = Wants::role(&self.graph, self.full, Role::Taps);
-        let both = Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]);
-        let last = [rows.len() as u32 - 1];
-        if self.prefer_head(rows, &last, wants, both)? {
-            let (_, buf) = self.launch_local(rows, &last, Head::Full(None), true, false)?;
-            return Ok(buf.expect("taps were asked for"));
-        }
-        let outputs = self.run_local(rows, &[], Head::Full(None), wants, false)?;
-        let buf = self.taps_buf(outputs[0], rows.len(), width)?;
-        self.report();
-        Ok(buf)
-    }
-
-    /// Whether all ranks should run `with_head` instead of `headless`.
-    fn prefer_head(
-        &mut self,
-        rows: &[Row],
-        last: &[u32],
-        headless: Wants,
-        with_head: Wants,
-    ) -> Result<bool, Error> {
-        // Probe both plans before voting across ranks.
-        let off = self.steps(rows, &[], headless);
-        let on = self.steps(rows, last, with_head);
-        let ctl = self.control.as_mut().map(|c| c.as_mut());
-        decide_plan(ctl, off, on)
-    }
-
-    /// Local launch picking the last row with taps.
-    pub(crate) fn step_taps_last(&mut self, rows: &[Row]) -> Result<(u32, TapsBuf), Error> {
-        self.check_rows(rows)?;
-        let last = [rows.len() as u32 - 1];
-        let (ids, taps) = self.launch_local(rows, &last, Head::Full(None), true, false)?;
-        Ok((ids[0], taps.expect("taps were asked for")))
-    }
-
-    /// Runs batched verify, reading logits when sampling.
-    pub(crate) fn step_verify_local(
-        &mut self,
-        rows: &[Row],
-        sampling: bool,
-    ) -> Result<(VerifyOut, TapsBuf), Error> {
-        if !sampling {
-            let (ids, taps) = self.step_taps_local(rows)?;
-            return Ok((VerifyOut::Ids(ids), taps));
-        }
-        let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let (logits, vocab, taps) = self.logits_local(rows, &all, true, false)?;
-        Ok((
-            VerifyOut::Logits(logits, vocab),
-            taps.expect("taps were asked for"),
-        ))
-    }
-
-    /// Picks the final prefill anchor and taps.
-    pub(crate) fn prefill_pick(
-        &mut self,
-        rows: &[Row],
-        sampler: &mut Sampler,
-    ) -> Result<(u32, TapsBuf), Error> {
-        if sampler.greedy() {
-            return self.step_taps_last(rows);
-        }
-        let (mut logits, _, taps) = self.logits_local(rows, &[0], true, false)?;
-        let anchor = sampler.draw_row(&mut logits, None, &[]);
-        Ok((anchor, taps.expect("taps were asked for")))
-    }
-
-    /// Reads full logits for `picks` rows, with optional device taps.
-    pub(crate) fn logits_local(
-        &mut self,
-        rows: &[Row],
-        picks: &[u32],
-        taps: bool,
-        peek: bool,
-    ) -> Result<(Vec<f32>, usize, Option<TapsBuf>), Error> {
-        let vocab = self.vocab.ok_or(Error::Scores)?;
-        let (out, taps) = self.tapped(rows, picks, (Head::Full(None), peek), Role::Logits, taps)?;
-        let logits = self.read_floats(out, picks.len() * vocab)?;
-        self.report();
-        Ok((logits, vocab, taps))
-    }
-
-    /// The ids after `picks` rows. Taps and peek on request.
-    pub(crate) fn launch_local(
-        &mut self,
-        rows: &[Row],
-        picks: &[u32],
-        head: Head,
-        taps: bool,
-        peek: bool,
-    ) -> Result<(Vec<u32>, Option<TapsBuf>), Error> {
-        let (out, taps) = self.tapped(rows, picks, (head, peek), Role::Tokens, taps)?;
-        let mut ids = self.runner.ids(out)?;
-        ids.truncate(picks.len());
-        self.report();
-        Ok((ids, taps))
-    }
-
-    /// The pick after the last row, and its taps.
-    fn pick_last(
-        &mut self,
-        rows: &[Row],
-        rules: &Rules,
-        taps: bool,
-    ) -> Result<(u32, Option<TapsBuf>), Error> {
-        let last = [rows.len() as u32 - 1];
-        if device(self, rules) {
-            let head = head(self, std::slice::from_ref(rules))?;
-            let (ids, taps) = self.launch_local(rows, &last, head, taps, false)?;
-            return Ok((ids[0], taps));
-        }
-        // Rules the device head cannot apply run on the host.
-        let (mut row, _, taps) = self.logits_local(rows, &last, taps, false)?;
-        let mut sampler = Sampler::new(Sampling::default());
-        Ok((sampler.draw_row(&mut row, Some(&rules.0), &rules.1), taps))
-    }
-
-    /// Runs `rows` locally: the `first` output, and taps if asked.
-    fn tapped(
-        &mut self,
-        rows: &[Row],
-        picks: &[u32],
-        (head, peek): (Head, bool),
-        first: Role,
-        taps: bool,
-    ) -> Result<(Slot, Option<TapsBuf>), Error> {
-        let width = match taps {
-            true => self.taps.ok_or(Error::Taps)?,
-            false => 0,
-        };
-        let roles = &[first, Role::Taps][..1 + taps as usize];
-        let wants = Wants::roles(&self.graph, self.full, roles);
-        // Outputs come in the entry's order.
-        let order = &self.graph.entries[self.full].outputs;
-        let wanted = order.iter().filter(|o| roles.contains(&o.role));
-        let at = |role| wanted.clone().position(|o| o.role == role).unwrap_or(0);
-        let (out_at, taps_at) = (at(first), at(Role::Taps));
-        let outputs = self.run_local(rows, picks, head, wants, peek)?;
-        let out = outputs[out_at];
-        if !taps {
-            return Ok((out, None));
-        }
-        let buf = self.taps_buf(outputs[taps_at], rows.len(), width)?;
-        Ok((out, Some(buf)))
-    }
-
-    /// Wraps a tap output slot on device or host.
-    fn taps_buf(&mut self, slot: Slot, rows: usize, width: usize) -> Result<TapsBuf, Error> {
-        if slot.form.name() == "f32"
-            && let Some(addr) = self.runner.address(slot)
-        {
-            return Ok(TapsBuf::Device { slot, addr, rows });
-        }
-        Ok(TapsBuf::Host(self.read_floats(slot, rows * width)?))
-    }
 }

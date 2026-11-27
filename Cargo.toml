@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "engine/engine",
+    "engine/hooks",
     "engine/gpu/*",
     "engine/ir/*",
     "engine/models",
@@ -35,6 +36,7 @@ tessera-calibrate = { path = "tools/calibrate" }
 tessera-checkpoint = { path = "frontend/checkpoint" }
 tessera-codegen = { path = "engine/plan/codegen" }
 tessera-engine-comm = { path = "engine/plan/comm" }
+tessera-engine-hooks = { path = "engine/hooks" }
 tessera-engine = { path = "engine/engine" }
 tessera-engine-settings = { path = "engine/settings" }
 tessera-frontend-comm = { path = "frontend/comm" }

@@ -2,14 +2,14 @@
 
 use crate::batch_dual::{DualPeer, push_tail};
 use crate::dual::DualState;
-use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, MtpJob, draft_mtp_batch, take_cols};
-use crate::sample::{Sampler, Sampling, Target, accept, take};
-use crate::schedule::Sink;
-use crate::spec_loop::{TapsBuf, TapsIn, VerifyOut, fnv_u32, span};
-use crate::{Engine, Error, Event, Reason, Request, Row};
+use crate::spec_loop::{fnv_u32, span};
 use std::collections::VecDeque;
 use tessera_engine_comm::{Reader, Writer};
+use tessera_engine_hooks::Kept;
+use tessera_engine_hooks::Sink;
+use tessera_engine_hooks::sample::{Sampler, Sampling, Target, accept, take};
+use tessera_engine_hooks::{Error, Event, Hooks, Reason, Request, Row, TapsBuf, TapsIn, VerifyOut};
 use tessera_run::Error as RunError;
 
 pub(crate) mod admit;
@@ -45,7 +45,7 @@ pub(crate) fn drive_step<'a>(host: &mut impl RoundHost<'a>) -> Result<bool, Erro
     let cancelled = host.collect_cancelled();
     let admitted = host.admit_local();
     let hash = host.core().hash;
-    if host.core().target.control.is_some() {
+    if host.core().target.rank().is_some() {
         let msg = encode_round(hash, &cancelled, &admitted);
         let _ = host.core().target.told(&msg)?;
     }
@@ -61,9 +61,8 @@ pub(crate) fn drive_follow<'a>(host: &mut impl RoundHost<'a>) -> Result<(), Erro
         let mine = host
             .core()
             .target
-            .held
-            .take()
-            .map_or_else(Vec::new, |(_, p)| p.to_bytes());
+            .take_held()
+            .map_or_else(Vec::new, |p| p.to_bytes());
         let Some(told) = host.core().target.told(&mine)? else {
             return Ok(());
         };
@@ -80,7 +79,7 @@ pub(crate) fn drive_follow<'a>(host: &mut impl RoundHost<'a>) -> Result<(), Erro
 
 /// Shared target, slot pool, and prefix state for batched decoders.
 pub(crate) struct BatchCore<'a> {
-    pub(crate) target: &'a mut Engine,
+    pub(crate) target: &'a mut dyn Hooks,
     pub(crate) prefill_chunk: usize,
     pub(crate) max_ctx: usize,
     pub(crate) waiting: VecDeque<(Request, Sink)>,
@@ -91,15 +90,19 @@ pub(crate) struct BatchCore<'a> {
 }
 
 impl<'a> BatchCore<'a> {
-    pub(crate) fn new(target: &'a mut Engine, slots: usize, max_ctx: usize, paged: bool) -> Self {
-        if paged && let Some(lanes) = &mut target.lanes {
+    pub(crate) fn new(
+        target: &'a mut dyn Hooks,
+        slots: usize,
+        max_ctx: usize,
+        paged: bool,
+    ) -> Self {
+        if paged && let Some(lanes) = target.lanes_mut() {
             lanes.reset();
         }
         let kept = paged
             .then(|| {
                 target
-                    .lanes
-                    .as_ref()
+                    .lanes()
                     .map(|l| Kept::paged(slots, max_ctx, l.pages(), l.page))
             })
             .flatten();
@@ -190,7 +193,7 @@ impl<'a> BatchCore<'a> {
             sampler,
         };
         let done = act.commit(&[anchor], self.max_ctx);
-        let ended = done.is_some() || (self.target.control.is_none() && act.cancelled);
+        let ended = done.is_some() || (self.target.rank().is_none() && act.cancelled);
         (act, ended)
     }
 
@@ -461,7 +464,7 @@ pub struct BatchMtp<'a> {
 
 impl<'a> BatchMtp<'a> {
     pub(crate) fn init(
-        target: &'a mut Engine,
+        target: &'a mut dyn Hooks,
         drafter: &'a mut MtpDrafter,
         dual: Option<DualPeer<'a>>,
         depth: usize,
@@ -470,7 +473,7 @@ impl<'a> BatchMtp<'a> {
         if let Some(lanes) = drafter.lanes_mut() {
             lanes.reset();
         }
-        if let (Some(tl), Some(dl)) = (target.lanes.as_ref(), drafter.lanes())
+        if let (Some(tl), Some(dl)) = (target.lanes(), drafter.lanes())
             && (tl.page != dl.page || tl.pages() != dl.pages())
         {
             return Err(Error::Rows);
@@ -490,7 +493,7 @@ impl<'a> BatchMtp<'a> {
 
     /// Pairs a multi-slot tapped target engine with its MTP drafter.
     pub fn new(
-        target: &'a mut Engine,
+        target: &'a mut dyn Hooks,
         drafter: &'a mut MtpDrafter,
         depth: usize,
     ) -> Result<Self, Error> {
@@ -569,7 +572,7 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
         }
         let mut out = Vec::new();
         let can_reuse = self.can_reuse();
-        let page = self.core.target.lanes.as_ref().map_or(0, |l| l.page);
+        let page = self.core.target.lanes().map_or(0, |l| l.page);
         while let Some((front, _)) = self.core.waiting.front() {
             let (slot, skip) = match &mut self.core.kept {
                 Some(kept) => {
@@ -610,7 +613,7 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
 
 impl BatchMtp<'_> {
     pub(crate) fn can_reuse(&self) -> bool {
-        self.reuse && (self.core.target.lanes.is_none() || self.drafter.lanes().is_some())
+        self.reuse && (self.core.target.lanes().is_none() || self.drafter.lanes().is_some())
     }
 
     pub(crate) fn retire_slot(&mut self, slot: u32, mut history: Vec<u32>, mtp_valid: usize) {
@@ -632,7 +635,7 @@ impl BatchMtp<'_> {
             }
             let solo_admit = self.dual.is_some() && self.mode.solo(self.flight(), admitted.len());
             let can_reuse = self.can_reuse();
-            let page = self.core.target.lanes.as_ref().map_or(0, |l| l.page);
+            let page = self.core.target.lanes().map_or(0, |l| l.page);
             for mut item in admitted {
                 if follower && let Some(kept) = &mut self.core.kept {
                     let Some((slot, _)) =
@@ -809,7 +812,7 @@ impl BatchMtp<'_> {
         self.ensure_pages(&rows)?;
         let (mut out, raw_taps) = self.core.target.step_verify_local(&rows, sampling)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
-        let ranked = self.core.target.control.is_some();
+        let ranked = self.core.target.rank().is_some();
         let mut jobs: Vec<DraftJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {

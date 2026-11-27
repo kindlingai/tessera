@@ -38,7 +38,7 @@ impl Sampling {
     }
 
     /// Resolves an omitted seed once so all ranks sample alike.
-    pub(crate) fn seeded(self) -> Self {
+    pub fn seeded(self) -> Self {
         match self.greedy() || self.seed.is_some() {
             true => self,
             false => Self {
@@ -49,7 +49,7 @@ impl Sampling {
     }
 
     /// Serializes sampling settings for cross-rank broadcast.
-    pub(crate) fn encode(&self, w: &mut Writer) {
+    pub fn encode(&self, w: &mut Writer) {
         let seed = self.seed.unwrap_or(0);
         w.u32(self.temperature.to_bits())
             .u32(self.top_p.to_bits())
@@ -61,7 +61,7 @@ impl Sampling {
     }
 
     /// Deserializes sampling settings from a rank broadcast.
-    pub(crate) fn decode(r: &mut Reader) -> Option<Self> {
+    pub fn decode(r: &mut Reader) -> Option<Self> {
         let temperature = f32::from_bits(r.u32()?);
         let top_p = f32::from_bits(r.u32()?);
         let top_k = r.u32()? as usize;
@@ -80,13 +80,13 @@ impl Sampling {
 }
 
 /// Per-sequence deterministic PRNG and token sampler.
-pub(crate) struct Sampler {
+pub struct Sampler {
     cfg: Sampling,
     state: u64,
 }
 
 impl Sampler {
-    pub(crate) fn new(cfg: Sampling) -> Self {
+    pub fn new(cfg: Sampling) -> Self {
         Self {
             cfg,
             state: cfg.seed.unwrap_or_else(fresh_seed),
@@ -94,7 +94,7 @@ impl Sampler {
     }
 
     /// The candidate weights of one row, after `edits` and filters.
-    pub(crate) fn weights(
+    pub fn weights(
         &self,
         logits: &mut [f32],
         allowed: Option<&Allowed>,
@@ -138,12 +138,12 @@ impl Sampler {
     }
 
     /// Whether this sampler uses greedy argmax decoding.
-    pub(crate) fn greedy(&self) -> bool {
+    pub fn greedy(&self) -> bool {
         self.cfg.greedy()
     }
 
     /// Draws one token from `logits` after optional guide rules.
-    pub(crate) fn draw_row(
+    pub fn draw_row(
         &mut self,
         logits: &mut [f32],
         allowed: Option<&Allowed>,
@@ -154,7 +154,7 @@ impl Sampler {
     }
 
     /// Verifies `drafts` against sampled target `logits`.
-    pub(crate) fn verify(
+    pub fn verify(
         &mut self,
         drafts: &[u32],
         logits: &mut [f32],
@@ -181,7 +181,7 @@ impl Sampler {
     }
 
     /// A uniform in `[0, 1)`. Each row draws one.
-    pub(crate) fn unit(&mut self) -> f32 {
+    pub fn unit(&mut self) -> f32 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -272,7 +272,7 @@ pub fn accept(drafts: &[u32], target: Target) -> (usize, u32) {
 }
 
 /// Counts `id` as an answer token, unless it stops.
-pub(crate) fn take(
+pub fn take(
     request: &Request,
     made: &mut usize,
     id: u32,
@@ -340,7 +340,7 @@ fn each_allowed(logits: &[f32], allowed: Option<&Allowed>, mut f: impl FnMut(u32
 }
 
 /// Lowest-index argmax over allowed tokens.
-pub(crate) fn argmax(logits: &[f32], allowed: Option<&Allowed>) -> u32 {
+pub fn argmax(logits: &[f32], allowed: Option<&Allowed>) -> u32 {
     let mut best_id = 0u32;
     let mut best = f32::NEG_INFINITY;
     let mut found = false;

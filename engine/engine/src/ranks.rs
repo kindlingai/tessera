@@ -1,110 +1,14 @@
 //! An engine as one rank of several.
 
+use crate::kept::Kept;
 use crate::lanes::{decode_patches, encode_patches};
-use crate::{Asks, Engine, Error, Head, Row};
+use crate::{Asks, Engine, Error, Head, Place, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::{DType, Graph, Parts, Whole, shard_mode};
+use tessera_engine_hooks::open_rank;
+use tessera_graph::Graph;
 use tessera_kv::{DiskKv, DiskMsg, KvConfig, StoreStats, decode_msg};
-use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, Wires, ZoneKind};
-use tessera_run::{Profile, Rank, Ranks, Run, Sum, sum_wire};
-
-/// A rank's zones and each rank's share of split weights.
-pub struct Place {
-    pub cluster: Cluster,
-    pub parts: Parts,
-    pub(crate) rank: u32,
-    /// A persistent grid for the sums, if any.
-    pub(crate) grid: Option<Box<dyn Sum>>,
-    /// Split routed experts along inner width, not experts.
-    pub(crate) moe_tp: bool,
-    /// The wire dtype for sums the model leaves unpinned.
-    pub(crate) wire: Option<DType>,
-}
-
-impl Place {
-    /// One zone per rank, in rank order.
-    pub fn new(cluster: Cluster, parts: Parts) -> Self {
-        let rank = 0;
-        Self {
-            cluster,
-            parts,
-            rank,
-            grid: None,
-            moe_tp: false,
-            wire: None,
-        }
-    }
-
-    /// Runs the sums through `grid`.
-    pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
-        self.grid = grid;
-        self
-    }
-
-    /// Sends unpinned sums' parts as `wire`. `None`: the transport's dtype.
-    pub fn with_wire(mut self, wire: Option<DType>) -> Self {
-        self.wire = wire;
-        self
-    }
-
-    /// Settles the wire dtype once the sums' transport is known.
-    pub(crate) fn settle(&mut self, grid: Option<&dyn Sum>) {
-        self.wire = Some(sum_wire(self.wire, grid));
-    }
-
-    /// Pins `g`'s sums: model pins, then `wires`, then setup.
-    pub(crate) fn resolve(&self, g: Graph, wires: &Wires) -> Graph {
-        let g = wires.pin(g);
-        match self.wire {
-            Some(wire) => g.wired(wire),
-            None => g,
-        }
-    }
-
-    /// Splits wide routed experts along inner width when `on`.
-    pub fn with_moe_tp(mut self, on: bool) -> Self {
-        self.moe_tp = on;
-        self
-    }
-
-    /// A zone per rank, all linked. No `parts`: even shares.
-    pub fn mesh(ranks: usize, parts: Vec<u32>, gpu: bool) -> Self {
-        let kind = match gpu {
-            true => ZoneKind::Gpu,
-            false => ZoneKind::Cpu,
-        };
-        let parts = match parts.is_empty() {
-            true => Parts::even(ranks),
-            false => Parts(parts),
-        };
-        Self::new(Cluster::mesh(ranks, kind), parts)
-    }
-
-    /// Logs unsharded weights on rank 0.
-    pub(crate) fn log_whole(&self, g: &Graph, tag: &str, whole: &[Whole]) {
-        if self.rank != 0 {
-            return;
-        }
-        for w in whole {
-            let path = &g.weights[w.weight as usize].path;
-            eprintln!("tessera: {tag}{path:?} stays whole: {}", w.why);
-        }
-    }
-
-    pub(crate) fn split(&self, g: &Graph, (pins, wires): (&Pins, &Wires)) -> Result<Graph, Error> {
-        let sharded = shard_mode(g, &self.parts, &pins.shares(g), self.moe_tp)?;
-        self.log_whole(g, "", &sharded.whole);
-        Ok(self.resolve(sharded.graph, wires))
-    }
-
-    /// `device`, lowering this rank's copy of the plan.
-    pub(crate) fn device(&self, device: Device) -> Device {
-        let ranks = self.parts.ranks() as u32;
-        let device = device.zoned(self.cluster.clone());
-        let device = device.ranked((0..ranks).collect());
-        device.uneven(self.parts.0.clone()).as_rank(self.rank)
-    }
-}
+use tessera_lower::{Device, Recipe, Settings, Wants};
+use tessera_run::{Profile, Ranks};
 
 /// Profile state preserved while an engine is evicted.
 pub(crate) struct ParkedProfile {
@@ -145,37 +49,6 @@ fn merge_carried(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
-}
-
-/// Opens a ranked runner with an optional persistent sum grid.
-pub(crate) fn open_rank<T: Transport + 'static>(
-    plan: tessera_lower::Plan,
-    settings: &Settings,
-    sums: T,
-    grid: Option<Box<dyn Sum>>,
-) -> Result<Box<dyn Run>, Error> {
-    Ok(Box::new(Rank::open(plan, settings, sums)?.with_grid(grid)?))
-}
-
-/// Configures `runner` and loads its stored device model.
-pub(crate) fn stored_device(
-    runner: &mut dyn Run,
-    recipe: &Recipe,
-    settings: &Settings,
-    place: Option<&Place>,
-    profile: bool,
-) -> Result<Device, Error> {
-    runner.launching(recipe.launch);
-    if profile {
-        runner.profiling(settings.profile.is_some());
-    }
-    let mut device = Device::stored(runner.platform(), settings)
-        .map_err(tessera_lower::Error::from)?
-        .with(recipe);
-    if let Some(place) = place {
-        device = place.device(device);
-    }
-    Ok(device)
 }
 
 impl Engine {
@@ -490,21 +363,6 @@ impl Engine {
         self.runner.plan().ranks as usize
     }
 
-    /// Grows paged slots for `rows`, syncing any `TIER_HOST` KV pages.
-    pub(crate) fn grow_kept(
-        &mut self,
-        kept: &mut crate::kept::Kept,
-        rows: &[Row],
-    ) -> Result<(), Error> {
-        let Some(lanes) = &mut self.lanes else {
-            return Ok(());
-        };
-        let runner = &mut self.runner;
-        kept.grow_rows_tiered(rows, lanes, &mut |promote, pairs| {
-            Ok(runner.move_kv_pages(promote, pairs)?)
-        })
-    }
-
     /// `(kv_vram_tokens, host_tokens, active_tokens)` when `TIER_HOST` is active.
     pub fn host_tier_info(&self) -> Option<(usize, usize, usize)> {
         let l = self.lanes.as_ref().filter(|l| l.tiered())?;
@@ -593,7 +451,7 @@ impl Engine {
     /// Restores extra prefix pages from the KV store past `skip`.
     pub(crate) fn restore_kv(
         &mut self,
-        kept: Option<&mut crate::kept::Kept>,
+        kept: Option<&mut Kept>,
         slot: u32,
         tokens: &[u32],
         skip: usize,
@@ -622,13 +480,7 @@ impl Engine {
     }
 
     /// Spills full pages of `slot` to the KV store.
-    pub(crate) fn spill_kv(
-        &mut self,
-        kept: Option<&crate::kept::Kept>,
-        slot: u32,
-        history: &[u32],
-        lead: bool,
-    ) {
+    pub(crate) fn spill_kv(&mut self, kept: Option<&Kept>, slot: u32, history: &[u32], lead: bool) {
         if history.is_empty() {
             return;
         }

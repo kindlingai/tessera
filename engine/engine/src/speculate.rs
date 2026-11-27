@@ -1,13 +1,14 @@
 //! DFlash speculative decoding: cached drafter and verify loop.
 
-use crate::ranks::open_rank;
 pub use crate::spec_len::SpecStats;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{D2dCopy, SpecReq, TapsIn, fill_d2d, run_speculate, spec_entry};
-use crate::{Engine, Error, Event, Place};
+use crate::spec_loop::{D2dCopy, SpecReq, fill_d2d, run_speculate, spec_entry};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tessera_engine_comm::{Error as CommError, Transport};
+use tessera_engine_hooks::{
+    Error, Event, Hooks, Lanes, Place, TapsIn, context_bucket, open_rank, stored_device,
+};
 use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs};
 use tessera_graph::{DType, Graph, Role};
 use tessera_interp::Tensor;
@@ -144,7 +145,7 @@ pub(crate) struct DraftCore {
     pub plans: Cache,
     pub context: usize,
     pub slots: usize,
-    pub lanes: Option<crate::lanes::Lanes>,
+    pub lanes: Option<Lanes>,
     pub profile: Option<u64>,
     pub launches: u64,
     pub label: &'static str,
@@ -184,10 +185,10 @@ impl DraftCore {
         let pool = plan.pool_pages;
         let lanes = lanes.map(|(table, page)| {
             let pages = if pool > 0 { pool } else { table.len };
-            crate::lanes::Lanes::new(page, table.len, slots, pages)
+            Lanes::new(page, table.len, slots, pages)
         });
         let mut runner = run(plan.clone())?;
-        let device = crate::ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
+        let device = stored_device(runner.as_mut(), recipe, settings, place, true)?;
         Ok(Self {
             graph,
             runner,
@@ -623,7 +624,7 @@ impl Drafter {
             (Rows, filled as u64),
             (
                 Context,
-                crate::context_bucket(start + self.block, self.core.context),
+                context_bucket(start + self.block, self.core.context),
             ),
             (Segments, 1),
         ];
@@ -634,7 +635,7 @@ impl Drafter {
 
 /// DFlash speculative decoding over a target and drafter pair.
 pub struct Speculate<'a> {
-    target: &'a mut Engine,
+    target: &'a mut dyn Hooks,
     drafter: &'a mut Drafter,
     spec_len: SpecLen,
     prefill_chunk: Option<usize>,
@@ -642,7 +643,7 @@ pub struct Speculate<'a> {
 
 impl<'a> Speculate<'a> {
     /// Pairs a tapped target engine with its DFlash drafter.
-    pub fn new(target: &'a mut Engine, drafter: &'a mut Drafter) -> Result<Self, Error> {
+    pub fn new(target: &'a mut dyn Hooks, drafter: &'a mut Drafter) -> Result<Self, Error> {
         let width = target.tap_width().ok_or(Error::Taps)?;
         if width != drafter.tap_width() {
             return Err(Error::Rows);
@@ -655,23 +656,17 @@ impl<'a> Speculate<'a> {
             prefill_chunk: None,
         })
     }
-
-    /// Configures adaptive or truncated draft length selection.
-    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
-        self.spec_len = spec_len;
-        self
-    }
 }
 
 spec_entry!(
     Speculate<'a>,
     SpecLen,
-    spec_len,
+    spec_len => with_spec_len,
     |s, target, req, spec, emit| run_dflash_req(target, s.drafter, req, spec, emit)
 );
 
 fn run_dflash_req(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     drafter: &mut Drafter,
     req: SpecReq,
     spec: SpecLen,

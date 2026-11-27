@@ -103,7 +103,7 @@ impl Allowed {
     }
 
     /// One bit per row, over `words` words.
-    pub(crate) fn bits(&self, words: usize) -> Vec<u32> {
+    pub fn bits(&self, words: usize) -> Vec<u32> {
         let set = |out: &mut [u32], id: u32, on: bool| {
             let (w, b) = (id as usize / 32, id % 32);
             if let Some(word) = out.get_mut(w) {
@@ -135,7 +135,7 @@ impl Allowed {
     }
 
     /// Returns `self` with every id in `ids` banned.
-    pub(crate) fn ban(&self, ids: &[u32], words: Option<usize>) -> Self {
+    pub fn ban(&self, ids: &[u32], words: Option<usize>) -> Self {
         if ids.is_empty() || matches!(self, Allowed::One(_)) {
             return self.clone();
         }
@@ -164,7 +164,7 @@ pub struct Edit {
 }
 
 /// Applies `edits` to a row, skipping ids past its end.
-pub(crate) fn edit(row: &mut [f32], edits: &[Edit]) {
+pub fn edit(row: &mut [f32], edits: &[Edit]) {
     for e in edits {
         if let Some(x) = row.get_mut(e.id as usize) {
             let scaled = if *x > 0.0 { *x / e.rep } else { *x * e.rep };
@@ -175,9 +175,9 @@ pub(crate) fn edit(row: &mut [f32], edits: &[Edit]) {
 
 /// Bans stop ids until `left` tokens have been accepted.
 #[derive(Clone)]
-pub(crate) struct MinTokens {
-    pub(crate) stop: Vec<u32>,
-    pub(crate) left: usize,
+pub struct MinTokens {
+    pub stop: Vec<u32>,
+    pub left: usize,
 }
 
 impl Guide for MinTokens {
@@ -228,10 +228,10 @@ pub trait Guide: Send {
 }
 
 /// One pick's allowed set and logit edits.
-pub(crate) type Rules = (Allowed, Vec<Edit>);
+pub type Rules = (Allowed, Vec<Edit>);
 
 /// Takes forced and single-choice tokens, then reads the next rules.
-pub(crate) fn settle(
+pub fn settle(
     guide: &mut dyn Guide,
     mut take: impl FnMut(u32) -> Option<Reason>,
 ) -> Result<Rules, Reason> {
@@ -267,7 +267,7 @@ pub(crate) fn settle(
 }
 
 /// Each verify row's rules along `drafts`, read from a fork.
-pub(crate) fn walk(
+pub fn walk(
     guide: &dyn Guide,
     first: Rules,
     drafts: &[u32],
@@ -385,7 +385,7 @@ impl Guide for Stacked {
 }
 
 /// One edit per id, sorted: adds sum, reps multiply.
-pub(crate) fn merged(mut all: Vec<Edit>) -> Vec<Edit> {
+pub fn merged(mut all: Vec<Edit>) -> Vec<Edit> {
     all.sort_by_key(|e| e.id);
     let mut out: Vec<Edit> = Vec::with_capacity(all.len());
     for e in all {
@@ -882,27 +882,5 @@ impl Runs {
             }
         }
         out
-    }
-}
-
-impl crate::Engine {
-    /// Picks guided ids from full logits without a mask port.
-    pub(crate) fn pick_unmasked(
-        &mut self,
-        rows: &[crate::Row],
-        picks: &[u32],
-        allowed: &[Allowed],
-    ) -> Result<Vec<u32>, crate::Error> {
-        let vocab = self.vocab.ok_or(crate::Error::Mask)?;
-        let wants = tessera_lower::Wants::role(&self.graph, self.full, tessera_graph::Role::Logits);
-        let outputs = self.run(rows, picks, crate::Head::Full(None), wants)?;
-        let floats = self.read_floats(outputs[0], picks.len() * vocab)?;
-        let out = floats
-            .chunks_exact(vocab)
-            .zip(allowed)
-            .map(|(row, allow)| crate::sample::argmax(row, Some(allow)))
-            .collect();
-        self.report();
-        Ok(out)
     }
 }

@@ -6,16 +6,16 @@ use crate::batch_spec::{
     drive_step, notify_kept, prefill_len, queue_request, retire_finished, retire_from, verify_rows,
 };
 use crate::dual::{DualSelector, DualState, DualStep, split_taps};
-use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, flush_mtp, take_cols};
-use crate::sample::Sampler;
-use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{TapsBuf, TapsIn, span};
+use crate::spec_loop::span;
 use crate::speculate::Drafter;
-use crate::{Engine, Error, Head, Request, Row};
 use interleave::{Cooldown, Interleave, Work};
 use std::collections::VecDeque;
+use tessera_engine_hooks::Kept;
+use tessera_engine_hooks::Sink;
+use tessera_engine_hooks::sample::Sampler;
+use tessera_engine_hooks::{Error, Head, Hooks, Request, Row, TapsBuf, TapsIn};
 use tessera_lower::Wants;
 
 mod interleave;
@@ -54,7 +54,8 @@ pub(crate) fn push_tail(buf: &mut Vec<f32>, src: &[f32], width: usize) {
 
 impl<'a> BatchMtp<'a> {
     pub(crate) fn ensure_pages(&mut self, rows: &[Row]) -> Result<(), Error> {
-        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
+        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, self.core.target.lanes_mut())
+        else {
             return Ok(());
         };
         let mut d_lanes = self.drafter.lanes_mut();
@@ -67,7 +68,8 @@ impl<'a> BatchMtp<'a> {
     }
 
     pub(crate) fn ensure_slot_pages(&mut self, slot: u32, need: usize) -> Result<(), Error> {
-        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
+        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, self.core.target.lanes_mut())
+        else {
             return Ok(());
         };
         if let Some(pages) = kept.grow(slot, need)? {
@@ -81,7 +83,7 @@ impl<'a> BatchMtp<'a> {
 
     /// Pairs a dual-tapped target with DFlash and MTP drafters.
     pub fn new_dual(
-        target: &'a mut Engine,
+        target: &'a mut dyn Hooks,
         dflash: &'a mut Drafter,
         drafter: &'a mut MtpDrafter,
         depth: usize,
@@ -174,7 +176,7 @@ impl<'a> BatchMtp<'a> {
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let peer = self.dual.as_ref().expect("dual peer");
         let total = peer.d_width + peer.m_width;
-        let raw = taps.into_host(&*self.core.target.runner, total)?;
+        let raw = taps.into_host(self.core.target.runner(), total)?;
         Ok(split_taps(&raw, rows, peer.d_width, peer.m_width))
     }
 
@@ -185,7 +187,7 @@ impl<'a> BatchMtp<'a> {
         match taps {
             TapsBuf::Host(v) => Ok(take_cols(v, rows, total, 0, peer.d_width)),
             TapsBuf::Device { slot, .. } => {
-                let raw = self.core.target.runner.read(*slot)?;
+                let raw = self.core.target.runner().read(*slot)?;
                 let floats = raw.floats().map_err(tessera_run::Error::from)?;
                 Ok(take_cols(floats, rows, total, 0, peer.d_width))
             }
@@ -225,7 +227,7 @@ impl<'a> BatchMtp<'a> {
         let (d_all, m_all) = self.split_dual_taps(taps, rows.len())?;
         let d_width = self.dual.as_ref().expect("dual peer").d_width;
         let m_width = self.drafter.hidden();
-        let ranked = self.core.target.control.is_some();
+        let ranked = self.core.target.rank().is_some();
         let (accepted, committed, done) =
             self.active[0].apply_verify(k, 0, &mut out, self.core.max_ctx, &mut self.core.hash);
         self.active[0].history.extend_from_slice(&committed);
@@ -367,7 +369,7 @@ pub struct BatchDFlash<'a> {
 
 impl<'a> BatchDFlash<'a> {
     /// Pairs a multi-slot tapped target engine with its DFlash drafter.
-    pub fn new(target: &'a mut Engine, drafter: &'a mut Drafter) -> Result<Self, Error> {
+    pub fn new(target: &'a mut dyn Hooks, drafter: &'a mut Drafter) -> Result<Self, Error> {
         let width = target.draft_taps()?;
         if width != drafter.tap_width() {
             return Err(Error::Rows);
@@ -661,7 +663,7 @@ impl<'a> BatchDFlash<'a> {
         let (rows, spans, sampling) = verify_rows(&self.active, self.core.max_ctx, |s| &s.seq);
         self.ensure_pages(&rows)?;
         let (mut out, raw_taps) = self.core.target.step_verify_local(&rows, sampling)?;
-        let ranked = self.core.target.control.is_some();
+        let ranked = self.core.target.rank().is_some();
         let mut jobs: Vec<DFlashJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
@@ -749,7 +751,7 @@ impl<'a> RoundHost<'a> for BatchDFlash<'a> {
         while let Some((req, _)) = self.core.waiting.front() {
             let limit = self.admit_limit(req.tokens.len());
             let (slot, skip) = if let Some(kept) = &mut self.core.kept {
-                if self.core.target.lanes.is_some() {
+                if self.core.target.lanes().is_some() {
                     let busy =
                         !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
                     let ask = Ask::of(kept.totals().pool, busy, req.tokens.len());

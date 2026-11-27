@@ -3,6 +3,7 @@
 use crate::progress::{Progress, Unit};
 use crate::{Error, Reads};
 use std::borrow::Cow;
+use tessera_engine_hooks::stored_device;
 use tessera_graph::{DimExpr, DimName, Graph, Shape, Size};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Weight};
@@ -121,8 +122,7 @@ impl Model {
             Err(tessera_lower::Error::Unsupported(_)) => Executor::Interpreted(Vec::new()),
             planned => {
                 let mut runner = open(planned?, settings)?;
-                let device =
-                    crate::ranks::stored_device(runner.as_mut(), recipe, settings, None, false)?;
+                let device = stored_device(runner.as_mut(), recipe, settings, None, false)?;
                 Executor::Planned(Box::new(Planned {
                     runner,
                     device,

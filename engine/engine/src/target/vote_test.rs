@@ -1,7 +1,7 @@
 //! Unit tests for ranked speculative plan selection.
 
 use super::decide_plan;
-use crate::{Engine, Error, Place, Recipe, Row};
+use crate::{Engine, Error, Hooks, Place, Recipe, Row};
 use std::time::Duration;
 use tessera_engine_comm::Sockets;
 use tessera_graph::{Graph, Parts, Role};

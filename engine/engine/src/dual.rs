@@ -2,11 +2,11 @@
 
 use crate::mtp_draft::{MtpDrafter, draft_mtp, flush_mtp};
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{SpecReq, TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::spec_loop::{SpecReq, run_speculate, spec_entry};
 use crate::speculate::{Drafter, SpecStats};
-use crate::{Engine, Error, Event};
 use switch::{DWELL, SWITCHES};
 use tessera_engine_comm::{Reader, Writer};
+use tessera_engine_hooks::{Error, Event, Hooks, TapsBuf, TapsIn};
 
 mod switch;
 
@@ -319,7 +319,7 @@ impl DualState {
     /// Proposes next drafts and returns any updated MTP cache watermark.
     pub(crate) fn draft(
         &mut self,
-        target: &mut Engine,
+        target: &mut dyn Hooks,
         dflash: &mut Drafter,
         mtp: &mut MtpDrafter,
         step: DualStep,
@@ -422,7 +422,7 @@ impl DualState {
 
 /// Dual-drafter speculative decoding combining DFlash and native MTP.
 pub struct DualSpeculate<'a> {
-    target: &'a mut Engine,
+    target: &'a mut dyn Hooks,
     dflash: &'a mut Drafter,
     mtp: &'a mut MtpDrafter,
     depth: usize,
@@ -433,7 +433,7 @@ pub struct DualSpeculate<'a> {
 impl<'a> DualSpeculate<'a> {
     /// Pairs a dual-tapped target engine with DFlash and MTP drafters.
     pub fn new(
-        target: &'a mut Engine,
+        target: &'a mut dyn Hooks,
         dflash: &'a mut Drafter,
         mtp: &'a mut MtpDrafter,
         depth: usize,
@@ -474,7 +474,7 @@ spec_entry!(
 );
 
 fn run_dual_req(
-    target: &mut Engine,
+    target: &mut dyn Hooks,
     dflash: &mut Drafter,
     mtp: &mut MtpDrafter,
     depth: usize,
@@ -498,7 +498,7 @@ fn run_dual_req(
         req,
         emit,
         |target, (dflash, mtp), pos, prompt, len, taps| {
-            let raw = taps.into_host(&*target.runner, total)?;
+            let raw = taps.into_host(target.runner(), total)?;
             let (d_taps, m_taps) = split_taps(&raw, len, d_width, m_width);
             let end = pos + len;
             if end > drop_before && (prompt.len() - drop_before) + block <= d_ctx {
@@ -519,7 +519,7 @@ fn run_dual_req(
         },
         |target, _, pos, prompt, anchor, taps| {
             let len = prompt.len() - pos;
-            let raw = taps.into_host(&*target.runner, total)?;
+            let raw = taps.into_host(target.runner(), total)?;
             let (d_all, m_taps) = split_taps(&raw, len, d_width, m_width);
             let skip = drop_before.saturating_sub(pos);
             let (d_pending, d_ctx_pos) =
@@ -552,7 +552,7 @@ fn run_dual_req(
         },
         |target, _, st, _start, drafted, accepted, posterior, block_taps, stats| {
             let commit = 1 + accepted;
-            let raw = block_taps.into_host(&*target.runner, total)?;
+            let raw = block_taps.into_host(target.runner(), total)?;
             let (d_taps, m_taps) = split_taps(&raw, commit, d_width, m_width);
             st.observe(
                 drafted,

@@ -14,6 +14,7 @@ rocm = ["tessera-run/rocm", "tessera-device/rocm"]
 [dependencies]
 tessera-device = { workspace = true }
 tessera-engine-comm = { workspace = true }
+tessera-engine-hooks = { workspace = true }
 tessera-engine-settings = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-interp = { workspace = true }

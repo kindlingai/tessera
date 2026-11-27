@@ -12,6 +12,7 @@ and tokens.
 <tr><td>&emsp;<a href="gpu/gpukit">gpukit/</a></td><td>tessera-gpukit</td><td>The GPU runtimes tessera loads at run time: pipelines and buffers</td></tr>
 <tr><td>&emsp;<a href="gpu/platform">platform/</a></td><td>tessera-platform</td><td>Plain hardware description: platforms, limits and the per-architecture table</td></tr>
 <tr><td>&emsp;<a href="gpu/work">work/</a></td><td>tessera-work</td><td>A launch's work: ops per trip and the load they make</td></tr>
+<tr><td><a href="hooks">hooks/</a></td><td>tessera-engine-hooks</td><td>Engine calls and types that speculative decoders share with the engine</td></tr>
 <tr><td colspan="3"><a href="ir"><b>ir/</b></a></td></tr>
 <tr><td>&emsp;<a href="ir/graph">graph/</a></td><td>tessera-graph</td><td>The model graph: typed nodes, symbolic shapes, a JSON form</td></tr>
 <tr><td>&emsp;<a href="ir/interp">interp/</a></td><td>tessera-interp</td><td>The CPU reference for every plan: runs a graph op by op</td></tr>
