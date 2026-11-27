@@ -28,11 +28,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Label changes to protected files
         if: contains(fromJSON('["opened", "reopened", "synchronize", "ready_for_review"]'), github.event.action)
+        env:
+          BIG_PR_LINES: 5000
         run: |
           # README.md changes inside the generated crate table skip review.
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
             | tools/scripts/review-paths.sh \
             | tools/scripts/protected.sh > "$RUNNER_TEMP/hits"
+          tools/scripts/big-pr.sh >> "$RUNNER_TEMP/hits"
           cat "$RUNNER_TEMP/hits"
           tools/scripts/protected-label.sh < "$RUNNER_TEMP/hits"
       - name: Rerun CI's success job
