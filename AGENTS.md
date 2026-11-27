@@ -6,13 +6,18 @@ checks.
 
 ## Docs
 
-No design docs, plans or history in the repo, outside an explicit changelog.
+No design docs, plans or history in the repo, outside an explicit changelog. If
+doc changes are required, tag @mmastrac in the PR for a follow-up doc change.
 
 No mannered prose in comments, error messages or text. Avoid flamboyant speech
 and prefer ASD-STE100 where possible. No historical commentary. Comments are
 intentionally limited - code should be clearly written.
 
 ## Code
+
+While agent-written docs are not allowed, agents may write to the structured
+`maps/` directory with any pointers to future agents. These maps are machine-readable
+and checked against code, and are less likely to go stale.
 
 Excessive code duplication is strictly checked. Use macros if duplicate
 detectors fire. Never change lint rules or add exceptions without a project
