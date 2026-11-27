@@ -348,16 +348,19 @@ impl Held {
         plan: &Plan,
         alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
     ) -> Result<bool, Error> {
-        Ok(!self.bind_sized(plan, |_, _| None, alloc)?.is_empty())
+        let mut retired = Vec::new();
+        self.bind_sized(plan, |_, _| None, &mut retired, alloc)?;
+        Ok(!retired.is_empty())
     }
 
-    /// As `bind`, returning retired buffers for deferred drop.
+    /// As `bind`, appending retired buffers for caller-deferred drop.
     pub(crate) fn bind_sized(
         &mut self,
         plan: &Plan,
         sized: impl Fn(u32, Option<u8>) -> Option<usize>,
+        retired: &mut Vec<Buffer>,
         mut alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
-    ) -> Result<Vec<Buffer>, Error> {
+    ) -> Result<(), Error> {
         let count = plan.buffers.len();
         let mut weights: Vec<Vec<(WeightKey, usize, usize)>> = vec![Vec::new(); count];
         for l in &plan.weights {
@@ -371,7 +374,6 @@ impl Held {
         }
         self.bound.clear();
         let mut seen: HashMap<u32, usize> = HashMap::new();
-        let mut retired = Vec::new();
         for (b, &bytes) in plan.buffers.iter().enumerate() {
             let zone = plan.zone(b as u32);
             let is_table = plan.table.is_some_and(|s| s.buffer as usize == b);
@@ -386,16 +388,16 @@ impl Held {
                 let slot = seen.entry(zone).or_insert(0);
                 let idx = *slot;
                 *slot += 1;
-                self.bind_scratch(zone, idx, bytes, &mut alloc, &mut retired)?
+                self.bind_scratch(zone, idx, bytes, &mut alloc, retired)?
             };
             self.bound.push(at);
         }
-        self.compact(&mut retired);
+        self.compact(retired);
         self.kept_spans.clear();
         for p in self.kept.values() {
             self.kept_spans.insert((p.buffer, p.offset), p.bytes);
         }
-        Ok(retired)
+        Ok(())
     }
 
     /// Reuses a zone's `slot`-th scratch buffer, growing in place.

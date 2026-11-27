@@ -76,11 +76,8 @@ impl Base {
         self.fresh_with(plan, 0)
     }
 
-    /// As `fresh`, counting `extra` bytes held beside `plan`'s buffers.
-    pub(crate) fn fresh_with(&self, plan: &Plan, extra: u64) -> Result<bool, Error> {
-        if plan.id != 0 && plan.id == self.plan.id {
-            return Ok(false);
-        }
+    /// Checks `plan`'s zone and memory budget with `extra` bytes.
+    pub(crate) fn validate(&self, plan: &Plan, extra: u64) -> Result<(), Error> {
         if plan.zoned() {
             return Err(Error::Zones);
         }
@@ -90,6 +87,15 @@ impl Base {
         {
             return Err(Error::OverBudget { planned, budget });
         }
+        Ok(())
+    }
+
+    /// As `fresh`, counting `extra` bytes held beside `plan`'s buffers.
+    pub(crate) fn fresh_with(&self, plan: &Plan, extra: u64) -> Result<bool, Error> {
+        if plan.id != 0 && plan.id == self.plan.id {
+            return Ok(false);
+        }
+        self.validate(plan, extra)?;
         Ok(true)
     }
 

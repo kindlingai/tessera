@@ -1,6 +1,7 @@
 //! Occupancy attrs, scoped GraphKeys, targeted invalidation, overrides, caching and sizer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_engine_settings::{Backend, ByBackend, Memory, Settings};
@@ -31,6 +32,9 @@ struct MockState {
     recording: Option<Vec<u64>>,
     attr_calls: Vec<(u32, u32)>,
     grid_running: bool,
+    fail_alloc: Option<usize>,
+    fail_finish: usize,
+    events: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -43,8 +47,10 @@ struct TinyGraph {
 
 impl Drop for TinyGraph {
     fn drop(&mut self) {
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         assert!(!s.grid_running, "dropped graph while grid ran");
+        let first = self.ptrs.first().copied().unwrap_or(0);
+        s.events.push(format!("drop_graph:{first:#x}"));
     }
 }
 
@@ -56,19 +62,39 @@ impl MockState {
         }
     }
 
-    fn alloc_buf(&mut self, size: usize) -> u64 {
+    fn alloc_buf(&mut self, size: usize) -> Result<u64, GpuError> {
         assert!(!self.grid_running, "alloc while grid ran");
+        if let Some(left) = self.fail_alloc {
+            if left == 0 {
+                self.fail_alloc = None;
+                self.events.push("alloc_err".into());
+                return Err(GpuError::Cuda("oom".into()));
+            }
+            self.fail_alloc = Some(left - 1);
+        }
         let ptr = self.next_ptr;
         self.next_ptr += (size.max(4096) as u64).next_multiple_of(4096) + 4096;
         self.live.insert(ptr, size.max(1));
         self.allocs += 1;
-        ptr
+        self.events.push(format!("alloc:{ptr:#x}"));
+        Ok(ptr)
     }
 
     fn free_buf(&mut self, ptr: u64) {
         assert!(!self.grid_running, "free while grid ran");
         assert!(self.live.remove(&ptr).is_some(), "double free {ptr:#x}");
         self.frees += 1;
+        self.events.push(format!("free:{ptr:#x}"));
+    }
+
+    fn finish_stream(&mut self) -> Result<Option<f64>, GpuError> {
+        if self.fail_finish > 0 {
+            self.fail_finish -= 1;
+            self.events.push("finish_err".into());
+            return Err(GpuError::Cuda("finish failed".into()));
+        }
+        self.events.push("finish_ok".into());
+        Ok(None)
     }
 
     fn count_compile(&mut self) {
@@ -101,6 +127,25 @@ impl TinyDevice {
         s.recording = None;
         s.attr_calls.clear();
         s.grid_running = false;
+        s.fail_alloc = None;
+        s.fail_finish = 0;
+        s.events.clear();
+    }
+
+    fn take_events(&self) -> Vec<String> {
+        std::mem::take(&mut self.0.lock().unwrap().events)
+    }
+
+    fn fail_alloc(&self, after: Option<usize>) {
+        self.0.lock().unwrap().fail_alloc = after;
+    }
+
+    fn fail_finish(&self, count: usize) {
+        self.0.lock().unwrap().fail_finish = count;
+    }
+
+    fn is_live(&self, ptr: u64) -> bool {
+        self.0.lock().unwrap().live.contains_key(&ptr)
     }
 
     fn stats_snapshot(&self) -> (usize, usize, usize, usize, usize) {
@@ -160,7 +205,7 @@ impl Device for TinyDevice {
         true
     }
     fn finish(&self) -> Result<Option<f64>, GpuError> {
-        Ok(None)
+        self.0.lock().unwrap().finish_stream()
     }
     fn upload(&self, _: u64, _: &[u8]) -> Result<(), GpuError> {
         Ok(())
@@ -174,7 +219,7 @@ impl Device for TinyDevice {
         Ok(())
     }
     fn alloc(&self, size: usize) -> Result<u64, GpuError> {
-        Ok(self.0.lock().unwrap().alloc_buf(size))
+        self.0.lock().unwrap().alloc_buf(size)
     }
     fn free(&self, ptr: u64) {
         self.0.lock().unwrap().free_buf(ptr);
@@ -317,22 +362,34 @@ impl Transport for NullTransport {
     }
 }
 
+type PauseLog = Arc<Mutex<(usize, usize)>>;
+type PauseFaults = Arc<Mutex<VecDeque<bool>>>;
+
 struct TinySum {
     ctx: &'static TinyDevice,
     running: bool,
-    log: Arc<Mutex<(usize, usize)>>,
+    log: PauseLog,
+    fail_pause: PauseFaults,
 }
 
 impl TinySum {
-    fn new(ctx: &'static TinyDevice) -> (Self, Arc<Mutex<(usize, usize)>>) {
+    fn new(ctx: &'static TinyDevice) -> (Self, PauseLog) {
+        let (sum, log, _) = Self::with_faults(ctx);
+        (sum, log)
+    }
+
+    fn with_faults(ctx: &'static TinyDevice) -> (Self, PauseLog, PauseFaults) {
         let log = Arc::new(Mutex::new((0, 0)));
+        let fail_pause = Arc::new(Mutex::new(VecDeque::new()));
         (
             Self {
                 ctx,
                 running: false,
                 log: log.clone(),
+                fail_pause: fail_pause.clone(),
             },
             log,
+            fail_pause,
         )
     }
 
@@ -371,7 +428,12 @@ impl Sum for TinySum {
     }
 
     fn pause(&mut self) -> Result<(), RunError> {
+        if self.fail_pause.lock().unwrap().pop_front() == Some(true) {
+            self.ctx.0.lock().unwrap().events.push("pause_err".into());
+            return Err(RunError::Grid("pause failed".into()));
+        }
         self.stop();
+        self.ctx.0.lock().unwrap().events.push("pause_ok".into());
         Ok(())
     }
 }
@@ -674,5 +736,229 @@ fn sizer_scope_isolated() {
     .unwrap();
     assert!(guard.sized().scratch >= 1024);
     drop(guard);
+    assert!(!sizer::counting());
+}
+
+fn ranked_plan(buffers: Vec<usize>, entry: &'static str) -> Plan {
+    let s0 = make_step(plain_kernel("ov", entry, None), 0, 16);
+    let ar = Step {
+        kernel: KernelRef::new(AllReduce {
+            len: 16,
+            wire: DType::F32,
+        }),
+        rule: "all_reduce",
+        reads: vec![Slot::floats(0, 16)],
+        write: Slot::floats(1, 16),
+        also: Vec::new(),
+        covers: Vec::new(),
+        zone: 0,
+        lane: 1,
+        table: None,
+        index_table: None,
+    };
+    let mut plan = make_plan(buffers, vec![s0, ar]);
+    (plan.rank, plan.ranks) = (0, 2);
+    plan
+}
+
+fn pos(events: &[String], needle: &str) -> usize {
+    events
+        .iter()
+        .position(|e| e == needle || e.starts_with(needle))
+        .unwrap_or_else(|| panic!("missing `{needle}` in {events:?}"))
+}
+
+#[test]
+fn retire_partial_bind() {
+    let (_g, ctx) = lock_ctx();
+    let p1 = make_plan(
+        vec![64, 64],
+        vec![
+            make_step(plain_kernel("a", "a_k", None), 0, 16),
+            make_step(plain_kernel("b", "b_k", None), 1, 16),
+        ],
+    );
+    let p2 = make_plan(
+        vec![65_536, 65_536],
+        vec![
+            make_step(plain_kernel("a", "a_k", None), 0, 16),
+            make_step(plain_kernel("b", "b_k", None), 1, 16),
+        ],
+    );
+    let mut runner = open_runner(p1.clone(), true);
+    runner.submit(0..2).unwrap();
+    let old0 = runner.address(Slot::floats(0, 16)).unwrap();
+    ctx.take_events();
+    // Grow slot 0, then fail slot 1 allocation.
+    ctx.fail_alloc(Some(1));
+    assert!(runner.replan(&p2).is_err());
+    let ev = ctx.take_events();
+    let free0 = format!("free:{old0:#x}");
+    assert!(pos(&ev, "alloc_err") < pos(&ev, "finish_ok"));
+    assert!(pos(&ev, "finish_ok") < pos(&ev, "drop_graph:"));
+    assert!(pos(&ev, "drop_graph:") < pos(&ev, &free0));
+    assert!(matches!(runner.submit(0..2), Err(RunError::Inconsistent)));
+    runner.replan(&p1).unwrap();
+    runner.submit(0..2).unwrap();
+}
+
+#[test]
+fn retire_pause_error() {
+    let (_g, ctx) = lock_ctx();
+    let p1 = ranked_plan(vec![64, 64], "rp_k");
+    let p2 = ranked_plan(vec![65_536, 64], "rp_k");
+    let settings = Settings {
+        memory: Memory::Off,
+        ..host()
+    };
+    let (sum, _, fails) = TinySum::with_faults(ctx);
+    let mut rank = Rank::open_device::<TinyDevice>(p1, &settings, NullTransport)
+        .unwrap()
+        .with_grid(Some(Box::new(sum)))
+        .unwrap();
+    rank.launching(Launching {
+        graphs: true,
+        pdl: false,
+    });
+    rank.submit(0..2).unwrap();
+    let old0 = rank.address(Slot::floats(0, 16)).unwrap();
+    ctx.take_events();
+    // First pause succeeds, then retire pause fails.
+    fails.lock().unwrap().extend([false, true]);
+    assert!(rank.replan(&p2).is_err());
+    let ev = ctx.take_events();
+    assert!(ev.iter().any(|e| e == "pause_err"));
+    assert!(!ev.iter().any(|e| e.starts_with("drop_graph:")));
+    assert!(!ev.iter().any(|e| e.starts_with("free:")));
+    assert!(ctx.is_live(old0));
+    assert!(matches!(rank.submit(0..2), Err(RunError::Inconsistent)));
+    // Retry replan once pause recovers.
+    rank.replan(&p2).unwrap();
+    let ev = ctx.take_events();
+    let free0 = format!("free:{old0:#x}");
+    assert!(pos(&ev, "pause_ok") < pos(&ev, "finish_ok"));
+    assert!(pos(&ev, "finish_ok") < pos(&ev, "drop_graph:"));
+    assert!(pos(&ev, "drop_graph:") < pos(&ev, &free0));
+    assert!(!ctx.is_live(old0));
+    rank.submit(0..2).unwrap();
+}
+
+#[test]
+fn retire_finish_error() {
+    let (_g, ctx) = lock_ctx();
+    let p1 = make_plan(
+        vec![64],
+        vec![make_step(plain_kernel("f", "f_k", None), 0, 16)],
+    );
+    let p2 = make_plan(
+        vec![65_536],
+        vec![make_step(plain_kernel("f", "f_k", None), 0, 16)],
+    );
+    let mut runner = open_runner(p1, true);
+    runner.submit(0..1).unwrap();
+    let old0 = runner.address(Slot::floats(0, 16)).unwrap();
+    ctx.take_events();
+    ctx.fail_finish(1);
+    assert!(runner.replan(&p2).is_err());
+    let ev = ctx.take_events();
+    assert!(ev.iter().any(|e| e == "finish_err"));
+    assert!(!ev.iter().any(|e| e.starts_with("drop_graph:")));
+    assert!(!ev.iter().any(|e| e.starts_with("free:")));
+    assert!(ctx.is_live(old0));
+    assert!(matches!(runner.submit(0..1), Err(RunError::Inconsistent)));
+    // Retry once stream synchronization succeeds.
+    runner.replan(&p2).unwrap();
+    let ev = ctx.take_events();
+    let free0 = format!("free:{old0:#x}");
+    assert!(pos(&ev, "finish_ok") < pos(&ev, "drop_graph:"));
+    assert!(pos(&ev, "drop_graph:") < pos(&ev, &free0));
+    assert!(!ctx.is_live(old0));
+    runner.submit(0..1).unwrap();
+}
+
+#[test]
+fn override_pause_retry() {
+    let (_g, ctx) = lock_ctx();
+    let dir = tessera_testkit::scratch(&format!("pause-retry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let plan = ranked_plan(vec![64, 64], "pr_k");
+    let settings = Settings {
+        memory: Memory::Off,
+        kernels: Some(dir.clone()),
+        ..host()
+    };
+    let (sum, log, fails) = TinySum::with_faults(ctx);
+    let mut rank = Rank::open_device::<TinyDevice>(plan, &settings, NullTransport)
+        .unwrap()
+        .with_grid(Some(Box::new(sum)))
+        .unwrap();
+    rank.launching(Launching {
+        graphs: true,
+        pdl: false,
+    });
+    rank.submit(0..2).unwrap();
+    let (_, _, c0, cap0, _) = ctx.stats_snapshot();
+    // Edit file, fail pause once, retry without touching disk.
+    let file = dir.join("pr_k.cu");
+    std::fs::write(&file, "__global__ void pr_k() { /* edit */ }").unwrap();
+    fails.lock().unwrap().push_back(true);
+    assert!(rank.submit(0..2).is_err());
+    assert_eq!((ctx.stats_snapshot().2, ctx.stats_snapshot().3), (c0, cap0));
+    rank.submit(0..2).unwrap();
+    assert_eq!(
+        (ctx.stats_snapshot().2, ctx.stats_snapshot().3),
+        (c0 + 1, cap0 + 1)
+    );
+    assert_eq!(*log.lock().unwrap(), (2, 1));
+    // Remove file, fail pause once, retry without touching disk.
+    std::fs::remove_file(&file).unwrap();
+    fails.lock().unwrap().push_back(true);
+    assert!(rank.submit(0..2).is_err());
+    assert_eq!(ctx.stats_snapshot().3, cap0 + 1);
+    rank.submit(0..2).unwrap();
+    assert_eq!(ctx.stats_snapshot().3, cap0 + 2);
+    assert_eq!(*log.lock().unwrap(), (3, 2));
+    drop(rank);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sizer_guard_order() {
+    trait NotSend {
+        const IS_SEND: bool = false;
+    }
+    struct Check<T: ?Sized>(PhantomData<T>);
+    impl<T: ?Sized> NotSend for Check<T> {}
+    impl<T: Send + ?Sized> Check<T> {
+        const IS_SEND: bool = true;
+    }
+    const { assert!(!Check::<sizer::SizerGuard>::IS_SEND) };
+    const { assert!(Check::<sizer::Scope>::IS_SEND) };
+    let sized = |bytes| {
+        make_plan(
+            vec![bytes],
+            vec![make_step(plain_kernel("s", "s_k", None), 0, 16)],
+        )
+    };
+    // Out-of-order drop: dropping outer never clobbers or resurrects.
+    let outer = sizer::sizing();
+    let inner = sizer::sizing();
+    let _r1 = tessera_run::open(sized(2048), &host()).unwrap();
+    assert!(inner.sized().scratch >= 2048);
+    assert_eq!(outer.sized().scratch, 0);
+    drop(outer);
+    assert!(sizer::counting());
+    let _r2 = tessera_run::open(sized(4096), &host()).unwrap();
+    assert!(inner.sized().scratch >= 4096);
+    drop(inner);
+    assert!(!sizer::counting());
+    // Normal LIFO drop restores outer until it drops.
+    let outer = sizer::sizing();
+    let inner = sizer::sizing();
+    drop(inner);
+    assert!(sizer::counting());
+    let _r3 = tessera_run::open(sized(1024), &host()).unwrap();
+    assert!(outer.sized().scratch >= 1024);
+    drop(outer);
     assert!(!sizer::counting());
 }

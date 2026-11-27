@@ -11,7 +11,7 @@ use crate::overrides::{self, Overrides};
 use crate::paged::{self, KvMem, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
-use crate::run::{Base, Outcome, Reload, Run};
+use crate::run::{Base, Reload, Run};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -59,6 +59,12 @@ pub(crate) struct Runner<D: Device> {
     ptrs: Vec<u64>,
     /// Recorded step ranges per `(plan, bound)`, bounded by LRU.
     graphs: Lru<GraphKey, GraphSet<D::Graph>>,
+    /// Drained graphs waiting on stream sync before drop.
+    evicted: Vec<D::Graph>,
+    /// Replaced buffers waiting on graph eviction and sync.
+    retired: Vec<Buffer>,
+    /// Set when a failure left bindings or retirement incomplete.
+    dirty: bool,
     launching: Launching,
     /// Whether the device overlaps dependent launches at all.
     overlaps: bool,
@@ -94,6 +100,18 @@ fn device_buf<D: Device>(buf: &Buffer) -> &DeviceBuffer<D> {
         .expect("this runner allocates device buffers")
 }
 
+impl<D: Device> Drop for Runner<D> {
+    fn drop(&mut self) {
+        if !self.graphs.is_empty() || !self.evicted.is_empty() || !self.retired.is_empty() {
+            let _ = self.ctx.finish();
+        }
+        // Drop captured graphs before any retired or bound buffers.
+        self.graphs.clear();
+        self.evicted.clear();
+        self.retired.clear();
+    }
+}
+
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
@@ -120,6 +138,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             plans: Lru::new(MAX_PLANS),
             ptrs: Vec::new(),
             graphs: Lru::new(MAX_GRAPHS),
+            evicted: Vec::new(),
+            retired: Vec::new(),
+            dirty: false,
             launching: Launching::default(),
             // Asked once: asking may launch, and captures come later.
             overlaps: ctx.platform().limits.pdl,
@@ -148,14 +169,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             .bound()
             .map(|b| device_buf::<D>(b).device_ptr())
             .collect()
-    }
-
-    /// Destroys all recorded graphs after draining the stream.
-    fn clear_graphs(&mut self) {
-        if !self.graphs.is_empty() {
-            let _ = self.ctx.finish();
-            self.graphs.clear();
-        }
     }
 
     /// Moves the active plan's tables into the plan cache.
@@ -330,6 +343,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         cross: bool,
         mut sums: Option<&mut (dyn Sum + 'static)>,
     ) -> Result<(Option<f64>, Option<usize>), Error> {
+        self.check_ready()?;
         self.reread_with(sums.as_deref_mut())?;
         let (end, profiled) = (steps.end, self.base.profile.is_some());
         if steps.is_empty() {
@@ -389,10 +403,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 Err(Capture::Split(at)) => return Ok((None, Some(at))),
                 Err(Capture::Err(e)) => return Err(e),
             };
-            let evicted = store_graph(&mut self.graphs, key.clone(), range, &self.ptrs, graph);
-            if evicted.is_some() {
-                self.ctx.finish()?;
-                drop(evicted);
+            if let Some(evicted) =
+                store_graph(&mut self.graphs, key.clone(), range, &self.ptrs, graph)
+            {
+                self.evicted.extend(evicted.into_values());
+                if let Err(e) = self.finish_evicted() {
+                    self.dirty = true;
+                    return Err(e);
+                }
             }
             if let Some(t0) = cap_start {
                 self.note_cold(
@@ -477,53 +495,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         self.missed.extend(found);
         Ok(())
-    }
-
-    /// Recompiles kernel files that changed. Returns what changed.
-    fn reload_with(
-        &mut self,
-        mut sum: Option<&mut (dyn Sum + 'static)>,
-    ) -> Result<Vec<Reload>, Error> {
-        let (ctx, plan) = (self.ctx, &self.base.plan);
-        let Some(files) = self.overrides.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let mut reloads = Vec::new();
-        let mut paused = false;
-        let mut pause_err = None;
-        for (entry, step) in &self.entries {
-            let planned = || overrides::text(&plan.steps[*step], D::BACKEND);
-            let compile = |text: &str| {
-                if !paused {
-                    if let Some(grid) = sum.as_deref_mut()
-                        && let Err(e) = grid.pause()
-                    {
-                        pause_err = Some(e);
-                        return Err(Error::Grid("pause failed".into()));
-                    }
-                    paused = true;
-                }
-                Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?)
-            };
-            reloads.extend(files.check(entry, planned, compile));
-            if let Some(e) = pause_err.take() {
-                return Err(e);
-            }
-        }
-        let changed = reloads
-            .iter()
-            .any(|r| matches!(r.outcome, Outcome::Loaded | Outcome::Planned));
-        if changed {
-            if !paused && let Some(grid) = sum {
-                grid.pause()?;
-            }
-            // Recorded launches name the kernels they replaced.
-            self.clear_graphs();
-            self.apply();
-            self.attrs = kernels::step_attrs(ctx, &self.base.plan, &self.kernels, &self.resident);
-            self.sync_grid();
-        }
-        Ok(reloads)
     }
 
     /// Passes profiling state and resident overrides to the grid.
@@ -636,10 +607,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         plan: &Plan,
         mut sum: Option<&mut (dyn Sum + 'static)>,
     ) -> Result<(), Error> {
-        if plan.id != 0 && plan.id == self.base.plan.id {
+        let pending = self.dirty || !self.retired.is_empty() || !self.evicted.is_empty();
+        if !pending && plan.id != 0 && plan.id == self.base.plan.id {
             return Ok(());
         }
-        self.flush_stamps()?;
+        if !self.dirty {
+            self.flush_stamps()?;
+        }
         if self.pager.is_none()
             && self
                 .base
@@ -654,7 +628,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
         let plan = self.base.held.reuse_weights(plan.as_ref(), sized);
         let plan = plan.as_ref();
-        if !self.base.fresh_with(plan, extra)? {
+        if pending {
+            self.base.validate(plan, extra)?;
+        } else if !self.base.fresh_with(plan, extra)? {
             return Ok(());
         }
         let (ctx, unified) = (self.ctx, self.ctx.unified());
@@ -662,49 +638,34 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let mut allocated = false;
         let pager = self.pager.as_ref();
         let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
-        let retired = match self
-            .base
-            .held
-            .bind_sized(plan, sized, |zone, bytes, holds| {
-                allocated = true;
-                if let Some(g) = sum.as_deref_mut() {
-                    g.pause()?;
-                }
-                // Weights pin when unified. Kept rows borrow carveout when enabled.
-                let buffer = match holds {
-                    Holds::Weights if unified => DeviceBuffer::pinned(ctx, bytes)?,
-                    Holds::Kept => DeviceBuffer::kept(ctx, bytes)?,
-                    _ => DeviceBuffer::alloc(ctx, bytes)?,
-                };
-                // Kernels may read what they are about to write.
-                buffer.zero()?;
-                Ok(Buffer::new(zone, buffer))
-            }) {
-            Ok(retired) => retired,
-            Err(e) => {
-                if let Some(g) = sum.as_deref_mut() {
-                    let _ = g.pause();
-                }
-                self.clear_graphs();
-                return Err(e);
-            }
-        };
-        let retired_count = retired.len();
-        if !retired.is_empty() {
-            if let Some(g) = sum.as_deref_mut() {
-                g.pause()?;
-            }
-            let dead: HashSet<u64> = retired
-                .iter()
-                .map(|b| device_buf::<D>(b).device_ptr())
-                .collect();
-            // Drop only graphs referencing retired device addresses.
-            let evicted = self
-                .graphs
-                .drain_if(|set| set.ptrs.iter().any(|p| dead.contains(p)));
-            let _ = self.ctx.finish();
-            drop(evicted);
-            drop(retired);
+        self.dirty = true;
+        let before = self.retired.len();
+        let bound =
+            self.base
+                .held
+                .bind_sized(plan, sized, &mut self.retired, |zone, bytes, holds| {
+                    allocated = true;
+                    if let Some(g) = sum.as_deref_mut() {
+                        g.pause()?;
+                    }
+                    // Weights pin when unified. Kept rows borrow carveout when enabled.
+                    let buffer = match holds {
+                        Holds::Weights if unified => DeviceBuffer::pinned(ctx, bytes)?,
+                        Holds::Kept => DeviceBuffer::kept(ctx, bytes)?,
+                        _ => DeviceBuffer::alloc(ctx, bytes)?,
+                    };
+                    // Kernels may read what they are about to write.
+                    buffer.zero()?;
+                    Ok(Buffer::new(zone, buffer))
+                });
+        if let Err(e) = bound {
+            // Keep retired buffers alive until graphs evict and stream syncs.
+            let _ = self.retire(sum.as_deref_mut(), true);
+            return Err(e);
+        }
+        let retired_count = self.retired.len() - before;
+        if !self.retired.is_empty() || !self.evicted.is_empty() {
+            self.retire(sum.as_deref_mut(), false)?;
         }
         if (allocated || retired_count > 0)
             && let Some(t0) = alloc_start
@@ -717,6 +678,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         self.ptrs = self.bound_ptrs();
         self.kv.bind(plan);
+        if plan.id != 0 && plan.id == self.base.plan.id && self.kernels.len() == plan.steps.len() {
+            self.apply();
+            if self.overrides.is_some() {
+                self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+            }
+            self.sync_grid();
+            self.ready(plan)?;
+            self.dirty = false;
+            return Ok(());
+        }
         if plan.id != 0
             && let Some(cached) = self.plans.remove(&plan.id)
         {
@@ -728,6 +699,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             }
             self.sync_grid();
             self.ready(plan)?;
+            self.dirty = false;
             return Ok(());
         }
         let compile_start = self.base.profile.is_some().then(Instant::now);
@@ -754,7 +726,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             kernels.push(kernel);
             waits.push(generated);
         }
-        self.stash_plan();
+        if self.base.plan.id != plan.id {
+            self.stash_plan();
+        }
         self.range_dims.clear();
         self.planned = kernels.clone();
         self.kernels = kernels;
@@ -769,6 +743,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.sync_grid();
         self.ready(plan)?;
         self.base.adopt(plan);
+        self.dirty = false;
         if let Some(t0) = compile_start {
             self.note_cold(
                 "plan: compile",
@@ -805,12 +780,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
+        self.check_ready()?;
         let mut all = std::mem::take(&mut self.missed);
         all.extend(self.reload_with(None)?);
         Ok(all)
     }
 
     fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
+        self.check_ready()?;
         if Dialect::of(D::BACKEND) == Dialect::Metal {
             return Ok(None);
         }
@@ -872,10 +849,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn launching(&mut self, launching: Launching) {
         self.launching = launching;
-        self.clear_graphs();
+        self.drop_graphs();
     }
 
     fn persist(&mut self, grid: Box<dyn Grid>) -> Result<(), Error> {
+        self.check_ready()?;
         *self.grid.get_mut() = Some(grid);
         self.sync_grid();
         let plan = self.base.plan.clone();
@@ -908,12 +886,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         src_addr: u64,
         bytes: usize,
     ) -> Result<(), Error> {
+        self.check_ready()?;
         assert!(dst_byte_off + bytes <= dst.bytes(), "copy_from past slot");
         let at = self.buffer(dst).device_ptr() + (dst.at(0) + dst_byte_off) as u64;
         Ok(self.ctx.copy_d2d(at, src_addr, bytes)?)
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
+        self.check_ready()?;
         self.reread_with(None)?;
         self.ctx.finish()?;
         let start = Instant::now();
@@ -943,6 +923,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn upload_weight(&mut self, weight: u32, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        self.check_ready()?;
         let desc_ptr = self.buffer(slot).device_ptr() + slot.at(0) as u64;
         if let Some(pager) = &mut self.pager
             && pager.upload(self.ctx, weight, slot, desc_ptr, bytes, &mut self.base.held)?
@@ -953,22 +934,26 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn download_kept_pages(&mut self, p: &[u32], g: usize, dst: &mut [u8]) -> Result<bool, Error> {
+        self.check_ready()?;
         let (ctx, st, b) = (self.ctx, &mut self.kv.stage, &self.base);
         b.held.download_pages(ctx, st, &b.plan, p, g, dst)
     }
 
     fn upload_kept_pages(&mut self, p: &[u32], g: usize, src: &[u8]) -> Result<bool, Error> {
+        self.check_ready()?;
         let (ctx, st, b) = (self.ctx, &mut self.kv.stage, &mut self.base);
         b.held.upload_pages(ctx, st, &b.plan, p, g, src)
     }
 
     fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+        self.check_ready()?;
         let ok = self.kv.open_host(self.ctx, &self.base.plan, pages, page);
-        self.clear_graphs();
+        self.clear_graphs()?;
         Ok(ok)
     }
 
     fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        self.check_ready()?;
         self.kv
             .move_pages(&self.base.held, &self.base.plan, promote, pairs)
     }

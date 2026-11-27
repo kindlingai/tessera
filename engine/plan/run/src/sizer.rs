@@ -2,8 +2,9 @@
 
 use crate::Error;
 use crate::run::{Base, Run};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::{Add, Range};
 use std::sync::{Arc, Mutex};
 use tessera_codegen::Precision;
@@ -71,8 +72,37 @@ impl Tracked {
     }
 }
 
+struct Entry {
+    id: u64,
+    tracked: Arc<Mutex<Tracked>>,
+}
+
 thread_local! {
-    static ACTIVE: RefCell<Option<Arc<Mutex<Tracked>>>> = const { RefCell::new(None) };
+    static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static ACTIVE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+}
+
+fn push_active(tracked: Arc<Mutex<Tracked>>) -> u64 {
+    let id = NEXT_ID.with(|cell| {
+        let id = cell.get();
+        cell.set(id.wrapping_add(1));
+        id
+    });
+    ACTIVE.with(|cell| cell.borrow_mut().push(Entry { id, tracked }));
+    id
+}
+
+fn remove_active(id: u64) {
+    ACTIVE.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        if let Some(pos) = stack.iter().rposition(|e| e.id == id) {
+            stack.remove(pos);
+        }
+    });
+}
+
+fn top_active() -> Option<Arc<Mutex<Tracked>>> {
+    ACTIVE.with(|cell| cell.borrow().last().map(|e| e.tracked.clone()))
 }
 
 /// Active sizing tracker that worker threads may inherit.
@@ -82,28 +112,29 @@ pub struct Scope(Arc<Mutex<Tracked>>);
 impl Scope {
     /// Runs `f` with this sizing tracker active on this thread.
     pub fn run<R>(self, f: impl FnOnce() -> R) -> R {
-        struct Reset(Option<Arc<Mutex<Tracked>>>);
+        struct Reset(u64);
         impl Drop for Reset {
             fn drop(&mut self) {
-                ACTIVE.with(|cell| *cell.borrow_mut() = self.0.take());
+                remove_active(self.0);
             }
         }
-        let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(self.0));
-        let _reset = Reset(prev);
+        let _reset = Reset(push_active(self.0));
         f()
     }
 }
 
 /// Active sizing scope on the current thread, if any.
 pub fn current_scope() -> Option<Scope> {
-    ACTIVE.with(|cell| cell.borrow().clone().map(Scope))
+    top_active().map(Scope)
 }
 
 /// Guard keeping byte-counting sizing mode active on this thread.
 #[must_use]
 pub struct SizerGuard {
+    id: u64,
     tracked: Arc<Mutex<Tracked>>,
-    prev: Option<Arc<Mutex<Tracked>>>,
+    /// Keeps the guard on its creating thread.
+    _thread: PhantomData<*const ()>,
 }
 
 impl SizerGuard {
@@ -115,20 +146,24 @@ impl SizerGuard {
 
 impl Drop for SizerGuard {
     fn drop(&mut self) {
-        ACTIVE.with(|cell| *cell.borrow_mut() = self.prev.take());
+        remove_active(self.id);
     }
 }
 
 /// Turns on byte-counting runners until the returned guard drops.
 pub fn sizing() -> SizerGuard {
     let tracked = Arc::new(Mutex::new(Tracked::default()));
-    let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(tracked.clone()));
-    SizerGuard { tracked, prev }
+    let id = push_active(tracked.clone());
+    SizerGuard {
+        id,
+        tracked,
+        _thread: PhantomData,
+    }
 }
 
 /// Whether `open` gives runners that only count bytes.
 pub fn counting() -> bool {
-    ACTIVE.with(|cell| cell.borrow().is_some()) || crate::check::active()
+    top_active().is_some() || crate::check::active()
 }
 
 /// Host memory: total, then available without swapping.
@@ -252,7 +287,7 @@ pub(crate) struct Sizer;
 impl Sizer {
     /// A sizer for `plan`, if sizing is on.
     pub(crate) fn open(plan: &Plan, settings: &Settings) -> Option<Box<dyn Run>> {
-        let tracked = ACTIVE.with(|cell| cell.borrow().clone())?;
+        let tracked = top_active()?;
         let at = {
             let mut guard = tracked.lock().expect("sizes");
             guard.live.push(None);

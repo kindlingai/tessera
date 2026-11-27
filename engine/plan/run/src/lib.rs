@@ -123,6 +123,8 @@ pub enum Error {
     Streaming { planned: u64, budget: u64 },
     #[error("a sizing runner runs nothing")]
     Sizing,
+    #[error("runner state is inconsistent after an earlier failure")]
+    Inconsistent,
     #[error("the input list does not match the plan")]
     InputCount,
     #[error("input {0} does not match the plan")]

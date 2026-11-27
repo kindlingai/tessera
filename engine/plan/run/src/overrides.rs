@@ -13,7 +13,7 @@ use tessera_lower::{Source, Step};
 
 /// A file's change time, length and inode.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Version {
+pub(crate) struct Version {
     modified: SystemTime,
     len: u64,
     inode: u64,
@@ -57,6 +57,89 @@ pub fn text(step: &Step, backend: Backend) -> String {
     }
 }
 
+/// A file change detected on disk before committing state.
+pub(crate) enum Pending {
+    /// File matches planned text with no active override.
+    Unchanged {
+        entry: String,
+        seen: Option<Version>,
+    },
+    /// Active override was deleted or reverted to planned text.
+    Revert {
+        entry: String,
+        path: PathBuf,
+        seen: Option<Version>,
+    },
+    /// File changed to text differing from planned.
+    Compile {
+        entry: String,
+        path: PathBuf,
+        seen: Option<Version>,
+        text: String,
+    },
+}
+
+/// A compiled or reverted override change waiting to commit.
+pub(crate) struct Ready<K> {
+    entry: String,
+    seen: Option<Version>,
+    kernel: Option<Option<(K, String)>>,
+    reload: Option<Reload>,
+}
+
+impl<K> Ready<K> {
+    pub(crate) fn unchanged(entry: String, seen: Option<Version>) -> Self {
+        Self {
+            entry,
+            seen,
+            kernel: None,
+            reload: None,
+        }
+    }
+
+    pub(crate) fn reverted(entry: String, path: PathBuf, seen: Option<Version>) -> Self {
+        Self {
+            entry,
+            seen,
+            kernel: Some(None),
+            reload: Some(Reload {
+                path,
+                outcome: Outcome::Planned,
+            }),
+        }
+    }
+
+    pub(crate) fn loaded(
+        entry: String,
+        path: PathBuf,
+        seen: Option<Version>,
+        kernel: K,
+        text: String,
+    ) -> Self {
+        Self {
+            entry,
+            seen,
+            kernel: Some(Some((kernel, text))),
+            reload: Some(Reload {
+                path,
+                outcome: Outcome::Loaded,
+            }),
+        }
+    }
+
+    pub(crate) fn failed(entry: String, path: PathBuf, seen: Option<Version>, why: String) -> Self {
+        Self {
+            entry,
+            seen,
+            kernel: None,
+            reload: Some(Reload {
+                path,
+                outcome: Outcome::Failed(why),
+            }),
+        }
+    }
+}
+
 /// A file's last seen version, and its kernel and text.
 struct File<K> {
     seen: Option<Version>,
@@ -84,39 +167,69 @@ impl<K> Overrides<K> {
             .join(format!("{entry}.{}", self.dialect.extension()))
     }
 
+    /// Inspects `entry`'s file without mutating recorded state.
+    pub(crate) fn scan(&self, entry: &str, planned: impl FnOnce() -> String) -> Option<Pending> {
+        let path = self.path(entry);
+        let now = Version::of(&path);
+        let prev = self.files.get(entry);
+        if prev.and_then(|f| f.seen) == now {
+            return None;
+        }
+        let text = now.and_then(|_| std::fs::read_to_string(&path).ok());
+        Some(match text.filter(|t| *t != planned()) {
+            None if prev.is_some_and(|f| f.kernel.is_some()) => Pending::Revert {
+                entry: entry.to_string(),
+                path,
+                seen: now,
+            },
+            None => Pending::Unchanged {
+                entry: entry.to_string(),
+                seen: now,
+            },
+            Some(text) => Pending::Compile {
+                entry: entry.to_string(),
+                path,
+                seen: now,
+                text,
+            },
+        })
+    }
+
+    /// Commits one prepared change into recorded state.
+    pub(crate) fn commit(&mut self, ready: Ready<K>) -> Option<Reload> {
+        let file = self.files.entry(ready.entry).or_insert(File {
+            seen: None,
+            kernel: None,
+        });
+        file.seen = ready.seen;
+        if let Some(kernel) = ready.kernel {
+            file.kernel = kernel;
+        }
+        ready.reload
+    }
+
     /// Reads `entry`'s file again if it changed since last checked.
+    #[cfg(test)]
     pub(crate) fn check(
         &mut self,
         entry: &str,
         planned: impl FnOnce() -> String,
         compile: impl FnOnce(&str) -> Result<K, Error>,
     ) -> Option<Reload> {
-        let path = self.path(entry);
-        let now = Version::of(&path);
-        let file = self.files.entry(entry.to_string()).or_insert(File {
-            seen: None,
-            kernel: None,
-        });
-        if file.seen == now {
-            return None;
-        }
-        file.seen = now;
-        let text = now.and_then(|_| std::fs::read_to_string(&path).ok());
-        let outcome = match text.filter(|t| *t != planned()) {
-            None => {
-                // Nothing ran in its place, so nothing changes.
-                file.kernel.take()?;
-                Outcome::Planned
-            }
-            Some(text) => match compile(&text) {
-                Ok(kernel) => {
-                    file.kernel = Some((kernel, text));
-                    Outcome::Loaded
-                }
-                Err(e) => Outcome::Failed(e.to_string()),
+        let ready = match self.scan(entry, planned)? {
+            Pending::Unchanged { entry, seen } => Ready::unchanged(entry, seen),
+            Pending::Revert { entry, path, seen } => Ready::reverted(entry, path, seen),
+            Pending::Compile {
+                entry,
+                path,
+                seen,
+                text,
+            } => match compile(&text) {
+                Ok(kernel) => Ready::loaded(entry, path, seen, kernel, text),
+                Err(e) => Ready::failed(entry, path, seen, e.to_string()),
             },
         };
-        Some(Reload { path, outcome })
+        self.commit(ready)
     }
 
     pub(crate) fn kernel(&self, entry: &str) -> Option<&K> {
