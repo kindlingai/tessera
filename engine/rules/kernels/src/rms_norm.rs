@@ -2,17 +2,19 @@
 
 use crate::per_row;
 use tessera_codegen::prelude::*;
-use tessera_lower::{Kernel, stage_rule};
+use tessera_lower::form::{F32_FORM, Load as Stored, plain};
+use tessera_lower::{Draft, Kernel, T, Tree, sites};
 
 /// One thread per row. Summing in order keeps batches alike.
 #[kernel]
 fn rms_norm<const WEIGHTED: bool>(
     x: Buf<F32>,
-    w: Buf<F32>,
+    #[form(w_form)] w: Buf<Dyn>,
     mut out: BufMut<F32>,
     rows: u32,
     width: u32,
     eps: f32,
+    #[build] w_form: &'static dyn Stored,
 ) {
     if gid() >= rows {
         return;
@@ -32,19 +34,20 @@ fn rms_norm<const WEIGHTED: bool>(
 /// One thread scales each row by its root mean square.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    rms_norm,
+    rms_norm(self.w_form),
     variant = self.weighted,
-    name = match self.weighted {
+    name = self.w_form.suffixed(match self.weighted {
         true => "rms_norm",
         false => "rms",
-    },
+    }),
     threads = self.rows,
+    accepts = rms_accepts,
     // The gains are read once per row.
     load = Some(per_row(
         self.rows,
         self.width,
         body.trip(),
-        4.0 * self.width as f64 * f64::from(self.weighted),
+        self.w_form.bytes(self.width) as f64 * f64::from(self.weighted),
     )),
 )]
 pub struct RmsNorm {
@@ -52,18 +55,31 @@ pub struct RmsNorm {
     pub width: usize,
     pub eps: f32,
     pub weighted: bool,
+    pub w_form: &'static dyn Stored,
 }
 
-stage_rule!(
-    "rms_norm",
-    |site| {
-        let (eps, weighted) = site.rms()?;
-        Some(RmsNorm {
-            rows: site.len / site.width,
-            width: site.width,
-            eps,
-            weighted,
-        })
-    },
-    |site| site.padded()
-);
+fn rms_accepts(k: &RmsNorm, input: usize, form: &dyn Stored) -> bool {
+    if k.weighted {
+        k.w_form.taken(input, 1, form)
+    } else {
+        !form.narrow()
+    }
+}
+
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let site: sites::Stage = tree.site(at)?;
+    let (eps, weighted) = site.rms()?;
+    let w_form = site
+        .operand
+        .map_or(F32_FORM, |(o, _)| plain(tree.node(o).form));
+    let kernel = RmsNorm {
+        rows: site.len / site.width,
+        width: site.width,
+        eps,
+        weighted,
+        w_form,
+    };
+    Some(vec![Draft::new(kernel, site.padded(), site.len)])
+}
+
+tessera_lower::rule!("rms_norm", propose);

@@ -198,6 +198,7 @@ fn trips_are_counted() {
         width: 64,
         eps: 1e-5,
         weighted: true,
+        w_form: tessera_lower::form::F32_FORM,
     };
     let trip = tessera_lower::Kernel::load(&norm, 64).unwrap().trip;
     assert_eq!((trip.loads, trip.stores), (3.0, 1.0));
