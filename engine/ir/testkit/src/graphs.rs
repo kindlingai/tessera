@@ -193,6 +193,21 @@ pub fn residual_norm(bounded: &[Dim], width: u64) -> Graph {
     m.finish([(Role::Logits, &n1.add(&n2))])
 }
 
+/// Row L2 clip followed by position-dependent log scaling.
+pub fn clipped(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, width)]);
+    let pos = Port {
+        role: Role::Positions,
+        ty: TensorType::new([Rows], DType::U32),
+    };
+    let [x, at] = m.entry(
+        EntryKind::Forward,
+        [rows_of(bounded, Hidden, DType::F32), pos],
+    );
+    let out = x.l2_clip(4.0, 1e-6).log_scale(&at, 4.0, 0.5);
+    m.finish([(Role::Logits, &out)])
+}
+
 /// A rotation, then causal attention over `Seqs`, `Rows` and `Context`.
 pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
