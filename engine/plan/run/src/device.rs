@@ -7,7 +7,7 @@ use crate::kernels::{self, Kernels};
 use crate::lanes::LaneSync;
 use crate::marks;
 use crate::overrides::{self, Overrides};
-use crate::paged::{self, KvMem, Pager};
+use crate::paged::{KvMem, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
@@ -19,15 +19,14 @@ use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
 use tessera_gpukit::backend::OnGpu;
-use tessera_gpukit::device::{
-    Device, DeviceBuffer, KernelAttrs, cached_context, cached_prefixed, cached_source,
-};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
 use tessera_lower::kernels::crosses;
 use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
 use tessera_mem::{Buffer, DType};
 
+mod replan;
 mod timing;
 
 pub(crate) struct Runner<D: Device> {
@@ -99,6 +98,26 @@ fn device_buf<D: Device>(buf: &Buffer) -> &DeviceBuffer<D> {
         .expect("this runner allocates device buffers")
 }
 
+/// Launches `kernel` with a fixed shape.
+fn fire_shape<D: Device + Launch<Kernel = <D as Device>::Kernel>>(
+    ctx: &D,
+    kernel: &<D as Device>::Kernel,
+    shape: Shape,
+    shared: u32,
+    args: &mut KernelArgs,
+) -> Result<(), Error> {
+    match shape {
+        Shape::Line(count) => launch_1d(ctx, kernel, count, args)?,
+        Shape::Grid {
+            across,
+            down,
+            threads,
+        } => launch_grid(ctx, kernel, across, down, threads as u32, shared, args)?,
+        Shape::Runtime(_) => return Err(tessera_lower::Error::Unbound.into()),
+    }
+    Ok(())
+}
+
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
@@ -159,43 +178,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             .collect()
     }
 
-    /// Moves the active plan's tables into the plan cache.
-    fn stash_plan(&mut self) {
-        let id = self.base.plan.id;
-        if id == 0 {
-            return;
-        }
-        let mut plan = Plan::default();
-        let mut launches = Vec::new();
-        self.base.swap(&mut plan, &mut launches);
-        let saved = Prepared {
-            plan,
-            launches,
-            kernels: std::mem::take(&mut self.kernels),
-            planned: std::mem::take(&mut self.planned),
-            entries: std::mem::take(&mut self.entries),
-            uses: std::mem::take(&mut self.uses),
-            waits: std::mem::take(&mut self.waits),
-            resident: std::mem::take(&mut self.resident),
-            attrs: std::mem::take(&mut self.attrs),
-            range_dims: std::mem::take(&mut self.range_dims),
-        };
-        self.plans.insert(id, saved);
-    }
-
-    /// Installs a cached plan's tables as active.
-    fn restore_plan(&mut self, mut cached: Prepared<<D as Device>::Kernel>) {
-        self.base.swap(&mut cached.plan, &mut cached.launches);
-        self.kernels = cached.kernels;
-        self.planned = cached.planned;
-        self.entries = cached.entries;
-        self.uses = cached.uses;
-        self.waits = cached.waits;
-        self.resident = cached.resident;
-        self.attrs = cached.attrs;
-        self.range_dims = cached.range_dims;
-    }
-
     /// Each argument by position, in the device's form.
     fn bound(&self, args: &[Arg]) -> Result<KernelArgs, Error> {
         let mut bound = KernelArgs::new();
@@ -220,19 +202,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         shared: u32,
         args: &mut KernelArgs,
     ) -> Result<(), Error> {
-        match shape {
-            Shape::Line(count) => launch_1d(self.ctx, kernel, count, args)?,
-            Shape::Grid {
-                across,
-                down,
-                threads,
-            } => {
-                let threads = threads as u32;
-                launch_grid(self.ctx, kernel, across, down, threads, shared, args)?
-            }
-            Shape::Runtime(_) => return Err(tessera_lower::Error::Unbound.into()),
-        }
-        Ok(())
+        fire_shape(self.ctx, kernel, shape, shared, args)
     }
 
     /// Passes each argument by position, then enqueues.
@@ -593,170 +563,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         run
     }
-
-    /// Replans, pausing `sum` before any allocation or compilation.
-    pub(crate) fn replan_with(
-        &mut self,
-        plan: &Plan,
-        mut sum: Option<&mut (dyn Sum + 'static)>,
-    ) -> Result<(), Error> {
-        let pending = self.dirty || !self.retired.is_empty() || !self.evicted.is_empty();
-        if !pending && plan.id != 0 && plan.id == self.base.plan.id {
-            return Ok(());
-        }
-        if !self.dirty {
-            self.flush_stamps()?;
-        }
-        if self.pager.is_none()
-            && self
-                .base
-                .budget
-                .is_some_and(|l| plan.buffers.iter().map(|&b| b as u64).sum::<u64>() > l)
-            && let Some(g) = sum.as_deref_mut()
-        {
-            g.pause()?;
-        }
-        let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, &self.base)?;
-        let pager = self.pager.as_ref();
-        let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
-        let plan = self.base.held.reuse_weights(plan.as_ref(), sized);
-        let plan = plan.as_ref();
-        if pending {
-            self.base.validate(plan, extra)?;
-        } else if !self.base.fresh_with(plan, extra)? {
-            return Ok(());
-        }
-        let (ctx, unified) = (self.ctx, self.ctx.unified());
-        let alloc_start = self.base.profile.is_some().then(Instant::now);
-        let mut allocated = false;
-        let pager = self.pager.as_ref();
-        let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
-        self.dirty = true;
-        let before = self.retired.len();
-        let bound =
-            self.base
-                .held
-                .bind_sized(plan, sized, &mut self.retired, |zone, bytes, holds| {
-                    allocated = true;
-                    if let Some(g) = sum.as_deref_mut() {
-                        g.pause()?;
-                    }
-                    let buffer = crate::held::alloc_buf(ctx, unified, bytes, holds)?;
-                    Ok(Buffer::new(zone, buffer))
-                });
-        if let Err(e) = bound {
-            // Keep retired buffers alive until graphs evict and stream syncs.
-            let _ = self.retire(sum.as_deref_mut(), true);
-            return Err(e);
-        }
-        let retired_count = self.retired.len() - before;
-        if !self.retired.is_empty() || !self.evicted.is_empty() {
-            self.retire(sum.as_deref_mut(), false)?;
-        }
-        if (allocated || retired_count > 0)
-            && let Some(t0) = alloc_start
-        {
-            self.note_cold(
-                "plan: alloc",
-                t0,
-                format_args!("plan={} retired={retired_count}", plan.id),
-            );
-        }
-        self.ptrs = self.bound_ptrs();
-        self.kv.bind(plan);
-        if plan.id != 0 && plan.id == self.base.plan.id && self.kernels.len() == plan.steps.len() {
-            self.apply();
-            if self.overrides.is_some() {
-                self.attrs = kernels::step_attrs(
-                    ctx,
-                    plan,
-                    &self.kernels,
-                    &self.resident,
-                    self.overrides.as_ref(),
-                );
-            }
-            self.sync_grid();
-            self.ready(plan)?;
-            self.dirty = false;
-            return Ok(());
-        }
-        if plan.id != 0
-            && let Some(cached) = self.plans.remove(&plan.id)
-        {
-            self.stash_plan();
-            self.restore_plan(cached);
-            self.apply();
-            if self.overrides.is_some() {
-                self.attrs = kernels::step_attrs(
-                    ctx,
-                    plan,
-                    &self.kernels,
-                    &self.resident,
-                    self.overrides.as_ref(),
-                );
-            }
-            self.sync_grid();
-            self.ready(plan)?;
-            self.dirty = false;
-            return Ok(());
-        }
-        let compile_start = self.base.profile.is_some().then(Instant::now);
-        if let Some(g) = sum {
-            g.pause()?;
-        }
-        let resident: Vec<bool> = plan
-            .steps
-            .iter()
-            .map(|s| s.kernel.resident().is_some())
-            .collect();
-        let mut kernels = Vec::with_capacity(plan.steps.len());
-        let mut waits = Vec::with_capacity(plan.steps.len());
-        for step in &plan.steps {
-            let fixed = |text: &'static str, entry: &'static str| -> Result<_, Error> {
-                match text.contains("TS_MARK") {
-                    true => Ok(cached_prefixed::<D>(marks::OFF, text, entry)?),
-                    false => Ok(cached_source::<D>(text, entry)?),
-                }
-            };
-            let made = |s: &str, e: &str| -> Result<_, Error> { Ok(ctx.compile(s, e)?) };
-            // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
-            let (kernel, generated) = self.compiled.get(step, D::BACKEND, fixed, made)?;
-            kernels.push(kernel);
-            waits.push(generated);
-        }
-        if self.base.plan.id != plan.id {
-            self.stash_plan();
-        }
-        self.range_dims.clear();
-        self.planned = kernels.clone();
-        self.kernels = kernels;
-        self.waits = waits;
-        self.resident = resident;
-        self.index(plan);
-        self.apply();
-        self.attrs = kernels::step_attrs(
-            ctx,
-            plan,
-            &self.kernels,
-            &self.resident,
-            self.overrides.as_ref(),
-        );
-        if self.log_attrs || self.base.profile.is_some() {
-            kernels::log_spills(plan, &self.attrs, &mut self.spills);
-        }
-        self.sync_grid();
-        self.ready(plan)?;
-        self.base.adopt(plan);
-        self.dirty = false;
-        if let Some(t0) = compile_start {
-            self.note_cold(
-                "plan: compile",
-                t0,
-                format_args!("plan={} steps={}", plan.id, plan.steps.len()),
-            );
-        }
-        Ok(())
-    }
 }
 
 /// Opens a runner on the context type `on` names.
@@ -841,15 +647,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
                 (&entry, &text, &flags),
                 |k| {
                     ctx.programmatic(false);
-                    match shape {
-                        Shape::Line(n) => Ok(launch_1d(ctx, k, n, a)?),
-                        Shape::Grid {
-                            across,
-                            down,
-                            threads,
-                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, sh, a)?),
-                        Shape::Runtime(_) => Err(tessera_lower::Error::Unbound.into()),
-                    }
+                    fire_shape(ctx, k, shape, sh, a)
                 },
             )?;
             let Some(one) = one else {
