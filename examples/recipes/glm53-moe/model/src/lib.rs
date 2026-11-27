@@ -39,10 +39,6 @@ const MOST_ROWS: usize = 2048;
 const MOST_EXPERTS: usize = 2048;
 const MAX_SLOTS: usize = 640;
 const PICKS: usize = 8;
-/// Words in `Plan` struct in `moe.cu`.
-const PLAN_WORDS: usize = 1 + MAX_SLOTS * 50 + MOST_ROWS * PICKS * 2;
-/// 16-byte aligned word offset for router score scratch.
-const SCORES_OFF: usize = PLAN_WORDS.next_multiple_of(4);
 
 /// Experts each row takes, by expert count.
 fn picks(experts: usize) -> Option<u32> {
@@ -136,12 +132,14 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let [first, count] = held(&w, experts, ffn)?;
     let [inner, wide] = shared_gate.parts?;
+    let max_rows = r.knob(NAME, "max_rows").unwrap_or(MOST_ROWS);
+    let max_slots = r.knob(NAME, "max_slots").unwrap_or(MAX_SLOTS);
     let sized = router.shape == [experts, hidden]
         && inner == hidden
         && shared_up.parts == shared_gate.parts
         && shared_down.parts == Some([wide, hidden])
         && rows > 0
-        && rows <= MOST_ROWS
+        && rows <= max_rows
         && experts <= MOST_EXPERTS
         && hidden % 128 == 0
         && ffn % 128 == 0
@@ -169,45 +167,103 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let [plan, gpart, z] = [0, 1, 2].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
     let ibs = hidden / 128;
-    let prefill = rows > 32;
-    let slot_cap = if prefill { 64 } else { 8 };
+    let prefill_rows = r.knob(NAME, "prefill").unwrap_or(32);
+    let prefill = rows > prefill_rows;
+    let slot_cap = match r.knob(NAME, "slot_cap") {
+        Some(v) => {
+            let valid = if prefill {
+                matches!(v, 8 | 32 | 64)
+            } else {
+                v == 8
+            };
+            if !valid {
+                return None;
+            }
+            v
+        }
+        None => {
+            if prefill {
+                64
+            } else {
+                8
+            }
+        }
+    };
     let z_chunks = if prefill { 0 } else { chunks };
-    let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
-    let ns2 = split_dim(ibs, if rows == 1 { 8 } else { 3 });
+    let ks1_want = r.knob(NAME, "ks1").unwrap_or(if rows == 1 { 8 } else { 4 });
+    let ns2_want = r.knob(NAME, "ns2").unwrap_or(if rows == 1 { 8 } else { 3 });
+    let ks1 = split_dim(ibs, ks1_want);
+    let ns2 = split_dim(ibs, ns2_want);
     let n_sh = rows.div_ceil(slot_cap);
     let assigns = (rows * picks).min(count * rows);
     let active = count.min(assigns);
     let max_routed = (count * n_sh).min(active + (assigns - active) / slot_cap);
-    if max_routed > MAX_SLOTS {
+    if max_routed > max_slots {
         return None;
     }
     let total_slots = n_sh + max_routed;
     let max_col = rows.min(8);
+    let pf64_rows = r.knob(NAME, "route_pf64_rows").unwrap_or(512);
     let (route_x, route_y, rks) = if rows == 1 && bf16 == 1 && experts % 2 == 0 && hidden % 8 == 0 {
         (experts / 2, 1, 1)
     } else if rows >= 64 && bf16 == 1 && experts == 256 && hidden % 64 == 0 {
         (1, rows.div_ceil(32), 1)
     } else if rows >= 64 && experts % 64 == 0 && hidden % 32 == 0 {
-        let rm = if rows >= 512 { 64 } else { 32 };
+        let rm = if rows >= pf64_rows { 64 } else { 32 };
         let nb = experts / 64;
         let rtiles = rows.div_ceil(rm);
-        let rks = split_dim(hidden / 32, 192usize.div_ceil(nb * rtiles).clamp(1, 8));
+        let want = r
+            .knob(NAME, "rks")
+            .unwrap_or_else(|| 192usize.div_ceil(nb * rtiles).clamp(1, 8));
+        let rks = split_dim(hidden / 32, want);
         (nb * rks, rtiles, rks)
     } else if rows > 1 && experts % 16 == 0 && hidden % 256 == 0 {
         let nb = experts / 16;
         let rtiles = rows.div_ceil(16);
-        let rks = split_dim(hidden / 256, 128usize.div_ceil(nb * rtiles).max(1));
+        let want = r
+            .knob(NAME, "rks")
+            .unwrap_or_else(|| 128usize.div_ceil(nb * rtiles).max(1));
+        let rks = split_dim(hidden / 256, want);
         (nb * rks, rtiles, rks)
     } else {
         (experts.div_ceil(2), 1, 1)
     };
+    let mut shared_defs = Vec::new();
+    if max_rows != MOST_ROWS {
+        shared_defs.push(("MAX_ROWS".into(), max_rows.to_string()));
+    }
+    if max_slots != MAX_SLOTS {
+        shared_defs.push(("MAX_SLOTS".into(), max_slots.to_string()));
+    }
+    if r.knob(NAME, "slot_cap").is_some() || r.knob(NAME, "prefill").is_some() {
+        shared_defs.push(("GLM53_SLOT_CAP".into(), format!("{slot_cap}u")));
+    }
+    if let Some(mx8) = r.knob(NAME, "use_mx8") {
+        shared_defs.push(("GLM53_USE_MX8".into(), mx8.to_string()));
+    }
+    if r.knob(NAME, "route_pf64_rows").is_some() {
+        shared_defs.push(("ROUTE_PF64_MIN_ROWS".into(), format!("{pf64_rows}u")));
+    }
+    let defs_with = |extra: Option<(&str, usize)>| {
+        let mut defs = shared_defs.clone();
+        if let Some((k, v)) = extra {
+            defs.push((k.into(), v.to_string()));
+        }
+        defs
+    };
+    let plan_words = 1 + max_slots * 50 + max_rows * PICKS * 2;
+    let scores_off = (plan_words + 3) & !3;
     let route = Offer {
         kernel: ROUTE,
         reads: vec![Place::Read(0), router.read(), bias.read()],
-        len: SCORES_OFF + rows * experts * rks,
+        len: scores_off + rows * experts * rks,
         counts: fixed(&[rows, hidden, experts, bf16, picks, first, count]),
         shape: Shape::grid(route_x, route_y, 256),
         work: (rows * experts * hidden) as f64,
+        defines: defs_with(
+            r.knob(NAME, "route_min_blocks")
+                .map(|v| ("ROUTE_MIN_BLOCKS", v)),
+        ),
         ..Offer::default()
     };
     let codes1 = [k1, sh_k1, book1, sh_book1].map(|b| b as usize);
@@ -242,6 +298,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 &[rows, hidden, first],
                 (ibs, total_slots),
                 total_slots * 64 * hidden,
+                defs_with(
+                    r.knob(NAME, "turn_min_blocks")
+                        .map(|v| ("FC1_TURN_MIN_BLOCKS", v)),
+                ),
             ),
             grid_offer(
                 FC1_PF,
@@ -250,6 +310,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 &c1,
                 (chunks, total_slots),
                 total_slots * 2 * hidden * ffn,
+                defs_with(
+                    r.knob(NAME, "pf1_min_blocks")
+                        .map(|v| ("FC1_PF_MIN_BLOCKS", v)),
+                ),
             ),
             grid_offer(
                 FC2_PF,
@@ -266,6 +330,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 &c2,
                 (ibs, total_slots),
                 total_slots * hidden * ffn,
+                defs_with(
+                    r.knob(NAME, "pf2_min_blocks")
+                        .map(|v| ("FC2_PF_MIN_BLOCKS", v)),
+                ),
             ),
         ]);
         z_pf
@@ -301,6 +369,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 &c1,
                 (chunks * 2 * ks1, total_slots),
                 total_slots * 2 * hidden * ffn,
+                defs_with(
+                    r.knob(NAME, "fc1_min_blocks")
+                        .map(|v| ("FC1_MIN_BLOCKS", v)),
+                ),
             ),
             grid_offer(
                 FC2,
@@ -309,6 +381,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 &c2,
                 (chunks * ns2, total_slots),
                 total_slots * hidden * ffn,
+                defs_with(
+                    r.knob(NAME, "fc2_min_blocks")
+                        .map(|v| ("FC2_MIN_BLOCKS", v)),
+                ),
             ),
         ]);
         z
@@ -331,6 +407,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         counts: fixed(&[rows, hidden, ffn, picks, wide, z_chunks]),
         shape: finish_shape,
         work: len as f64,
+        defines: defs_with(
+            r.knob(NAME, "finish_min_blocks")
+                .map(|v| ("FINISH_MIN_BLOCKS", v)),
+        ),
         ..Offer::default()
     });
     Some(steps)
@@ -343,6 +423,7 @@ fn grid_offer(
     counts: &[usize],
     (x, y): (usize, usize),
     work: usize,
+    defines: Vec<(String, String)>,
 ) -> Offer {
     Offer {
         kernel,
@@ -352,6 +433,7 @@ fn grid_offer(
         shape: Shape::grid(x, y, 256),
         work: work as f64,
         guess: 1e-15,
+        defines,
         ..Offer::default()
     }
 }
@@ -360,6 +442,24 @@ tessera_guest::exports! {
     rules: { NAME => Kind::Moe },
     kernels: { "moe.cu": [ROUTE, FC1, FC2, FC1_TURN, FC1_PF, FC2_PF, FINISH] },
     files: ["mx8.cuh"],
+    knobs: [
+        (NAME, "prefill", 0, 2048),
+        (NAME, "slot_cap", 8, 64),
+        (NAME, "ks1", 1, 16),
+        (NAME, "ns2", 1, 16),
+        (NAME, "rks", 1, 32),
+        (NAME, "route_pf64_rows", 64, 2048),
+        (NAME, "max_rows", 1, 2048),
+        (NAME, "max_slots", 1, 2048),
+        (NAME, "use_mx8", 0, 1),
+        (NAME, "route_min_blocks", 1, 16),
+        (NAME, "fc1_min_blocks", 1, 16),
+        (NAME, "fc2_min_blocks", 1, 16),
+        (NAME, "turn_min_blocks", 1, 16),
+        (NAME, "pf1_min_blocks", 1, 16),
+        (NAME, "pf2_min_blocks", 1, 16),
+        (NAME, "finish_min_blocks", 1, 16),
+    ],
     propose: offer,
 }
 

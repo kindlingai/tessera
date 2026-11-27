@@ -44,6 +44,7 @@ pub(crate) const CROSS: [usize; 2] = [CROSSOVER, SCATTER_CROSSOVER];
 
 tessera_lower::knob!("p2p_sum", "threads", 32, 1024);
 tessera_lower::knob!("p2p_sum", "grid", 1, 64);
+tessera_lower::knob!("p2p_sum", "min_blocks", 1, 16);
 tessera_lower::knob!("p2p_sum", "crossover", 0, MAX_BYTES as u64);
 tessera_lower::knob!("p2p_sum", "scatter_crossover", 0, MAX_BYTES as u64);
 pub(crate) const LARGE_GRID: u32 = 16;
@@ -244,8 +245,14 @@ where
                 .get("p2p_sum", "scatter_crossover")
                 .unwrap_or(CROSS[1]),
         ];
+        let min_blocks = knobs.get("p2p_sum", "min_blocks");
         let text = flatten("p2p.kernel", KERNEL, &|_| None, &options)?.text;
-        let text = format!("#define P2P_THREADS {threads}\n{text}");
+        let text = match min_blocks {
+            Some(mb) => {
+                format!("#define P2P_THREADS {threads}\n#define P2P_MIN_BLOCKS {mb}\n{text}")
+            }
+            None => format!("#define P2P_THREADS {threads}\n{text}"),
+        };
         let kernel = ctx.compile(&text, ENTRY)?;
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
         let gather_rows_kernel = ctx.compile(&text, GATHER_ROWS_ENTRY)?;

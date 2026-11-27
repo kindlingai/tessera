@@ -69,7 +69,7 @@ where
                 .as_ref()
                 .ok_or("--sums arx needs --verbs or --ring")?;
             let settings = tessera_frontend_settings::read();
-            tessera_frontend_comm::arx_sums(&mut *boot, fabric, &settings)?
+            tessera_frontend_comm::arx_sums(&mut *boot, fabric, &settings, &args.shape)?
         }
         _ => unreachable!(),
     };

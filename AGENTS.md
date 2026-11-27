@@ -29,6 +29,9 @@ instead.
 Prefer procedural loops over functional ones when heavily nested (eg `for` and
 `if` over `iter` and `map`/`filter`).
 
+Do not write implicit state machines. State machines should be implicit, tested
+independently and pluggable.
+
 Do not over-test. If lint flags excessive tests, assume you are over-testing and
 remove tests or refactor. Do not over-index on "byte identical".
 

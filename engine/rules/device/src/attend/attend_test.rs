@@ -178,3 +178,48 @@ fn ring_attend_matches() {
     let gqa = ring_graph(16, 4, GQA_WIDTH as u64, false);
     check_ring(&gqa, false, "fast_gqa_attend");
 }
+
+#[test]
+fn mla_attend_knobs() {
+    let g = ring_graph(32, 1, MLA_WIDTH as u64, true);
+    let base_dev = Device::default().pinned(Pins::default().kept(BF16_FORM));
+    let mut tuned_dev = base_dev.clone();
+    tuned_dev.knobs.parse("fast_mla_attend:splits=4").unwrap();
+    tuned_dev
+        .knobs
+        .parse("fast_mla_attend:min_blocks=4")
+        .unwrap();
+    tuned_dev
+        .knobs
+        .parse("fast_mla_attend:reduce_threads=128")
+        .unwrap();
+    let tree_for = |dev: &Device| {
+        let parts = dev.division();
+        let mut tree = Tree::upto(
+            &g,
+            0,
+            Wants::ALL,
+            &[(Rows, 1), (Seqs, 2), (Context, 4096)],
+            &[],
+            &dev.pins,
+            dev.kept,
+            &parts,
+            0,
+        )
+        .unwrap();
+        tree.knobs = dev.knobs.clone();
+        tree
+    };
+    let t_base = tree_for(&base_dev);
+    let t_tuned = tree_for(&tuned_dev);
+    let d_base = check_mla(&t_base, t_base.outputs[0].0).unwrap().unwrap();
+    let d_tuned = check_mla(&t_tuned, t_tuned.outputs[0].0).unwrap().unwrap();
+    assert_eq!(d_base.len(), 2);
+    assert_eq!(d_tuned.len(), 2);
+    assert_ne!(d_base[0].kernel.identity(), d_tuned[0].kernel.identity());
+    let Source::Fixed { text, .. } = d_tuned[0].kernel.source() else {
+        panic!("expected fixed source");
+    };
+    assert!(text[tessera_lower::Backend::Cuda].contains("#define MLA_MIN_BLOCKS 4"));
+    assert_eq!(d_tuned[1].kernel.needs().group_threads, 128);
+}

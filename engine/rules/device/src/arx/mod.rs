@@ -7,6 +7,7 @@ use tessera_engine_comm::{ArxLink, ArxMem};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_lower::Knobs;
 use tessera_mem::DType;
 use tessera_run::Sum;
 
@@ -16,6 +17,11 @@ const THREADS: u32 = 256;
 const TWO_SHOT_BYTES: usize = 256 << 10;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(300);
+
+tessera_lower::knob!("arx_sum", "max_grid", 1, 256);
+tessera_lower::knob!("arx_sum", "gather_max_grid", 1, 256);
+tessera_lower::knob!("arx_sum", "two_shot_bytes", 0, 128 << 20);
+tessera_lower::knob!("arx_sum", "min_blocks", 1, 16);
 
 /// GPU-side arx kernels paired with a host RDMA proxy link.
 pub struct Arx<D: Device> {
@@ -35,6 +41,9 @@ pub struct Arx<D: Device> {
     gather_rows: D::Kernel,
     state: DeviceBuffer<D>,
     blocks: DeviceBuffer<D>,
+    max_grid_cap: u32,
+    gather_max_grid: u32,
+    two_shot_bytes: usize,
     timeout_ticks: u64,
     timed: bool,
     last: [u64; 2],
@@ -52,13 +61,26 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
     /// Compiles arx kernels on `ctx` over `link`.
-    pub fn on(ctx: &D, link: ArxLink) -> Result<Self, Error> {
+    pub fn on(ctx: &D, link: ArxLink, knobs: &Knobs) -> Result<Self, Error> {
         let options = Options {
             backend: backend::<D>()?,
             remote_kv: false,
             marks: false,
         };
-        let text = flatten("arx.cu", KERNEL, &|_| None, &options)?.text;
+        let mut text = flatten("arx.cu", KERNEL, &|_| None, &options)?.text;
+        if let Some(mb) = knobs.get("arx_sum", "min_blocks") {
+            let v = mb.to_string();
+            let prefix = tessera_lower::define_prefix([("ARX_MIN_BLOCKS", v.as_str())])
+                .expect("valid cuda define");
+            text = format!("{prefix}{text}");
+        }
+        let max_grid_cap = knobs.get("arx_sum", "max_grid").map_or(48, |v| v as u32);
+        let gather_max_grid = knobs
+            .get("arx_sum", "gather_max_grid")
+            .map_or(64, |v| v as u32);
+        let two_shot_bytes = knobs
+            .get("arx_sum", "two_shot_bytes")
+            .unwrap_or(TWO_SHOT_BYTES);
         let one_bf16 = ctx.compile(&text, "tessera_arx_one_bf16")?;
         let one_f32 = ctx.compile(&text, "tessera_arx_one_f32")?;
         let one_fp8 = ctx.compile(&text, "tessera_arx_one_fp8")?;
@@ -94,6 +116,9 @@ where
             gather_rows,
             state,
             blocks,
+            max_grid_cap,
+            gather_max_grid,
+            two_shot_bytes,
             timeout_ticks,
             timed: false,
             last: [0; 2],
@@ -143,7 +168,7 @@ where
         } else {
             THREADS * 8
         };
-        let grid = n.div_ceil(step).clamp(1, self.max_grid(48));
+        let grid = n.div_ceil(step).clamp(1, self.max_grid(self.max_grid_cap));
         let kernel = match (two, wire) {
             (false, DType::Bf16) => &self.one_bf16,
             (false, DType::Fp8) => &self.one_fp8,
@@ -172,7 +197,7 @@ where
         let aligned = (from & 15) == 0 && (to & 15) == 0;
         let two_shot = self.mem.mesh
             && aligned
-            && wire_bytes(len) > TWO_SHOT_BYTES
+            && wire_bytes(len) > self.two_shot_bytes
             && len.is_multiple_of(align);
         let max_elems = match (two_shot, wire) {
             (true, DType::Fp8) => {
@@ -196,7 +221,7 @@ where
             let t = to + (off * 4) as u64;
             let n = u32::try_from(step).map_err(|_| Error::Plan("arx sum too long".into()))?;
             let use_two =
-                two_shot && wire_bytes(step) > TWO_SHOT_BYTES && step.is_multiple_of(align);
+                two_shot && wire_bytes(step) > self.two_shot_bytes && step.is_multiple_of(align);
             self.launch_sum_kernel(f, t, n, wire, use_two)?;
             off += step;
         }
@@ -287,7 +312,7 @@ where
         } else {
             THREADS * 8
         };
-        let grid = n.div_ceil(step).clamp(1, self.max_grid(48));
+        let grid = n.div_ceil(step).clamp(1, self.max_grid(self.max_grid_cap));
         let kernel = match wire {
             DType::Bf16 => &self.rs_bf16,
             DType::Fp8 => &self.rs_fp8,
@@ -327,7 +352,8 @@ where
             let mut args = self.base_args();
             args.u64(f).u64(t).u32(part_stride).u32(n as u32);
             self.finish_args(&mut args);
-            let grid = ((n * ranks) as u32 / (THREADS * 4)).clamp(1, self.max_grid(64));
+            let grid =
+                ((n * ranks) as u32 / (THREADS * 4)).clamp(1, self.max_grid(self.gather_max_grid));
             self.ctx.programmatic(false);
             self.ctx.launch(
                 &self.gather_rows,
@@ -446,17 +472,17 @@ fn arx_err<T>(res: Result<T, Error>) -> Result<T, tessera_run::Error> {
     res.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
 }
 
-struct Start(ArxLink);
+struct Start<'a>(ArxLink, &'a Knobs);
 
-impl OnGpu for Start {
+impl OnGpu for Start<'_> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Ok(Box::new(Arx::on(cached_context::<D>()?, self.0)?))
+        Ok(Box::new(Arx::on(cached_context::<D>()?, self.0, self.1)?))
     }
 }
 
 /// Opens arx sums over `link` on the GPU `gpu` names.
-pub fn open(gpu: Option<Gpu>, link: ArxLink) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(link))
+pub fn open(gpu: Option<Gpu>, link: ArxLink, knobs: &Knobs) -> Result<Box<dyn Sum>, Error> {
+    persistent(gpu, Start(link, knobs))
 }

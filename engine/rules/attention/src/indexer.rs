@@ -5,7 +5,7 @@ use tessera_codegen::prelude::*;
 use tessera_graph::{Act, DType, Mask, Op, Order, Select, Stage, View};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::{
-    Arg, Draft, Extent, Kernel, Launch, Needs, Shape, Source, Step, T, Term, Tree,
+    Arg, Draft, Extent, Kernel, Launch, Needs, Shape, Source, Step, T, Term, Tree, knob,
 };
 
 /// Elements one wide load brings per lane.
@@ -14,8 +14,7 @@ const WIDE: u32 = 4;
 /// SIMD groups in one warp-parallel block.
 const WARPS: u32 = 8;
 
-/// Threads in one warp-parallel block.
-const THREADS: u32 = WARPS * LANES as u32;
+knob!("indexer", "warps", 1, 32);
 
 /// Widest key dimension for register-held warp scoring.
 const MAX_DIM: usize = 256;
@@ -331,22 +330,22 @@ impl Sizes {
     order = Order::PerConfig,
     sizes = [self.0.rows, self.0.out_keys(), self.0.heads, self.0.dim],
     work = self.0.out_len() * self.0.heads * self.0.dim,
-    needs = warp_needs(),
+    needs = warp_needs(self.1),
     accepts = warp_accepts,
     emits = warp_emits,
     source = warp_source,
     launches = warp_launches,
     shape = Shape::grid(
-        ((self.0.rows * self.0.per_row()).div_ceil(WARPS as usize), 1),
-        THREADS as usize,
+        ((self.0.rows * self.0.per_row()).div_ceil(self.1 as usize), 1),
+        (self.1 * LANES as u32) as usize,
     ),
 )]
-pub(crate) struct IndexerWarp(pub Sizes);
+pub(crate) struct IndexerWarp(pub Sizes, pub u32);
 
-fn warp_needs() -> Needs {
+fn warp_needs(warps: u32) -> Needs {
     Needs {
         lanes: LANES,
-        group_threads: THREADS as usize,
+        group_threads: (warps * LANES as u32) as usize,
         ..Needs::default()
     }
 }
@@ -648,8 +647,12 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let mut drafts = Vec::new();
     let fits_warp =
         sizes.dim.is_multiple_of(WIDE as usize) && sizes.dim <= MAX_DIM && sizes.rows <= MAX_WARPS;
+    let warps = tree
+        .knobs
+        .get("indexer", "warps")
+        .map_or(WARPS, |w| w as u32);
     if fits_warp {
-        drafts.push(Draft::new(IndexerWarp(sizes), reads.iter().copied(), out).choice(0));
+        drafts.push(Draft::new(IndexerWarp(sizes, warps), reads.iter().copied(), out).choice(0));
     }
     if out <= u32::MAX as usize {
         drafts.push(Draft::new(IndexerPlain(sizes), reads, out).choice(1));

@@ -9,8 +9,11 @@ use tessera_graph::{Mask, Order};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites;
 use tessera_lower::{
-    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
+    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, knob,
 };
+
+knob!("flash", "bk", 16, 32);
+knob!("flash", "held", 0, 1);
 
 /// Queries one group handles.
 const BQ: u32 = 32;
@@ -936,18 +939,25 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if site.rows.is_some() {
         return site.ragged(FlashRows(site.sizes));
     }
+    let want_bk = tree.knobs.get("flash", "bk").map(|v| v as u32);
+    if want_bk.is_some_and(|bk| bk != 16 && bk != 32) {
+        return None;
+    }
+    let want_held = tree.knobs.get("flash", "held").map(|v| v != 0);
     // Each way: scaling, then flash. Held queries need one slice.
     let mut drafts = Vec::new();
-    let ways = WAYS
-        .into_iter()
-        .filter(|&(_, held)| !held || w <= CW as usize);
+    let ways = WAYS.into_iter().filter(|&(bk, held)| {
+        (!held || w <= CW as usize)
+            && want_bk.is_none_or(|b| b == bk)
+            && want_held.is_none_or(|h| h == held)
+    });
     for (way, (bk, held)) in ways.enumerate() {
         let (scaled, out) = crate::scaled(&site)?;
         let reads = [Read::Draft(0), Read::Node(site.k), Read::Node(site.v)];
         drafts.push(scaled.choice(way));
         drafts.push(Draft::new(Flash(site.sizes, bk, held), reads, out).choice(way));
     }
-    Some(drafts)
+    (!drafts.is_empty()).then_some(drafts)
 }
 
 fn why_not(tree: &Tree, at: T) -> Option<String> {

@@ -82,6 +82,8 @@ impl Fixed {
 #[derive(Clone)]
 pub struct Text {
     pub fixed: &'static Fixed,
+    pub source: ByBackend<&'static str>,
+    pub defines: Vec<(String, String)>,
     pub args: Vec<Arg>,
     pub shape: tessera_lower::Shape,
     pub work: f64,
@@ -92,7 +94,22 @@ pub struct Text {
 }
 
 impl Text {
-    pub fn new(fixed: &'static Fixed, offer: &Offer, args: Vec<Arg>) -> Self {
+    /// Builds a launch kernel, validating and interning any `#define` prefix.
+    pub fn try_new(fixed: &'static Fixed, offer: &Offer, args: Vec<Arg>) -> Result<Self, String> {
+        let source = if offer.defines.is_empty() {
+            fixed.text
+        } else {
+            let prefix = tessera_lower::define_prefix(
+                offer.defines.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            )?;
+            ByBackend(fixed.text.0.map(|s| {
+                if s.is_empty() {
+                    s
+                } else {
+                    tessera_lower::prefixed(&prefix, s)
+                }
+            }))
+        };
         let shape = match offer.shape {
             Shape::Line(n) => tessera_lower::Shape::Line(n),
             Shape::Grid {
@@ -115,24 +132,30 @@ impl Text {
             scratch: r.scratch,
             lanes: r.lanes.iter().map(lane).collect(),
         });
-        Self {
+        Ok(Self {
             fixed,
+            source,
+            defines: offer.defines.clone(),
             args,
             shape,
             work: offer.work,
             guess: offer.guess,
             kept: None,
             resident,
-        }
+        })
     }
 }
 
-/// Name and launch, not text. Compiled kernels key on it.
+/// Keyed by name, defines, and launch for compiled caching.
 impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Fixed { name, .. } = self.fixed;
         let layout = self.kept.as_ref().map(|(l, _)| l.name());
-        write!(f, "{name}{:?}{:?}{layout:?}", self.args, self.shape)?;
+        write!(
+            f,
+            "{name}{:?}{:?}{:?}{layout:?}",
+            self.defines, self.args, self.shape
+        )?;
         match &self.resident {
             Some(r) => write!(f, "{r:?}"),
             None => Ok(()),
@@ -146,8 +169,10 @@ impl Kernel for Text {
     }
 
     fn source(&self) -> Source {
-        let Fixed { entry, text, .. } = *self.fixed;
-        Source::Fixed { text, entry }
+        Source::Fixed {
+            text: self.source,
+            entry: self.fixed.entry,
+        }
     }
 
     fn shape(&self) -> Option<tessera_lower::Shape> {

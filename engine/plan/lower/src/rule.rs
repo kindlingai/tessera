@@ -335,6 +335,15 @@ macro_rules! stage_rule {
     ($name:literal, $kernel:expr) => {
         $crate::stage_rule!($name, $kernel, |site| site.reads());
     };
+    ($name:literal, knobs: $kernel:expr) => {
+        fn propose(tree: &$crate::Tree, at: $crate::T) -> Option<Vec<$crate::Draft>> {
+            let site: $crate::sites::Stage = tree.site(at)?;
+            let kernel = $crate::rule::at_stage(&site, &tree.knobs, $kernel)?;
+            Some(vec![$crate::Draft::new(kernel, site.reads(), site.len)])
+        }
+
+        $crate::rule!($name, propose);
+    };
     // The third closure gives the reads, else the site's.
     ($name:literal, $kernel:expr, $reads:expr) => {
         fn propose(tree: &$crate::Tree, at: $crate::T) -> Option<Vec<$crate::Draft>> {
@@ -351,6 +360,15 @@ macro_rules! stage_rule {
 /// `f` at `site`, typing the closure `stage_rule!` is given.
 pub fn at_site<R>(site: &crate::sites::Stage, f: impl FnOnce(&crate::sites::Stage) -> R) -> R {
     f(site)
+}
+
+/// Types `f` for stage `site` and `knobs`.
+pub fn at_stage<R>(
+    site: &crate::sites::Stage,
+    knobs: &crate::Knobs,
+    f: impl FnOnce(&crate::sites::Stage, &crate::Knobs) -> R,
+) -> R {
+    f(site, knobs)
 }
 
 /// Every registered rule, in name order.

@@ -266,3 +266,48 @@ fn wide_strided_narrow_forms() {
         assert!(diff < 2e-2, "diff={diff:e}");
     }
 }
+
+#[test]
+fn kernel_launch_knobs() {
+    let mut knobs = tessera_lower::Knobs::default();
+    knobs.parse("lane_norm:warps=4").unwrap();
+    knobs.parse("lane_norm:block_rows=64").unwrap();
+    knobs.parse("lane_norm:ahead=2").unwrap();
+    knobs.parse("softmax:threads=64").unwrap();
+    let gpu = Platform {
+        backend: "cuda".into(),
+        arch: "sm_90".into(),
+        name: "GPU".into(),
+        units: 128,
+        bandwidth: 1e12,
+        ..Platform::assumed(Limits::assumed())
+    };
+    let wide = graphs::rows(&dims(), 600);
+    let base = lower(&wide, 0, &SIZES, &Device::default().on(gpu.clone())).unwrap();
+    let mut tuned_dev = Device::default().on(gpu);
+    tuned_dev.knobs = knobs;
+    let tuned = lower(&wide, 0, &SIZES, &tuned_dev).unwrap();
+    let norm = |p: &Plan| {
+        p.steps
+            .iter()
+            .find(|s| s.kernel.name().contains("norm"))
+            .unwrap()
+            .clone()
+    };
+    assert_ne!(
+        norm(&base).kernel.identity(),
+        norm(&tuned).kernel.identity()
+    );
+    let n = norm(&tuned).launches()[0].shape;
+    assert!(matches!(n, tessera_lower::Shape::Grid { threads: 128, .. }));
+
+    let step = tuned
+        .steps
+        .iter()
+        .find(|s| s.kernel.name() == "softmax")
+        .unwrap();
+    assert!(matches!(
+        step.launches()[0].shape,
+        tessera_lower::Shape::Grid { threads: 64, .. }
+    ));
+}

@@ -41,8 +41,15 @@ static __device__ void embed_rows(const mat& embed, const u32* tokens, float* x,
     }
 }
 
+#ifndef WHOLE_THREADS
+#define WHOLE_THREADS 256
+#endif
+#ifndef WHOLE_MIN_BLOCKS
+#define WHOLE_MIN_BLOCKS 2
+#endif
+
 // Persistent grid entry: embed, decoder layers, final norm, logits.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_whole(const table* t) {
+extern "C" __global__ __launch_bounds__(WHOLE_THREADS, WHOLE_MIN_BLOCKS) void glm53_whole(const table* t) {
     if (!check(t)) return;
     __shared__ Smem smem;
     sizes s = values<sizes>(t);

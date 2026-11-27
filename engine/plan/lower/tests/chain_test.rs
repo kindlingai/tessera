@@ -415,3 +415,30 @@ fn made_identity_no_leak() {
     }
     assert_eq!(entry_calls.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn knobs_and_prefixes() {
+    use tessera_lower::{Knob, Knobs, define_prefix, find_knob, prefixed, register_knob};
+
+    assert_eq!(Knobs::split_flag("k:n=42").unwrap(), ("k", "n", 42));
+    assert!(Knobs::split_flag("bad_spec").is_err());
+
+    register_knob(Knob {
+        kernel: "guest_test_k",
+        name: "tile",
+        least: 8,
+        most: 64,
+    });
+    assert!(find_knob("guest_test_k", "tile").is_some());
+    let mut k = Knobs::default();
+    k.parse("guest_test_k:tile=16").unwrap();
+    assert_eq!(k.get("guest_test_k", "tile"), Some(16));
+    assert!(k.parse("guest_test_k:tile=128").is_err());
+
+    let def = define_prefix([("BLK_N", "16"), ("USE_X", "1")]).unwrap();
+    assert!(def.contains("#define BLK_N 16\n#define USE_X 1\n#line 1\n"));
+    assert!(define_prefix([("1bad", "2")]).is_err());
+    let base: &'static str = "void f() {}";
+    assert!(std::ptr::eq(prefixed("", base), base));
+    assert_ne!(prefixed(&def, base), base);
+}

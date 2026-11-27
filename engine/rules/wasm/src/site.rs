@@ -59,6 +59,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         kept,
         sums: reads.sums.iter().map(|t| tree.elements(*t)).collect(),
         scalars,
+        knobs: tree.knobs.entries().to_vec(),
     };
     Some((site, reads))
 }
@@ -99,6 +100,7 @@ fn matmul(tree: &Tree, at: T) -> Option<(Site, Reads)> {
         n: m.n,
         k: m.k,
         form: m.form.name().into(),
+        knobs: tree.knobs.entries().to_vec(),
     };
     let reads = Reads {
         nodes: vec![m.x, m.w],
@@ -340,7 +342,7 @@ fn launch(
         let built = arg(tree, &from.nodes, *count).map_err(|e| format!("{}: {e}", offer.kernel))?;
         args.push(built);
     }
-    let mut text = Text::new(fixed, offer, args);
+    let mut text = Text::try_new(fixed, offer, args)?;
     text.kept = kept.map(|k| {
         let values = tree.kept.values(k.slots, k.context);
         let values = values.into_iter().map(|v| Arg::count(v as usize));

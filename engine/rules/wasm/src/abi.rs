@@ -9,6 +9,16 @@ pub(crate) use tessera_guest::site::{
 /// The version of this exchange the host reads.
 pub(crate) use tessera_guest::ABI;
 
+/// One knob declared in `manifest()`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeclaredKnob {
+    pub kernel: String,
+    pub name: String,
+    pub least: u64,
+    pub most: u64,
+}
+
 /// The return value of `manifest()`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +33,8 @@ pub(crate) struct Manifest {
     pub graph: bool,
     #[serde(default)]
     pub files: Vec<File>,
+    #[serde(default)]
+    pub knobs: Vec<DeclaredKnob>,
 }
 
 /// One kernel's source, the same for every launch.

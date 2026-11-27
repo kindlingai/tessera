@@ -131,6 +131,11 @@ const GEMM_STRIDE: usize = BK + 8;
 /// `sizeof(gemm_smem)`: two stages of A and B, then rows.
 const SMEM: usize = 2 * 2 * TILE * GEMM_STRIDE * 2 + TILE * 4;
 
+tessera_lower::knob!("picked_bf16", "min_rows", 1, 1024);
+tessera_lower::knob!("picked_bf16", "sort_blocks", 1, 1024);
+tessera_lower::knob!("picked_bf16", "min_blocks", 1, 16);
+tessera_lower::knob!("picked_bf16", "group_m", 1, 64);
+
 fn is_plain_float(form: &dyn Stored) -> bool {
     matches!(form.name(), "f32" | "bf16")
 }
@@ -154,11 +159,23 @@ fn fixed_cuda(entry: &'static str) -> Source {
     }
 }
 
+fn gemm_source(k: &PickedBf16) -> Source {
+    let entry = gemm_entry(k.out_form.name() == "f32", k.fused);
+    let mut defs = Vec::new();
+    if let Some(mb) = k.min_blocks {
+        defs.push(("PBF16_MIN_BLOCKS", mb as usize));
+    }
+    if let Some(gm) = k.group_m {
+        defs.push(("PBF16_GM", gm as usize));
+    }
+    crate::cuda_source_with(cuda_source(), entry, defs)
+}
+
 /// Pass 1 of deterministic expert sort: per-block histograms.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "calib_sort_hist",
-    sizes = [self.rows, self.count],
+    sizes = [self.rows, self.count, self.sort_blocks],
     work = self.rows,
     accepts = hist_accepts,
     emits = u32_only,
@@ -172,6 +189,7 @@ fn fixed_cuda(entry: &'static str) -> Source {
 struct SortHist {
     rows: usize,
     count: usize,
+    sort_blocks: usize,
 }
 
 fn u32_only<K>(_: &K, form: &dyn Stored) -> bool {
@@ -182,11 +200,17 @@ fn hist_accepts(_: &SortHist, _: usize, form: &dyn Stored) -> bool {
     form.name() == "u32"
 }
 
-fn sort_load(group: usize, rows: usize, reads: Vec<f64>, written: f64) -> Option<Load> {
+fn sort_load(
+    group: usize,
+    rows: usize,
+    sort_blocks: usize,
+    reads: Vec<f64>,
+    written: f64,
+) -> Option<Load> {
     Some(Load {
-        threads: SORT_BLOCKS * group,
+        threads: sort_blocks * group,
         group,
-        trips: (rows / SORT_BLOCKS).max(1) as f64,
+        trips: (rows / sort_blocks).max(1) as f64,
         reads,
         written,
         flight: 256.0,
@@ -198,14 +222,15 @@ fn hist_load(k: &SortHist, _: usize) -> Option<Load> {
     sort_load(
         THREADS,
         k.rows,
+        k.sort_blocks,
         vec![(4 * k.rows) as f64],
-        (4 * SORT_BLOCKS * k.count) as f64,
+        (4 * k.sort_blocks * k.count) as f64,
     )
 }
 
 fn hist_launches(k: &SortHist, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
-        across: SORT_BLOCKS,
+        across: k.sort_blocks,
         down: 1,
         threads: THREADS,
     };
@@ -215,7 +240,7 @@ fn hist_launches(k: &SortHist, step: &Step) -> Vec<Launch> {
         Arg::count(k.rows),
         Arg::count(k.count),
         Arg::count(0),
-        Arg::count(SORT_BLOCKS),
+        Arg::count(k.sort_blocks),
     ];
     vec![Launch { args, shape }]
 }
@@ -224,8 +249,8 @@ fn hist_launches(k: &SortHist, step: &Step) -> Vec<Launch> {
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "calib_sort_prefix",
-    sizes = [self.count, self.max_tiles],
-    work = self.count * SORT_BLOCKS,
+    sizes = [self.count, self.max_tiles, self.sort_blocks],
+    work = self.count * self.sort_blocks,
     accepts = prefix_accepts,
     emits = u32_only,
     needs = bf16_needs(MAX_EXPERTS * 4, THREADS),
@@ -238,6 +263,7 @@ fn hist_launches(k: &SortHist, step: &Step) -> Vec<Launch> {
 struct SortPrefix {
     count: usize,
     max_tiles: usize,
+    sort_blocks: usize,
 }
 
 fn prefix_accepts(_: &SortPrefix, _: usize, form: &dyn Stored) -> bool {
@@ -245,12 +271,12 @@ fn prefix_accepts(_: &SortPrefix, _: usize, form: &dyn Stored) -> bool {
 }
 
 fn prefix_load(k: &SortPrefix, _: usize) -> Option<Load> {
-    let words = SORT_BLOCKS * k.count + k.count + 1 + 1 + 2 * k.max_tiles;
+    let words = k.sort_blocks * k.count + k.count + 1 + 1 + 2 * k.max_tiles;
     Some(Load {
         threads: THREADS,
         group: THREADS,
-        trips: SORT_BLOCKS as f64,
-        reads: vec![(4 * SORT_BLOCKS * k.count) as f64],
+        trips: k.sort_blocks as f64,
+        reads: vec![(4 * k.sort_blocks * k.count) as f64],
         written: (4 * words) as f64,
         flight: 128.0,
         ..Load::default()
@@ -258,7 +284,7 @@ fn prefix_load(k: &SortPrefix, _: usize) -> Option<Load> {
 }
 
 fn prefix_launches(k: &SortPrefix, step: &Step) -> Vec<Launch> {
-    let off_start = SORT_BLOCKS * k.count;
+    let off_start = k.sort_blocks * k.count;
     let meta_start = off_start + k.count + 1;
     let zero: u64 = 0;
     let shape = Shape::Grid {
@@ -273,7 +299,7 @@ fn prefix_launches(k: &SortPrefix, step: &Step) -> Vec<Launch> {
         Arg::value(&zero),
         Arg::at(step.write, meta_start),
         Arg::count(k.count),
-        Arg::count(SORT_BLOCKS),
+        Arg::count(k.sort_blocks),
         Arg::count(TILE),
     ];
     vec![Launch { args, shape }]
@@ -283,7 +309,7 @@ fn prefix_launches(k: &SortPrefix, step: &Step) -> Vec<Launch> {
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "calib_sort_scatter",
-    sizes = [self.rows, self.count],
+    sizes = [self.rows, self.count, self.sort_blocks],
     work = self.rows,
     accepts = scatter_accepts,
     emits = u32_only,
@@ -297,6 +323,7 @@ fn prefix_launches(k: &SortPrefix, step: &Step) -> Vec<Launch> {
 struct SortScatter {
     rows: usize,
     count: usize,
+    sort_blocks: usize,
 }
 
 fn scatter_accepts(_: &SortScatter, _: usize, form: &dyn Stored) -> bool {
@@ -307,15 +334,16 @@ fn scatter_load(k: &SortScatter, _: usize) -> Option<Load> {
     sort_load(
         32,
         k.rows,
-        vec![(4 * k.rows) as f64, (4 * SORT_BLOCKS * k.count) as f64],
+        k.sort_blocks,
+        vec![(4 * k.rows) as f64, (4 * k.sort_blocks * k.count) as f64],
         (4 * k.rows) as f64,
     )
 }
 
 fn scatter_launches(k: &SortScatter, step: &Step) -> Vec<Launch> {
-    let off_start = SORT_BLOCKS * k.count;
+    let off_start = k.sort_blocks * k.count;
     let shape = Shape::Grid {
-        across: SORT_BLOCKS,
+        across: k.sort_blocks,
         down: 1,
         threads: 32,
     };
@@ -327,7 +355,7 @@ fn scatter_launches(k: &SortScatter, step: &Step) -> Vec<Launch> {
         Arg::count(k.rows),
         Arg::count(k.count),
         Arg::count(0),
-        Arg::count(SORT_BLOCKS),
+        Arg::count(k.sort_blocks),
     ];
     vec![Launch { args, shape }]
 }
@@ -351,7 +379,7 @@ fn gemm_entry(out_f32: bool, fused: bool) -> &'static str {
     emits = gemm_emits,
     needs = bf16_needs(SMEM, THREADS),
     order = Order::PerConfig,
-    source = fixed_cuda(gemm_entry(self.out_form.name() == "f32", self.fused)),
+    source = gemm_source(self),
     launches = gemm_launches,
     load = gemm_load,
     unproven,
@@ -365,6 +393,9 @@ struct PickedBf16 {
     offset: usize,
     repeat: usize,
     max_tiles: usize,
+    sort_blocks: usize,
+    min_blocks: Option<u32>,
+    group_m: Option<u32>,
     fused: bool,
     out_form: &'static dyn Stored,
 }
@@ -407,7 +438,7 @@ fn gemm_load(k: &PickedBf16, _: usize) -> Option<Load> {
 
 fn gemm_launches(k: &PickedBf16, step: &Step) -> Vec<Launch> {
     let n_tile = if k.fused { 64 } else { TILE };
-    let off_start = SORT_BLOCKS * k.count;
+    let off_start = k.sort_blocks * k.count;
     let meta_start = off_start + k.count + 1;
     let shape = Shape::Grid {
         across: k.n / n_tile,
@@ -487,7 +518,11 @@ fn match_bf16_pick(tree: &Tree, mat: T, n_align: usize) -> Option<PickSite> {
     }
     let rows = tree.elements(ids);
     let x_rows = tree.elements(x) / k;
-    if rows < MIN_ROWS || x_rows == 0 || !rows.is_multiple_of(x_rows) {
+    let min_rows = tree
+        .knobs
+        .get("picked_bf16", "min_rows")
+        .unwrap_or(MIN_ROWS);
+    if rows < min_rows || x_rows == 0 || !rows.is_multiple_of(x_rows) {
         return None;
     }
     Some(PickSite {
@@ -502,19 +537,36 @@ fn match_bf16_pick(tree: &Tree, mat: T, n_align: usize) -> Option<PickSite> {
     })
 }
 
-fn build_drafts(site: &PickSite, out_form: &'static dyn Stored, w_up: Option<T>) -> Vec<Draft> {
+fn build_drafts(
+    tree: &Tree,
+    site: &PickSite,
+    out_form: &'static dyn Stored,
+    w_up: Option<T>,
+) -> Vec<Draft> {
+    let sort_blocks = tree
+        .knobs
+        .get("picked_bf16", "sort_blocks")
+        .unwrap_or(SORT_BLOCKS);
+    let min_blocks = tree
+        .knobs
+        .get("picked_bf16", "min_blocks")
+        .map(|v| v as u32);
+    let group_m = tree.knobs.get("picked_bf16", "group_m").map(|v| v as u32);
     let max_tiles = site.count + site.rows.div_ceil(TILE);
     let hist = SortHist {
         rows: site.rows,
         count: site.count,
+        sort_blocks,
     };
     let prefix = SortPrefix {
         count: site.count,
         max_tiles,
+        sort_blocks,
     };
     let scatter = SortScatter {
         rows: site.rows,
         count: site.count,
+        sort_blocks,
     };
     let gemm = PickedBf16 {
         rows: site.rows,
@@ -525,17 +577,20 @@ fn build_drafts(site: &PickSite, out_form: &'static dyn Stored, w_up: Option<T>)
         offset: 0,
         repeat: site.repeat,
         max_tiles,
+        sort_blocks,
+        min_blocks,
+        group_m,
         fused: w_up.is_some(),
         out_form,
     };
-    let prefix_len = SORT_BLOCKS * site.count + site.count + 1 + 1 + 2 * max_tiles;
+    let prefix_len = sort_blocks * site.count + site.count + 1 + 1 + 2 * max_tiles;
     let mut gemm_reads = vec![Read::Node(site.x), Read::Node(site.w)];
     if let Some(wu) = w_up {
         gemm_reads.push(Read::Node(wu));
     }
     gemm_reads.extend([Read::Draft(1), Read::Draft(2)]);
     vec![
-        Draft::new(hist, [Read::Node(site.ids)], SORT_BLOCKS * site.count),
+        Draft::new(hist, [Read::Node(site.ids)], sort_blocks * site.count),
         Draft::new(prefix, [Read::Draft(0)], prefix_len),
         Draft::new(scatter, [Read::Node(site.ids), Read::Draft(1)], site.rows),
         Draft::new(gemm, gemm_reads, site.rows * site.n),
@@ -573,7 +628,7 @@ fn match_fused_gu(tree: &Tree, at: T, out_form: &'static dyn Stored) -> Option<V
             && gs.k == us.k
             && gs.count == us.count;
         if same {
-            return Some(build_drafts(&gs, out_form, Some(us.w)));
+            return Some(build_drafts(tree, &gs, out_form, Some(us.w)));
         }
     }
     None
@@ -589,7 +644,7 @@ pub(crate) fn propose_picked_bf16(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return Some(drafts);
     }
     let site = match_bf16_pick(tree, at, TILE)?;
-    Some(build_drafts(&site, out_form, None))
+    Some(build_drafts(tree, &site, out_form, None))
 }
 
 cuda_rule!("picked_bf16", propose_picked_bf16);

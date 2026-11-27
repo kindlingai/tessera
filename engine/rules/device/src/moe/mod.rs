@@ -6,15 +6,17 @@ use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Rotated;
-use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
 use tessera_mem::trellis::parse_form;
 
 const KERNEL: &str = include_str!("trellis.cu");
 const BLOCK: usize = 128;
 const THREADS: usize = 256;
 const SMEM: usize = 4096 * 4;
+
+tessera_lower::knob!("picked_trellis", "chunk", 1, 4);
+tessera_lower::knob!("picked_trellis", "min_blocks", 1, 16);
+tessera_lower::knob!("picked_trellis", "gen_min_blocks", 1, 16);
 
 fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
@@ -29,6 +31,22 @@ fn entry_name(k: &PickedTrellis) -> &'static str {
     }
 }
 
+fn trellis_source(k: &PickedTrellis) -> Source {
+    let entry = entry_name(k);
+    let mut defs = Vec::new();
+    if let Some(c) = k.chunk {
+        defs.push(("PTR_CHUNK", c as usize));
+    }
+    if entry == "ptr_k3_pmcgx_t" {
+        if let Some(mb) = k.min_blocks {
+            defs.push(("PTR_K3_MIN_BLOCKS", mb as usize));
+        }
+    } else if let Some(mb) = k.gen_min_blocks {
+        defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
+    }
+    crate::cuda_source_with(cuda_source(), entry, defs)
+}
+
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = self.form.suffixed(if self.turned { "picked_trellis_t" } else { "picked_trellis" }),
@@ -38,7 +56,7 @@ fn entry_name(k: &PickedTrellis) -> &'static str {
     emits = emits,
     needs = needs(),
     order = Order::PerConfig,
-    source = Source::Fixed { text: ByBackend(["", cuda_source(), ""]), entry: entry_name(self) },
+    source = trellis_source(self),
     launches = launches,
     load = load,
     unproven,
@@ -54,6 +72,9 @@ struct PickedTrellis {
     book: u32,
     turned: bool,
     post: u32,
+    chunk: Option<u32>,
+    min_blocks: Option<u32>,
+    gen_min_blocks: Option<u32>,
     form: &'static dyn Stored,
 }
 
@@ -186,6 +207,15 @@ fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis
         book,
         turned,
         post: 0,
+        chunk: tree.knobs.get("picked_trellis", "chunk").map(|v| v as u32),
+        min_blocks: tree
+            .knobs
+            .get("picked_trellis", "min_blocks")
+            .map(|v| v as u32),
+        gen_min_blocks: tree
+            .knobs
+            .get("picked_trellis", "gen_min_blocks")
+            .map(|v| v as u32),
         form,
     };
     Some((kernel, codes, ids))

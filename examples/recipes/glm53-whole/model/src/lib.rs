@@ -316,11 +316,31 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     ];
     let sizes = [&shape[..], &attn_bits, &mlp_bits, &[width]].concat();
     let ops = ["rms_norm", "rope_adjacent", "scale", "attend"];
+    let warps = ask.knob(NAME, "warps").unwrap_or((THREADS / 32) as usize);
+    if !warps.is_multiple_of(2) {
+        return None;
+    }
+    let threads = (warps * 32) as u32;
+    let mut defs = Vec::new();
+    if warps != 8 {
+        defs.push(("WARPS".into(), format!("{warps}u")));
+        defs.push(("WHOLE_THREADS".into(), threads.to_string()));
+    }
+    if let Some(rt) = ask.knob(NAME, "row_tile") {
+        defs.push(("ROW_TILE".into(), format!("{rt}u")));
+    }
+    if let Some(st) = ask.knob(NAME, "attn_stage") {
+        defs.push(("ATTN_STAGE".into(), format!("{st}u")));
+    }
+    if let Some(mb) = ask.knob(NAME, "min_blocks") {
+        defs.push(("WHOLE_MIN_BLOCKS".into(), mb.to_string()));
+    }
     let floats =
         rows * (3 * hidden + s.q_latent + s.latent + s.rope + 6 * width + keep + 2 * top_k);
     let work = (rows * layers * hidden * (s.q_latent + s.heads * s.head_dim)) as f64;
-    let resident = Resident::grid(THREADS, floats * 4, lane);
-    let whole = step.resident(NAME, w.reads, &sizes, &ops, work, resident)?;
+    let resident = Resident::grid(threads, floats * 4, lane);
+    let mut whole = step.resident(NAME, w.reads, &sizes, &ops, work, resident)?;
+    whole.defines = defs;
     Some(vec![whole])
 }
 
@@ -328,5 +348,11 @@ tessera_guest::exports! {
     rules: { NAME => Kind::Model },
     kernels: { "whole.cu": [NAME] },
     files: ["math.cuh", "trellis.cuh", "gemv.cuh", "attn.cuh", "moe.cuh"],
+    knobs: [
+        (NAME, "warps", 2, 16),
+        (NAME, "row_tile", 1, 16),
+        (NAME, "attn_stage", 256, 8192),
+        (NAME, "min_blocks", 1, 16),
+    ],
     ask: offer,
 }

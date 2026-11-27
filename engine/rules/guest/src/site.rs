@@ -3,6 +3,15 @@
 pub use crate::kit::{Found, Weights, agreed, fixed, layer, same, trellis};
 use serde::{Deserialize, Serialize};
 
+/// One shape number a module reads, with its range.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Knob {
+    pub kernel: &'static str,
+    pub name: &'static str,
+    pub least: u64,
+    pub most: u64,
+}
+
 /// The output of `manifest()`.
 #[derive(Debug, Serialize)]
 pub struct Manifest {
@@ -16,6 +25,9 @@ pub struct Manifest {
     /// Recipe files that kernels from files read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<File>,
+    /// Kernel shape knobs declared by this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knobs: Vec<Knob>,
 }
 
 /// One kernel's source, the same for every launch.
@@ -112,6 +124,15 @@ pub struct Ask {
     pub config: Option<serde_json::Value>,
 }
 
+/// Returns the last value set for `kernel:name`, if any.
+pub fn find_knob(knobs: &[(String, u64)], kernel: &str, name: &str) -> Option<usize> {
+    knobs
+        .iter()
+        .rev()
+        .find(|(spot, _)| spot.split_once(':') == Some((kernel, name)))
+        .map(|(_, value)| *value as usize)
+}
+
 /// A site's sizes. Offers name reads by place.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,6 +143,8 @@ pub enum Site {
         n: usize,
         k: usize,
         form: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        knobs: Vec<(String, u64)>,
     },
     /// A whole region. Reads are its inputs, in order.
     Region {
@@ -135,7 +158,26 @@ pub enum Site {
         /// Each distinct op constant inside, in first-use order.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scalars: Vec<Scalar>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        knobs: Vec<(String, u64)>,
     },
+}
+
+impl Site {
+    /// The value set for `kernel:name`, if any.
+    pub fn knob(&self, kernel: &str, name: &str) -> Option<usize> {
+        let knobs = match self {
+            Site::Matmul { knobs, .. } | Site::Region { knobs, .. } => knobs,
+        };
+        find_knob(knobs, kernel, name)
+    }
+}
+
+impl Ask {
+    /// The value set for `kernel:name`, if any.
+    pub fn knob(&self, kernel: &str, name: &str) -> Option<usize> {
+        self.site.knob(kernel, name)
+    }
 }
 
 /// One op constant: an eps, a theta or a scale.
@@ -247,6 +289,9 @@ pub struct Offer<K = &'static str, C = Count> {
     /// Set when the launch is one persistent grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident: Option<Resident>,
+    /// Preprocessor defines prepended before compiling this kernel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defines: Vec<(String, String)>,
 }
 
 /// One grid per launch, over a table, with sums inside.

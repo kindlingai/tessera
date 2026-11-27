@@ -162,8 +162,17 @@ __device__ bool run_gather(session& s, const float* from, float* to, u32 n, u32 
     return true;
 }
 
+#ifndef SUM_THREADS
+#define SUM_THREADS 512
+#endif
+#ifdef SUM_MIN_BLOCKS
+#define SUM_BOUNDS __launch_bounds__(SUM_THREADS, SUM_MIN_BLOCKS)
+#else
+#define SUM_BOUNDS __launch_bounds__(SUM_THREADS)
+#endif
+
 // Values: floats per round, job. Zero floats stop.
-extern "C" __global__ __launch_bounds__(512) void tessera_sums(const table* t) {
+extern "C" __global__ SUM_BOUNDS void tessera_sums(const table* t) {
     if (!check(t)) return;
     u32 room = value(t, 0);
     job* j = address<job>(t, 1);

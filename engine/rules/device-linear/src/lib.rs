@@ -4,24 +4,24 @@
 mod device_test;
 mod gemv;
 pub(crate) mod mm;
+mod stacked;
 #[cfg(test)]
 mod stacked_test;
 
 use gemv::{propose_gemv, why_gemv};
+use stacked::check_stacked;
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
 pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
-use tessera_graph::{DType, DimExpr, Op, Order, Pairs, Stage, View};
+use tessera_graph::Order;
 use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Term,
-    Tree,
+    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
 };
 
 const KERNEL: &str = include_str!("linear.cu");
 const PREFILL: &str = include_str!("prefill.cu");
-const STACKED: &str = include_str!("stacked.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
@@ -40,23 +40,11 @@ pub(crate) fn prefill_source() -> &'static str {
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prefill.kernel", PREFILL))
 }
 
-fn prefill_source_entry(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend(["", prefill_source(), ""]),
-        entry,
-    }
-}
-
-pub(crate) fn stacked_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "stacked.kernel", STACKED))
-}
-
-fn stacked_source_entry(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend(["", stacked_source(), ""]),
-        entry,
-    }
+fn prefill_source_with<'a>(
+    entry: &'static str,
+    defs: impl IntoIterator<Item = (&'a str, usize)>,
+) -> Source {
+    tessera_device::cuda_source_with(prefill_source(), entry, defs)
 }
 
 #[cfg(test)]
@@ -65,12 +53,52 @@ pub(crate) fn hip_source() -> &'static str {
     HIP.get_or_init(|| flatten_for(Backend::Rocm, "linear.kernel", KERNEL))
 }
 
-fn dtr_ks(m: usize, n: usize, k: usize) -> usize {
+macro_rules! dtr_knobs {
+    ($k:literal) => {
+        tessera_lower::knob!($k, "splits", 1, 16);
+        tessera_lower::knob!($k, "split_max_rows", 1, 64);
+        tessera_lower::knob!($k, "target_small", 1, 1024);
+        tessera_lower::knob!($k, "target_large", 1, 1024);
+        tessera_lower::knob!($k, "tile_rows", 8, 32);
+        tessera_lower::knob!($k, "prefill_min_rows", 1, 1024);
+        tessera_lower::knob!($k, "prefill_tile", 64, 128);
+        tessera_lower::knob!($k, "prefill_large_rows", 64, 2048);
+        tessera_lower::knob!($k, "prefill_min_groups", 1, 1024);
+        tessera_lower::knob!($k, "min_blocks", 1, 16);
+        tessera_lower::knob!($k, "t8_min_blocks", 1, 16);
+        tessera_lower::knob!($k, "t16_min_blocks", 1, 16);
+        tessera_lower::knob!($k, "prep_min_blocks", 1, 16);
+        tessera_lower::knob!($k, "reduce_min_blocks", 1, 16);
+    };
+}
+
+dtr_knobs!("trellis_mma");
+dtr_knobs!("trellis_turned");
+
+fn dtr_ks(m: usize, n: usize, k: usize, tree: &Tree, rule: &str) -> usize {
     let ibs = k / BLOCK;
-    if m > 16 || ibs <= 1 {
+    if let Some(want) = tree.knobs.get(rule, "splits") {
+        let cap = ibs.clamp(1, 16);
+        let w = want.clamp(1, cap);
+        for d in w..=cap {
+            if ibs.is_multiple_of(d) {
+                return d;
+            }
+        }
+        for d in (1..w).rev() {
+            if ibs.is_multiple_of(d) {
+                return d;
+            }
+        }
         return 1;
     }
-    let target: usize = if m <= 2 { 288 } else { 128 };
+    let split_max_rows = tree.knobs.get(rule, "split_max_rows").unwrap_or(16);
+    if m > split_max_rows || ibs <= 1 {
+        return 1;
+    }
+    let small = tree.knobs.get(rule, "target_small").unwrap_or(288);
+    let large = tree.knobs.get(rule, "target_large").unwrap_or(128);
+    let target = if m <= 2 { small } else { large };
     let want = target.div_ceil(n / BLOCK).clamp(1, 16).min(ibs);
     for d in want..=ibs.min(16) {
         if ibs.is_multiple_of(d) {
@@ -96,7 +124,7 @@ fn dtr_tile(m: usize) -> usize {
 }
 
 fn dtr_entry(t: &TrellisMma) -> &'static str {
-    match (dtr_tile(t.m), t.bits, t.book, t.turned, t.ks > 1) {
+    match (t.tile, t.bits, t.book, t.turned, t.ks > 1) {
         (8, 4, 0, true, true) => "dtr_k4_t1s",
         (8, 4, 0, true, false) => "dtr_k4_t1",
         (8, 4, 0, false, true) => "dtr_k4_p1s",
@@ -110,6 +138,17 @@ fn dtr_entry(t: &TrellisMma) -> &'static str {
     }
 }
 
+fn dtr_source(t: &TrellisMma) -> Source {
+    let entry = dtr_entry(t);
+    let def = match entry {
+        "dtr_k4_t1s" | "dtr_k4_t1" | "dtr_k4_p1s" | "dtr_k4_p1" => "DTR_T1_BLK",
+        "dtr_k4_t2s" | "dtr_k4_t2" => "DTR_T2_BLK",
+        "dtr_k4_t4" => "DTR_T4_BLK",
+        _ => "DTR_GEN_BLK",
+    };
+    cuda_source_with(entry, t.min_blocks.map(|v| (def, v as usize)))
+}
+
 fn dtr_needs(bytes: usize) -> Needs {
     Needs {
         bf16_tile: true,
@@ -117,34 +156,61 @@ fn dtr_needs(bytes: usize) -> Needs {
     }
 }
 
-/// Dense trellis matmul with warp-per-tile MMA and split-K.
-#[derive(Clone, Debug, Kernel)]
-#[launch(
-    name = self.form.suffixed(if self.turned { "trellis_turned" } else { "trellis_mma" }),
-    sizes = [self.m, self.n, self.k],
-    work = self.m * self.n * self.k,
-    accepts = mma_accepts,
-    emits = f32_only,
-    needs = dtr_needs(DTR_SMEM),
-    order = Order::PerConfig,
-    source = cuda_source_entry(dtr_entry(self)),
-    launches = mma_launches,
-    load = mma_load,
-    unproven,
-)]
-struct TrellisMma {
-    m: usize,
-    n: usize,
-    k: usize,
-    ks: usize,
-    bits: u32,
-    book: u32,
-    turned: bool,
-    form: &'static dyn Stored,
+macro_rules! dtr_mma_kernel {
+    (
+        $(#[$meta:meta])*
+        struct $name:ident,
+        accepts = $accepts:ident,
+        smem = $smem:expr,
+        source = $source:ident,
+        launches = $launches:ident,
+        load = $load:ident,
+        suffix = $suffix:literal
+        $(, extra: $extra:ident : $extra_ty:ty)?
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Kernel)]
+        #[launch(
+            name = self.form.suffixed(if self.turned {
+                concat!("trellis_turned", $suffix)
+            } else {
+                concat!("trellis_mma", $suffix)
+            }),
+            sizes = [self.m, self.n, self.k],
+            work = self.m * self.n * self.k,
+            accepts = $accepts, emits = f32_only,
+            needs = dtr_needs($smem), order = Order::PerConfig,
+            source = $source(self), launches = $launches, load = $load, unproven,
+        )]
+        struct $name {
+            m: usize,
+            n: usize,
+            k: usize,
+            $($extra: $extra_ty,)?
+            tile: usize,
+            min_blocks: Option<u32>,
+            bits: u32,
+            book: u32,
+            turned: bool,
+            form: &'static dyn Stored,
+        }
+
+        fn $accepts(k: &$name, input: usize, form: &dyn Stored) -> bool {
+            weight_accepts(input, k.form, form)
+        }
+    };
 }
 
-fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+dtr_mma_kernel! {
+    /// Dense trellis matmul with warp-per-tile MMA and split-K.
+    struct TrellisMma,
+    accepts = mma_accepts,
+    smem = DTR_SMEM,
+    source = dtr_source,
+    launches = mma_launches,
+    load = mma_load,
+    suffix = "",
+    extra: ks: usize
 }
 
 fn trellis_mma_load(
@@ -175,13 +241,13 @@ fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
         (true, _) => &[t.k],
         (false, _) => &[],
     };
-    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], dtr_tile(t.m), 4, scales)
+    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], t.tile, 4, scales)
 }
 
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: (t.n / BLOCK) * t.ks,
-        down: t.m.div_ceil(dtr_tile(t.m)),
+        down: t.m.div_ceil(t.tile),
         threads: THREADS,
     };
     let sizes = [t.m, t.n, t.k, t.ks];
@@ -199,7 +265,10 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     emits = f32_only,
     needs = dtr_needs(0),
     order = Order::PerConfig,
-    source = cuda_source_entry("dtr_reduce"),
+    source = cuda_source_with(
+        "dtr_reduce",
+        self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
+    ),
     launches = reduce_launches,
     load = reduce_load,
     unproven,
@@ -208,6 +277,7 @@ struct TrellisReduce {
     m: usize,
     n: usize,
     ks: usize,
+    min_blocks: Option<u32>,
     turned: bool,
 }
 
@@ -250,21 +320,24 @@ fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn dtr_pre_tile(m: usize, n: usize) -> usize {
-    if m >= 128 && m.div_ceil(128) * (n / BLOCK) >= 96 {
-        128
-    } else {
-        64
-    }
-}
-
 fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
-    match (dtr_pre_tile(t.m, t.n), t.bits, t.book, t.turned) {
+    match (t.tile, t.bits, t.book, t.turned) {
         (128, 4, 0, true) => "dtr_pre_k4_t16",
         (64, 4, 0, true) => "dtr_pre_k4_t8",
         (128, _, _, _) => "dtr_pre_gen16",
         (_, _, _, _) => "dtr_pre_gen8",
     }
+}
+
+fn dtr_pre_source(t: &TrellisPreMma) -> Source {
+    let entry = dtr_pre_entry(t);
+    let def = match entry {
+        "dtr_pre_k4_t16" => "DTR_T16_BLK",
+        "dtr_pre_k4_t8" => "DTR_T8_BLK",
+        "dtr_pre_gen16" => "DTR_GEN16_BLK",
+        _ => "DTR_GEN8_BLK",
+    };
+    prefill_source_with(entry, t.min_blocks.map(|v| (def, v as usize)))
 }
 
 /// Rotates and quantizes dense inputs once per 64x128 block.
@@ -277,7 +350,10 @@ fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
     emits = f32_only,
     needs = dtr_needs(DTR_SMEM),
     order = Order::PerConfig,
-    source = prefill_source_entry("dtr_prep"),
+    source = prefill_source_with(
+        "dtr_prep",
+        self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)),
+    ),
     launches = prep_launches,
     load = prep_load,
     shared,
@@ -286,6 +362,7 @@ fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
 struct TrellisPrep {
     m: usize,
     k: usize,
+    min_blocks: Option<u32>,
     turned: bool,
 }
 
@@ -328,51 +405,26 @@ fn prep_launches(p: &TrellisPrep, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-/// Prefill dense trellis matmul from pre-rotated input blocks.
-#[derive(Clone, Debug, Kernel)]
-#[launch(
-    name = self.form.suffixed(if self.turned { "trellis_turned_pf" } else { "trellis_mma_pf" }),
-    sizes = [self.m, self.n, self.k],
-    work = self.m * self.n * self.k,
+dtr_mma_kernel! {
+    /// Prefill dense trellis matmul from pre-rotated input blocks.
+    struct TrellisPreMma,
     accepts = pre_mma_accepts,
-    emits = f32_only,
-    needs = dtr_needs(DTR_PRE_SMEM),
-    order = Order::PerConfig,
-    source = prefill_source_entry(dtr_pre_entry(self)),
+    smem = DTR_PRE_SMEM,
+    source = dtr_pre_source,
     launches = pre_mma_launches,
     load = pre_mma_load,
-    unproven,
-)]
-struct TrellisPreMma {
-    m: usize,
-    n: usize,
-    k: usize,
-    bits: u32,
-    book: u32,
-    turned: bool,
-    form: &'static dyn Stored,
-}
-
-fn pre_mma_accepts(k: &TrellisPreMma, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+    suffix = "_pf"
 }
 
 fn pre_mma_load(t: &TrellisPreMma, _: usize) -> Option<Load> {
     let scales: &[usize] = if t.turned { &[t.n] } else { &[] };
-    trellis_mma_load(
-        t.form,
-        [t.m, t.n, t.k, 1],
-        dtr_pre_tile(t.m, t.n),
-        1,
-        scales,
-    )
+    trellis_mma_load(t.form, [t.m, t.n, t.k, 1], t.tile, 1, scales)
 }
 
 fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
-    let tile = dtr_pre_tile(t.m, t.n);
     let shape = Shape::Grid {
         across: t.n / BLOCK,
-        down: t.m.div_ceil(tile),
+        down: t.m.div_ceil(t.tile),
         threads: THREADS,
     };
     let svh = if t.turned { step.read(2) } else { step.read(0) };
@@ -391,47 +443,101 @@ fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn trellis_drafts(d: &Dense) -> Vec<Draft> {
+fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> {
     let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
-    let ks = dtr_ks(m, n, k);
-    if ks == 1 && m >= 64 {
+    let rule = if turned {
+        "trellis_turned"
+    } else {
+        "trellis_mma"
+    };
+    let ks = dtr_ks(m, n, k, tree, rule);
+    let pre_min_rows = tree.knobs.get(rule, "prefill_min_rows").unwrap_or(64);
+    if ks == 1 && m >= pre_min_rows {
+        let large_rows = tree.knobs.get(rule, "prefill_large_rows").unwrap_or(128);
+        let min_groups = tree.knobs.get(rule, "prefill_min_groups").unwrap_or(96);
+        let pre_tile = match tree.knobs.get(rule, "prefill_tile") {
+            Some(64) => 64,
+            Some(128) => 128,
+            Some(v) => return Some(Err(format!("prefill_tile={v} (requires 64 or 128)"))),
+            None => {
+                if m >= large_rows && m.div_ceil(128) * (n / BLOCK) >= min_groups {
+                    128
+                } else {
+                    64
+                }
+            }
+        };
+        let t8_blk = tree.knobs.get(rule, "t8_min_blocks");
+        let t16_blk = tree.knobs.get(rule, "t16_min_blocks");
+        let pre_blk = match (pre_tile, d.bits, d.book, turned) {
+            (128, 4, 0, true) => t16_blk.or_else(|| tree.knobs.get(rule, "min_blocks")),
+            (64, 4, 0, true) => t8_blk.or_else(|| tree.knobs.get(rule, "min_blocks")),
+            _ => tree.knobs.get(rule, "min_blocks"),
+        }
+        .map(|v| v as u32);
         let [suh, svh] = d.turn.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
         let p_reads = [d.x].into_iter().chain(suh).map(Read::Node);
         let m_reads = [Read::Draft(0), Read::Node(d.w)]
             .into_iter()
             .chain(svh.map(Read::Node));
-        let prep = TrellisPrep { m, k, turned };
+        let prep = TrellisPrep {
+            m,
+            k,
+            min_blocks: tree.knobs.get(rule, "prep_min_blocks").map(|v| v as u32),
+            turned,
+        };
         let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
         let mma = TrellisPreMma {
             m,
             n,
             k,
+            tile: pre_tile,
+            min_blocks: pre_blk,
             bits: d.bits,
             book: d.book,
             turned,
             form: d.form,
         };
-        return vec![
+        return Some(Ok(vec![
             Draft::new(prep, p_reads, pre_len),
             Draft::new(mma, m_reads, m * n),
-        ];
+        ]));
     }
+    let tile = match tree.knobs.get(rule, "tile_rows") {
+        Some(8) => 8,
+        Some(16) => 16,
+        Some(32) => 32,
+        Some(v) => return Some(Err(format!("tile_rows={v} (requires 8, 16, or 32)"))),
+        None => dtr_tile(m),
+    };
     let mma = TrellisMma {
         m,
         n,
         k,
         ks,
+        tile,
+        min_blocks: tree.knobs.get(rule, "min_blocks").map(|v| v as u32),
         bits: d.bits,
         book: d.book,
         turned,
         form: d.form,
     };
-    d.drafts(mma, ks, TrellisReduce { m, n, ks, turned })
+    let red = TrellisReduce {
+        m,
+        n,
+        ks,
+        min_blocks: tree.knobs.get(rule, "reduce_min_blocks").map(|v| v as u32),
+        turned,
+    };
+    Some(Ok(d.drafts(mma, ks, red)))
 }
 
 /// Rotated or plain dense trellis matmul.
 fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    Some(Dense::find(tree, at, BLOCK)?.map(|d| trellis_drafts(&d)))
+    match Dense::find(tree, at, BLOCK)? {
+        Ok(d) => trellis_drafts(tree, &d),
+        Err(e) => Some(Err(e)),
+    }
 }
 
 /// One thread's trip. Bf16 widens with one integer op.
@@ -457,11 +563,11 @@ fn cuda_needs(group_bytes: usize) -> Needs {
     }
 }
 
-pub(crate) fn cuda_source_entry(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend(["", cuda_source(), ""]),
-        entry,
-    }
+pub(crate) fn cuda_source_with<'a>(
+    entry: &'static str,
+    defs: impl IntoIterator<Item = (&'a str, usize)>,
+) -> Source {
+    tessera_device::cuda_source_with(cuda_source(), entry, defs)
 }
 
 pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
@@ -469,480 +575,6 @@ pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Sto
         1 => form.name() == expected.name(),
         _ => form.name() == "f32",
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RopeTail {
-    width: usize,
-    rot_stride: usize,
-    rot_off: usize,
-    turned: usize,
-    adjacent: bool,
-    rope_first: bool,
-    theta: f32,
-}
-
-/// Fast CUDA stacked BF16 matmul, transposed or row-major.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    name = if self.wide { "fast_stacked_wide" } else { "fast_stacked_lanes" },
-    sizes = [
-        self.batches, self.rows, self.n, self.k,
-        self.x_stride[0], self.x_stride[1], self.o_stride[0], self.o_stride[1],
-    ],
-    work = self.len * self.k,
-    accepts = stacked_accepts,
-    emits = f32_only,
-    needs = stacked_needs(self),
-    order = Order::PerConfig,
-    source = stacked_source_for(self),
-    launches = stacked_launches,
-    load = stacked_load,
-    unproven,
-)]
-struct FastStacked {
-    len: usize,
-    batches: usize,
-    rows: usize,
-    n: usize,
-    k: usize,
-    block: usize,
-    first: usize,
-    step: usize,
-    x_stride: [usize; 2],
-    o_stride: [usize; 2],
-    wide: bool,
-    rope: Option<RopeTail>,
-    form: &'static dyn Stored,
-}
-
-impl FastStacked {
-    fn wide_64(&self) -> bool {
-        self.wide && self.rows >= 32 && self.n.is_multiple_of(64) && self.k.is_multiple_of(32)
-    }
-
-    fn lanes_64(&self) -> bool {
-        !self.wide && self.rows >= 32 && self.n.is_multiple_of(64) && self.k.is_multiple_of(32)
-    }
-
-    fn tiled_64(&self) -> bool {
-        self.wide_64() || self.lanes_64()
-    }
-
-    fn lanes_tc(&self) -> bool {
-        !self.wide && self.n.is_multiple_of(16) && self.k.is_multiple_of(128)
-    }
-}
-
-fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
-    match input {
-        1 => form.name() == k.form.name(),
-        3 => form.name() == "u32",
-        _ => form.name() == "f32",
-    }
-}
-
-fn stacked_needs(k: &FastStacked) -> Needs {
-    if k.tiled_64() {
-        return Needs {
-            bf16_tile: true,
-            ..cuda_needs(64 * 18 * 4 * 2 + 64 * 40 * 2)
-        };
-    }
-    if !(k.wide || k.lanes_tc()) {
-        return cuda_needs(0);
-    }
-    let group_bytes = if k.wide {
-        16 * 18 * 8 + 32 * 34 * 2
-    } else {
-        4 * 24 * 36 * 4
-    };
-    Needs {
-        group_threads: WIDE_THREADS,
-        bf16_tile: true,
-        ..cuda_needs(group_bytes)
-    }
-}
-
-fn stacked_source_for(k: &FastStacked) -> Source {
-    match (k.wide, k.tiled_64(), k.lanes_tc()) {
-        (true, true, _) => stacked_source_entry("tessera_stacked_wide_64"),
-        (false, true, _) => stacked_source_entry("tessera_stacked_lanes_64"),
-        (true, false, _) => stacked_source_entry("tessera_stacked_wide"),
-        (false, false, true) => cuda_source_entry("tessera_stacked_lanes_tc"),
-        (false, false, false) => cuda_source_entry("tessera_stacked_lanes"),
-    }
-}
-
-fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
-    let (tiled, tc) = (k.tiled_64(), k.lanes_tc());
-    let rtiles = k.rows.div_ceil(match (tiled, k.wide || tc) {
-        (true, _) => 64,
-        (false, true) => 16,
-        (false, false) => 8,
-    });
-    let r = k.rows.min(8);
-    let (groups, group, trips, mut trip_ops, flight) = if tiled {
-        (
-            (k.n / 64) * k.batches * rtiles,
-            THREADS,
-            k.k as f64 / 32.0,
-            Ops::default(),
-            1024.0,
-        )
-    } else if tc {
-        (
-            (k.n / 16) * k.batches * rtiles,
-            128,
-            k.k as f64 / 128.0,
-            Ops::default(),
-            1024.0,
-        )
-    } else if k.wide {
-        (
-            (k.n / WIDE_COLS) * k.batches * rtiles,
-            WIDE_THREADS,
-            k.k as f64 / 32.0,
-            Ops::default(),
-            512.0,
-        )
-    } else {
-        (
-            (k.batches * k.n).div_ceil(WARPS) * rtiles,
-            THREADS,
-            k.k as f64 / 256.0,
-            trip(8 * r, 8, 1 + 2 * r, 16 + 32 * r),
-            512.0,
-        )
-    };
-    trip_ops.fresh = f64::from(u8::from(tiled || tc));
-    let mut reads = vec![
-        (2 * k.batches * rtiles * k.n * k.k) as f64,
-        (4 * k.batches * k.rows * k.k) as f64,
-    ];
-    if let Some(r) = k.rope {
-        reads.push((4 * k.batches * k.rows * r.width) as f64);
-        reads.push((4 * k.rows) as f64);
-    }
-    Some(Load {
-        threads: groups * group,
-        group,
-        trips,
-        trip: trip_ops,
-        reads,
-        written: (4 * k.len) as f64,
-        flight,
-        ..Load::default()
-    })
-}
-
-fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
-    let ([xb, xr], [ob, or]) = (k.x_stride, k.o_stride);
-    let dims = [k.rows, k.n, k.k, k.block, k.first, k.step, xb, xr, ob, or];
-    if k.wide {
-        let (across, down, threads) = if k.wide_64() {
-            (k.n / 64, k.batches * k.rows.div_ceil(64), THREADS)
-        } else {
-            (
-                k.n / WIDE_COLS,
-                k.batches * k.rows.div_ceil(16),
-                WIDE_THREADS,
-            )
-        };
-        let (rot, pos, mat_off, rope_out_off, r) = match k.rope {
-            Some(r) => {
-                let (m_off, r_off) = if r.rope_first { (r.width, 0) } else { (0, k.n) };
-                (step.read(2), step.read(3), m_off, r_off, r)
-            }
-            None => (
-                step.read(0),
-                step.read(0),
-                0,
-                0,
-                RopeTail {
-                    width: 0,
-                    rot_stride: 0,
-                    rot_off: 0,
-                    turned: 0,
-                    adjacent: false,
-                    rope_first: false,
-                    theta: 1.0,
-                },
-            ),
-        };
-        let mut args = vec![
-            step.read(0),
-            step.read(1),
-            rot,
-            pos,
-            step.out(),
-            Arg::count(k.batches),
-        ];
-        args.extend(dims.map(Arg::count));
-        args.extend([
-            Arg::count(mat_off),
-            Arg::count(r.width),
-            Arg::count(r.rot_stride),
-            Arg::count(r.rot_off),
-            Arg::count(rope_out_off),
-            Arg::count(r.turned),
-            Arg::count(usize::from(r.adjacent)),
-            Arg::value(&r.theta),
-        ]);
-        let shape = Shape::Grid {
-            across,
-            down,
-            threads,
-        };
-        return vec![Launch { args, shape }];
-    }
-    let tc = k.lanes_tc() || k.lanes_64();
-    let bn = k.batches * k.n;
-    let (across, down, threads) = if k.lanes_64() {
-        (k.n / 64, k.batches * k.rows.div_ceil(64), THREADS)
-    } else if k.lanes_tc() {
-        (k.n / 16, k.batches * k.rows.div_ceil(16), WIDE_THREADS)
-    } else {
-        (bn.div_ceil(WARPS), k.rows.div_ceil(8), THREADS)
-    };
-    let shape = Shape::Grid {
-        across,
-        down,
-        threads,
-    };
-    let mut args = vec![step.read(0), step.read(1), step.out()];
-    args.extend((!tc).then(|| Arg::count(bn)));
-    args.extend(dims.map(Arg::count));
-    vec![Launch { args, shape }]
-}
-
-fn peel_input(tree: &Tree, x: T, batches: usize, rows: usize, k: usize) -> (T, [usize; 2]) {
-    let is_swap = |t: T| matches!(&tree.node(t).term, Term::Op(Op::View(View::Permute(p))) if p[..] == [1, 0, 2]);
-    if !is_swap(x) || tree.root(x) || tree.node(tree.node(x).args[0]).form.name() != "f32" {
-        return (x, [rows * k, k]);
-    }
-    let inner = tree.node(x).args[0];
-    let slice = matches!(
-        &tree.node(inner).term,
-        Term::Op(Op::View(View::Slice {
-            axis: 2,
-            start: DimExpr::Const(0),
-            ..
-        }))
-    );
-    if slice && !tree.root(inner) {
-        let base = tree.node(inner).args[0];
-        if let &[r, b, fk] = tree.node(base).shape.as_slice()
-            && (r, b) == (rows, batches)
-            && fk.is_multiple_of(4)
-            && tree.node(base).form.name() == "f32"
-        {
-            return (base, [fk, batches * fk]);
-        }
-    }
-    (inner, [k, batches * k])
-}
-
-/// Peels an optional single-reader last-axis slice from `t`.
-fn peel_rot_slice(tree: &Tree, t: T) -> Option<(T, usize, usize)> {
-    if tree.root(t) {
-        return None;
-    }
-    let n = tree.node(t);
-    let Term::Op(Op::View(View::Slice {
-        axis: 2,
-        start: off,
-        ..
-    })) = &n.term
-    else {
-        return None;
-    };
-    let parent = n.args[0];
-    if tree.node(parent).form.name() != "f32" {
-        return None;
-    }
-    let off = off.value(&tree.g.dims, &|d| tree.size(d))? as usize;
-    let stride = *tree.node(parent).shape.last()?;
-    Some((parent, off, stride))
-}
-
-/// Matches `concat(permute(matmul), rope)` or `concat(rope, permute(matmul))`.
-fn match_rope_concat(tree: &Tree, at: T) -> Option<(T, RopeTail, T, T)> {
-    let outer = tree.node(at);
-    if outer.term != Term::Op(Op::View(View::Concat)) || outer.form.name() != "f32" {
-        return None;
-    }
-    let [a, b] = outer.args[..] else {
-        return None;
-    };
-    let is_rope = |t: T| matches!(tree.node(t).term, Term::Stage(Stage::Rope { .. }));
-    let (plain_t, rope_t, rope_first) = match (is_rope(a), is_rope(b)) {
-        (false, true) => (a, b, false),
-        (true, false) => (b, a, true),
-        _ => return None,
-    };
-    if tree.root(plain_t) || tree.root(rope_t) {
-        return None;
-    }
-    let perm = tree.node(plain_t);
-    let Term::Op(Op::View(View::Permute(order))) = &perm.term else {
-        return None;
-    };
-    if order[..] != [1, 0, 2] || perm.form.name() != "f32" {
-        return None;
-    }
-    let mat = perm.args[0];
-    if tree.root(mat) || tree.node(mat).term != Term::Op(Op::Matmul) {
-        return None;
-    }
-    let rope_node = tree.node(rope_t);
-    let Term::Stage(Stage::Rope {
-        theta,
-        pairs,
-        turned,
-    }) = rope_node.term
-    else {
-        return None;
-    };
-    let [rot_in, pos_t] = rope_node.args[..] else {
-        return None;
-    };
-    if rope_node.form.name() != "f32"
-        || tree.node(rot_in).form.name() != "f32"
-        || tree.node(pos_t).form.dtype() != DType::U32
-    {
-        return None;
-    }
-    let &[r_rows, r_heads, rope_w] = rope_node.shape.as_slice() else {
-        return None;
-    };
-    if rope_w == 0
-        || !rope_w.is_multiple_of(2)
-        || tree.elements(pos_t) != r_rows
-        || perm.shape[..2] != [r_rows, r_heads]
-    {
-        return None;
-    }
-    let (rot_src, rot_off, rot_stride) =
-        peel_rot_slice(tree, rot_in).unwrap_or((rot_in, 0, rope_w));
-    let tail = RopeTail {
-        width: rope_w,
-        rot_stride,
-        rot_off,
-        turned: turned.map_or(rope_w / 2, |t| t as usize),
-        adjacent: pairs == Pairs::Adjacent,
-        rope_first,
-        theta,
-    };
-    Some((mat, tail, rot_src, pos_t))
-}
-
-fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    let outer = tree.node(at);
-    let (node, out_swap, rope_match) =
-        if let Some((mat, tail, rot, pos)) = match_rope_concat(tree, at) {
-            (tree.node(mat), true, Some((tail, rot, pos)))
-        } else {
-            match &outer.term {
-                Term::Op(Op::View(View::Permute(p))) if p[..] == [1, 0, 2] => {
-                    let inner = outer.args[0];
-                    if tree.root(inner) || tree.node(inner).term != Term::Op(Op::Matmul) {
-                        return None;
-                    }
-                    (tree.node(inner), true, None)
-                }
-                Term::Op(Op::Matmul) => (outer, false, None),
-                _ => return None,
-            }
-        };
-    let (x, mut w) = (node.args[0], node.args[1]);
-    let (&[batches, n, k], &[xb, rows, xk]) =
-        (tree.node(w).shape.as_slice(), tree.node(x).shape.as_slice())
-    else {
-        return None;
-    };
-    if xb != batches || xk != k || rows == 0 {
-        return None;
-    }
-    if [outer.form, node.form, tree.node(x).form]
-        .iter()
-        .any(|f| f.name() != "f32")
-    {
-        return Some(Err("stacked requires f32 input and output".into()));
-    }
-    let wide =
-        matches!(&tree.node(w).term, Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]);
-    if rope_match.is_some() && !wide {
-        return None;
-    }
-    let (x, x_stride) = peel_input(tree, x, batches, rows, k);
-    let out_w = n + rope_match.map_or(0, |(r, _, _)| r.width);
-    let o_stride = if out_swap {
-        [out_w, batches * out_w]
-    } else {
-        [rows * out_w, out_w]
-    };
-    w = if wide { tree.node(w).args[0] } else { w };
-    let mut first_row = 0usize;
-    if let Term::Op(Op::View(View::Slice { axis: 1, start, .. })) = &tree.node(w).term {
-        let Some(offset) = start.value(&tree.g.dims, &|d| tree.size(d)) else {
-            return Some(Err("slice start is dynamic".into()));
-        };
-        (first_row, w) = (offset as usize, tree.node(w).args[0]);
-    }
-    if !matches!(&tree.node(w).term, Term::Op(Op::View(View::Reshape(_)))) {
-        return Some(Err("weight is not a reshaped 2D leaf".into()));
-    }
-    let leaf = tree.node(w).args[0];
-    let (&[_, block_rows, width], &[_, stored_w]) = (
-        tree.node(w).shape.as_slice(),
-        tree.node(leaf).shape.as_slice(),
-    ) else {
-        return Some(Err("reshaped weight is not 3D over 2D leaf".into()));
-    };
-    let form = tree.node(leaf).form;
-    if !tree.leaf(leaf) || stored_w != width || form.name() != "bf16" {
-        return Some(Err(
-            "stacked requires direct bf16 leaf with matching width".into()
-        ));
-    }
-    let (block, first) = (block_rows * width, first_row * width);
-    if ![block, first, width].iter().all(|v| v.is_multiple_of(8)) {
-        return Some(Err(format!(
-            "strides ({width}, {block}, {first}) not multiple of 8"
-        )));
-    }
-    let ok = if wide {
-        n > 0 && n.is_multiple_of(WIDE_COLS) && k > 0 && k.is_multiple_of(32)
-    } else {
-        n > 0 && k > 0 && k.is_multiple_of(8)
-    };
-    if !ok {
-        return Some(Err(format!(
-            "stacked shape n={n} k={k} wide={wide} unsupported"
-        )));
-    }
-    let (rope, reads) = match rope_match {
-        Some((tail, rot, pos)) => (Some(tail), vec![x, leaf, rot, pos]),
-        None => (None, vec![x, leaf]),
-    };
-    let len = batches * rows * out_w;
-    let k = FastStacked {
-        len,
-        batches,
-        rows,
-        n,
-        k,
-        block,
-        first,
-        step: width,
-        x_stride,
-        o_stride,
-        wide,
-        rope,
-        form,
-    };
-    Some(Ok(vec![Draft::new(k, reads, len)]))
 }
 
 cuda_rule!("trellis_mma", check = eval_trellis);

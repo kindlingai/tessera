@@ -275,6 +275,12 @@ fn sweep_follows_rows() {
     assert!(points.iter().all(|p| p.seconds > 0.0 && p.bytes > 0));
     let table = crate::sweep::table(&points, Rows);
     assert!(table.contains("least timed time per Rows"), "{table}");
+
+    let mut knobs = tessera_lower::Knobs::default();
+    knobs.parse("tiled:band=16").unwrap();
+    let tuned =
+        crate::sweep::points_with(&mut s, Rows, &[4, 16], &settings(), &knobs, false).unwrap();
+    assert_eq!(tuned.len(), 2);
 }
 
 /// Zipf routing yields distinct ids and higher skew than uniform.

@@ -2,8 +2,9 @@
 
 use tessera_codegen::ir::Body;
 use tessera_codegen::prelude::*;
-use tessera_lower::sites;
-use tessera_lower::{Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
+use tessera_lower::{
+    Draft, Kernel, Knobs, Launch, Needs, Read, Shape, Source, Step, T, Tree, knob, sites,
+};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 512;
@@ -13,12 +14,6 @@ const RADIX_THREADS: u32 = 256;
 
 /// Eleven-bit radix buckets per histogram pass.
 const HIST_BINS: u32 = 2048;
-
-/// Histogram bins reduced per thread.
-const HIST_STEP: u32 = HIST_BINS / RADIX_THREADS;
-
-/// Warps per radix block.
-const WARPS: u32 = RADIX_THREADS / LANES as u32;
 
 /// Elements per thread in each collect tile.
 const TILE_ELEMS: u32 = 4;
@@ -32,18 +27,6 @@ const SLOTS_SMALL: u32 = 4096;
 /// Shared pool slots for `4096 < k <= 8192`.
 const SLOTS_LARGE: u32 = 8192;
 
-/// Scan scratch entries: per-thread plus bin totals.
-const SCAN_LEN: u32 = RADIX_THREADS + WARPS;
-
-/// The best index in each piece of each row.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(peaks, threads = self.rows * self.parts, work = self.rows * self.width)]
-pub(crate) struct Peaks {
-    pub rows: usize,
-    pub width: usize,
-    pub parts: usize,
-}
-
 /// Threads per row in the final argmax reduction.
 const ARGMAX_THREADS: u32 = 256;
 
@@ -56,13 +39,70 @@ const MERGE_THREADS: u32 = 256;
 /// Maximum candidate list cached in shared memory by `merge_top`.
 const MERGE_MAX: u32 = 1024;
 
+knob!("argmax", "parts", 1, 4096);
+knob!("argmax", "chunk_min_width", 1, 1_048_576);
+knob!("argmax", "chunk_max_k", 1, 64);
+knob!("argmax", "radix_min_k", 2, 8192);
+knob!("argmax", "argmax_threads", 32, 1024);
+knob!("argmax", "chunk_threads", 32, 1024);
+knob!("argmax", "merge_threads", 32, 1024);
+knob!("argmax", "merge_max", 32, 4096);
+knob!("argmax", "radix_threads", 64, 1024);
+knob!("argmax", "cache_keys", 0, 1);
+
+#[derive(Clone, Copy)]
+struct ArgmaxCfg {
+    parts: usize,
+    chunk_min_width: usize,
+    chunk_max_k: usize,
+    radix_min_k: usize,
+    argmax_threads: u32,
+    chunk_threads: u32,
+    merge_threads: u32,
+    merge_max: u32,
+    radix_threads: u32,
+    cache_keys: Option<bool>,
+}
+
+impl ArgmaxCfg {
+    fn of(knobs: &Knobs) -> Option<Self> {
+        let get = |name, default| knobs.get("argmax", name).unwrap_or(default);
+        let cfg = Self {
+            parts: get("parts", PARTS),
+            chunk_min_width: get("chunk_min_width", 512),
+            chunk_max_k: get("chunk_max_k", 32),
+            radix_min_k: get("radix_min_k", 33),
+            argmax_threads: get("argmax_threads", ARGMAX_THREADS as usize) as u32,
+            chunk_threads: get("chunk_threads", CHUNK_THREADS as usize) as u32,
+            merge_threads: get("merge_threads", MERGE_THREADS as usize) as u32,
+            merge_max: get("merge_max", MERGE_MAX as usize) as u32,
+            radix_threads: get("radix_threads", RADIX_THREADS as usize) as u32,
+            cache_keys: knobs.get("argmax", "cache_keys").map(|v| v != 0),
+        };
+        let pow2 = cfg.argmax_threads.is_power_of_two()
+            && cfg.chunk_threads.is_power_of_two()
+            && cfg.radix_threads.is_power_of_two()
+            && HIST_BINS.is_multiple_of(cfg.radix_threads);
+        pow2.then_some(cfg)
+    }
+}
+
+/// The best index in each piece of each row.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(peaks, threads = self.rows * self.parts, work = self.rows * self.width)]
+pub(crate) struct Peaks {
+    pub rows: usize,
+    pub width: usize,
+    pub parts: usize,
+}
+
 /// The best of each row's peaks.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    argmax,
+    argmax(self.threads, self.threads.trailing_zeros(), self.threads / 2),
     sizes = [self.rows, self.width, self.parts],
     work = self.rows * self.parts,
-    needs = argmax_needs(),
+    needs = argmax_needs(self.threads),
     launches = argmax_launches,
 )]
 pub(crate) struct Argmax {
@@ -71,12 +111,13 @@ pub(crate) struct Argmax {
     pub parts: usize,
     pub first: usize,
     pub whole: usize,
+    pub threads: u32,
 }
 
-fn argmax_needs() -> Needs {
+fn argmax_needs(threads: u32) -> Needs {
     Needs {
-        group_bytes: 8 * ARGMAX_THREADS as usize,
-        group_threads: ARGMAX_THREADS as usize,
+        group_bytes: 8 * threads as usize,
+        group_threads: threads as usize,
         ..Needs::default()
     }
 }
@@ -85,7 +126,7 @@ fn argmax_launches(k: &Argmax, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: k.rows,
         down: 1,
-        threads: ARGMAX_THREADS as usize,
+        threads: k.threads as usize,
     };
     vec![Launch::plain(
         step,
@@ -112,10 +153,10 @@ pub(crate) struct TopK {
 /// Top `k` indices inside each winning chunk of each row.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    chunk_top,
+    chunk_top(self.threads, self.threads.trailing_zeros(), self.threads / 2),
     sizes = [self.rows, self.width, self.parts, self.k],
     work = self.rows * self.width * self.k / self.parts.max(1),
-    needs = chunk_needs(),
+    needs = chunk_needs(self.threads),
     launches = chunk_launches,
 )]
 pub(crate) struct ChunkTop {
@@ -123,12 +164,13 @@ pub(crate) struct ChunkTop {
     pub width: usize,
     pub parts: usize,
     pub k: usize,
+    pub threads: u32,
 }
 
-fn chunk_needs() -> Needs {
+fn chunk_needs(threads: u32) -> Needs {
     Needs {
-        group_bytes: 8 * CHUNK_THREADS as usize,
-        group_threads: CHUNK_THREADS as usize,
+        group_bytes: 8 * threads as usize,
+        group_threads: threads as usize,
         ..Needs::default()
     }
 }
@@ -137,7 +179,7 @@ fn chunk_launches(c: &ChunkTop, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: c.rows * c.k,
         down: 1,
-        threads: CHUNK_THREADS as usize,
+        threads: c.threads as usize,
     };
     vec![Launch::plain(step, &[c.rows, c.width, c.parts, c.k], shape)]
 }
@@ -145,10 +187,10 @@ fn chunk_launches(c: &ChunkTop, step: &Step) -> Vec<Launch> {
 /// Selects top `k` from `total` distinct row candidates.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    merge_top,
+    merge_top(self.threads, self.merge_max),
     sizes = [self.rows, self.width, self.total, self.k],
     work = self.rows * self.total * self.total,
-    needs = merge_needs(),
+    needs = merge_needs(self.threads, self.merge_max),
     launches = merge_launches,
 )]
 pub(crate) struct MergeTop {
@@ -158,12 +200,14 @@ pub(crate) struct MergeTop {
     pub k: usize,
     pub first: usize,
     pub whole: usize,
+    pub threads: u32,
+    pub merge_max: u32,
 }
 
-fn merge_needs() -> Needs {
+fn merge_needs(threads: u32, merge_max: u32) -> Needs {
     Needs {
-        group_bytes: 8 * MERGE_MAX as usize,
-        group_threads: MERGE_THREADS as usize,
+        group_bytes: 8 * merge_max as usize,
+        group_threads: threads as usize,
         ..Needs::default()
     }
 }
@@ -172,7 +216,7 @@ fn merge_launches(m: &MergeTop, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: m.rows,
         down: 1,
-        threads: MERGE_THREADS as usize,
+        threads: m.threads as usize,
     };
     vec![Launch::plain(
         step,
@@ -196,6 +240,8 @@ pub(crate) struct RadixTopK {
     pub k: usize,
     pub first: usize,
     pub whole: usize,
+    pub threads: u32,
+    pub cache_keys: bool,
 }
 
 fn radix_name(k: usize) -> &'static str {
@@ -214,11 +260,18 @@ fn radix_slots(k: usize) -> usize {
 }
 
 fn radix_body(k: &RadixTopK) -> Body {
-    match k.k {
-        0..=2048 => radix_top_k_ir::<SLOTS_SMALL, 11, true>(),
-        2049..=4096 => radix_top_k_ir::<SLOTS_SMALL, 12, false>(),
-        _ => radix_top_k_ir::<SLOTS_LARGE, 13, false>(),
-    }
+    let (slots, stages) = match k.k {
+        0..=2048 => (SLOTS_SMALL, 11),
+        2049..=4096 => (SLOTS_SMALL, 12),
+        _ => (SLOTS_LARGE, 13),
+    };
+    let warps = k.threads / LANES as u32;
+    let hist_step = HIST_BINS / k.threads;
+    let scan_len = k.threads + warps;
+    let cache_keys = k.cache_keys && k.k <= 2048;
+    radix_top_k_ir(
+        slots, stages, cache_keys, k.threads, warps, hist_step, scan_len,
+    )
 }
 
 fn radix_source(k: &RadixTopK) -> Source {
@@ -229,7 +282,7 @@ fn radix_launches(k: &RadixTopK, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: k.rows,
         down: 1,
-        threads: RADIX_THREADS as usize,
+        threads: k.threads as usize,
     };
     vec![Launch::plain(
         step,
@@ -239,9 +292,11 @@ fn radix_launches(k: &RadixTopK, step: &Step) -> Vec<Launch> {
 }
 
 fn radix_needs(k: &RadixTopK) -> Needs {
+    let warps = k.threads as usize / LANES;
+    let scan = k.threads as usize + warps;
     Needs {
-        group_bytes: 4 * (radix_slots(k.k) + HIST_BINS as usize + SCAN_LEN as usize),
-        group_threads: RADIX_THREADS as usize,
+        group_bytes: 4 * (radix_slots(k.k) + HIST_BINS as usize + scan),
+        group_threads: k.threads as usize,
         ..Needs::default()
     }
 }
@@ -254,7 +309,7 @@ fn radix_work(k: &RadixTopK) -> usize {
     let per_row = passes
         .saturating_mul(k.width)
         .saturating_add(sort)
-        .saturating_add(RADIX_THREADS as usize * 4);
+        .saturating_add(k.threads as usize * 4);
     k.rows.saturating_mul(per_row)
 }
 
@@ -329,8 +384,11 @@ fn argmax(
     parts: u32,
     first: u32,
     whole: u32,
+    #[build] threads: u32,
+    #[build] steps: u32,
+    #[build] half: u32,
 ) {
-    let row = gid() / ARGMAX_THREADS;
+    let row = gid() / threads;
     if row >= rows {
         return;
     }
@@ -338,7 +396,7 @@ fn argmax(
     let at = row as u64 * width as u64;
     let mut arg = width;
     let mut best = f32::NEG_INFINITY;
-    for p in (l..parts).by(ARGMAX_THREADS) {
+    for p in (l..parts).by(threads) {
         let i = peaks[(row * parts + p) as u64];
         if i < width {
             let v = x[at + i as u64];
@@ -348,13 +406,13 @@ fn argmax(
             }
         }
     }
-    let mut val_s = shared::<f32>(ARGMAX_THREADS);
-    let mut idx_s = shared::<u32>(ARGMAX_THREADS);
+    let mut val_s = shared::<f32>(threads);
+    let mut idx_s = shared::<u32>(threads);
     val_s[l] = best;
     idx_s[l] = arg;
     barrier();
-    for shift in 0..8 {
-        let s = 128u32 >> shift;
+    for shift in 0..steps {
+        let s = half >> shift;
         if l < s {
             let ov = val_s[l + s];
             let oi = idx_s[l + s];
@@ -383,8 +441,11 @@ fn chunk_top(
     width: u32,
     parts: u32,
     k: u32,
+    #[build] threads: u32,
+    #[build] steps: u32,
+    #[build] half: u32,
 ) {
-    let item = gid() / CHUNK_THREADS;
+    let item = gid() / threads;
     if item >= rows * k {
         return;
     }
@@ -393,7 +454,7 @@ fn chunk_top(
     let win = winners[item as u64];
     let dst = (item * k) as u64;
     if win >= width {
-        for p in (l..k).by(CHUNK_THREADS) {
+        for p in (l..k).by(threads) {
             out[dst + p as u64] = width;
         }
         return;
@@ -406,8 +467,8 @@ fn chunk_top(
         width
     };
     let at = row as u64 * width as u64;
-    let mut val_s = shared::<f32>(CHUNK_THREADS);
-    let mut idx_s = shared::<u32>(CHUNK_THREADS);
+    let mut val_s = shared::<f32>(threads);
+    let mut idx_s = shared::<u32>(threads);
     if l == 0 {
         out[dst] = win;
     }
@@ -416,7 +477,7 @@ fn chunk_top(
     for p in 1..k {
         let mut arg = width;
         let mut best = f32::NEG_INFINITY;
-        for i in (from + l..to).by(CHUNK_THREADS) {
+        for i in (from + l..to).by(threads) {
             let v = x[at + i as u64];
             if v > f32::NEG_INFINITY {
                 let under = v < cap || (v == cap && i > prev);
@@ -429,8 +490,8 @@ fn chunk_top(
         val_s[l] = best;
         idx_s[l] = arg;
         barrier();
-        for shift in 0..7 {
-            let s = 64u32 >> shift;
+        for shift in 0..steps {
+            let s = half >> shift;
             if l < s {
                 let ov = val_s[l + s];
                 let oi = idx_s[l + s];
@@ -462,17 +523,19 @@ fn merge_top(
     k: u32,
     first: u32,
     whole: u32,
+    #[build] threads: u32,
+    #[build] merge_max: u32,
 ) {
-    let row = gid() / MERGE_THREADS;
+    let row = gid() / threads;
     if row >= rows {
         return;
     }
     let l = lid();
     let at = row as u64 * width as u64;
     let base = (row * total) as u64;
-    let mut vals = shared::<f32>(MERGE_MAX);
-    let mut idxs = shared::<u32>(MERGE_MAX);
-    for m in (l..total).by(MERGE_THREADS) {
+    let mut vals = shared::<f32>(merge_max);
+    let mut idxs = shared::<u32>(merge_max);
+    for m in (l..total).by(threads) {
         let idx = cands[base + m as u64];
         idxs[m] = idx;
         vals[m] = if idx < width {
@@ -482,7 +545,7 @@ fn merge_top(
         };
     }
     barrier();
-    for t in (l..total).by(MERGE_THREADS) {
+    for t in (l..total).by(threads) {
         let idx = idxs[t];
         let val = vals[t];
         let mut rank = 0u32;
@@ -524,7 +587,8 @@ fn float_key(v: f32) -> u32 {
 
 /// Radix-selects and bitonic-sorts top `k` indices per row.
 #[kernel]
-fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
+#[allow(clippy::too_many_arguments)]
+fn radix_top_k(
     x: Buf<F32>,
     mut out: BufMut<U32>,
     rows: u32,
@@ -532,17 +596,24 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
     k: u32,
     first: u32,
     whole: u32,
+    #[build] slots: u32,
+    #[build] max_stages: u32,
+    #[build] cache_keys: bool,
+    #[build] threads: u32,
+    #[build] warps: u32,
+    #[build] hist_step: u32,
+    #[build] scan_len: u32,
 ) {
-    let row = gid() / RADIX_THREADS;
+    let row = gid() / threads;
     if row >= rows {
         return;
     }
     let l = lid();
     let at = row as u64 * width as u64;
     let out_at = row as u64 * k as u64;
-    let mut pool = shared::<u32>(SLOTS);
+    let mut pool = shared::<u32>(slots);
     let mut hist = atomic_shared(HIST_BINS);
-    let mut scan = shared::<u32>(SCAN_LEN);
+    let mut scan = shared::<u32>(scan_len);
 
     let mut strict_min = 1u32;
     let mut thresh = 0u32;
@@ -563,7 +634,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
             };
             let bmask = if pass < 2u32 { 2047u32 } else { 1023u32 };
             if !done {
-                for j in (l..HIST_BINS).by(RADIX_THREADS) {
+                for j in (l..HIST_BINS).by(threads) {
                     hist[j] = 0u32;
                 }
             }
@@ -571,7 +642,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
             if !done {
                 let mut run_b = HIST_BINS;
                 let mut run_c = 0u32;
-                for i in (l..width).by(RADIX_THREADS) {
+                for i in (l..width).by(threads) {
                     let key = float_key(x[at + i as u64]);
                     if key != 0u32 && (key & mask) == prefix {
                         let d = (key >> shift) & bmask;
@@ -592,28 +663,28 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
             }
             barrier();
             if !done {
-                let base = l * HIST_STEP;
+                let base = l * hist_step;
                 let mut sum = 0u32;
-                for j in 0..HIST_STEP {
+                for j in 0..hist_step {
                     sum += hist[base + j];
                 }
                 scan[l] = sum;
             }
             barrier();
-            if !done && l < WARPS {
+            if !done && l < warps {
                 let w_base = l * LANES as u32;
                 let mut wt = 0u32;
                 for j in 0..LANES as u32 {
                     wt += scan[w_base + j];
                 }
-                scan[RADIX_THREADS + l] = wt;
+                scan[threads + l] = wt;
             }
             barrier();
             if !done {
                 if pass == 0u32 {
                     let mut finite = 0u32;
-                    for w in 0..WARPS {
-                        finite += scan[RADIX_THREADS + w];
+                    for w in 0..warps {
+                        finite += scan[threads + w];
                     }
                     if finite <= k {
                         done = true;
@@ -622,10 +693,10 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
                 if !done {
                     let mut win_w = 0u32;
                     let mut found_w = false;
-                    for rev in 0..WARPS {
+                    for rev in 0..warps {
                         if !found_w {
-                            let w = WARPS - 1u32 - rev;
-                            let c = scan[RADIX_THREADS + w];
+                            let w = warps - 1u32 - rev;
+                            let c = scan[threads + w];
                             if need > c {
                                 need -= c;
                             } else {
@@ -650,10 +721,10 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
                         }
                     }
                     let mut found_b = false;
-                    let b_base = win_m * HIST_STEP;
-                    for rev in 0..HIST_STEP {
+                    let b_base = win_m * hist_step;
+                    for rev in 0..hist_step {
                         if !found_b {
-                            let j = HIST_STEP - 1u32 - rev;
+                            let j = hist_step - 1u32 - rev;
                             let b = b_base + j;
                             let c = hist[b];
                             if need > c {
@@ -683,7 +754,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
     let mut running_gt = 0u32;
     let mut running_eq = 0u32;
     let eq_base = k - need_eq;
-    let tile = RADIX_THREADS * TILE_ELEMS;
+    let tile = threads * TILE_ELEMS;
     for base in (0..width).by(tile) {
         let t_base = base + l * TILE_ELEMS;
         let mut keys = [0u32; TILE_ELEMS as usize];
@@ -704,7 +775,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
         }
         scan[l] = c_gt | (c_eq << 16u32);
         barrier();
-        if l < WARPS {
+        if l < warps {
             let mut sum = 0u32;
             let w_base = l * LANES as u32;
             for j in 0..LANES as u32 {
@@ -712,14 +783,14 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
                 scan[w_base + j] = sum;
                 sum += v;
             }
-            scan[RADIX_THREADS + l] = sum;
+            scan[threads + l] = sum;
         }
         barrier();
         let warp = l / LANES as u32;
         let mut w_pre = 0u32;
         let mut tile_tot = 0u32;
-        for w in 0..WARPS {
-            let wt = scan[RADIX_THREADS + w];
+        for w in 0..warps {
+            let wt = scan[threads + w];
             if w < warp {
                 w_pre += wt;
             }
@@ -734,7 +805,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
             if key >= strict_min {
                 if pos_gt < k {
                     pool[pos_gt] = idx;
-                    if CACHE_KEYS {
+                    if cache_keys {
                         pool[2048u32 + pos_gt] = key;
                     }
                 }
@@ -753,15 +824,14 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
 
     let above = running_gt;
     let mut cap = 1u32;
-    let max_stages = MAX_STAGES;
     for _s in 0..max_stages {
         if cap < above {
             cap = cap * 2u32;
         }
     }
-    for p in (above + l..cap).by(RADIX_THREADS) {
+    for p in (above + l..cap).by(threads) {
         pool[p] = width;
-        if CACHE_KEYS {
+        if cache_keys {
             pool[2048u32 + p] = 0u32;
         }
     }
@@ -773,7 +843,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
         for sub in 0..stage + 1u32 {
             if size <= cap {
                 let stride = 1u32 << (stage - sub);
-                for pair in (l..pairs).by(RADIX_THREADS) {
+                for pair in (l..pairs).by(threads) {
                     let block = pair / stride;
                     let off = pair % stride;
                     let p = block * stride * 2u32 + off;
@@ -782,7 +852,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
                     let iq = pool[q];
                     let mut kp = 0u32;
                     let mut kq = 0u32;
-                    if CACHE_KEYS {
+                    if cache_keys {
                         kp = pool[2048u32 + p];
                         kq = pool[2048u32 + q];
                     } else {
@@ -799,7 +869,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
                     if swap {
                         pool[p] = iq;
                         pool[q] = ip;
-                        if CACHE_KEYS {
+                        if cache_keys {
                             pool[2048u32 + p] = kq;
                             pool[2048u32 + q] = kp;
                         }
@@ -810,11 +880,11 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
         }
     }
 
-    for p in (l..above).by(RADIX_THREADS) {
+    for p in (l..above).by(threads) {
         out[out_at + p as u64] = first + pool[p];
     }
     if need_eq == 0u32 {
-        for p in (above + l..k).by(RADIX_THREADS) {
+        for p in (above + l..k).by(threads) {
             out[out_at + p as u64] = whole;
         }
     }
@@ -829,45 +899,46 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         first,
         whole,
     } = tree.site(at)?;
+    let cfg = ArgmaxCfg::of(&tree.knobs)?;
+    let parts = cfg.parts.min(width);
     if k > 1 {
-        if width > 512 && k <= 32 {
-            let parts = PARTS.min(width / 2).max(k);
-            return Some(vec![
-                Draft::new(Peaks { rows, width, parts }, [x], rows * parts),
+        let can_chunk = width > cfg.chunk_min_width
+            && k <= cfg.chunk_max_k
+            && k * k <= cfg.merge_max as usize
+            && parts >= k
+            && parts <= cfg.merge_max as usize;
+        if can_chunk {
+            let merge = |total, first, whole, src| {
                 Draft::new(
                     MergeTop {
                         rows,
                         width,
-                        total: parts,
+                        total,
                         k,
-                        first: 0,
-                        whole: width,
+                        first,
+                        whole,
+                        threads: cfg.merge_threads,
+                        merge_max: cfg.merge_max,
                     },
-                    [Read::Node(x), Read::Draft(0)],
+                    [Read::Node(x), Read::Draft(src)],
                     rows * k,
-                ),
+                )
+            };
+            return Some(vec![
+                Draft::new(Peaks { rows, width, parts }, [x], rows * parts),
+                merge(parts, 0, width, 0),
                 Draft::new(
                     ChunkTop {
                         rows,
                         width,
                         parts,
                         k,
+                        threads: cfg.chunk_threads,
                     },
                     [Read::Node(x), Read::Draft(1)],
                     rows * k * k,
                 ),
-                Draft::new(
-                    MergeTop {
-                        rows,
-                        width,
-                        total: k * k,
-                        k,
-                        first,
-                        whole,
-                    },
-                    [Read::Node(x), Read::Draft(2)],
-                    rows * k,
-                ),
+                merge(k * k, first, whole, 2),
             ]);
         }
         let mut drafts = vec![Draft::new(
@@ -881,7 +952,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             [x],
             rows * k,
         )];
-        if k > 32 && k <= RADIX_MAX_K {
+        if k >= cfg.radix_min_k && k <= RADIX_MAX_K {
             drafts.push(
                 Draft::new(
                     RadixTopK {
@@ -890,6 +961,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                         k,
                         first,
                         whole,
+                        threads: cfg.radix_threads,
+                        cache_keys: cfg.cache_keys.unwrap_or(k <= 2048),
                     },
                     [x],
                     rows * k,
@@ -899,7 +972,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         }
         return Some(drafts);
     }
-    let parts = PARTS.min(width).max(1);
+    let parts = parts.max(1);
     let both = [Read::Node(x), Read::Draft(0)];
     Some(vec![
         Draft::new(Peaks { rows, width, parts }, [x], rows * parts),
@@ -910,6 +983,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                 parts,
                 first,
                 whole,
+                threads: cfg.argmax_threads,
             },
             both,
             rows,

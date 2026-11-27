@@ -1,4 +1,4 @@
-use crate::{FastStacked, stacked_needs, stacked_source, stacked_source_for};
+use crate::stacked::{FastStacked, stacked_needs, stacked_source, stacked_source_for};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{
     DType, Dim, Node, NodeId, Op, Pairs, Port, Role, Row, Stage, TensorType, View,
@@ -21,6 +21,8 @@ fn stacked_kernel(rows: usize, n: usize, k: usize, wide: bool) -> FastStacked {
         x_stride: [rows * k, k],
         o_stride: [rows * n, n],
         wide,
+        tiled64_min_rows: 32,
+        min_blocks: None,
         rope: None,
         form: BF16_FORM,
     }

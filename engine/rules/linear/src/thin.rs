@@ -5,10 +5,12 @@ use tessera_codegen::ir::{Body, Expr, Intrinsic};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Launch, Load, Shape, Step, T, Tree};
+use tessera_lower::{Draft, Kernel, Launch, Load, Shape, Step, T, Tree, knob};
 
 /// Its row limit: each thread keeps one sum per row.
 pub(crate) const THIN_ROWS: usize = 32;
+
+knob!("thin", "max_rows", 1, 64);
 
 /// The same product as `Matmul`, for few rows.
 #[derive(Clone, Debug, Kernel)]
@@ -28,6 +30,7 @@ pub(crate) const THIN_ROWS: usize = 32;
 )]
 pub(crate) struct Thin {
     pub product: Product,
+    pub rows_cap: usize,
 }
 
 /// One thread per column with one sum per row.
@@ -39,6 +42,7 @@ fn thin(
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] rows_cap: usize,
     #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
@@ -46,7 +50,7 @@ fn thin(
     if gid() >= n {
         return;
     }
-    let mut sums = [0.0f32; THIN_ROWS];
+    let mut sums = local::<f32>(rows_cap);
     for row in 0..m as u32 {
         sums[row as usize] = 0.0;
     }
@@ -68,10 +72,19 @@ impl Thin {
             out_form,
             ..
         } = self.product;
-        let key: Variant = ("thin", m, x_form.name(), form.name(), out_form.name(), 0);
+        let rows_cap = self.rows_cap;
+        let key: Variant = (
+            "thin",
+            m,
+            x_form.name(),
+            form.name(),
+            out_form.name(),
+            0,
+            rows_cap,
+        );
         let mut body = self
             .product
-            .tree(key, || thin_ir(m, x_form, form, out_form));
+            .tree(key, || thin_ir(m, rows_cap, x_form, form, out_form));
         let gid = Expr::Call(Intrinsic::Gid, Vec::new());
         body.stmts.push(self.product.rows("row", "sums", gid));
         body
@@ -107,11 +120,13 @@ fn thin_launches(k: &Thin, step: &Step) -> Vec<Launch> {
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (product, reads) = Product::find(tree, at)?;
-    if product.picked.is_some() || product.m > THIN_ROWS {
+    let max_rows = tree.knobs.get("thin", "max_rows").unwrap_or(THIN_ROWS);
+    if product.picked.is_some() || product.m > max_rows {
         return None;
     }
     let len = product.outputs();
-    Some(vec![Draft::new(Thin { product }, reads, len)])
+    let rows_cap = product.m.max(THIN_ROWS);
+    Some(vec![Draft::new(Thin { product, rows_cap }, reads, len)])
 }
 
 tessera_lower::rule!("thin", propose);

@@ -4,6 +4,16 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
+#ifndef ST_WIDE_BLK
+#define ST_WIDE_BLK 6
+#endif
+#ifndef ST_LANES64_BLK
+#define ST_LANES64_BLK 3
+#endif
+#ifndef ST_WIDE64_BLK
+#define ST_WIDE64_BLK 3
+#endif
+
 static __device__ __forceinline__ uint4 st_ld_nc4(const void* p) {
     return __ldg(reinterpret_cast<const uint4*>(p));
 }
@@ -97,7 +107,7 @@ static __device__ __forceinline__ void st_rope_tail(
 }
 
 // Tensor-Core BF16 transposed stacked matmul, 16x32 per CTA.
-extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
+extern "C" __global__ __launch_bounds__(128, ST_WIDE_BLK) void tessera_stacked_wide(
     const float* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
     u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
     u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
@@ -224,14 +234,14 @@ static __device__ __forceinline__ void st_stacked_64(
     }
 }
 
-extern "C" __global__ __launch_bounds__(256, 3) void tessera_stacked_lanes_64(
+extern "C" __global__ __launch_bounds__(256, ST_LANES64_BLK) void tessera_stacked_lanes_64(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
     u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     st_stacked_64<false>(x, w, out, 1u, rows, n, k, block, first, col_step, x_bs, x_rs, o_bs, o_rs,
                          0u, nullptr, nullptr, 0u, 0u, 0u, 0u, 0u, 0u, 0.0f);
 }
 
-extern "C" __global__ __launch_bounds__(256, 3) void tessera_stacked_wide_64(
+extern "C" __global__ __launch_bounds__(256, ST_WIDE64_BLK) void tessera_stacked_wide_64(
     const float* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
     u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
     u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,

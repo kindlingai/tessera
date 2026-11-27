@@ -112,6 +112,35 @@ pub(crate) fn flatten_cuda(name: &str, kernel: &str) -> &'static str {
     flatten_for(Backend::Cuda, name, kernel)
 }
 
+/// Prefixes CUDA text with `#define` overrides when non-empty.
+pub(crate) fn cuda_prefixed<'a>(
+    base: &'static str,
+    defs: impl IntoIterator<Item = (&'a str, usize)>,
+) -> &'static str {
+    let items: Vec<(String, String)> = defs
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    if items.is_empty() {
+        return base;
+    }
+    let prefix = tessera_lower::define_prefix(items.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .expect("valid cuda define");
+    tessera_lower::prefixed(&prefix, base)
+}
+
+/// Static CUDA source with optional `#define NAME VAL` overrides.
+pub fn cuda_source_with<'a>(
+    base: &'static str,
+    entry: &'static str,
+    defs: impl IntoIterator<Item = (&'a str, usize)>,
+) -> tessera_lower::Source {
+    tessera_lower::Source::Fixed {
+        text: tessera_lower::ByBackend(["", cuda_prefixed(base, defs), ""]),
+        entry,
+    }
+}
+
 /// A name a kernel may import after `<tessera/1/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Import {

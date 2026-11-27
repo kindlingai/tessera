@@ -435,4 +435,31 @@ fn fast_mm_loads() {
         mm_draft(&g_mx, 256, "mxfp8", k_mx_sk2, true).map(|(n, e, _, _)| (n, e)),
         Some(("fast_mm_mxfp8_mx8_sk", "tessera_mm_mxfp8_mx8_sk"))
     );
+
+    let mut k_blk = Knobs::default();
+    k_blk.parse("fast_mm_bf16:min_blocks=3").unwrap();
+    let g_blk = linear(&rows, 4096, 12288);
+    let (_, e_base, _, _) = mm_draft(&g_blk, 16, "bf16", Knobs::default(), false).unwrap();
+    let (_, e_blk, _, _) = mm_draft(&g_blk, 16, "bf16", k_blk.clone(), false).unwrap();
+    assert_eq!(e_base, e_blk);
+    let pins = Pins::all(tessera_lower::form::named("bf16").unwrap());
+    let parts = Device::default().division();
+    let mut tree = Tree::upto(
+        &g_blk,
+        0,
+        Wants::ALL,
+        &[(Rows, 16)],
+        &[],
+        &pins,
+        tessera_lower::kept::DENSE,
+        &parts,
+        0,
+    )
+    .unwrap();
+    tree.knobs = k_blk;
+    let d_blk = &propose_mm(&tree, tree.outputs[0].0).unwrap()[0];
+    let Source::Fixed { text, .. } = d_blk.kernel.source() else {
+        panic!("expected fixed source");
+    };
+    assert!(text[tessera_lower::Backend::Cuda].contains("#define MM_BF16_BLK 3"));
 }

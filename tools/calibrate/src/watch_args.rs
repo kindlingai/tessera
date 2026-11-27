@@ -7,7 +7,7 @@ use tessera_bundle::names::Rule as NameRule;
 use tessera_engine::progress::Progress;
 use tessera_engine::wasm::{Module, Trace};
 use tessera_graph::Parts;
-use tessera_lower::{Pins, Recipe, Settings};
+use tessera_lower::{Knobs, Pins, Recipe, Settings};
 use tessera_recipe::Files;
 use tessera_serve::start::Options;
 
@@ -91,6 +91,12 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<WatchArgs, Box<dyn Error>> 
                 let val = it.next().ok_or(USAGE)?;
                 out.subject_args.push(arg.clone());
                 out.subject_args.push(val.clone());
+            }
+            "--shape" => {
+                let val = it.next().ok_or(USAGE)?;
+                Knobs::split_flag(val)
+                    .map_err(|_| format!("invalid flag `--shape {val}`\n{USAGE}"))?;
+                out.serve_flags.push((arg.clone(), Some(val.clone())));
             }
             _ if probe.switch(arg) => out.serve_flags.push((arg.clone(), None)),
             _ if arg.starts_with("--") => {

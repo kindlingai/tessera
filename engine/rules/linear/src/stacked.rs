@@ -3,13 +3,15 @@
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order, View};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Load, Needs, T, Term, Tree};
+use tessera_lower::{Draft, Kernel, Load, Needs, T, Term, Tree, knob};
 
 /// Elements one wide load brings per lane.
 const WIDE: u32 = 4;
 
 /// Trips unrolled so each lane keeps loads in flight.
 const AHEAD: u32 = 4;
+
+knob!("stacked", "ahead", 1, 16);
 
 /// Kernel mode: 0 scalar, 1 warp-laned, 2 wide-x.
 const MODE_SCALAR: u32 = 0;
@@ -18,6 +20,7 @@ const MODE_WIDE: u32 = 2;
 
 /// Products with blocks of a stored matrix.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn stacked(
     x: Buf<F32>,
     #[form(form)] w: Buf<Dyn>,
@@ -32,6 +35,7 @@ fn stacked(
     k_step: u32,
     #[build] form: &'static dyn Stored,
     #[build] mode: u32,
+    #[build] ahead: u32,
 ) {
     let idx = if mode == MODE_LANES {
         gid() / LANES as u32
@@ -47,7 +51,7 @@ fn stacked(
     let from = row as u64 * k as u64;
     let mut sum = 0.0f32;
     if mode == MODE_LANES {
-        for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(AHEAD) {
+        for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(ahead) {
             let c = w.load4(at + i as u64);
             let v = x.load4(from + i as u64);
             sum += v.x * c.x;
@@ -62,7 +66,7 @@ fn stacked(
     } else {
         if mode == MODE_WIDE {
             let ks = k_step as u64;
-            for i in (0..k).by(WIDE).unroll(AHEAD) {
+            for i in (0..k).by(WIDE).unroll(ahead) {
                 let v = x.load4(from + i as u64);
                 let base = at + i as u64 * ks;
                 sum += v.x * w[base];
@@ -82,7 +86,7 @@ fn stacked(
 /// `x[b, rows, k]` times block `b` of a stored matrix.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    stacked(self.form, self.mode),
+    stacked(self.form, self.mode, self.ahead),
     name = self.form.suffixed(match self.mode {
         MODE_LANES => "stacked_lanes",
         MODE_WIDE => "stacked_wide",
@@ -108,6 +112,7 @@ pub(crate) struct Stacked {
     pub k_step: usize,
     pub form: &'static dyn Stored,
     pub mode: u32,
+    pub ahead: u32,
 }
 
 fn stacked_accepts(k: &Stacked, input: usize, form: &dyn Stored) -> bool {
@@ -116,8 +121,8 @@ fn stacked_accepts(k: &Stacked, input: usize, form: &dyn Stored) -> bool {
 
 fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
     let (threads, step, flight) = match k.mode {
-        MODE_LANES => (k.len * LANES, LANES * WIDE as usize, AHEAD as usize),
-        MODE_WIDE => (k.len, WIDE as usize, AHEAD as usize),
+        MODE_LANES => (k.len * LANES, LANES * WIDE as usize, k.ahead as usize),
+        MODE_WIDE => (k.len, WIDE as usize, k.ahead as usize),
         _ => (k.len, 1, 1),
     };
     let width = if k.mode == MODE_SCALAR {
@@ -126,7 +131,7 @@ fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
         WIDE as usize
     };
     let products = k.len / k.n;
-    let mut trip = stacked_ir(k.form, k.mode).trip();
+    let mut trip = stacked_ir(k.form, k.mode, k.ahead).trip();
     if k.mode != MODE_LANES {
         // Threads on columns of one row share its x.
         let shared = (4 * width) as f64 * (1.0 - 1.0 / k.n.min(LANES) as f64);
@@ -210,6 +215,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     } else {
         MODE_SCALAR
     };
+    let ahead = tree
+        .knobs
+        .get("stacked", "ahead")
+        .map_or(AHEAD, |v| v as u32);
     let kernel = Stacked {
         len: tree.elements(at),
         rows: xs[1],
@@ -221,6 +230,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         k_step,
         form,
         mode,
+        ahead,
     };
     Some(vec![Draft::new(kernel, [x, b.leaf], kernel.len)])
 }

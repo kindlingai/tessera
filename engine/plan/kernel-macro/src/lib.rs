@@ -439,6 +439,11 @@ fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
     }))
 }
 
+/// Evaluates all method call arguments in kernel expression context.
+fn call_args(m: &syn::ExprMethodCall, ctx: &Ctx) -> Result<Vec<Tokens>, Error> {
+    m.args.iter().map(|a| expr(a, ctx)).collect()
+}
+
 /// A name, or `g.field` of group `g` as `g__field`.
 fn named(e: &Expr) -> Result<String, Error> {
     match e {
@@ -498,16 +503,22 @@ fn declare(name: &Tokens, init: &Expr, ctx: &Ctx) -> Res {
     if let Expr::Call(call) = init
         && let Expr::Path(p) = &*call.func
         && let Some(last) = p.path.segments.last()
-        && last.ident == "shared"
+        && matches!(last.ident.to_string().as_str(), "shared" | "local")
     {
+        let kind = last.ident.to_string();
         let PathArguments::AngleBracketed(a) = &last.arguments else {
-            return Err(Error::new(p.span(), "`shared::<T>(len)`"));
+            return Err(Error::new(p.span(), format!("`{kind}::<T>(len)`")));
         };
         let Some(GenericArgument::Type(t)) = a.args.first() else {
-            return Err(Error::new(a.span(), "`shared::<T>(len)`"));
+            return Err(Error::new(a.span(), format!("`{kind}::<T>(len)`")));
         };
         let (ty, len) = (scalar(t)?, &call.args[0]);
-        return Ok(quote!(Stmt::Shared { name: #name.into(), ty: #ty, len: (#len) as usize }));
+        let kind_id = if kind == "local" {
+            quote!(Stmt::Array)
+        } else {
+            quote!(Stmt::Shared)
+        };
+        return Ok(quote!(#kind_id { name: #name.into(), ty: #ty, len: (#len) as usize }));
     }
     if let Expr::Call(c) = init
         && is_path(&c.func, "atomic_shared")
@@ -577,12 +588,7 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
             }))
         }
         Expr::MethodCall(m) if m.method == "block" => {
-            let acc = named(&m.receiver)?;
-            let args: Vec<Tokens> = m
-                .args
-                .iter()
-                .map(|a| expr(a, ctx))
-                .collect::<Result<_, _>>()?;
+            let (acc, args) = (named(&m.receiver)?, call_args(m, ctx)?);
             let [a, a_at, b, b_at, stride, _] = args.as_slice() else {
                 return Err(Error::new(
                     m.span(),
@@ -603,12 +609,7 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
             }))
         }
         Expr::MethodCall(m) if m.method == "parts" => {
-            let acc = named(&m.receiver)?;
-            let args: Vec<Tokens> = m
-                .args
-                .iter()
-                .map(|a| expr(a, ctx))
-                .collect::<Result<_, _>>()?;
+            let (acc, args) = (named(&m.receiver)?, call_args(m, ctx)?);
             let [a, a_at, apart, _, b, b_at, stride, _] = args.as_slice() else {
                 return Err(Error::new(
                     m.span(),
@@ -629,12 +630,7 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
             }))
         }
         Expr::MethodCall(m) if m.method == "hold" => {
-            let held = named(&m.receiver)?;
-            let args: Vec<Tokens> = m
-                .args
-                .iter()
-                .map(|a| expr(a, ctx))
-                .collect::<Result<_, _>>()?;
+            let (held, args) = (named(&m.receiver)?, call_args(m, ctx)?);
             let [a, a_at, stride] = args.as_slice() else {
                 return Err(Error::new(m.span(), "`held.hold(a, a_at, stride)`"));
             };
@@ -789,7 +785,7 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
 }
 
 /// Prelude names this macro reads as statements.
-const STATEMENTS: &[&str] = &["barrier", "shared", "atomic_shared", "tiles"];
+const STATEMENTS: &[&str] = &["barrier", "shared", "local", "atomic_shared", "tiles"];
 
 /// Each intrinsic's kind, source name and variant.
 macro_rules! sources {

@@ -6,16 +6,18 @@ use tessera_graph::Order;
 use tessera_lower::form::{F32_FORM, Load as Stored};
 use tessera_lower::kernels::Join;
 use tessera_lower::sites;
-use tessera_lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
+use tessera_lower::{
+    Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree, knob,
+};
 
 /// Threads in a group: one group per query and head.
 const THREADS: u32 = 256;
 
-/// The widest head: two sums per thread.
-const WIDEST: u32 = 2 * THREADS;
+knob!("attend", "threads", 32, 1024);
 
 /// Every thread's share of a dot product, summed through `red`.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn group_dot(
     q: Buf<F32>,
     #[form(k_form)] k: Buf<Dyn>,
@@ -24,15 +26,18 @@ fn group_dot(
     width: u32,
     red: &mut Shared<f32>,
     #[build] k_form: &'static dyn Stored,
+    #[build] threads: u32,
+    #[build] steps: u32,
+    #[build] half: u32,
 ) -> f32 {
     let mut partial = 0.0f32;
-    for d in (lid()..width).by(THREADS) {
+    for d in (lid()..width).by(threads) {
         partial += q[q_off + d as u64] * k[k_off + d as u64];
     }
     red[lid()] = partial;
     barrier();
-    for level in 0..8 {
-        let span = 128 >> level;
+    for level in 0..steps {
+        let span = half >> level;
         if lid() < span {
             red[lid()] += red[lid() + span];
         }
@@ -53,6 +58,7 @@ fn take_key(
     v_off: u64,
     width: u32,
     #[build] v_form: &'static dyn Stored,
+    #[build] threads: u32,
 ) {
     let m_new = max(state[0], dot);
     let corr = exp(state[0] - m_new);
@@ -60,7 +66,7 @@ fn take_key(
     state[0] = m_new;
     state[1] = state[1] * corr + p;
     for i in 0..2 {
-        let d = lid() + i * THREADS;
+        let d = lid() + i * threads;
         if d < width {
             acc[i as usize] = acc[i as usize] * corr + p * v[v_off + d as u64];
         }
@@ -76,10 +82,11 @@ fn write_row(
     q_off: u64,
     width: u32,
     #[build] out_form: &'static dyn Stored,
+    #[build] threads: u32,
 ) {
     let inv = if state[1] > 0.0 { 1.0 / state[1] } else { 0.0 };
     for i in 0..2 {
-        let d = lid() + i * THREADS;
+        let d = lid() + i * threads;
         if d < width {
             out[q_off + d as u64] = acc[i as usize] * inv;
         }
@@ -88,6 +95,7 @@ fn write_row(
 
 /// A group per query and head shares each dot product.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn attend(
     q: Buf<F32>,
     #[form(F32_FORM)] kv: Buf<Dyn>,
@@ -101,8 +109,11 @@ fn attend(
     back: u32,
     ahead: u32,
     #[build] out_form: &'static dyn Stored,
+    #[build] threads: u32,
+    #[build] steps: u32,
+    #[build] half: u32,
 ) {
-    let group = gid() / THREADS;
+    let group = gid() / threads;
     let tok = group / heads;
     let qh = group % heads;
     if tok >= queries {
@@ -110,7 +121,7 @@ fn attend(
     }
     let kvh = qh / (heads / kv_heads);
     let q_off = ((tok * heads + qh) * width) as u64;
-    let mut red = shared::<f32>(THREADS);
+    let mut red = shared::<f32>(threads);
     let mut state = [0.0f32; 2];
     state[0] = f32::NEG_INFINITY;
     let mut acc = [0.0f32; 2];
@@ -125,15 +136,20 @@ fn attend(
     for t in first..last {
         // A joined row: every head's key, then every head's value.
         let k_off = ((t * kv_heads * 2 + kvh) * width) as u64;
-        let dot = group_dot(q, kv, q_off, k_off, width, &mut red, F32_FORM);
+        let dot = group_dot(
+            q, kv, q_off, k_off, width, &mut red, F32_FORM, threads, steps, half,
+        );
         let v_off = k_off + (kv_heads * width) as u64;
-        take_key(&mut state, &mut acc, dot, kv, v_off, width, F32_FORM);
+        take_key(
+            &mut state, &mut acc, dot, kv, v_off, width, F32_FORM, threads,
+        );
     }
-    write_row(&state, &acc, out, q_off, width, out_form);
+    write_row(&state, &acc, out, q_off, width, out_form, threads);
 }
 
 /// A group per query row and head, within its slot.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn attend_rows(
     q: Buf<F32>,
     #[form(k_form)] k: Buf<Dyn>,
@@ -150,8 +166,11 @@ fn attend_rows(
     #[build] k_form: &'static dyn Stored,
     #[build] v_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
+    #[build] threads: u32,
+    #[build] steps: u32,
+    #[build] half: u32,
 ) {
-    let group = gid() / THREADS;
+    let group = gid() / threads;
     let row = group / heads;
     let qh = group % heads;
     if row >= rows {
@@ -161,7 +180,7 @@ fn attend_rows(
     let position = positions[row as u64];
     let kvh = qh / (heads / kv_heads);
     let q_off = ((row * heads + qh) * width) as u64;
-    let mut red = shared::<f32>(THREADS);
+    let mut red = shared::<f32>(threads);
     let mut state = [0.0f32; 2];
     state[0] = f32::NEG_INFINITY;
     let mut acc = [0.0f32; 2];
@@ -174,10 +193,12 @@ fn attend_rows(
     let first = if position > back { position - back } else { 0 };
     for t in first..last {
         let kv_off = ((kept_row(slot, t) * kv_heads + kvh) * width) as u64;
-        let dot = group_dot(q, k, q_off, kv_off, width, &mut red, k_form);
-        take_key(&mut state, &mut acc, dot, v, kv_off, width, v_form);
+        let dot = group_dot(
+            q, k, q_off, kv_off, width, &mut red, k_form, threads, steps, half,
+        );
+        take_key(&mut state, &mut acc, dot, v, kv_off, width, v_form, threads);
     }
-    write_row(&state, &acc, out, q_off, width, out_form);
+    write_row(&state, &acc, out, q_off, width, out_form, threads);
 }
 
 /// Scaled query rows over kept keys, by slot and position.
@@ -187,14 +208,14 @@ fn attend_rows(
     order = Order::PerConfig,
     sizes = self.0.sizes(),
     work = self.0.heads * self.0.queries * self.0.keys.most() * self.0.width,
-    needs = group_needs(),
+    needs = group_needs(self.1),
     accepts = rows_accepts,
     emits = rows_emits,
     source = rows_source,
     launches = rows_launches,
-    shape = Shape::grid((self.0.queries * self.0.heads, 1), THREADS as usize),
+    shape = Shape::grid((self.0.queries * self.0.heads, 1), self.1 as usize),
 )]
-pub(crate) struct AttendRows(pub Attn);
+pub(crate) struct AttendRows(pub Attn, pub u32);
 
 fn rows_accepts(k: &AttendRows, input: usize, form: &dyn Stored) -> bool {
     match input {
@@ -209,11 +230,26 @@ fn rows_emits(k: &AttendRows, form: &dyn Stored) -> bool {
 }
 
 fn rows_source(k: &AttendRows) -> Source {
-    let a = &k.0;
-    let body = kept::attach(attend_rows_ir(a.k_form, a.v_form, a.out_form), a.kept);
+    let (a, threads) = (&k.0, k.1);
+    let body = kept::attach(
+        attend_rows_ir(
+            a.k_form,
+            a.v_form,
+            a.out_form,
+            threads,
+            threads.trailing_zeros(),
+            threads / 2,
+        ),
+        a.kept,
+    );
+    let tag = if threads == THREADS {
+        String::new()
+    } else {
+        format!("_t{threads}")
+    };
     let entry = match (a.k_form.name(), a.v_form.name(), a.out_form.name()) {
-        ("f32", "f32", "f32") => format!("plan_attend_rows_{}", a.kept.name()),
-        (kf, vf, of) => format!("plan_attend_rows_{}_{kf}_{vf}_{of}", a.kept.name()),
+        ("f32", "f32", "f32") => format!("plan_attend_rows_{}{tag}", a.kept.name()),
+        (kf, vf, of) => format!("plan_attend_rows_{}_{kf}_{vf}_{of}{tag}", a.kept.name()),
     };
     Source::named(body, entry)
 }
@@ -231,28 +267,34 @@ fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
 /// Reads scaled queries, and keys joined with values. Any mask.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    attend(self.0.out_form),
+    attend(self.0.out_form, self.1, self.1.trailing_zeros(), self.1 / 2),
     name = "attend",
     order = Order::PerConfig,
     sizes = self.0.sizes(),
     work = self.0.seqs * self.0.heads * self.0.queries * self.0.seen() * self.0.width,
-    needs = group_needs(),
+    needs = group_needs(self.1),
     emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
 )]
-pub(crate) struct Attend(pub Attn);
+pub(crate) struct Attend(pub Attn, pub u32);
 
 fn attend_emits(k: &Attend, form: &dyn Stored) -> bool {
     form.name() == k.0.out_form.name()
 }
 
 fn attend_source(k: &Attend) -> Source {
-    let entry = match k.0.out_form.name() {
-        "f32" => "plan_attend".into(),
-        of => format!("plan_attend_{of}"),
+    let t = k.1;
+    let tag = if t == THREADS {
+        String::new()
+    } else {
+        format!("_t{t}")
     };
-    Source::named(attend_ir(k.0.out_form), entry)
+    let entry = match k.0.out_form.name() {
+        "f32" => format!("plan_attend{tag}"),
+        of => format!("plan_attend_{of}{tag}"),
+    };
+    Source::named(attend_ir(k.0.out_form, t, t.trailing_zeros(), t / 2), entry)
 }
 
 /// One launch per sequence, each at its own offset.
@@ -271,14 +313,14 @@ fn attend_launches(k: &Attend, step: &Step) -> Vec<Launch> {
         ]
     };
     let across = a.queries * a.heads;
-    let launch = |s| a.launch(buffers(s), [Arg::count(a.width)], across, THREADS as usize);
+    let launch = |s| a.launch(buffers(s), [Arg::count(a.width)], across, k.1 as usize);
     (0..a.seqs).map(launch).collect()
 }
 
-fn group_needs() -> Needs {
+fn group_needs(threads: u32) -> Needs {
     Needs {
-        group_bytes: 4 * THREADS as usize,
-        group_threads: THREADS as usize,
+        group_bytes: 4 * threads as usize,
+        group_threads: threads as usize,
         ..Needs::default()
     }
 }
@@ -286,12 +328,16 @@ fn group_needs() -> Needs {
 /// Scale the queries, join keys with values, then attend.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Attend = tree.site(at)?;
-    if site.sizes.width > WIDEST as usize {
+    let threads = tree
+        .knobs
+        .get("attend", "threads")
+        .map_or(THREADS, |t| t as u32);
+    if !threads.is_power_of_two() || site.sizes.width > 2 * threads as usize {
         return None;
     }
     // Ragged rows read the kept keys and values in place.
     if site.rows.is_some() {
-        return site.ragged(AttendRows(site.sizes));
+        return site.ragged(AttendRows(site.sizes, threads));
     }
     let (scaled, out) = crate::scaled(&site)?;
     let sizes = site.sizes;
@@ -308,7 +354,11 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![
         scaled,
         Draft::new(join, [site.k, site.v], joined),
-        Draft::new(Attend(sizes), [Read::Draft(0), Read::Draft(1)], out),
+        Draft::new(
+            Attend(sizes, threads),
+            [Read::Draft(0), Read::Draft(1)],
+            out,
+        ),
     ])
 }
 

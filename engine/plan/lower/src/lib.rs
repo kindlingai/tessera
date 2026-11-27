@@ -24,7 +24,7 @@ mod select;
 pub mod sites;
 mod tree;
 
-pub use abi::{Arg, Launch, Shape, Source, ToArg};
+pub use abi::{Arg, Launch, Shape, Source, ToArg, define_prefix, prefixed};
 pub use assign::assign;
 pub use body::{GUESS, small, source};
 pub use cache::Cache;
@@ -35,7 +35,10 @@ pub use extent::Extent;
 pub use form::{Filed, Pins, Site, Weight};
 pub use kernel::{COMMIT, Collective, Keeping, Kernel, KernelRef, Needs, PEEK, Resident, UNPROVEN};
 pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
-pub use recipe::{Compute, Dtype, KNOBS, Knob, Knobs, Launching, Recipe, Scoped, Wires, labels};
+pub use recipe::{
+    Compute, Dtype, KNOBS, Knob, Knobs, Launching, Recipe, Scoped, Wires, find_knob, labels,
+    register_knob,
+};
 pub use rule::{Attn, Draft, Propose, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Report, Selected, Val, Value, select};

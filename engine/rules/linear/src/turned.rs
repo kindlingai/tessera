@@ -5,10 +5,12 @@ use tessera_graph::Order;
 use tessera_kernels::{BLOCK, spin, spin_inline};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Rotated;
-use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Tree};
+use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Tree, knob};
 
 /// Its row limit: each thread keeps one sum per row.
 const ROWS: usize = 8;
+
+knob!("turned", "max_rows", 1, 16);
 
 /// SIMD groups in a group, a block of `x` each.
 const SIMDS: u32 = BLOCK / LANES as u32;
@@ -27,13 +29,14 @@ fn turned(
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] rows_cap: usize,
     #[build] form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     let four = lane() * (BLOCK / LANES as u32);
     let col = (gid() / BLOCK) * BLOCK + lid();
-    let mut xs = shared::<f32>(ROWS as u32 * SPAN);
-    let mut sums = [0.0f32; ROWS];
+    let mut xs = shared::<f32>(rows_cap as u32 * SPAN);
+    let mut sums = local::<f32>(rows_cap);
     for row in 0..m as u32 {
         sums[row as usize] = 0.0;
     }
@@ -83,13 +86,13 @@ fn turned(
 /// `x[m, k]` through a rotated `w[n, k]`, in one launch.
 #[derive(Clone, Debug, Kernel)]
 #[launch(
-    turned(self.m, self.form),
+    turned(self.m, self.rows_cap, self.form),
     name = self.form.suffixed("turned"),
     threads = Shape::Grid { across: self.n / BLOCK as usize, down: 1, threads: BLOCK as usize },
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,
     accepts = accepts,
-    needs = turned_needs(),
+    needs = turned_needs(self.rows_cap),
     order = Order::PerConfig,
     source = turned_source,
     load = turned_load,
@@ -99,13 +102,19 @@ pub struct Turned {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    pub rows_cap: usize,
     pub form: &'static dyn Stored,
 }
 
 fn turned_source(t: &Turned) -> Source {
+    let tag = if t.rows_cap == ROWS {
+        String::new()
+    } else {
+        format!("_r{}", t.rows_cap)
+    };
     Source::named(
-        turned_ir(t.m, t.form),
-        format!("plan_turned_{}_m{}", t.form.name(), t.m),
+        turned_ir(t.m, t.rows_cap, t.form),
+        format!("plan_turned_{}_m{}{tag}", t.form.name(), t.m),
     )
 }
 
@@ -113,10 +122,10 @@ fn accepts(t: &Turned, input: usize, form: &dyn Stored) -> bool {
     t.form.taken(input, 1, form)
 }
 
-fn turned_needs() -> Needs {
+fn turned_needs(rows_cap: usize) -> Needs {
     Needs {
         lanes: LANES,
-        group_bytes: 4 * ROWS * SPAN as usize,
+        group_bytes: 4 * rows_cap * SPAN as usize,
         group_threads: BLOCK as usize,
         ..Needs::default()
     }
@@ -124,13 +133,19 @@ fn turned_needs() -> Needs {
 
 /// Each group reads `x`, `suh` and its rows of `w`.
 fn turned_load(t: &Turned, _: usize) -> Option<Load> {
-    let Turned { m, n, k, form } = *t;
+    let Turned {
+        m,
+        n,
+        k,
+        rows_cap,
+        form,
+    } = *t;
     let groups = (n / BLOCK as usize) as f64;
     Some(Load {
         threads: n,
         group: BLOCK as usize,
         trips: (k / SPAN as usize) as f64,
-        trip: turned_ir(m, form).trip(),
+        trip: turned_ir(m, rows_cap, form).trip(),
         reads: vec![
             4.0 * (m * k) as f64 * groups,
             form.bytes(n * k) as f64,
@@ -151,13 +166,21 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     };
     let m = tree.elements(x) / k;
+    let max_rows = tree.knobs.get("turned", "max_rows").unwrap_or(ROWS);
     let block = BLOCK as usize;
-    let fits = n % block == 0 && k % SPAN as usize == 0 && m <= ROWS;
+    let fits = n % block == 0 && k % SPAN as usize == 0 && m <= max_rows;
     if !fits || tree.elements(suh) != k || tree.elements(svh) != n {
         return None;
     }
     let form = tree.node(w).form;
-    let kernel = Turned { m, n, k, form };
+    let rows_cap = m.max(ROWS);
+    let kernel = Turned {
+        m,
+        n,
+        k,
+        rows_cap,
+        form,
+    };
     Some(vec![Draft::new(kernel, [x, w, suh, svh], m * n)])
 }
 

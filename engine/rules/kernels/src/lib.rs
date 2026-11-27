@@ -23,6 +23,7 @@ pub use hadamard::{BLOCK, spin, spin_inline};
 pub use rms_norm::RmsNorm;
 
 use tessera_codegen::prelude::LANES;
+pub(crate) use tessera_lower::knob as __knob;
 use tessera_work::{Load, Ops};
 
 /// Elements one wide load brings a lane.

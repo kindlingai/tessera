@@ -135,6 +135,7 @@ macro_rules! exports {
         $(rules: { $($rule:expr => $kind:expr),+ $(,)? },)?
         $(kernels: { $($file:literal: [$($kernel:expr),+ $(,)?]),+ $(,)? },)?
         $(files: [$($extra:literal),* $(,)?],)?
+        $(knobs: [ $(($kk:expr, $kn:expr, $kl:expr, $km:expr)),* $(,)? ],)?
         $(propose: $propose:path,)?
         $(ask: $ask:path,)?
         $(graph: $graph:path, tables: $tables:path,)?
@@ -172,6 +173,12 @@ macro_rules! exports {
                         },
                     )*)?
                 ],
+                knobs: vec![$($($crate::site::Knob {
+                    kernel: $kk,
+                    name: $kn,
+                    least: $kl,
+                    most: $km,
+                },)*)?],
             })
         }
 

@@ -5,6 +5,30 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
+#ifndef MLA_MIN_BLOCKS
+#define MLA_MIN_BLOCKS 2
+#endif
+#ifndef MLA_REDUCE_THREADS
+#define MLA_REDUCE_THREADS 160
+#endif
+#ifndef MLA_REDUCE_MIN_BLOCKS
+#define MLA_REDUCE_MIN_BLOCKS 4
+#endif
+#ifndef GQA_MIN_BLOCKS
+#define GQA_MIN_BLOCKS 4
+#endif
+#ifndef GQA_REDUCE_MIN_BLOCKS
+#define GQA_REDUCE_MIN_BLOCKS 4
+#endif
+#ifdef IDX_MIN_BLOCKS
+#define IDX_BOUNDS __launch_bounds__(128, IDX_MIN_BLOCKS)
+#else
+#define IDX_BOUNDS __launch_bounds__(128)
+#endif
+#ifndef IDX_QT_MIN_BLOCKS
+#define IDX_QT_MIN_BLOCKS 2
+#endif
+
 static __device__ __forceinline__ float attn_neg_inf() {
     return __int_as_float(0xff800000u);
 }
@@ -511,11 +535,11 @@ static __device__ __forceinline__ void mla_attend_body(
 }
 
 #define MLA_DEF(NAME, NAME512, T, FMT) \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
+    extern "C" __global__ __launch_bounds__(256, MLA_MIN_BLOCKS) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
         __shared__ mla_smem sm; \
         mla_attend_body<FMT, 576u>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
     } \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME512(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
+    extern "C" __global__ __launch_bounds__(256, MLA_MIN_BLOCKS) void NAME512(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
         __shared__ mla_smem sm; \
         mla_attend_body<FMT, 512u>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
@@ -525,7 +549,7 @@ MLA_DEF(tessera_mla_attend_bf16, tessera_mla_attend_512_bf16, u16, 1u)
 MLA_DEF(tessera_mla_attend_f32, tessera_mla_attend_512_f32, float, 2u)
 
 // Combines split-K MLA partials for one row and head.
-extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
+extern "C" __global__ __launch_bounds__(MLA_REDUCE_THREADS, MLA_REDUCE_MIN_BLOCKS) void tessera_mla_reduce(
     const float* part, float* out, u32 lists, u32 splits, u32 out_w) {
     u32 list = blockIdx.x, tid = threadIdx.x, stride = out_w + 4u;
     if (list >= lists) return;
@@ -543,10 +567,10 @@ extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
         s_inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     }
     prim::block_sync();
-    if (tid < (out_w >> 2u)) {
+    for (u32 t4 = tid; t4 < (out_w >> 2u); t4 += blockDim.x) {
         float inv = s_inv;
         float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
-        u32 d4 = tid << 2;
+        u32 d4 = t4 << 2;
         for (u32 s = 0u; s < splits; s++) if (s_w[s] > 0.0f) attn_fma4(sum, base + u64(s) * stride + d4, s_w[s]);
         *reinterpret_cast<float4*>(out + u64(list) * out_w + d4) = make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
     }
@@ -650,7 +674,7 @@ static __device__ __forceinline__ void gqa_attend_body(
 }
 
 #define GQA_DEF(NAME, T, FMT) \
-    extern "C" __global__ __launch_bounds__(128, 4) void NAME(const float* q, const T* k, const T* v, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks) { \
+    extern "C" __global__ __launch_bounds__(128, GQA_MIN_BLOCKS) void NAME(const float* q, const T* k, const T* v, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks) { \
         __shared__ gqa_smem sm; \
         gqa_attend_body<FMT>(q, k, v, slots, positions, sinks, part, scale, rows, keys, context, heads, kv_heads, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
@@ -660,7 +684,7 @@ GQA_DEF(tessera_gqa_attend_bf16, u16, 1u)
 GQA_DEF(tessera_gqa_attend_f32, float, 2u)
 
 // Warp-level reduction of split-K GQA partials for head_dim 128.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_gqa_reduce(
+extern "C" __global__ __launch_bounds__(128, GQA_REDUCE_MIN_BLOCKS) void tessera_gqa_reduce(
     const float* part, float* out, u32 lists, u32 splits) {
     u32 list = blockIdx.x * 4u + (threadIdx.x >> 5), lane = threadIdx.x & 31u;
     if (list >= lists) return;
@@ -930,11 +954,11 @@ static __device__ __forceinline__ void idx_qtile_body(
 }
 
 #define IDX_DEF(NAME, QT_NAME, FMT) \
-    extern "C" __global__ __launch_bounds__(128) void NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
+    extern "C" __global__ IDX_BOUNDS void NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
         __shared__ idx_smem sm; \
         idx_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads, dim, masked, tile_keys, page_table, page_shift, sm); \
     } \
-    extern "C" __global__ __launch_bounds__(256, 2) void QT_NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
+    extern "C" __global__ __launch_bounds__(256, IDX_QT_MIN_BLOCKS) void QT_NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
         (void)heads; (void)dim; __shared__ idx_qt_smem sm; \
         idx_qtile_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, masked, tile_keys, page_table, page_shift, sm); \
     }

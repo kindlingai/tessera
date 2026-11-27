@@ -3,7 +3,20 @@
 use tessera_codegen::prelude::*;
 use tessera_graph::{Pairs, Stage};
 use tessera_lower::sites;
-use tessera_lower::{Draft, Kernel, Read, T, Tree};
+use tessera_lower::{Draft, Kernel, Read, Shape, T, Tree, knob};
+
+knob!("rope", "threads", 1, 1024);
+
+fn line_or_grid(len: usize, threads: usize) -> Shape {
+    match threads {
+        0 => Shape::Line(len),
+        t => Shape::Grid {
+            across: len.div_ceil(t),
+            down: 1,
+            threads: t,
+        },
+    }
+}
 
 /// One thread per position, head and pair, rotating in place.
 #[kernel]
@@ -62,12 +75,17 @@ fn angles(
 
 /// Each position's cosine and sine, per pair.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(angles, threads = self.count * self.width / 2, shared)]
+#[launch(
+    angles,
+    threads = line_or_grid(self.count * self.width / 2, self.threads),
+    shared,
+)]
 pub(crate) struct Angles {
     pub count: usize,
     pub width: usize,
     pub theta: f32,
     pub turned: usize,
+    pub threads: usize,
 }
 
 /// Rotates pairs in place, by the second input's angles.
@@ -79,7 +97,7 @@ pub(crate) struct Angles {
         true => "rope_adjacent",
         false => "rope",
     },
-    threads = self.positions * self.heads * self.width / 2,
+    threads = line_or_grid(self.positions * self.heads * self.width / 2, self.threads),
     overwrites,
 )]
 pub struct Rope {
@@ -87,6 +105,7 @@ pub struct Rope {
     pub heads: usize,
     pub width: usize,
     pub adjacent: bool,
+    pub threads: usize,
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -104,17 +123,20 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     else {
         return None;
     };
+    let threads = tree.knobs.get("rope", "threads").unwrap_or(0);
     let angles = Angles {
         count: positions,
         width,
         theta,
         turned: turned.map_or(width / 2, |t| t as usize),
+        threads,
     };
     let rope = Rope {
         positions,
         heads: len / (positions * width),
         width,
         adjacent: pairs == Pairs::Adjacent,
+        threads,
     };
     Some(vec![
         Draft::new(angles, [at], positions * width),

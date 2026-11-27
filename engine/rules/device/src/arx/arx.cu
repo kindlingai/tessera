@@ -649,10 +649,16 @@ TESSERA_FN void rs_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* stat
 
 }  // namespace arx
 
+#ifdef ARX_MIN_BLOCKS
+#define ARX_BOUNDS __launch_bounds__(256, ARX_MIN_BLOCKS)
+#else
+#define ARX_BOUNDS
+#endif
+
 #define ARX_DEF(NAME, BODY, WIRE)                                                              \
-    extern "C" __global__ void NAME(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, \
-                                    u32* blocks, u64 from_p, u64 to_p, u32 n, u32 me, u32 nr,  \
-                                    u32 lanes, u64 timeout) {                                  \
+    extern "C" __global__ ARX_BOUNDS void NAME(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,  \
+                                               u64* state, u32* blocks, u64 from_p, u64 to_p,  \
+                                               u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) { \
         arx::BODY<arx::Wire::WIRE>(send_p, recv_p, flag_p, ctl_p, state, blocks, from_p, to_p, \
                                    n, me, nr, lanes, timeout);                                 \
     }
