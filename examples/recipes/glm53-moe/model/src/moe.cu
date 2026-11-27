@@ -949,7 +949,7 @@ extern "C" __global__ void glm53_finish(
   const u16* z = reinterpret_cast<const u16*>(z_in);
   u32 warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
   u32 base = blockIdx.x * 128u + (lane << 2u);
-  if (z_chunks == 1u) {
+  if (z_chunks == 0u) {
     u32 row = blockIdx.y * 8u + warp;
     if (row < rows) pf_finish_row(z, y, row, base, hidden, picks, [&](u32 p) { return plan->tok_expert[row][p] != 0xFFFFFFFFu; });
     return;

@@ -171,7 +171,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let ibs = hidden / 128;
     let prefill = rows > 32;
     let slot_cap = if prefill { 64 } else { 8 };
-    let z_chunks = if prefill { 1 } else { chunks };
+    let z_chunks = if prefill { 0 } else { chunks };
     let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
     let ns2 = split_dim(ibs, if rows == 1 { 8 } else { 3 });
     let n_sh = rows.div_ceil(slot_cap);
