@@ -19,6 +19,9 @@ macro_rules! entries {
 
 entries!(generate, draft, mtp, embed, klein, sprite; mtp::DUAL);
 
+mod intake;
+#[cfg(test)]
+mod intake_test;
 #[cfg(test)]
 mod task_test;
 

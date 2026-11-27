@@ -1,5 +1,6 @@
 //! Text generation, batched over slots and ranks.
 
+use super::intake::{Arrival, Feed};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::Links;
 use crate::start::Options;
@@ -300,7 +301,7 @@ pub(super) fn guides(
 }
 
 /// Fills the slot with `generate`. Returns the job queue.
-pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> mpsc::Receiver<Job> {
+pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> Feed<Job> {
     seated(load, generate, score, None)
 }
 
@@ -310,7 +311,7 @@ fn seated(
     generate: Generate,
     score: bool,
     seat: Option<Asker>,
-) -> mpsc::Receiver<Job> {
+) -> Feed<Job> {
     let generate = Arc::new(generate);
     let (queue, jobs) = mpsc::channel::<Job>();
     let sent = seat.map(|s| Box::new(move || s.asked()) as Box<dyn Fn() + Send + Sync>);
@@ -324,7 +325,7 @@ fn seated(
         m.generator = Some(queued.clone());
         m.score = score.then_some(queued as Arc<dyn Score>);
     });
-    jobs
+    Feed::new(jobs, Box::new(Arrival::default()))
 }
 
 /// A model's graph and weights, kept for each reload.
@@ -373,15 +374,14 @@ impl Source<'_> {
 }
 
 /// Steps `batch` on its turns until the model must leave.
-fn serve(mut batch: Batch, jobs: &mpsc::Receiver<Job>, seat: &Seated) -> Result<Parked, String> {
+fn serve(mut batch: Batch, jobs: &mut Feed<Job>, seat: &Seated) -> Result<Parked, String> {
     loop {
         match seat.next() {
             Turn::Step { admit } => batch.admitting(admit),
             Turn::Leave => return Ok(batch.park()),
             Turn::Load => continue,
         }
-        // Takes every job that has arrived.
-        for (request, sink) in jobs.try_iter() {
+        for (request, sink) in jobs.ready(batch.busy()) {
             batch.submit(request, sink);
         }
         batch.step().map_err(|e| e.to_string())?;
@@ -445,7 +445,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         stop: loaded.stop,
         sampling: true,
     };
-    let jobs = seated(load, generate, scores, Some(seat.asker()));
+    let mut jobs = seated(load, generate, scores, Some(seat.asker()));
     let mut parked = Parked::default();
     loop {
         let mut batch = Batch::resumed(&mut engine, Box::new(Fair), parked);
@@ -455,7 +455,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         if load.on("--reuse-prefix") || kv_on {
             batch.reuse();
         }
-        parked = serve(batch, &jobs, &seat)?;
+        parked = serve(batch, &mut jobs, &seat)?;
         drop(engine);
         seat.left();
         engine = source.enter(&seat, None, &Progress::default())?;

@@ -251,18 +251,10 @@ pub(super) fn drive_batch(
     if load.options.ranks.follows() {
         return batch.follow().map_err(|e| e.to_string());
     }
-    let jobs = queue(load, generate, false);
-    loop {
-        let job = match batch.busy() {
-            true => jobs.try_recv().ok(),
-            false => match jobs.recv() {
-                Ok(job) => Some(job),
-                Err(_) => break,
-            },
-        };
-        if let Some((request, sink)) = job {
+    let mut jobs = queue(load, generate, false);
+    while let Some(started) = jobs.pull(batch.busy()) {
+        for (request, sink) in started {
             batch.submit(request, sink);
-            continue;
         }
         batch.step().map_err(|e| e.to_string())?;
     }
@@ -347,8 +339,9 @@ pub(super) fn serve(
     label: &str,
     mut run: impl FnMut(Request, &mut Sink) -> Result<SpecStats, String>,
 ) -> Result<(), String> {
-    let jobs = queue(load, generate, false);
-    while let Ok((request, mut sink)) = jobs.recv() {
+    let mut jobs = queue(load, generate, false);
+    while let Some(started) = jobs.pull(false) {
+      for (request, mut sink) in started {
         let t0 = Instant::now();
         let stats = run(request, &mut sink)?;
         if settings.profile.is_some() && stats.steps > 0 {
@@ -365,6 +358,7 @@ pub(super) fn serve(
                 stats.switches,
             );
         }
+      }
     }
     Ok(())
 }
