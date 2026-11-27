@@ -244,19 +244,64 @@ extern "C" __global__ __launch_bounds__(256, DTR_GEN16_BLK) void dtr_pre_gen16(
     dtr_pre_gen<16u>(xpre, w, svh, out, m, n, k, bits, book, turned, sm);
 }
 
+#if defined(O_MXFP8)
+using mx8_o_t = u8;
+static __device__ __forceinline__ float mx8_load_o(const u8* p, u64 idx) {
+    u64 base = (idx >> 5u) * 33ull;
+    u32 e = p[base];
+    float sc = __uint_as_float(e == 0u ? 0x00400000u : (e << 23u));
+    return sc * trellis::e4m3_to_f32(p[base + 1u + (idx & 31u)]);
+}
+#else
+using mx8_o_t = trellis::o_t;
+static __device__ __forceinline__ float mx8_load_o(const trellis::o_t* p, u64 idx) {
+    return trellis::load_o(p, idx);
+}
+#endif
+
+#if defined(Y_MXFP8)
+using mx8_y_t = u8;
+#else
+using mx8_y_t = trellis::y_t;
+#endif
+
 static __device__ __forceinline__ float mx8_silu(float v) {
     return v / (1.0f + expf(-v));
 }
 
-static __device__ __forceinline__ float mx8_epilogue(float v, const trellis::o_t* other, u64 off,
+static __device__ __forceinline__ float mx8_epilogue(float v, const mx8_o_t* other, u64 off,
                                                      u32 col, u32 mode) {
-    if (mode == 1u) return v + trellis::load_o(other, off);
-    if (mode == 2u) return v + trellis::load_o(other, col);
-    if (mode == 3u) return mx8_silu(v) * trellis::load_o(other, off);
-    if (mode == 4u) return v * trellis::load_o(other, off);
+    if (mode == 1u) return v + mx8_load_o(other, off);
+    if (mode == 2u) return v + mx8_load_o(other, col);
+    if (mode == 3u) return mx8_silu(v) * mx8_load_o(other, off);
+    if (mode == 4u) return v * mx8_load_o(other, off);
     if (mode == 5u) return mx8_silu(v);
     return v;
 }
+
+#if DTR_MX8
+// Quantizes 32 values across 8 lanes into one mxfp8 block.
+static __device__ __forceinline__ void mx8_store_blk4(
+    float4 v, u8* out, u64 row, u32 nblk, u32 col, u32 sub, bool valid) {
+    float amax =
+        valid ? fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))) : 0.0f;
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4u));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2u));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1u));
+    if (!valid) return;
+    float inv;
+    u32 e = trellis::mx_scale(amax, inv);
+    u16 p0 = trellis::f2_e4m3x2(v.x * inv, v.y * inv);
+    u16 p1 = trellis::f2_e4m3x2(v.z * inv, v.w * inv);
+    u8* dst = out + (row * u64(nblk) + u64(col >> 5u)) * 33ull;
+    if (sub == 0u) dst[0] = u8(e);
+    u32 q = 1u + (sub << 2u);
+    dst[q] = u8(p0 & 0xFFu);
+    dst[q + 1u] = u8(p0 >> 8u);
+    dst[q + 2u] = u8(p1 & 0xFFu);
+    dst[q + 3u] = u8(p1 >> 8u);
+}
+#endif
 
 // Quantizes X[m, k] once to packed E4M3 and UE8M0 scales.
 extern "C" __global__ __launch_bounds__(256, MM_PREP_BLK) void tessera_mm_mxfp8_prep(
@@ -300,9 +345,10 @@ static __device__ __forceinline__ void mx8_ldm4(u32 (&r)[4], const void* smem_pt
                  : "r"(addr));
 }
 
+#if !defined(Y_MXFP8)
 template <bool SPLIT>
 static __device__ __forceinline__ void mx8_store_vec4(
-    float4 v, const trellis::o_t* other, trellis::y_t* out, u64 off, u32 col, u32 n, u32 mode,
+    float4 v, const mx8_o_t* other, trellis::y_t* out, u64 off, u32 col, u32 n, u32 mode,
     bool vec4) {
     if (vec4 && col + 3u < n) {
         if (!SPLIT && mode != 0u) {
@@ -319,16 +365,19 @@ static __device__ __forceinline__ void mx8_store_vec4(
         }
     }
 }
+#endif
 
 template <u32 MI, bool SPLIT>
 static __device__ __forceinline__ void mx8_epilogue_smem(
-    float (*out_sm)[132], const float (&acc)[2][MI][4], const trellis::o_t* other,
-    trellis::y_t* out, u32 m, u32 n, u32 r0, u32 n0, u32 p, u32 mode, u32 tid, u32 wm, u32 n_base,
+    float (*out_sm)[132], const float (&acc)[2][MI][4], const mx8_o_t* other,
+    mx8_y_t* out, u32 m, u32 n, u32 r0, u32 n0, u32 p, u32 mode, u32 tid, u32 wm, u32 n_base,
     u32 g, u32 t) {
     constexpr u32 Q_ROWS = MI << 3u;
     constexpr u32 Q_SHIFT = (MI == 8u) ? 6u : 5u;
     u32 sr = tid >> 5u, sc4 = (tid & 31u) << 2u;
+#if !defined(Y_MXFP8)
     bool vec4 = (n & 3u) == 0u;
+#endif
 #pragma unroll
     for (u32 q = 0u; q < 2u; q++) {
         if (wm == q) {
@@ -350,11 +399,25 @@ static __device__ __forceinline__ void mx8_epilogue_smem(
 #pragma unroll
         for (u32 dr = 0u; dr < Q_ROWS; dr += 8u) {
             u32 row = r0 + (q << Q_SHIFT) + sr + dr;
+#if defined(Y_MXFP8) && DTR_MX8
+            bool valid = row < m && col < n;
+            float4 v = valid ? *reinterpret_cast<const float4*>(&out_sm[sr + dr][sc4])
+                             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (valid && !SPLIT && mode != 0u) {
+                u64 off = u64(row) * n + col;
+                v.x = mx8_epilogue(v.x, other, off, col, mode);
+                v.y = mx8_epilogue(v.y, other, off + 1u, col + 1u, mode);
+                v.z = mx8_epilogue(v.z, other, off + 2u, col + 2u, mode);
+                v.w = mx8_epilogue(v.w, other, off + 3u, col + 3u, mode);
+            }
+            mx8_store_blk4(v, out, row, n >> 5u, col, tid & 7u, valid);
+#else
             if (row < m && col < n) {
                 float4 v = *reinterpret_cast<const float4*>(&out_sm[sr + dr][sc4]);
                 u64 off = u64(SPLIT ? (p * m + row) : row) * n + col;
                 mx8_store_vec4<SPLIT>(v, other, out, off, col, n, mode, vec4);
             }
+#endif
         }
         if (q == 0u) prim::block_sync();
     }
@@ -365,8 +428,12 @@ static __device__ __forceinline__ void mx8_epilogue_smem(
 union alignas(16) mx8_128_smem {
     struct {
         u32 sw[2][128][36];
+#if defined(X_MXFP8)
+        u32 sx[2][128][36];
+#else
         u32 sx[2][128][32];
         u32 sxs[2][128];
+#endif
     } k;
     float out[64][132];
 };
@@ -394,6 +461,21 @@ static __device__ __forceinline__ void mx8_load_fa(
     }
 }
 
+#if defined(X_MXFP8)
+template <u32 SH>
+static __device__ __forceinline__ void mx8_load_fb(
+    const u32* sx, u32 w_base, u32 t, u32 (&fb)[2]) {
+    u32 w0 = w_base + t;
+    if constexpr (SH == 0u) {
+        fb[0] = sx[w0];
+        fb[1] = sx[w0 + 4u];
+    } else {
+        asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(fb[0]) : "r"(sx[w0]), "r"(sx[w0 + 1u]), "n"(SH));
+        asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(fb[1]) : "r"(sx[w0 + 4u]), "r"(sx[w0 + 5u]), "n"(SH));
+    }
+}
+#endif
+
 static __device__ __forceinline__ void mx8_load_stage(
     mx8_128_smem& sm, u32 st, u32 ch128, const u8* xq, const u8* xs, const u8* w,
     u32 m, u32 n, u32 k, u32 nblk, u64 row_bytes, u32 n0, u32 r0, u32 tid, u32 r0_t, u32 col16) {
@@ -407,6 +489,18 @@ static __device__ __forceinline__ void mx8_load_stage(
     if (tid < 128u) {
         mx8_cp16(&sm.k.sw[st][tid][32u], w + u64(n0 + tid) * row_bytes + aligned_off + 128u, n0 + tid < n);
     }
+#if defined(X_MXFP8)
+    (void)xs; (void)k; (void)nblk;
+#pragma unroll
+    for (u32 dr = 0u; dr < 128u; dr += 32u) {
+        u32 mr = r0_t + dr;
+        mx8_cp16(&sm.k.sx[st][mr][col16 << 2u],
+                 xq + u64(r0 + mr) * row_bytes + aligned_off + (col16 << 4u), r0 + mr < m);
+    }
+    if (tid < 128u) {
+        mx8_cp16(&sm.k.sx[st][tid][32u], xq + u64(r0 + tid) * row_bytes + aligned_off + 128u, r0 + tid < m);
+    }
+#else
     u32 k_off = ch128 << 7u;
 #pragma unroll
     for (u32 dr = 0u; dr < 128u; dr += 32u) {
@@ -417,19 +511,33 @@ static __device__ __forceinline__ void mx8_load_stage(
     if (tid < 128u) {
         mx8_cp4(&sm.k.sxs[st][tid], xs + u64(r0 + tid) * nblk + (ch128 << 2u), r0 + tid < m);
     }
+#endif
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
 template <u32 PH, u32 BLK>
 static __device__ __forceinline__ void mx8_run_blk(
+#if defined(X_MXFP8)
+    const u32 (*sw_st)[36], const u32 (*sx_st)[36],
+#else
     const u32 (*sw_st)[36], const u32 (*sx_st)[32], const u32 sb4[8],
+#endif
     u32 n_base, u32 m_base, u32 g, u32 t, u32 lb_row, u32 lb_half, float acc[2][8][4]) {
     constexpr u32 B_OFF = PH * 4u + BLK * 33u;
     constexpr u32 Q_BASE = B_OFF + 1u;
     constexpr u32 SH = (Q_BASE & 3u) << 3u;
     constexpr u32 W_BASE = Q_BASE >> 2u;
-    constexpr u32 S_SH = BLK << 3u;
     u32 fb[8][2], sb[8];
+#if defined(X_MXFP8)
+    (void)lb_row; (void)lb_half;
+#pragma unroll
+    for (u32 mi = 0u; mi < 8u; mi++) {
+        const u32* sx_mr = sx_st[m_base + (mi << 3u) + g];
+        sb[mi] = u32(reinterpret_cast<const u8*>(sx_mr)[B_OFF]);
+        mx8_load_fb<SH>(sx_mr, W_BASE, t, fb[mi]);
+    }
+#else
+    constexpr u32 S_SH = BLK << 3u;
 #pragma unroll
     for (u32 q = 0u; q < 4u; q++) {
         u32 mr = m_base + (q << 4u) + lb_row, tmp[4];
@@ -439,6 +547,7 @@ static __device__ __forceinline__ void mx8_run_blk(
     }
 #pragma unroll
     for (u32 mi = 0u; mi < 8u; mi++) sb[mi] = (sb4[mi] >> S_SH) & 0xFFu;
+#endif
 
     u32 fa0[4], fa1[4], sa0, sa1;
     {
@@ -472,6 +581,12 @@ static __device__ __forceinline__ void mx8_phase_step(
         asm volatile("cp.async.wait_group 0;\n" ::);
     }
     prim::block_sync();
+#if defined(X_MXFP8)
+    mx8_run_blk<PH, 0u>(sm.k.sw[st], sm.k.sx[st], n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 1u>(sm.k.sw[st], sm.k.sx[st], n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 2u>(sm.k.sw[st], sm.k.sx[st], n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 3u>(sm.k.sw[st], sm.k.sx[st], n_base, m_base, g, t, lb_row, lb_half, acc);
+#else
     u32 sb4[8];
 #pragma unroll
     for (u32 mi = 0u; mi < 8u; mi++) sb4[mi] = sm.k.sxs[st][m_base + (mi << 3u) + g];
@@ -479,12 +594,13 @@ static __device__ __forceinline__ void mx8_phase_step(
     mx8_run_blk<PH, 1u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
     mx8_run_blk<PH, 2u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
     mx8_run_blk<PH, 3u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
+#endif
     if (has_nxt) prim::block_sync();
 }
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_mxfp8_mx8(
-    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out,
+    const float* xpre, const u8* w, const mx8_o_t* other, mx8_y_t* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks) {
     extern __shared__ u8 raw_smem[];
     mx8_128_smem& sm = *reinterpret_cast<mx8_128_smem*>(raw_smem);
@@ -535,7 +651,7 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
 
 // Blackwell native MXFP8 MMA matmul, 128x128 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX8_BLK) void tessera_mm_mxfp8_mx8(
-    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n,
+    const float* xpre, const u8* w, const mx8_o_t* other, mx8_y_t* out, u32 m, u32 n,
     u32 k, u32 mode) {
 #if DTR_MX8
     fg_mxfp8_mx8<false>(xpre, w, other, out, m, n, k, mode, 1u);
@@ -546,12 +662,141 @@ extern "C" __global__ __launch_bounds__(256, MM_MX8_BLK) void tessera_mm_mxfp8_m
 
 // Split-K Blackwell native MXFP8 MMA matmul, 128x128 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX8_SK_BLK) void tessera_mm_mxfp8_mx8_sk(
-    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n,
+    const float* xpre, const u8* w, const mx8_o_t* other, mx8_y_t* out, u32 m, u32 n,
     u32 k, u32 mode, u32 ks) {
 #if DTR_MX8
     fg_mxfp8_mx8<true>(xpre, w, other, out, m, n, k, mode, ks);
 #else
     (void)xpre; (void)w; (void)other; (void)out; (void)m; (void)n; (void)k; (void)mode; (void)ks;
+#endif
+}
+
+// Split-K reduction with optional MXFP8 epilogue and output quantization.
+extern "C" __global__ __launch_bounds__(256, MM_PREP_BLK) void tessera_mm_reduce_mx8(
+    const float* part, const mx8_o_t* other, mx8_y_t* out, u32 m, u32 n, u32 ks, u32 mode) {
+#if DTR_MX8
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.y;
+    u32 col = (blockIdx.x * 256u + tid) << 2u;
+    bool valid = row < m && col < n;
+    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (valid) {
+        u64 off = u64(row) * n + col;
+        u64 mn = u64(m) * n;
+        for (u32 p = 0u; p < ks; p++) {
+            float4 s = *reinterpret_cast<const float4*>(part + u64(p) * mn + off);
+            v.x += s.x; v.y += s.y; v.z += s.z; v.w += s.w;
+        }
+        if (mode != 0u) {
+            v.x = mx8_epilogue(v.x, other, off, col, mode);
+            v.y = mx8_epilogue(v.y, other, off + 1u, col + 1u, mode);
+            v.z = mx8_epilogue(v.z, other, off + 2u, col + 2u, mode);
+            v.w = mx8_epilogue(v.w, other, off + 3u, col + 3u, mode);
+        }
+    }
+#if defined(Y_MXFP8)
+    mx8_store_blk4(v, out, row, n >> 5u, col, tid & 7u, valid);
+#else
+    if (valid) trellis::store_y4(out + u64(row) * n + col, v);
+#endif
+#else
+    (void)part; (void)other; (void)out; (void)m; (void)n; (void)ks; (void)mode;
+#endif
+}
+
+#if defined(A_BF16)
+using nmx_a_t = u16;
+#else
+using nmx_a_t = float;
+#endif
+#if defined(B_BF16)
+using nmx_b_t = u16;
+#else
+using nmx_b_t = float;
+#endif
+#if defined(C_BF16)
+using nmx_c_t = u16;
+#else
+using nmx_c_t = float;
+#endif
+#if defined(W_BF16)
+using nmx_w_t = u16;
+#else
+using nmx_w_t = float;
+#endif
+#if defined(S_BF16)
+using nmx_s_t = u16;
+#else
+using nmx_s_t = float;
+#endif
+
+static __device__ __forceinline__ float4 nmx_load_sum(
+    const nmx_a_t* a, const nmx_b_t* b, const nmx_c_t* c, u64 off, u32 flags) {
+    float4 s = trellis::load_e4(a + off);
+    if (flags & 1u) {
+        float4 vb = trellis::load_e4(b + off);
+        s.x += vb.x; s.y += vb.y; s.z += vb.z; s.w += vb.w;
+    }
+    if (flags & 2u) {
+        float4 vc = trellis::load_e4(c + off);
+        s.x += vc.x; s.y += vc.y; s.z += vc.z; s.w += vc.w;
+    }
+    return s;
+}
+
+// Fused RMS norm and optional add to OCP mxfp8.
+extern "C" __global__ __launch_bounds__(256, 2) void tessera_norm_mxfp8(
+    const nmx_a_t* a, const nmx_b_t* b, const nmx_c_t* c, const nmx_w_t* w, u8* out,
+    nmx_s_t* sum_out, u32 rows, u32 width, float eps, u32 flags) {
+#if DTR_MX8
+    u32 row = blockIdx.x;
+    if (row >= rows) return;
+    u32 tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    u64 row_off = u64(row) * width;
+    float4 cache[8];
+    float acc = 0.0f;
+    u32 trip = 0u;
+    for (u32 base = 0u; base < width; base += 1024u, trip++) {
+        u32 col = base + (tid << 2u);
+        if (col < width) {
+            float4 s = nmx_load_sum(a, b, c, row_off + col, flags);
+            if (flags & 8u) trellis::store_e4(sum_out + row_off + col, s);
+            if (trip < 8u) cache[trip] = s;
+            acc += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+        }
+    }
+#pragma unroll
+    for (u32 off = 16u; off > 0u; off >>= 1u) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    __shared__ float wsum[8];
+    if (lane == 0u) wsum[warp] = acc;
+    prim::block_sync();
+    float tot = 0.0f;
+#pragma unroll
+    for (u32 i = 0u; i < 8u; i++) tot += wsum[i];
+    float inv = rsqrtf(tot / float(width) + eps);
+    u32 nblk = width >> 5u;
+    bool use_cache = width <= 8192u;
+    trip = 0u;
+    for (u32 base = 0u; base < width; base += 1024u, trip++) {
+        u32 col = base + (tid << 2u);
+        bool valid = col < width;
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (valid) {
+            if (use_cache) s = cache[trip];
+            else if (flags & 16u) s = trellis::load_e4(sum_out + row_off + col);
+            else s = nmx_load_sum(a, b, c, row_off + col, flags);
+            if (flags & 4u) {
+                float4 gw = trellis::load_e4(w + col);
+                s.x *= inv * gw.x; s.y *= inv * gw.y; s.z *= inv * gw.z; s.w *= inv * gw.w;
+            } else {
+                s.x *= inv; s.y *= inv; s.z *= inv; s.w *= inv;
+            }
+        }
+        mx8_store_blk4(s, out, row, nblk, col, tid & 7u, valid);
+    }
+#else
+    (void)a; (void)b; (void)c; (void)w; (void)out; (void)sum_out;
+    (void)rows; (void)width; (void)eps; (void)flags;
 #endif
 }
 

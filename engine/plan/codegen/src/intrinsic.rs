@@ -735,6 +735,17 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
                 host: |g, args, mask| g.unary(args, mask, round_e4m3),
                 count: |c, _| c.tally(Ops { e4m3: 2.0, ..Ops::default() }, true),
             }
+            /// `to_e4m3(x)`: `x` encoded as an OCP e4m3 byte.
+            ToE4M3 = fn to_e4m3(f32) -> u32 {
+                device: define("f_e4m3_byte(x)", "(u32)f_to_e4m3(x)", "(u32)f_to_e4m3(x)"),
+                text: |p, args| p.spell("f_e4m3_byte", args),
+                wgsl: None,
+                host: |g, args, mask| {
+                    let v = g.eval(&args[0], mask);
+                    v.into_iter().map(|x| Val::U(to_e4m3(x.f()))).collect()
+                },
+                count: |c, _| c.tally(Ops { e4m3: 1.0, ..Ops::default() }, true),
+            }
         }
     };
 }

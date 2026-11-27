@@ -1,6 +1,6 @@
 //! Runs a body on the host, each group in lockstep.
 
-use crate::lockstep::{Slabs, bf16_pair, leaders, round_e4m3, round_f16};
+use crate::lockstep::{Slabs, bf16_pair, leaders, round_e4m3, round_f16, to_e4m3};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tessera_codegen::form::{Load, Read};
@@ -199,6 +199,10 @@ impl Group<'_, '_> {
             Read::U32 => {
                 let raw = bytes.get_mut(idx * 4..idx * 4 + 4).unwrap_or_else(fail);
                 raw.copy_from_slice(&value.u().to_le_bytes());
+            }
+            Read::U8 => {
+                let raw = bytes.get_mut(idx..idx + 1).unwrap_or_else(fail);
+                raw[0] = value.u() as u8;
             }
             other => panic!("cannot write form {other:?}"),
         }

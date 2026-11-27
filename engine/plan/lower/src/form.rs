@@ -132,7 +132,11 @@ impl Pins {
 
     /// Pins kept rows (KV cache) to `form`.
     pub fn kept(mut self, form: &'static dyn Load) -> Self {
-        assert!(form.stores(), "kept form `{}` is not writable", form.name());
+        assert!(
+            form.stores() && form.block() == 1,
+            "kept form `{}` is not element-writable",
+            form.name()
+        );
         self.kept = form;
         self
     }
@@ -192,9 +196,9 @@ pub fn plain(form: &'static dyn Load) -> &'static dyn Load {
     }
 }
 
-/// `form` if a writable float form, else `F32_FORM`.
+/// `form` if an element-writable float form, else `F32_FORM`.
 pub fn writable(form: &'static dyn Load) -> &'static dyn Load {
-    match form.stores() && form.dtype().is_float() {
+    match form.stores() && form.dtype().is_float() && form.block() == 1 {
         true => form,
         false => F32_FORM,
     }
@@ -286,9 +290,18 @@ impl<'de> Deserialize<'de> for Pins {
                 ))),
             }
         };
+        let kept_store = |name: &str| {
+            let f = store(name)?;
+            match f.block() == 1 {
+                true => Ok(f),
+                false => Err(serde::de::Error::custom(format!(
+                    "form {name} is not element-writable"
+                ))),
+            }
+        };
         let mut pins = Pins::all(form(&text.weights)?)
             .activations(store(&text.activations)?)
-            .kept(store(&text.kept)?)
+            .kept(kept_store(&text.kept)?)
             .outputs(store(&text.outputs)?);
         for (site, name) in text.sites {
             pins = pins.site(site, store(&name)?);
@@ -304,7 +317,7 @@ impl<'de> Deserialize<'de> for Pins {
             pins.spots.push(Spot {
                 at: s.at,
                 activations: s.activations.as_deref().map(store).transpose()?,
-                kept: s.kept.as_deref().map(store).transpose()?,
+                kept: s.kept.as_deref().map(kept_store).transpose()?,
                 sites,
             });
         }

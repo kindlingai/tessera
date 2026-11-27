@@ -6,7 +6,7 @@ use super::{
 };
 mod mx8;
 
-use mx8::{Mxfp8Mx8, Mxfp8Prep, mxfp8_pre_len};
+use mx8::{MxIo, Mxfp8Reduce, mx8_site};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
@@ -393,9 +393,14 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
     Some(load)
 }
 
-fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
-    let shape = k.shape().expect("a grid");
-    let other = if matches!(k.mode, 1..=4) {
+fn matmul_launches(
+    step: &Step,
+    shape: Shape,
+    [m, n, k]: [usize; 3],
+    mode: u32,
+    ks: Option<usize>,
+) -> Vec<Launch> {
+    let other = if matches!(mode, 1..=4) {
         step.read(2)
     } else {
         step.read(0)
@@ -405,15 +410,39 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
         step.read(1),
         other,
         step.out(),
-        Arg::count(k.m),
-        Arg::count(k.n),
-        Arg::count(k.k),
-        Arg::value(&k.mode),
+        Arg::count(m),
+        Arg::count(n),
+        Arg::count(k),
+        Arg::value(&mode),
     ];
-    if k.kind.is_split() {
-        args.push(Arg::count(k.ks));
+    if let Some(splits) = ks {
+        args.push(Arg::count(splits));
     }
     vec![Launch { args, shape }]
+}
+
+fn reduce_launches(step: &Step, shape: Shape, [m, n, ks]: [usize; 3], mode: u32) -> Vec<Launch> {
+    let other = if matches!(mode, 1..=4) {
+        step.read(1)
+    } else {
+        step.read(0)
+    };
+    let args = vec![
+        step.read(0),
+        other,
+        step.out(),
+        Arg::count(m),
+        Arg::count(n),
+        Arg::count(ks),
+        Arg::value(&mode),
+    ];
+    vec![Launch { args, shape }]
+}
+
+fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
+    let shape = k.shape().expect("a grid");
+    let ks = k.kind.is_split().then_some(k.ks);
+    matmul_launches(step, shape, [k.m, k.n, k.k], k.mode, ks)
 }
 
 /// Deterministic split-K reduction and matmul epilogue.
@@ -497,21 +526,7 @@ fn mm_red_launches(r: &FastMmReduce, step: &Step) -> Vec<Launch> {
         down: 1,
         threads: 256,
     };
-    let other = if matches!(r.mode, 1..=4) {
-        step.read(1)
-    } else {
-        step.read(0)
-    };
-    let args = vec![
-        step.read(0),
-        other,
-        step.out(),
-        Arg::count(r.m),
-        Arg::count(r.n),
-        Arg::count(r.ks),
-        Arg::value(&r.mode),
-    ];
-    vec![Launch { args, shape }]
+    reduce_launches(step, shape, [r.m, r.n, r.ks], r.mode)
 }
 
 struct MmSite {
@@ -525,31 +540,44 @@ struct MmSite {
     min_blocks: Option<u32>,
     prep_min_blocks: Option<u32>,
     reduce_min_blocks: Option<u32>,
-    x_bf16: bool,
-    y_bf16: bool,
-    o_bf16: bool,
+    x_io: MxIo,
+    y_io: MxIo,
+    o_io: MxIo,
     form: &'static dyn Stored,
 }
 
 impl MmSite {
     fn reduce_draft(&self, prev: usize, mode: u32, other: Option<T>) -> Draft {
+        let mut reads = vec![Read::Draft(prev)];
+        if let Some(extra) = other {
+            reads.push(Read::Node(extra));
+        }
+        if self.y_io == MxIo::Mxfp8 || self.o_io == MxIo::Mxfp8 {
+            let red = Mxfp8Reduce {
+                m: self.m,
+                n: self.n,
+                ks: self.ks,
+                mode,
+                min_blocks: self.reduce_min_blocks,
+                y_io: self.y_io,
+                o_io: self.o_io,
+            };
+            return Draft::new(red, reads, self.m * self.n);
+        }
         let red = FastMmReduce {
             m: self.m,
             n: self.n,
             ks: self.ks,
             mode,
             min_blocks: self.reduce_min_blocks,
-            y_bf16: self.y_bf16,
-            o_bf16: self.o_bf16,
+            y_bf16: self.y_io == MxIo::Bf16,
+            o_bf16: self.o_io == MxIo::Bf16,
         };
-        let mut reads = vec![Read::Draft(prev)];
-        if let Some(extra) = other {
-            reads.push(Read::Node(extra));
-        }
         Draft::new(red, reads, self.m * self.n)
     }
 
     fn draft(self, mode: u32, other: Option<T>) -> Vec<Draft> {
+        let x_bf16 = self.x_io == MxIo::Bf16;
         if self.kind.is_split() {
             let mm = FastMm {
                 m: self.m,
@@ -559,7 +587,7 @@ impl MmSite {
                 mode: 0,
                 min_blocks: self.min_blocks,
                 kind: self.kind,
-                x_bf16: self.x_bf16,
+                x_bf16,
                 y_bf16: false,
                 o_bf16: false,
                 form: self.form,
@@ -577,9 +605,9 @@ impl MmSite {
             mode,
             min_blocks: self.min_blocks,
             kind: self.kind,
-            x_bf16: self.x_bf16,
-            y_bf16: self.y_bf16,
-            o_bf16: self.o_bf16,
+            x_bf16,
+            y_bf16: self.y_io == MxIo::Bf16,
+            o_bf16: self.o_io == MxIo::Bf16,
             form: self.form,
         };
         let mut reads = vec![self.x, self.w];
@@ -588,61 +616,10 @@ impl MmSite {
         }
         vec![Draft::new(kernel, reads, self.m * self.n)]
     }
-
-    fn draft_mx8(self, mode: u32, other: Option<T>) -> Vec<Draft> {
-        let prep = Mxfp8Prep {
-            m: self.m,
-            k: self.k,
-            min_blocks: self.prep_min_blocks,
-            x_bf16: self.x_bf16,
-        };
-        let pre_len = mxfp8_pre_len(self.m, self.k);
-        if self.ks > 1 {
-            let mm = Mxfp8Mx8 {
-                m: self.m,
-                n: self.n,
-                k: self.k,
-                ks: self.ks,
-                mode: 0,
-                min_blocks: self.min_blocks,
-                y_bf16: false,
-                o_bf16: false,
-                form: self.form,
-            };
-            return vec![
-                Draft::new(prep, [Read::Node(self.x)], pre_len),
-                Draft::new(
-                    mm,
-                    [Read::Draft(0), Read::Node(self.w)],
-                    self.ks * self.m * self.n,
-                ),
-                self.reduce_draft(1, mode, other),
-            ];
-        }
-        let mm = Mxfp8Mx8 {
-            m: self.m,
-            n: self.n,
-            k: self.k,
-            ks: 1,
-            mode,
-            min_blocks: self.min_blocks,
-            y_bf16: self.y_bf16,
-            o_bf16: self.o_bf16,
-            form: self.form,
-        };
-        let mut reads = vec![Read::Draft(0), Read::Node(self.w)];
-        if let Some(extra) = other {
-            reads.push(Read::Node(extra));
-        }
-        vec![
-            Draft::new(prep, [Read::Node(self.x)], pre_len),
-            Draft::new(mm, reads, self.m * self.n),
-        ]
-    }
 }
 
 /// Validates a multi-row 2D matmul site or explains its rejection.
-fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
+fn check_mm(tree: &Tree, mat: T, allow_mx8: bool) -> Option<Result<MmSite, String>> {
     let node = tree.node(mat);
     if node.term != Term::Op(Op::Matmul) {
         return None;
@@ -663,21 +640,15 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         return None;
     }
     let y_name = node.form.name();
-    let y_bf16 = match y_name {
-        "f32" => false,
-        "bf16" => true,
-        _ => {
-            return Some(Err(format!("output form {y_name} (requires f32 or bf16)")));
-        }
+    let Some(y_io) = io_of(y_name, allow_mx8 && n.is_multiple_of(32)) else {
+        return Some(Err(format!("output form {y_name} (requires f32 or bf16)")));
     };
     if !tree.leaf(w) {
         return Some(Err("weight is not a direct leaf".into()));
     }
     let x_name = tree.node(x).form.name();
-    let x_bf16 = match x_name {
-        "f32" => false,
-        "bf16" => true,
-        _ => return Some(Err(format!("input form {x_name} (requires f32 or bf16)"))),
+    let Some(x_io) = io_of(x_name, allow_mx8) else {
+        return Some(Err(format!("input form {x_name} (requires f32 or bf16)")));
     };
     let form = tree.node(w).form;
     let split_groups = knob(tree, "fast_mm_bf16", "split_groups", 144);
@@ -806,68 +777,48 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         min_blocks,
         prep_min_blocks: None,
         reduce_min_blocks,
-        x_bf16,
-        y_bf16,
-        o_bf16: false,
+        x_io,
+        y_io,
+        o_io: MxIo::F32,
         form,
     }))
 }
 
 fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
-    check_mm(tree, mat)?.ok()
+    check_mm(tree, mat, false)?.ok()
 }
 
-fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
-    let mut site = mm_site(tree, mat)?;
-    if site.form.name() != "mxfp8" || site.m < knob(tree, "fast_mm_mxfp8_mx8", "min_rows", 64) {
-        return None;
-    }
-    let chunks = site.k / 512;
-    let set = set_ks(tree, "fast_mm_mxfp8_mx8_sk", chunks)
-        .or_else(|| set_ks(tree, "fast_mm_mxfp8_sk", chunks));
-    let min_g = knob(tree, "fast_mm_mxfp8_mx8", "min_groups", 40);
-    let target = knob(tree, "fast_mm_mxfp8_mx8", "target_groups", 64);
-    site.ks = set.unwrap_or_else(|| mxfp8_tile_ks(site.m, site.n, site.k, 128, min_g, 24, target));
-    let mx_rule = if site.ks > 1 {
-        "fast_mm_mxfp8_mx8_sk"
-    } else {
-        "fast_mm_mxfp8_mx8"
-    };
-    site.min_blocks = tree.knobs.get(mx_rule, "min_blocks").map(|v| v as u32);
-    site.prep_min_blocks = tree
-        .knobs
-        .get("fast_mm_mxfp8_mx8", "prep_min_blocks")
-        .map(|v| v as u32);
-    site.reduce_min_blocks = tree
-        .knobs
-        .get("fast_mm_mxfp8_mx8_sk", "reduce_min_blocks")
-        .map(|v| v as u32);
-    Some(site)
-}
-
-fn is_plain_io(form: &dyn Stored) -> bool {
-    matches!(form.name(), "f32" | "bf16")
+fn io_of(name: &str, allow_mx8: bool) -> Option<MxIo> {
+    let io = MxIo::from_name(name)?;
+    (allow_mx8 || io != MxIo::Mxfp8).then_some(io)
 }
 
 fn match_mm_add(
     tree: &Tree,
     at: T,
     pick: fn(&Tree, T) -> Option<MmSite>,
+    allow_mx8: bool,
 ) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Add) || !is_plain_io(node.form) {
+    if node.term != Term::Stage(Stage::Add) {
         return None;
     }
-    let y_bf16 = node.form.name() == "bf16";
+    let y_io = io_of(node.form.name(), allow_mx8)?;
     let (a, b) = (node.args[0], *node.args.get(1)?);
     for (mat, add) in [(a, b), (b, a)] {
-        if mat == add || tree.root(mat) || !is_plain_io(tree.node(add).form) {
+        if mat == add || tree.root(mat) {
             continue;
         }
+        let add_node = tree.node(add);
+        let Some(o_io) = io_of(add_node.form.name(), allow_mx8) else {
+            continue;
+        };
         let Some(mut site) = pick(tree, mat) else {
             continue;
         };
-        let add_node = tree.node(add);
+        if y_io == MxIo::Mxfp8 && !site.n.is_multiple_of(32) {
+            continue;
+        }
         let add_elems = tree.elements(add);
         let mode = if add_elems == site.m * site.n && add_node.shape == node.shape {
             1
@@ -876,8 +827,8 @@ fn match_mm_add(
         } else {
             continue;
         };
-        site.y_bf16 = y_bf16;
-        site.o_bf16 = add_node.form.name() == "bf16";
+        site.y_io = y_io;
+        site.o_io = o_io;
         return Some((site, mode, Some(add)));
     }
     None
@@ -887,20 +838,24 @@ fn match_mm_mul(
     tree: &Tree,
     at: T,
     pick: fn(&Tree, T) -> Option<MmSite>,
+    allow_mx8: bool,
 ) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Mul) || !is_plain_io(node.form) {
+    if node.term != Term::Stage(Stage::Mul) {
         return None;
     }
-    let y_bf16 = node.form.name() == "bf16";
+    let y_io = io_of(node.form.name(), allow_mx8)?;
     let (a, b) = (node.args[0], *node.args.get(1)?);
     let silu = Term::Stage(Stage::Act(Act::Silu));
     for (cand, other) in [(a, b), (b, a)] {
-        if cand == other || tree.root(cand) || !is_plain_io(tree.node(other).form) {
+        if cand == other || tree.root(cand) {
             continue;
         }
+        let Some(o_io) = io_of(tree.node(other).form.name(), allow_mx8) else {
+            continue;
+        };
         let cnode = tree.node(cand);
-        if cnode.term != silu || !is_plain_io(cnode.form) {
+        if cnode.term != silu || io_of(cnode.form.name(), allow_mx8).is_none() {
             continue;
         }
         let mat = cnode.args[0];
@@ -910,22 +865,31 @@ fn match_mm_mul(
         let Some(mut site) = pick(tree, mat) else {
             continue;
         };
+        if y_io == MxIo::Mxfp8 && !site.n.is_multiple_of(32) {
+            continue;
+        }
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            site.y_bf16 = y_bf16;
-            site.o_bf16 = tree.node(other).form.name() == "bf16";
+            site.y_io = y_io;
+            site.o_io = o_io;
             return Some((site, 3, Some(other)));
         }
     }
     for (mat, other) in [(a, b), (b, a)] {
-        if mat == other || tree.root(mat) || !is_plain_io(tree.node(other).form) {
+        if mat == other || tree.root(mat) {
             continue;
         }
+        let Some(o_io) = io_of(tree.node(other).form.name(), allow_mx8) else {
+            continue;
+        };
         let Some(mut site) = pick(tree, mat) else {
             continue;
         };
+        if y_io == MxIo::Mxfp8 && !site.n.is_multiple_of(32) {
+            continue;
+        }
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            site.y_bf16 = y_bf16;
-            site.o_bf16 = tree.node(other).form.name() == "bf16";
+            site.y_io = y_io;
+            site.o_io = o_io;
             return Some((site, 4, Some(other)));
         }
     }
@@ -936,20 +900,24 @@ fn match_mm_site(
     tree: &Tree,
     at: T,
     pick: fn(&Tree, T) -> Option<MmSite>,
+    allow_mx8: bool,
 ) -> Option<(MmSite, u32, Option<T>)> {
-    if let Some(hit) = match_mm_add(tree, at, pick) {
+    if let Some(hit) = match_mm_add(tree, at, pick, allow_mx8) {
         return Some(hit);
     }
-    if let Some(hit) = match_mm_mul(tree, at, pick) {
+    if let Some(hit) = match_mm_mul(tree, at, pick, allow_mx8) {
         return Some(hit);
     }
     let node = tree.node(at);
-    if node.term == Term::Stage(Stage::Act(Act::Silu)) && is_plain_io(node.form) {
+    if node.term == Term::Stage(Stage::Act(Act::Silu))
+        && let Some(y_io) = io_of(node.form.name(), allow_mx8)
+    {
         let mat = node.args[0];
         if !tree.root(mat)
             && let Some(mut site) = pick(tree, mat)
+            && (y_io != MxIo::Mxfp8 || site.n.is_multiple_of(32))
         {
-            site.y_bf16 = node.form.name() == "bf16";
+            site.y_io = y_io;
             return Some((site, 5, None));
         }
     }
@@ -957,17 +925,17 @@ fn match_mm_site(
 }
 
 pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (site, mode, other) = match_mm_site(tree, at, mm_site)?;
+    let (site, mode, other) = match_mm_site(tree, at, mm_site, false)?;
     Some(site.draft(mode, other))
 }
 
 pub(crate) fn propose_mm_mx8(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (site, mode, other) = match_mm_site(tree, at, mx8_site)?;
+    let (site, mode, other) = match_mm_site(tree, at, mx8_site, true)?;
     Some(site.draft_mx8(mode, other))
 }
 
 fn why_mm(tree: &Tree, at: T) -> Option<String> {
-    check_mm(tree, at)?.err()
+    check_mm(tree, at, false)?.err()
 }
 
 super::cuda_rule!("fast_mm", propose_mm, why = why_mm);

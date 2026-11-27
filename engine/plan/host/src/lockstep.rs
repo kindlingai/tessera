@@ -89,6 +89,11 @@ pub fn st_u32(bytes: &mut [u8], at: usize, v: u32) {
     bytes[at * 4..at * 4 + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+#[inline(always)]
+pub fn st_u8(bytes: &mut [u8], at: usize, v: u32) {
+    bytes[at] = v as u8;
+}
+
 /// `n` floats from `at` through stage `code`.
 pub fn stage_f32(
     out: &mut [u8],
@@ -206,6 +211,11 @@ pub fn round_f16(x: f32) -> f32 {
 #[inline(always)]
 pub fn round_e4m3(x: f32) -> f32 {
     round_to(x, 4, 3, 448.0)
+}
+
+#[inline(always)]
+pub fn to_e4m3(x: f32) -> u32 {
+    u32::from(E4M3::from(x).0)
 }
 
 /// `hi` and `lo` to bf16, nearest even, `hi` high.

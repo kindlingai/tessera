@@ -291,27 +291,14 @@ fn lowering_report_diagnostics() {
 
     // Blackwell sm_121 picks native MXFP8 MMA, sm_90 stays on r64.
     let g_mx = linear(&rows, 6144, 6144);
-    let dyn_limits = Limits {
-        group_bytes: 48 * 1024,
-        dynamic_group_bytes: 99 * 1024,
-        ..Limits::assumed()
-    };
-    let mut sm121 = Platform {
-        backend: "cuda".into(),
-        arch: "sm_121".into(),
-        name: "NVIDIA GB10".into(),
-        units: 48,
-        bandwidth: 273e9,
-        ..Platform::host(dyn_limits)
-    };
-    sm121.row.as_mut().unwrap().mxfp8_tile = Some([16, 8, 32]);
+    let sm121 = sm121_platform();
     let sm90 = Platform {
         backend: "cuda".into(),
         arch: "sm_90".into(),
         name: "NVIDIA H100".into(),
         units: 132,
         bandwidth: 3350e9,
-        ..Platform::host(dyn_limits)
+        ..Platform::host(sm121.limits)
     };
     let p121 = lower(
         &g_mx,
@@ -470,15 +457,7 @@ fn fast_mm_loads() {
     assert!(text[tessera_lower::Backend::Cuda].contains("#define MM_BF16_BLK 3"));
 }
 
-#[test]
-fn bf16_inputs_skip_widen() {
-    let mut g = linear(&[Dim::bounded(Rows, 64)], 4096, 4096);
-    g.entries[0].inputs[0].ty.dtype = DType::Bf16;
-    for n in &mut g.nodes {
-        if matches!(n.op, Op::Input { .. }) {
-            n.ty.dtype = DType::Bf16;
-        }
-    }
+fn sm121_platform() -> Platform {
     let limits = Limits {
         group_bytes: 48 * 1024,
         dynamic_group_bytes: 99 * 1024,
@@ -493,7 +472,19 @@ fn bf16_inputs_skip_widen() {
         ..Platform::host(limits)
     };
     sm121.row.as_mut().unwrap().mxfp8_tile = Some([16, 8, 32]);
-    let cuda = Device::default().on(sm121);
+    sm121
+}
+
+#[test]
+fn bf16_inputs_skip_widen() {
+    let mut g = linear(&[Dim::bounded(Rows, 64)], 4096, 4096);
+    g.entries[0].inputs[0].ty.dtype = DType::Bf16;
+    for n in &mut g.nodes {
+        if matches!(n.op, Op::Input { .. }) {
+            n.ty.dtype = DType::Bf16;
+        }
+    }
+    let cuda = Device::default().on(sm121_platform());
     for (w_form, rows) in [
         ("bf16", 1),
         ("bf16", 16),
@@ -534,4 +525,97 @@ fn bf16_inputs_skip_widen() {
             "{w_form} rows={rows}: missing X/Y_BF16 in {names:?}"
         );
     }
+}
+
+#[test]
+fn mxfp8_edges_skip_prep() {
+    let mut g = linear(&[Dim::bounded(Rows, 128)], 4096, 4096);
+    let inp = NodeId(
+        g.nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Input { .. }))
+            .expect("input") as u32,
+    );
+    let w1 = NodeId(
+        g.nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Weight(_)))
+            .expect("weight") as u32,
+    );
+    let ty = g.nodes[inp.0 as usize].ty.clone();
+    let r_port = g.entries[0].inputs.len() as u32;
+    g.entries[0].inputs.push(Port {
+        role: Role::Logits,
+        ty: ty.clone(),
+    });
+    let res = push_node(
+        &mut g,
+        Op::Input {
+            entry: 0,
+            port: r_port,
+        },
+        vec![],
+        ty.clone(),
+    );
+    let sum = push_node(
+        &mut g,
+        Op::Row(Row(vec![Stage::Add])),
+        vec![inp, res],
+        ty.clone(),
+    );
+    let nw_ty = TensorType::new(vec![tessera_graph::DimExpr::Const(4096)], DType::F32);
+    let nw_idx = g.weights.len() as u32;
+    g.weights.push(tessera_graph::Weight {
+        path: vec![tessera_graph::PathSeg::Field("norm".into())],
+        ty: nw_ty.clone(),
+    });
+    let nw = push_node(&mut g, Op::Weight(nw_idx), vec![], nw_ty);
+    let norm = push_node(
+        &mut g,
+        Op::Row(Row(vec![Stage::RmsNorm { eps: 1e-5 }])),
+        vec![sum, nw],
+        ty.clone(),
+    );
+    let w2_ty = g.nodes[w1.0 as usize].ty.clone();
+    let w2_idx = g.weights.len() as u32;
+    g.weights.push(tessera_graph::Weight {
+        path: vec![tessera_graph::PathSeg::Field("w2".into())],
+        ty: w2_ty.clone(),
+    });
+    let w2 = push_node(&mut g, Op::Weight(w2_idx), vec![], w2_ty);
+    let h = push_node(&mut g, Op::Matmul, vec![norm, w1], ty.clone());
+    let y = push_node(&mut g, Op::Matmul, vec![h, w2], ty.clone());
+    g.entries[0].outputs = vec![
+        tessera_graph::Output {
+            node: y,
+            role: Role::Logits,
+        },
+        tessera_graph::Output {
+            node: sum,
+            role: Role::Logits,
+        },
+    ];
+    let mxfp8 = named("mxfp8").expect("mxfp8");
+    let pins = Pins::all(mxfp8)
+        .pin("*norm*", tessera_lower::form::F32_FORM)
+        .site(tessera_lower::Site::Norm, mxfp8)
+        .site(tessera_lower::Site::Matmul, mxfp8)
+        .site(tessera_lower::Site::Residual, tessera_lower::form::F32_FORM);
+    let dev = Device::default().on(sm121_platform()).pinned(pins);
+    let plan = lower(&g, 0, &[(Rows, 128)], &dev).expect("lowers");
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert!(
+        names.contains(&"fast_norm_mxfp8"),
+        "expected fast_norm_mxfp8 in {names:?}"
+    );
+    assert!(
+        !names.contains(&"fast_mm_mxfp8_prep"),
+        "unexpected prep in {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("widen") || n.contains("narrow")),
+        "unexpected cast in {names:?}"
+    );
 }

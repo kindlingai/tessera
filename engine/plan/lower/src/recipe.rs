@@ -332,6 +332,14 @@ fn store(value: &str) -> Result<&'static dyn Load, String> {
     }
 }
 
+fn plain_store(value: &str) -> Result<&'static dyn Load, String> {
+    let f = store(value)?;
+    match f.block() == 1 {
+        true => Ok(f),
+        false => Err(format!("form {value} is not element-writable")),
+    }
+}
+
 fn wire(value: &str) -> Result<DType, String> {
     match value {
         "f32" => Ok(DType::F32),
@@ -368,7 +376,7 @@ impl Dtype {
             (Some("activation"), Some("store") | None) | (None, Some("store")) => {
                 Set::Activations(store(value)?)
             }
-            (Some("kept"), Some("store") | None) => Set::Kept(store(value)?),
+            (Some("kept"), Some("store") | None) => Set::Kept(plain_store(value)?),
             (Some("output"), Some("store") | None) => Set::Outputs(store(value)?),
             (Some(kind), Some("store") | None) => match site(kind) {
                 Some(site) => Set::Site(site, store(value)?),

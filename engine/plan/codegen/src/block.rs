@@ -130,6 +130,9 @@ impl<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const HEAD: 
     fn ty(&self) -> &'static str {
         "u8"
     }
+    fn stores(&self) -> bool {
+        self.name == "mxfp8"
+    }
     /// Nibbles: one word holds four codes of each half.
     fn pairs(&self) -> usize {
         match (C::BITS, HALVES) {
