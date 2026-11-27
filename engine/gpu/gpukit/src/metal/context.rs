@@ -109,6 +109,36 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Typical GPU core count and memory bandwidth for Apple Silicon.
+pub(super) fn apple_specs(name: &str) -> (usize, f64) {
+    const SPECS: &[(&str, usize, f64)] = &[
+        ("M5 Ultra", 80, 1228e9),
+        ("M5 Max", 40, 614e9),
+        ("M5 Pro", 20, 307e9),
+        ("M5", 10, 153e9),
+        ("M4 Ultra", 64, 819e9),
+        ("M4 Max", 40, 546e9),
+        ("M4 Pro", 20, 273e9),
+        ("M4", 10, 120e9),
+        ("M3 Ultra", 60, 800e9),
+        ("M3 Max", 30, 300e9),
+        ("M3 Pro", 14, 150e9),
+        ("M3", 10, 100e9),
+        ("M2 Ultra", 60, 800e9),
+        ("M2 Max", 30, 400e9),
+        ("M2 Pro", 16, 200e9),
+        ("M2", 10, 100e9),
+        ("M1 Ultra", 48, 800e9),
+        ("M1 Max", 24, 400e9),
+        ("M1 Pro", 14, 200e9),
+        ("M1", 8, 68.25e9),
+    ];
+    SPECS
+        .iter()
+        .find(|(tag, _, _)| name.contains(tag))
+        .map_or((0, 0.0), |&(_, units, bw)| (units, bw))
+}
+
 fn compile_error(err: Retained<NSError>) -> Error {
     Error::Compile(err.localizedDescription().to_string())
 }
@@ -298,14 +328,16 @@ impl Device for Context {
             name if name.starts_with("applegpu_") => name,
             _ => newest.map_or("apple", |(_, n)| n).into(),
         };
+        let name = self.name();
+        let (units, bandwidth) = apple_specs(&name);
         Platform::new(Asked {
             backend: crate::backend::Backend::Metal.name(),
             arch,
-            name: self.name(),
+            name,
             driver: String::new(),
             limits: self.limits(),
-            units: 0,
-            bandwidth: 0.0,
+            units,
+            bandwidth,
             integrated: true,
             memory: device.recommendedMaxWorkingSetSize(),
         })
