@@ -2,3 +2,4 @@
 # changes count, one a line. tier-ranks.sh reads this file.
 # An app login ends in [bot].
 mmastrac
+tessera-tiers[bot]
