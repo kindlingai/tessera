@@ -1,6 +1,6 @@
 //! The choices lowering takes, as data a search can edit.
 
-use crate::form::{Load, Pins, Site, matches, named};
+use crate::form::{Load, Pins, Site, in_scope, matches, named};
 use crate::rule::{Rule, gather};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
@@ -137,11 +137,15 @@ pub struct Wires {
     /// Patterns over each sum's weight path. The last match wins.
     #[serde(default)]
     pub named: Vec<(String, DType)>,
+    /// Scopes over each sum's region label, above `named`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spots: Vec<(String, DType)>,
 }
 
 impl Wires {
     /// Pins the sums of `g` the model left unpinned.
     pub fn pin(&self, mut g: Graph) -> Graph {
+        let labels = (!self.spots.is_empty()).then(|| labels(&g));
         for at in 0..g.nodes.len() {
             let n = &g.nodes[at];
             if !sums_ranks(&n.op) || n.numerics.is_some_and(|m| m.wire.is_some()) {
@@ -150,7 +154,9 @@ impl Wires {
             let name = source(&g, n.args[0]).map(PathSeg::dotted);
             let named =
                 name.and_then(|name| self.named.iter().rev().find(|(p, _)| matches(p, &name)));
-            let wire = named.map(|(_, w)| *w).or(self.all);
+            let label = labels.as_ref().map(|l| l[at].as_str());
+            let spot = label.and_then(|l| self.spots.iter().rev().find(|(p, _)| in_scope(p, l)));
+            let wire = spot.or(named).map(|(_, w)| *w).or(self.all);
             if let (Some(wire), Some(num)) = (wire, &mut g.nodes[at].numerics) {
                 num.wire = Some(wire);
             }

@@ -379,7 +379,16 @@ impl<'a> Tree<'a> {
         let mut turned: Vec<Option<[T; 3]>> = vec![None; g.nodes.len()];
         // Sliced views of replicated nodes for owned readers.
         let mut sliced: HashMap<(T, usize, usize), T> = HashMap::new();
+        // Spot pins, built once per label.
+        let labels = (!pins.spots.is_empty()).then(|| crate::recipe::labels(g));
+        let mut spotted: HashMap<&str, Pins> = HashMap::new();
         for i in (0..g.nodes.len()).filter(|i| needed[*i]) {
+            let pins: &Pins = match &labels {
+                Some(l) => spotted
+                    .entry(l[i].as_str())
+                    .or_insert_with(|| pins.at(&l[i])),
+                None => pins,
+            };
             let n = &g.nodes[i];
             let mut extents = sized(g, sizes, upto, &n.ty.shape)?;
             let mut share = None;

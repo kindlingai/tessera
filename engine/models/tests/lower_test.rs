@@ -419,3 +419,49 @@ fn picks_stay() {
     assert!(kernels_at(&plan, &labels, "layer.0.mlp").contains(&pick.as_str()));
     assert!(!kernels_at(&plan, &labels, "layer.1.mlp").contains(&pick.as_str()));
 }
+
+/// Spot pins set KV forms for the named layer set.
+#[test]
+fn spot_pins_stay() {
+    let mut c = Config::qwen3_small();
+    c.stack.layers = 3;
+    let g = stepper::<Norm, Swiglu>(&c);
+    let sizes = [(Seqs, 4), (Rows, 1), (Context, 64)];
+    let text = r#"{"pins": {"spots": [{"at": "layer.0,2.attention", "kept": "bf16"}]}}"#;
+    let recipe: Recipe = serde_json::from_str(text).unwrap();
+    let device = Device::guess(&Settings::default()).with(&recipe);
+    let plan = lower(&g, 0, &sizes, &device).unwrap();
+    let forms: Vec<&str> = plan.kept.iter().map(|(_, s)| s.form.name()).collect();
+    assert_eq!(
+        forms,
+        ["bf16", "bf16", "f32", "f32", "bf16", "bf16"],
+        "{forms:?}"
+    );
+}
+
+/// Spot wires pin the sums of the named layers only.
+#[test]
+fn spot_wires_stay() {
+    let g = stepper::<Norm, Swiglu>(&Config::qwen3_small());
+    let pins = Pins::all(BF16_FORM);
+    let tp = shard_mode(&g, &Parts::even(2), &pins.shares(&g), false)
+        .unwrap()
+        .graph;
+    let text = r#"{"spots": [["layer.0.*", "Bf16"]]}"#;
+    let wires: tessera_lower::Wires = serde_json::from_str(text).unwrap();
+    let pinned = wires.pin(tp);
+    let labels = tessera_lower::labels(&pinned);
+    let mut seen = Vec::new();
+    for (at, n) in pinned.nodes.iter().enumerate() {
+        if tessera_graph::sums_ranks(&n.op) {
+            seen.push((
+                labels[at].starts_with("layer.0."),
+                n.numerics.and_then(|m| m.wire),
+            ));
+        }
+    }
+    assert!(seen.iter().any(|s| s.0), "{seen:?}");
+    for (first, wire) in seen {
+        assert_eq!(wire, first.then_some(DType::Bf16));
+    }
+}

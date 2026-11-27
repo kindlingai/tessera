@@ -72,6 +72,18 @@ pub struct Pins {
     pub sites: BTreeMap<Site, &'static dyn Load>,
     /// Patterns over weight paths, the last match winning.
     pub named: Vec<(String, &'static dyn Load)>,
+    /// Forms for some regions. The last match wins.
+    pub spots: Vec<Spot>,
+}
+
+/// Forms for the nodes whose region label fits `at`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spot {
+    /// A pattern over labels such as `layer.3.attention`. `*` is any run.
+    pub at: String,
+    pub activations: Option<&'static dyn Load>,
+    pub kept: Option<&'static dyn Load>,
+    pub sites: BTreeMap<Site, &'static dyn Load>,
 }
 
 impl Default for Pins {
@@ -89,6 +101,7 @@ impl Pins {
             outputs: F32_FORM,
             sites: BTreeMap::new(),
             named: Vec::new(),
+            spots: Vec::new(),
         }
     }
 
@@ -149,6 +162,22 @@ impl Pins {
         hit.map_or(self.weights, |(_, form)| *form)
     }
 
+    /// These pins with the spots that fit `label` applied.
+    pub fn at(&self, label: &str) -> Pins {
+        let mut out = Pins {
+            sites: self.sites.clone(),
+            named: Vec::new(),
+            spots: Vec::new(),
+            ..*self
+        };
+        for s in self.spots.iter().filter(|s| in_scope(&s.at, label)) {
+            out.activations = s.activations.unwrap_or(out.activations);
+            out.kept = s.kept.unwrap_or(out.kept);
+            out.sites.extend(&s.sites);
+        }
+        out
+    }
+
     /// The override form for `site`, if pinned.
     pub fn site_form(&self, site: Site) -> Option<&'static dyn Load> {
         self.sites.get(&site).copied()
@@ -195,6 +224,21 @@ struct PinNames {
     sites: BTreeMap<Site, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     named: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spots: Vec<SpotNames>,
+}
+
+/// A spot's forms as names.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpotNames {
+    at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activations: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kept: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sites: BTreeMap<Site, String>,
 }
 
 impl Serialize for Pins {
@@ -212,6 +256,16 @@ impl Serialize for Pins {
             outputs: self.outputs.name().into(),
             sites,
             named: self.named.iter().map(named).collect(),
+            spots: self
+                .spots
+                .iter()
+                .map(|s| SpotNames {
+                    at: s.at.clone(),
+                    activations: s.activations.map(|f| f.name().into()),
+                    kept: s.kept.map(|f| f.name().into()),
+                    sites: s.sites.iter().map(|(k, f)| (*k, f.name().into())).collect(),
+                })
+                .collect(),
         }
         .serialize(s)
     }
@@ -241,6 +295,18 @@ impl<'de> Deserialize<'de> for Pins {
         }
         for (pattern, name) in text.named {
             pins = pins.pin(&pattern, form(&name)?);
+        }
+        for s in text.spots {
+            let mut sites = BTreeMap::new();
+            for (site, name) in s.sites {
+                sites.insert(site, store(&name)?);
+            }
+            pins.spots.push(Spot {
+                at: s.at,
+                activations: s.activations.as_deref().map(store).transpose()?,
+                kept: s.kept.as_deref().map(store).transpose()?,
+                sites,
+            });
         }
         Ok(pins)
     }
