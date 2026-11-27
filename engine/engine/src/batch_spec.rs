@@ -12,6 +12,10 @@ use std::collections::VecDeque;
 use tessera_engine_comm::{Reader, Writer};
 use tessera_run::Error as RunError;
 
+pub(crate) mod admit;
+#[cfg(test)]
+mod admit_test;
+
 /// Wire tag identifying a batched speculative round header.
 const BATCH_STEP_TAG: u32 = 2;
 
@@ -78,6 +82,7 @@ pub(crate) struct BatchCore<'a> {
     pub(crate) waiting: VecDeque<(Request, Sink)>,
     pub(crate) free: Vec<u32>,
     pub(crate) kept: Option<Kept>,
+    pub(crate) admit: Box<dyn admit::Admit>,
     pub(crate) hash: u32,
 }
 
@@ -106,6 +111,7 @@ impl<'a> BatchCore<'a> {
             waiting: VecDeque::new(),
             free,
             kept,
+            admit: Box::new(admit::Headroom::default()),
             hash: 2166136261,
         }
     }
@@ -563,10 +569,9 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
                 Some(kept) => {
                     let busy =
                         !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
-                    let pool = kept.totals().pool;
-                    let free_rows = pool.size.saturating_sub(pool.active);
                     let extra = if can_reuse { 0 } else { front.tokens.len() };
-                    if page > 0 && busy && free_rows < extra + crate::batch_dual::PAGE_HEADROOM {
+                    let ask = admit::Ask::of(kept.totals().pool, busy, extra);
+                    if page > 0 && !self.core.admit.admit(ask) {
                         break;
                     }
                     let Some(pair) =

@@ -1,5 +1,6 @@
 //! Multi-slot DFlash decoding and solo DFlash/MTP promotion.
 
+use crate::batch_spec::admit::Ask;
 use crate::batch_spec::{
     ActiveSeq, Admitted, BatchCore, BatchMtp, DraftJob, RoundHost, batch_methods, drive_follow,
     drive_step, notify_kept, prefill_len, queue_request, retire_finished, retire_from, verify_rows,
@@ -294,9 +295,6 @@ impl<'a> BatchMtp<'a> {
         Ok(())
     }
 }
-
-/// Headroom rows reserved before admitting another paged request.
-pub(crate) const PAGE_HEADROOM: usize = 2048;
 
 fn taps_slice(buf: &TapsBuf, row_off: usize, rows: usize, width: usize) -> TapsIn<'_> {
     match buf {
@@ -745,9 +743,8 @@ impl<'a> RoundHost<'a> for BatchDFlash<'a> {
                 if self.core.target.lanes.is_some() {
                     let busy =
                         !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
-                    let pool = kept.totals().pool;
-                    let free_rows = pool.size.saturating_sub(pool.active);
-                    if busy && free_rows < req.tokens.len() + PAGE_HEADROOM {
+                    let ask = Ask::of(kept.totals().pool, busy, req.tokens.len());
+                    if !self.core.admit.admit(ask) {
                         break;
                     }
                 }
