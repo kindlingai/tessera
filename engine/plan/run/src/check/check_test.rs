@@ -83,7 +83,13 @@ ptxas info    : Used 10 registers, used 0 barriers
 fn checks_platform_and_config() {
     let p = target_platform("sm_121").unwrap();
     assert_eq!((p.backend.as_str(), p.arch.as_str()), ("cuda", "sm_121"));
-    assert!(p.limits.compiler && p.limits.pdl);
+    assert_eq!(p.name, "NVIDIA GB10");
+    assert!(p.tabled() && p.integrated && p.limits.compiler && p.limits.pdl);
+    let dev = tessera_lower::Device::stored(p, &Settings::default()).unwrap();
+    assert_eq!(dev.name, "cuda NVIDIA GB10");
+    let p120 = target_platform("sm_120").unwrap();
+    assert_eq!((p120.arch.as_str(), p120.integrated), ("sm_120", false));
+    assert!(p120.tabled() && p120.limits.pdl);
     assert_eq!(sm_target("sm_121").unwrap(), "sm_121a");
     assert_eq!(sm_target("sm_89").unwrap(), "sm_89");
     assert!(sm_target("sm_12é").is_err());

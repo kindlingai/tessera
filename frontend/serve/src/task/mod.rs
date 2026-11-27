@@ -19,11 +19,11 @@ macro_rules! entries {
 
 entries!(generate, draft, mtp, embed, klein, sprite; mtp::DUAL);
 
+#[cfg(test)]
+mod generate_test;
 mod intake;
 #[cfg(test)]
 mod intake_test;
-#[cfg(test)]
-mod task_test;
 
 /// One flag an entry owns.
 pub struct Flag {

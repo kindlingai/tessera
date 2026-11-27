@@ -225,6 +225,32 @@ pub(crate) fn warm_rows(slots: usize, extra_rows: Option<usize>) -> Vec<usize> {
     rows
 }
 
+/// Propagates warm errors during offline checks, else warns.
+fn warm_bucket(
+    checking: bool,
+    show: bool,
+    phase: &str,
+    rows: usize,
+    context: usize,
+    res: Result<(), tessera_engine::Error>,
+) -> Result<(), String> {
+    let Err(e) = res else {
+        return Ok(());
+    };
+    if checking {
+        return Err(format!(
+            "offline warm failed (phase={phase}, rows={rows}, context={context}): {e}"
+        ));
+    }
+    if show {
+        match phase {
+            "prefill" => eprintln!("warning: prefill warm failed: {e}"),
+            _ => eprintln!("warning: decode warm ({rows}) failed: {e}"),
+        }
+    }
+    Ok(())
+}
+
 /// Reports lowering on rank 0 and warms plans.
 pub(super) fn check_lowering(
     o: &Options,
@@ -232,6 +258,7 @@ pub(super) fn check_lowering(
     extra_rows: Option<usize>,
 ) -> Result<(), String> {
     let show = !o.ranks.follows();
+    let checking = tessera_engine::check::active();
     let chunk = engine.chunk(o.max_batch_rows);
     if show {
         let mut fell = false;
@@ -241,6 +268,11 @@ pub(super) fn check_lowering(
                 if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
                     eprintln!("{text}");
                 }
+            }
+            Err(e) if checking => {
+                return Err(format!(
+                    "offline lowering failed (phase=decode, rows=1, context=1): {e}"
+                ));
             }
             Err(e) => eprintln!("warning: lowering report failed: {e}"),
         }
@@ -260,6 +292,11 @@ pub(super) fn check_lowering(
                     eprintln!("{text}");
                 }
             }
+            Err(e) if checking => {
+                return Err(format!(
+                    "offline lowering failed (phase=prefill, rows={chunk}, context={chunk}): {e}"
+                ));
+            }
             Err(e) => eprintln!("warning: prefill lowering report failed: {e}"),
         }
         if fell && !o.allow_failed_lowering {
@@ -268,25 +305,39 @@ pub(super) fn check_lowering(
             );
         }
     }
-    if chunk > 1
-        && let Err(e) = engine.warm(chunk, true)
-        && show
-    {
-        eprintln!("warning: prefill warm failed: {e}");
+    if chunk > 1 {
+        warm_bucket(
+            checking,
+            show,
+            "prefill",
+            chunk,
+            chunk,
+            engine.warm(chunk, true),
+        )?;
     }
     for rows in warm_rows(o.slots, extra_rows) {
-        if let Err(e) = engine.warm(rows, false)
-            && show
-        {
-            eprintln!("warning: decode warm ({rows}) failed: {e}");
-        }
+        warm_bucket(checking, show, "decode", rows, 1, engine.warm(rows, false))?;
     }
-    if tessera_engine::check::active() {
+    if checking {
         let deep = engine.context().min(chunk.saturating_mul(2).max(4096));
         if deep > chunk {
-            let _ = engine.warm_at(chunk, true, deep);
+            warm_bucket(
+                true,
+                show,
+                "prefill",
+                chunk,
+                deep,
+                engine.warm_at(chunk, true, deep),
+            )?;
             for rows in warm_rows(o.slots, extra_rows) {
-                let _ = engine.warm_at(rows, false, deep);
+                warm_bucket(
+                    true,
+                    show,
+                    "decode",
+                    rows,
+                    deep,
+                    engine.warm_at(rows, false, deep),
+                )?;
             }
         }
     }

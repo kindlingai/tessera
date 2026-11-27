@@ -127,15 +127,28 @@ fn sm_target(target: &str) -> Result<String, Error> {
     Ok(format!("sm_{major}{minor}{suffix}"))
 }
 
+/// Hardware defaults for known CUDA architectures in offline checks.
+fn arch_spec(major: u32, minor: u32) -> (Option<&'static str>, usize, f64, usize, bool) {
+    match (major, minor) {
+        // Match the calibrated GB10 chip model on sm_121.
+        (12, 1) => (Some("NVIDIA GB10"), 48, 273e9, 99 * 1024, true),
+        (12, 0) => (None, 170, 1792e9, 99 * 1024, false),
+        (10, _) => (None, 148, 8000e9, 227 * 1024, false),
+        (9, _) => (None, 132, 3350e9, 227 * 1024, false),
+        (8, 0) => (None, 108, 2039e9, 163 * 1024, false),
+        _ => (None, 48, 273e9, 99 * 1024, false),
+    }
+}
+
 /// Builds a synthetic CUDA `Platform` for offline lowering.
 fn target_platform(target: &str) -> Result<Platform, Error> {
     let (major, minor, _) = tessera_gpukit::backend::cuda_arch(target)?;
     let arch = format!("sm_{major}{minor}");
-    let integrated = major == 12 && minor == 1;
+    let (known, units, bandwidth, dynamic_group_bytes, integrated) = arch_spec(major, minor);
     let limits = Limits {
         lanes: 32,
         group_bytes: 48 * 1024,
-        dynamic_group_bytes: 99 * 1024,
+        dynamic_group_bytes,
         group_threads: 1024,
         compiler: true,
         pdl: false,
@@ -143,11 +156,11 @@ fn target_platform(target: &str) -> Result<Platform, Error> {
     Ok(Platform::new(Asked {
         backend: Backend::Cuda.name(),
         arch: arch.clone(),
-        name: format!("offline {arch}"),
+        name: known.map_or_else(|| format!("offline {arch}"), str::to_string),
         driver: "13.0".into(),
         limits,
-        units: 48,
-        bandwidth: 273e9,
+        units,
+        bandwidth,
         integrated,
         memory: 128u64 << 30,
     }))

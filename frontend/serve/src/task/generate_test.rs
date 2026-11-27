@@ -1,8 +1,9 @@
-use super::generate::lowering;
+use super::generate::{check_lowering, lowering};
 use super::{Pick, pick};
 use crate::start::{Options, flags};
 use tessera_engine::form::{BF16_FORM, F32_FORM};
-use tessera_engine::{Compute, DType, Dtype, Pins, Recipe, Site};
+use tessera_engine::{Backend, Compute, DType, Dtype, Engine, Pick as DevicePick, Pins, Recipe};
+use tessera_engine::{Settings, Site, mla};
 
 /// Owned flags parse, and the most given flags pick.
 #[test]
@@ -83,4 +84,44 @@ fn dtypes_fold() {
         lowering(&opts, None).shape.get("p2p_sum", "threads"),
         Some(256)
     );
+}
+
+#[test]
+fn deep_warm_fails_offline() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_seqs = 1;
+    cfg.stack.max_context = 1024;
+    cfg.index.as_mut().unwrap().keep = 512;
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let recipe: Recipe = serde_json::from_str(
+        r#"{"scoped":[{"at":"*","barred":["listed","listed_fused","cpu_listed"]}]}"#,
+    )
+    .unwrap();
+    let opts = Options {
+        slots: 1,
+        max_batch_rows: Some(4),
+        allow_failed_lowering: true,
+        ..Options::default()
+    };
+    // Ordinary serving skips deep warm and stays green.
+    let host = Settings {
+        backend: DevicePick::Host,
+        ..Settings::default()
+    };
+    let mut serving = Engine::open(g.clone(), 1024, &recipe, &host).unwrap();
+    check_lowering(&opts, &mut serving, None).unwrap();
+
+    // Shallow warm passes while deep warm fails offline checks.
+    let _session = tessera_engine::check::start("sm_121").unwrap();
+    let cuda = Settings {
+        backend: DevicePick::Gpu(Backend::Cuda),
+        ..Settings::default()
+    };
+    let mut offline = Engine::open(g, 1024, &recipe, &cuda).unwrap();
+    offline.warm(4, true).unwrap();
+    offline.warm(1, false).unwrap();
+    let err = check_lowering(&opts, &mut offline, None).unwrap_err();
+    assert!(err.contains("phase=prefill"), "{err}");
+    assert!(err.contains("rows=4"), "{err}");
+    assert!(err.contains("context=1024"), "{err}");
 }
