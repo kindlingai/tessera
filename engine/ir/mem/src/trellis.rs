@@ -20,6 +20,12 @@ pub const MUL1_OFFSET: f32 = F16(0xC931).to_f32();
 /// Header words: `in`, `out`, the sharded side, `1 / in`.
 pub const HEAD: usize = 16;
 
+/// A mixed set's table, after its matrix count.
+pub const MIX_TABLE: usize = HEAD + 8;
+
+/// A table row: a matrix's u64 offset, then width.
+pub const MIX_ROW: usize = 16;
+
 /// Record field 4: entries hold 128 input channels.
 pub const INPUT_SIDE: u32 = 2;
 
@@ -30,6 +36,12 @@ const ENTRY: usize = 128;
 pub struct Trellis<const K: u32> {
     pub name: &'static str,
     pub rotated: bool,
+    pub codebook: Codebook,
+}
+
+/// Codes at one width for each matrix of a set.
+pub struct TrellisMix {
+    pub name: &'static str,
     pub codebook: Codebook,
 }
 
@@ -270,35 +282,84 @@ impl<const K: u32> Trellis<K> {
         let shape = Shape::read(bytes);
         let (col, row) = (index / shape.inp, index % shape.inp);
         let at = HEAD + shape.tile(row, col) * Self::TILE;
-        let tile = &bytes[at..at + Self::TILE];
         let j = position(row % 16, col % 16) as u32;
-        let (bits, pairs) = (self.codebook.state_bits(), self.codebook.pairs());
-        let state = window(K, tile, start::<K>(bits, pairs, j)) >> (32 - bits);
-        self.codebook.weight(state, pairs && j % 2 == 1)
+        code::<K>(self.codebook, &bytes[at..at + Self::TILE], j)
     }
+}
 
-    /// The first `n` decoded elements, a tile at a time.
-    fn decode_all(&self, bytes: &[u8], n: usize) -> Vec<f32> {
-        let shape = Shape::read(bytes);
-        let inp = shape.inp;
-        let mut t = vec![0.0; n];
-        // Sixteen outputs a piece: one column of tiles.
-        spread(&mut t, 16 * inp, |c16, piece| {
-            for r16 in 0..inp / 16 {
-                let at = HEAD + shape.tile(16 * r16, 16 * c16) * Self::TILE;
-                let pairs = self.codebook.pairs();
-                let tile = &bytes[at..at + Self::TILE];
-                let w = stream(K as usize, pairs, tile, |s, odd| {
-                    self.codebook.weight(s, odd)
-                });
-                for c in 0..16 {
-                    for r in 0..16 {
-                        piece[c * inp + 16 * r16 + r] = w[position(r, c)];
-                    }
+/// Code `j` of a `K`-bit tile, as its weight.
+fn code<const K: u32>(book: Codebook, tile: &[u8], j: u32) -> f32 {
+    let (bits, pairs) = (book.state_bits(), book.pairs());
+    let state = window(K, tile, start::<K>(bits, pairs, j)) >> (32 - bits);
+    book.weight(state, pairs && j % 2 == 1)
+}
+
+/// `n` elements. `place` gives a tile's start and width.
+fn decode_tiles(
+    book: Codebook,
+    bytes: &[u8],
+    [inp, n]: [usize; 2],
+    place: impl Fn(usize, usize) -> (usize, usize) + Sync,
+) -> Vec<f32> {
+    let mut t = vec![0.0; n];
+    // Sixteen outputs a piece: one column of tiles.
+    spread(&mut t, 16 * inp, |c16, piece| {
+        for r16 in 0..inp / 16 {
+            let (at, k) = place(16 * r16, 16 * c16);
+            let tile = &bytes[at..at + 32 * k];
+            let w = stream(k, book.pairs(), tile, |s, odd| book.weight(s, odd));
+            for c in 0..16 {
+                for r in 0..16 {
+                    piece[c * inp + 16 * r16 + r] = w[position(r, c)];
                 }
             }
-        });
-        t
+        }
+    });
+    t
+}
+
+/// A side cut's tile runs: `[runs, per, at, take]`.
+fn cut(shape: &Shape, outputs: bool, [first, count]: [usize; 2]) -> [usize; 4] {
+    match (outputs, shape.side == INPUT_SIDE) {
+        // Along the stored side: whole entries, in one run.
+        (true, false) => [
+            1,
+            0,
+            first / ENTRY * (shape.inp / 2),
+            count / ENTRY * (shape.inp / 2),
+        ],
+        (false, true) => [
+            1,
+            0,
+            first / ENTRY * (shape.out / 2),
+            count / ENTRY * (shape.out / 2),
+        ],
+        // Outputs of input entries: 64 tiles per 128 outputs.
+        (true, true) => [shape.inp / ENTRY, shape.out / 2, first / 2, count / 2],
+        // Inputs of output entries: 8 tiles per 16 inputs.
+        (false, false) => [shape.out / ENTRY, shape.inp / 2, first / 2, count / 2],
+    }
+}
+
+/// `shape` with `count` channels on the cut side.
+fn narrowed(shape: Shape, outputs: bool, count: usize) -> Shape {
+    match outputs {
+        true => Shape {
+            out: count,
+            ..shape
+        },
+        false => Shape {
+            inp: count,
+            ..shape
+        },
+    }
+}
+
+/// Appends each matrix run of `take` tiles of `tile` bytes.
+fn runs(out: &mut Vec<u8>, bytes: &[u8], base: usize, tile: usize, [n, per, at, take]: [usize; 4]) {
+    for g in 0..n {
+        let from = base + (g * per + at) * tile;
+        out.extend_from_slice(&bytes[from..from + take * tile]);
     }
 }
 
@@ -383,29 +444,47 @@ fn spread<T: Send>(data: &mut [T], size: usize, work: impl Fn(usize, &mut [T]) +
     });
 }
 
+/// The `Form` methods every trellis form shares.
+macro_rules! coded_form {
+    () => {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+        fn read(&self) -> Read {
+            Read::Decode
+        }
+        fn narrow(&self) -> bool {
+            true
+        }
+        /// A tile, so no float row copies in as is.
+        fn block(&self) -> usize {
+            256
+        }
+        fn packs(&self) -> bool {
+            false
+        }
+        fn align(&self) -> usize {
+            ENTRY
+        }
+        fn pack(&self, _: &[f32]) -> Vec<u8> {
+            panic!("{} codes are read from a release, never packed", self.name)
+        }
+        /// A set's whole matrices, or a matrix's whole entries.
+        fn shares(&self, shape: &[usize], axis: usize, count: usize) -> bool {
+            match shape.len() {
+                2 => count.is_multiple_of(ENTRY),
+                3 => axis == 0 || count.is_multiple_of(ENTRY),
+                _ => axis == 0,
+            }
+        }
+    };
+}
+
 impl<const K: u32> Form for Trellis<K> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    fn dtype(&self) -> DType {
-        DType::F32
-    }
-    fn read(&self) -> Read {
-        Read::Decode
-    }
-    fn narrow(&self) -> bool {
-        true
-    }
-    /// A tile, so no float row copies in as is.
-    fn block(&self) -> usize {
-        256
-    }
-    fn packs(&self) -> bool {
-        false
-    }
-    fn align(&self) -> usize {
-        ENTRY
-    }
+    coded_form!();
     fn bytes(&self, elements: usize) -> usize {
         HEAD + elements * K as usize / 8
     }
@@ -437,7 +516,8 @@ impl<const K: u32> Form for Trellis<K> {
             true => shape.inp * shape.out,
             false => self.elements(bytes.len()),
         };
-        let t = self.decode_all(bytes, n);
+        let place = |row, col| (HEAD + shape.tile(row, col) * Self::TILE, K as usize);
+        let t = decode_tiles(self.codebook, bytes, [shape.inp, n], place);
         if !self.rotated {
             return t;
         }
@@ -452,17 +532,6 @@ impl<const K: u32> Form for Trellis<K> {
         }
         let (codes, suh, svh) = Self::parts(bytes);
         Some(vec![codes.to_vec(), floats(suh), floats(svh)])
-    }
-    fn pack(&self, _: &[f32]) -> Vec<u8> {
-        panic!("{} codes are read from a release, never packed", self.name)
-    }
-    /// A set's whole matrices, or a matrix's whole entries.
-    fn shares(&self, shape: &[usize], axis: usize, count: usize) -> bool {
-        match shape.len() {
-            2 => count.is_multiple_of(ENTRY),
-            3 => axis == 0 || count.is_multiple_of(ENTRY),
-            _ => axis == 0,
-        }
     }
     /// Whole matrices of a set, or whole stored-side entries.
     fn share(
@@ -481,7 +550,6 @@ impl<const K: u32> Form for Trellis<K> {
             let set = &bytes[at..at + count * matrix];
             return Some(packed(shape.inp, shape.out, shape.side, set));
         }
-        let input = shape.side == INPUT_SIDE;
         if !first.is_multiple_of(ENTRY) || !count.is_multiple_of(ENTRY) {
             return None;
         }
@@ -494,39 +562,130 @@ impl<const K: u32> Form for Trellis<K> {
             }
             _ => return None,
         };
-        let part = match outputs {
-            true => Shape {
-                out: count,
-                ..shape
-            },
-            false => Shape {
-                inp: count,
-                ..shape
-            },
-        };
-        // `take` tiles from `at` in each run of `per`.
-        let (entries, per, at, take) = match (outputs, input) {
-            // Along the stored side: whole entries, in one run.
-            (true, false) | (false, true) => {
-                let tiles = if input { shape.out / 2 } else { shape.inp / 2 };
-                (1, 0, first / ENTRY * tiles, count / ENTRY * tiles)
-            }
-            // Outputs of input entries: 64 tiles per 128 outputs.
-            (true, true) => (shape.inp / ENTRY, shape.out / 2, first / 2, count / 2),
-            // Inputs of output entries: 8 tiles per 16 inputs.
-            (false, false) => (shape.out / ENTRY, shape.inp / 2, first / 2, count / 2),
-        };
-        let mut out = Vec::with_capacity(HEAD + matrices * entries * take * Self::TILE);
-        out.extend_from_slice(&part.write());
+        let tiles = cut(&shape, outputs, [first, count]);
+        let mut out = Vec::with_capacity(HEAD + matrices * tiles[0] * tiles[3] * Self::TILE);
+        out.extend_from_slice(&narrowed(shape, outputs, count).write());
         for m in 0..matrices {
-            let base = HEAD + m * matrix;
-            for g in 0..entries {
-                let from = base + (g * per + at) * Self::TILE;
-                out.extend_from_slice(&bytes[from..from + take * Self::TILE]);
-            }
+            runs(&mut out, bytes, HEAD + m * matrix, Self::TILE, tiles);
         }
         Some(out)
     }
+}
+
+/// A mixed set's table: each matrix's offset and width.
+fn table(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    let row = |m: usize| {
+        let at = MIX_TABLE + MIX_ROW * m;
+        let offset = u64::from(word(at)) | u64::from(word(at + 4)) << 32;
+        (offset as usize, word(at + 8) as usize)
+    };
+    (0..word(HEAD) as usize).map(row).collect()
+}
+
+/// Code `j` of a tile `k` bits wide.
+fn code_at(book: Codebook, k: usize, tile: &[u8], j: u32) -> f32 {
+    match k {
+        2 => code::<2>(book, tile, j),
+        3 => code::<3>(book, tile, j),
+        4 => code::<4>(book, tile, j),
+        _ => panic!("no trellis codes are {k} bits wide"),
+    }
+}
+
+impl TrellisMix {
+    /// The start and width of the tile of `T[row][col]`.
+    fn place(shape: &Shape, table: &[(usize, usize)], row: usize, col: usize) -> (usize, usize) {
+        let (at, k) = table[col / shape.out];
+        (at + shape.local(row, col % shape.out) * 32 * k, k)
+    }
+}
+
+impl Form for TrellisMix {
+    coded_form!();
+    /// An upper bound: 4-bit codes, each tile a matrix.
+    fn bytes(&self, elements: usize) -> usize {
+        (MIX_TABLE + MIX_ROW * (elements / 256)).next_multiple_of(16) + elements / 2
+    }
+    fn offset(&self, index: usize) -> usize {
+        match index {
+            0 => 0,
+            _ => self.bytes(index),
+        }
+    }
+    fn elements(&self, offset: usize) -> usize {
+        offset.saturating_sub(MIX_TABLE.next_multiple_of(16)) * 16 / 9
+    }
+    fn element_bytes(&self) -> f64 {
+        0.5
+    }
+    fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
+        let shape = Shape::read(bytes);
+        let (col, row) = (index / shape.inp, index % shape.inp);
+        let (at, k) = Self::place(&shape, &table(bytes), row, col);
+        let j = position(row % 16, col % 16) as u32;
+        code_at(self.codebook, k, &bytes[at..at + 32 * k], j)
+    }
+    fn unpack_all(&self, bytes: &[u8]) -> Vec<f32> {
+        let (shape, table) = (Shape::read(bytes), table(bytes));
+        let n = table.len() * shape.inp * shape.out;
+        let place = |row, col| Self::place(&shape, &table, row, col);
+        decode_tiles(self.codebook, bytes, [shape.inp, n], place)
+    }
+    /// Whole matrices of a set, or whole entries of each.
+    fn share(
+        &self,
+        bytes: &[u8],
+        [outer, _, inner]: [usize; 3],
+        [first, count]: [usize; 2],
+    ) -> Option<Vec<u8>> {
+        let (shape, table) = (Shape::read(bytes), table(bytes));
+        let widths = |t: &[(usize, usize)]| t.iter().map(|e| e.1 as u32).collect::<Vec<u32>>();
+        if (outer, inner) == (1, shape.inp * shape.out) {
+            let kept = table.get(first..first + count)?;
+            let (mut out, at) = alloc_mixed(shape.inp, shape.out, shape.side, &widths(kept));
+            for (to, (from, k)) in at.iter().zip(kept) {
+                let len = shape.inp * shape.out * k / 8;
+                out[*to..to + len].copy_from_slice(&bytes[*from..from + len]);
+            }
+            return Some(out);
+        }
+        if !first.is_multiple_of(ENTRY) || !count.is_multiple_of(ENTRY) {
+            return None;
+        }
+        let outputs = match (outer, inner) {
+            (m, i) if i == shape.inp && m == table.len() => true,
+            (o, 1) if o == table.len() * shape.out => false,
+            _ => return None,
+        };
+        let tiles = cut(&shape, outputs, [first, count]);
+        let part = narrowed(shape, outputs, count);
+        let (mut out, _) = alloc_mixed(part.inp, part.out, part.side, &widths(&table));
+        out.truncate(MIX_TABLE + MIX_ROW * table.len());
+        out.resize(out.len().next_multiple_of(16), 0);
+        for (from, k) in table {
+            runs(&mut out, bytes, from, 32 * k, tiles);
+        }
+        Some(out)
+    }
+}
+
+/// A mixed set's buffer, and each matrix's offset.
+pub fn alloc_mixed(inp: usize, out: usize, side: u32, widths: &[u32]) -> (Vec<u8>, Vec<usize>) {
+    let mut end = (MIX_TABLE + MIX_ROW * widths.len()).next_multiple_of(16);
+    let mut at = Vec::with_capacity(widths.len());
+    for k in widths {
+        at.push(end);
+        end += inp * out * *k as usize / 8;
+    }
+    let mut bytes = alloc_packed(inp, out, side, end - HEAD);
+    bytes[HEAD..HEAD + 4].copy_from_slice(&(widths.len() as u32).to_le_bytes());
+    for (m, (offset, k)) in at.iter().zip(widths).enumerate() {
+        let row = MIX_TABLE + MIX_ROW * m;
+        bytes[row..row + 8].copy_from_slice(&(*offset as u64).to_le_bytes());
+        bytes[row + 8..row + 12].copy_from_slice(&k.to_le_bytes());
+    }
+    (bytes, at)
 }
 
 /// The header, then the entries in the release's layout.
@@ -658,3 +817,37 @@ macro_rules! define_trellis {
 }
 
 crate::trellis_forms!(define_trellis);
+
+/// The mixed-width forms for `$each`, each with its `form_kind`.
+#[macro_export]
+macro_rules! trellis_mixes {
+    ($each:ident) => {
+        $each! {
+            (Mcg, "", TRELLIS_MIX, 19),
+            (Mul1, "_mul1", TRELLIS_MIX_MUL1, 20),
+            (Pmcgx, "_pmcgx", TRELLIS_MIX_PMCGX, 21),
+        }
+    };
+}
+
+macro_rules! define_mixes {
+    ($(($book:ident, $suffix:literal, $mix:ident, $kind:literal),)*) => {
+        $(
+            #[doc = concat!("exlr8 at a width for each matrix, ", stringify!($book), ".")]
+            pub const $mix: TrellisMix = TrellisMix {
+                name: concat!("trellis_mix", $suffix),
+                codebook: Codebook::$book,
+            };
+            form!($mix);
+        )*
+
+        /// The mixed-width form in `codebook`.
+        pub fn mixed_for(codebook: Codebook) -> Option<&'static dyn Form> {
+            match codebook {
+                $(Codebook::$book => Some(&$mix),)*
+            }
+        }
+    };
+}
+
+crate::trellis_mixes!(define_mixes);

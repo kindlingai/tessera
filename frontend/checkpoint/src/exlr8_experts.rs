@@ -39,10 +39,16 @@ impl Proj {
     }
 }
 
+/// A projection's width: one for the set or each expert.
+pub(crate) enum Width {
+    Uniform(u32),
+    PerExpert(Vec<u32>),
+}
+
 /// Manifest widths for routed and shared experts, by layer.
 #[derive(Default)]
 pub(crate) struct Widths {
-    map: HashMap<(usize, bool, Proj), u32>,
+    map: HashMap<(usize, bool, Proj), Width>,
 }
 
 /// Trellis forms for one layer's routed and shared projections.
@@ -64,19 +70,28 @@ impl Widths {
     }
 
     /// Width for `(layer, shared, proj)`, falling back to `default`.
+    // A mixed set gives its widest.
     pub(crate) fn get(&self, layer: usize, shared: bool, proj: Proj, default: u32) -> u32 {
-        if let Some(&k) = self.map.get(&(layer, shared, proj)) {
-            return k;
+        let one = |w: &Width| match w {
+            Width::Uniform(k) => *k,
+            Width::PerExpert(each) => each.iter().copied().max().unwrap_or(default),
+        };
+        if let Some(w) = self.map.get(&(layer, shared, proj)) {
+            return one(w);
         }
         if shared {
-            let routed = self
-                .map
-                .get(&(layer, false, proj))
-                .copied()
-                .unwrap_or(default);
+            let routed = self.map.get(&(layer, false, proj)).map_or(default, one);
             return shared_width(routed);
         }
         default
+    }
+
+    /// Each routed expert's width, where a set mixes them.
+    pub(crate) fn mixed(&self, layer: usize, proj: Proj) -> Option<&[u32]> {
+        match self.map.get(&(layer, false, proj))? {
+            Width::Uniform(_) => None,
+            Width::PerExpert(each) => Some(each),
+        }
     }
 
     /// Parses manifest `"layers"` entries into `self`.
@@ -113,14 +128,33 @@ impl Widths {
             let Some(val) = obj.get(p.name()) else {
                 continue;
             };
-            let k = uniform_width(val).map_err(|why| {
+            let width = match shared {
+                true => uniform_width(val).map(Width::Uniform),
+                false => expert_widths(val),
+            };
+            let width = width.map_err(|why| {
                 let kind = if shared { "shared." } else { "" };
                 format!("layer {layer} {kind}{}: {why}", p.name())
             })?;
-            self.map.insert((layer, shared, p), k);
+            self.map.insert((layer, shared, p), width);
         }
         Ok(())
     }
+}
+
+/// A routed set's width, one for each expert.
+fn expert_widths(val: &serde_json::Value) -> Result<Width, String> {
+    let Some(items) = val.as_array().filter(|items| !items.is_empty()) else {
+        return uniform_width(val).map(Width::Uniform);
+    };
+    let mut each = Vec::with_capacity(items.len());
+    for item in items {
+        each.push(uniform_width(item)?);
+    }
+    Ok(match each.iter().all(|k| *k == each[0]) {
+        true => Width::Uniform(each[0]),
+        false => Width::PerExpert(each),
+    })
 }
 
 /// One uniform width from a scalar or nested array.
@@ -140,7 +174,7 @@ fn collect_width(val: &serde_json::Value, seen: &mut Option<u32>) -> Result<(), 
             && prev != k
         {
             return Err(format!(
-                "mixed widths {prev} and {k} in one tensor. \
+                "mixed widths {prev} and {k} in one matrix. \
                  Pick a manifest with one width for each matrix"
             ));
         }
@@ -377,4 +411,98 @@ pub(crate) fn packed(
         return Err(Error::Format(format!("{name}: zero-filled expert slice")));
     }
     Ok(out)
+}
+
+/// The distinct widths of a mixed set, in order.
+pub(crate) fn distinct(widths: &[u32]) -> Vec<u32> {
+    let mut out = widths.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A routed table, each expert's row from its width.
+pub(crate) fn mixed_floats(idx: &File, local: &str, widths: &[u32]) -> Result<Vec<f32>, Error> {
+    let mut out = Vec::new();
+    for k in distinct(widths) {
+        let table = floats(idx, local, k)?;
+        let row = table.len() / widths.len();
+        out.resize(table.len(), 0.0);
+        for (e, _) in widths.iter().enumerate().filter(|(_, w)| **w == k) {
+            out[e * row..(e + 1) * row].copy_from_slice(&table[e * row..(e + 1) * row]);
+        }
+    }
+    Ok(out)
+}
+
+/// A mixed set, filled one codes file at a time.
+pub(crate) struct Mixed {
+    pub(crate) bytes: Vec<u8>,
+    /// Each kept expert: its index, width and byte offset.
+    kept: Vec<(usize, u32, usize)>,
+    /// Bytes to skip and take, for each bit of width.
+    span: [usize; 2],
+    stem: String,
+    matrix: usize,
+}
+
+impl Mixed {
+    /// The buffer for `local`, optionally sliced along an axis.
+    pub(crate) fn new(
+        local: &str,
+        [hidden, _, experts, ffn]: [usize; 4],
+        widths: &[u32],
+        slice: Option<(u32, usize, usize)>,
+    ) -> Result<Self, Error> {
+        let named = local.strip_prefix("experts.");
+        let p = named
+            .and_then(|rest| rest.strip_suffix(".weight"))
+            .ok_or_else(|| Error::Missing(local.into()))?;
+        if widths.len() != experts {
+            let found = widths.len();
+            return Err(Error::Format(format!(
+                "{local}: {found} widths for {experts} experts"
+            )));
+        }
+        let inner = if p == "down" { 2 } else { 1 };
+        let whole = hidden * ffn / 8;
+        let (range, span, ffn_out) = match slice {
+            Some((0, f, c)) => (f..f + c, [0, whole], ffn),
+            Some((ax, f, c))
+                if ax == inner && f.is_multiple_of(BLOCK) && c.is_multiple_of(BLOCK) =>
+            {
+                let entry = hidden * BLOCK / 8;
+                (0..experts, [f / BLOCK * entry, c / BLOCK * entry], c)
+            }
+            _ => (0..experts, [0, whole], ffn),
+        };
+        let picked = &widths[range.clone()];
+        let (bytes, at) = match p {
+            "down" => trellis::alloc_mixed(ffn_out, hidden, trellis::INPUT_SIDE, picked),
+            _ => trellis::alloc_mixed(hidden, ffn_out, 1, picked),
+        };
+        let kept = range.zip(picked).zip(at).map(|((e, k), at)| (e, *k, at));
+        Ok(Self {
+            bytes,
+            kept: kept.collect(),
+            span,
+            stem: format!("trellis.{p}"),
+            matrix: whole,
+        })
+    }
+
+    /// Reads the experts `codes` holds at width `k`.
+    pub(crate) fn fill(&mut self, codes: &File, k: u32) -> Result<(), Error> {
+        let name = coded(codes, &self.stem)?.0;
+        let [skip, take] = self.span.map(|n| n * k as usize);
+        for &(e, _, at) in self.kept.iter().filter(|kept| kept.1 == k) {
+            let from = (e * self.matrix * k as usize + skip) as u64;
+            let dst = &mut self.bytes[at..at + take];
+            codes.read_into(&name, from, dst)?;
+            if take >= 16 && dst[..16] == [0; 16] {
+                return Err(Error::Format(format!("{name}: zero-filled expert slice")));
+            }
+        }
+        Ok(())
+    }
 }

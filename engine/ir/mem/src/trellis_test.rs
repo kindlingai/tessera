@@ -1,6 +1,9 @@
 use crate::block_test::same_part;
 use crate::form::Form;
-use crate::trellis::{Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, form_for, packed, rotated};
+use crate::trellis::{
+    Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, alloc_mixed, form_for, mixed_for, packed,
+    rotated,
+};
 use tessera_graph::F16;
 
 /// Each side's cuts, and a set's, decode as the whole.
@@ -133,5 +136,34 @@ fn pmcgx_tiles() {
         let t = form.unpack_all(&packed(16, 16, 1, &tile));
         let got = at.map(|(row, col)| t[col * 16 + row]);
         assert_eq!(got, values, "K{k}");
+    }
+}
+
+/// A mixed set decodes as each matrix at its width.
+#[test]
+fn mixed_widths_match() {
+    let widths = [3u32, 2, 4, 2];
+    for (book, (inp, out, side)) in
+        Codebook::ALL
+            .into_iter()
+            .zip([(256, 128, 1), (128, 256, INPUT_SIDE), (256, 256, 1)])
+    {
+        let mix = mixed_for(book).unwrap();
+        let (mut set, at) = alloc_mixed(inp, out, side, &widths);
+        let mut want = Vec::new();
+        for (m, (k, at)) in widths.iter().zip(at).enumerate() {
+            let len = inp * out * *k as usize / 8;
+            let codes: Vec<u8> = (0..len).map(|i| (i * 31 + m * 7 + i / 251) as u8).collect();
+            set[at..at + len].copy_from_slice(&codes);
+            let one = form_for(*k, book).unwrap();
+            want.extend(one.unpack_all(&packed(inp, out, side, &codes)));
+        }
+        assert_eq!(mix.unpack_all(&set), want, "{book:?}");
+        for i in (0..want.len()).step_by(89) {
+            assert_eq!(mix.unpack(&set, i), want[i], "{book:?} element {i}");
+        }
+        same_part(mix, &set, [1, 4, inp * out], [1, 2]);
+        same_part(mix, &set, [4, out, inp], [0, 128]);
+        same_part(mix, &set, [4 * out, inp, 1], [0, 128]);
     }
 }
