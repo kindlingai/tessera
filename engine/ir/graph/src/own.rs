@@ -6,7 +6,7 @@ use crate::node::{Composite, Graph, Node, NodeId, Op, Region, Row};
 use crate::numerics::Numerics;
 use crate::shard::{open, retype_node};
 use crate::stages::Stage;
-use crate::types::Placement;
+use crate::types::{DType, Placement};
 use crate::verify::{VerifyError, verify};
 
 fn gather_op() -> Op {
@@ -18,7 +18,13 @@ fn owned(g: &Graph, id: NodeId) -> bool {
 }
 
 /// A gather of `from`: one before `before`, else new.
-fn gathered(g: &mut Graph, from: NodeId, at: usize, before: usize) -> (NodeId, bool) {
+fn gathered(
+    g: &mut Graph,
+    from: NodeId,
+    at: usize,
+    before: usize,
+    wire: Option<DType>,
+) -> (NodeId, bool) {
     let op = gather_op();
     let found = g.nodes[..before]
         .iter()
@@ -30,7 +36,10 @@ fn gathered(g: &mut Graph, from: NodeId, at: usize, before: usize) -> (NodeId, b
         op,
         args: vec![from],
         ty: g.node(from).ty.clone(),
-        numerics: Some(Numerics::default()),
+        numerics: Some(Numerics {
+            wire,
+            ..Numerics::default()
+        }),
     };
     let new = NodeId(at as u32);
     open(g, new, node);
@@ -45,11 +54,14 @@ fn gathered(g: &mut Graph, from: NodeId, at: usize, before: usize) -> (NodeId, b
 
 /// Whether a region's ops split their rows among ranks.
 fn splits(r: &Region) -> bool {
-    matches!(r.kind, Composite::Moe | Composite::Mlp)
+    matches!(
+        r.kind,
+        Composite::Attention | Composite::Moe | Composite::Mlp
+    )
 }
 
 /// Gathers owned inputs of split regions starting at `at`.
-fn enter_regions(g: &mut Graph, at: usize) -> bool {
+fn enter_regions(g: &mut Graph, at: usize, wire: Option<DType>) -> bool {
     let starts = |g: &Graph, at: usize| {
         let here = move |r: &&Region| r.start.0 as usize == at && splits(r);
         let regions = g.regions.iter().filter(here);
@@ -60,7 +72,7 @@ fn enter_regions(g: &mut Graph, at: usize) -> bool {
     let Some(from) = starts(g, at) else {
         return false;
     };
-    let (whole, new) = gathered(g, from, at, at);
+    let (whole, new) = gathered(g, from, at, at, wire);
     let first = at + usize::from(new);
     for r in 0..g.regions.len() {
         if g.regions[r].start.0 as usize != first || !splits(&g.regions[r]) {
@@ -81,6 +93,7 @@ fn enter_regions(g: &mut Graph, at: usize) -> bool {
 /// Sums over rows scatter. Readers of all rows gather.
 pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
     let mut out = g.clone();
+    let mut wire = None;
     for n in &mut out.nodes {
         if let Op::Row(r) = &mut n.op
             && n.ty.rank() == 2
@@ -88,12 +101,13 @@ pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
         {
             for s in r.0.iter_mut().filter(|s| **s == Stage::AllReduce) {
                 *s = Stage::ReduceScatter;
+                wire = wire.or(n.numerics.and_then(|num| num.wire));
             }
         }
     }
     let mut at = 0;
     while at < out.nodes.len() {
-        if enter_regions(&mut out, at) {
+        if enter_regions(&mut out, at, wire) {
             continue;
         }
         let Err(error) = retype_node(&mut out, at) else {
@@ -104,7 +118,7 @@ pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
         let Some(from) = args.into_iter().find(|a| owned(&out, *a)) else {
             return Err(failed(at, error));
         };
-        let (whole, new) = gathered(&mut out, from, at, at);
+        let (whole, new) = gathered(&mut out, from, at, at, wire);
         let reader = at + usize::from(new);
         let args = &mut out.nodes[reader].args;
         args.iter_mut()
@@ -118,7 +132,7 @@ pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
                 continue;
             }
             let all = out.nodes.len();
-            let (whole, new) = gathered(&mut out, from, from.0 as usize + 1, all);
+            let (whole, new) = gathered(&mut out, from, from.0 as usize + 1, all, wire);
             if new {
                 retype_node(&mut out, whole.0 as usize).map_err(|e| failed(whole.0 as usize, e))?;
             }

@@ -39,9 +39,14 @@ impl Numerics {
     }
 }
 
-/// Whether `op` sums parts across ranks.
+/// Whether `op` crosses ranks with a configurable wire dtype.
 pub fn sums_ranks(op: &Op) -> bool {
-    let sums = |s: &Stage| matches!(s, Stage::AllReduce | Stage::ReduceScatter);
+    let sums = |s: &Stage| {
+        matches!(
+            s,
+            Stage::AllReduce | Stage::ReduceScatter | Stage::GatherRows
+        )
+    };
     matches!(op, Op::Row(r) if r.0.iter().any(sums))
 }
 

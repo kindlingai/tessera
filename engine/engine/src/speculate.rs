@@ -81,10 +81,11 @@ impl Sum for SharedSum {
         start: usize,
         part: usize,
         total: usize,
+        wire: DType,
     ) -> Result<bool, RunError> {
         self.0
             .borrow_mut()
-            .gather_rows(from, to, start, part, total)
+            .gather_rows(from, to, start, part, total, wire)
     }
 
     fn capturable(&self) -> bool {

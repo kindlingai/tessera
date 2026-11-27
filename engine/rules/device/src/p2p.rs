@@ -568,6 +568,7 @@ where
         start: usize,
         part: usize,
         total: usize,
+        _wire: DType,
     ) -> Result<bool, tessera_run::Error> {
         if self.broken {
             return Err(tessera_run::Error::Sums(Box::new(Error::Plan(

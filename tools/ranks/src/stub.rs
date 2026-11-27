@@ -189,6 +189,14 @@ where
             }
         }
     }
+    wrong += check_owned(
+        ctx,
+        &mut *boot,
+        &mut *sum,
+        &from,
+        (rank, ranks, n, rounds),
+        wire,
+    )?;
     let us = elapsed * 1e6 / f64::from(rounds);
     let gbs = (bytes as f64 * f64::from(ranks - 1)) / (us * 1e3);
     let kind = match args.sums {
@@ -206,6 +214,120 @@ where
         0 => Ok(()),
         _ => Err(format!("{wrong} sums are wrong").into()),
     }
+}
+
+/// Verifies and times `reduce_scatter` and `gather_rows`, direct and graphed.
+fn check_owned<D>(
+    ctx: &D,
+    boot: &mut dyn Transport,
+    sum: &mut dyn Sum,
+    from: &DeviceBuffer<D>,
+    (rank, ranks, n, rounds): (u32, u32, usize, u32),
+    wire: DType,
+) -> Result<usize, Box<dyn Error>>
+where
+    D: Device + Launch<Kernel = <D as Device>::Kernel>,
+{
+    if !n.is_multiple_of(ranks as usize) {
+        return Ok(0);
+    }
+    let close = |got: f32, want: f32| match wire {
+        DType::Bf16 => (got - want).abs() <= want.abs() * 0.02 + 1e-2,
+        DType::Fp8 => (got - want).abs() <= want.abs() * 0.12 + 2.0,
+        _ => got == want,
+    };
+    let part = n / ranks as usize;
+    let start = rank as usize * part;
+    let triangle = (ranks * (ranks + 1) / 2) as f32;
+    let rs_out = DeviceBuffer::alloc(ctx, part * 4)?;
+    let gr_out = DeviceBuffer::alloc(ctx, n * 4)?;
+    rs_out.zero()?;
+    gr_out.zero()?;
+    let (fp, rp, gp) = (from.device_ptr(), rs_out.device_ptr(), gr_out.device_ptr());
+    if !sum.reduce_scatter(fp, rp, start, part, n, wire)? {
+        return Ok(0);
+    }
+    let mut wrong = 0usize;
+    let check_buf =
+        |buf: &DeviceBuffer<D>, len: usize, base: usize| -> Result<usize, Box<dyn Error>> {
+            let mut got = vec![0f32; len];
+            buf.read_f32(&mut got)?;
+            Ok(got
+                .iter()
+                .enumerate()
+                .filter(|(j, v)| !close(**v, ((base + j) % 97) as f32 * triangle))
+                .count())
+        };
+    ctx.finish()?;
+    sum.check()?;
+    wrong += check_buf(&rs_out, part, start)?;
+    let (rs_us, rs_g_us) = time_op(ctx, boot, sum, rounds, |s| {
+        s.reduce_scatter(fp, rp, start, part, n, wire)
+    })?;
+    wrong += check_buf(&rs_out, part, start)?;
+    let gr_ok = sum.gather_rows(rp, gp, start, part, n, wire)?;
+    let (mut gr_us, mut gr_g_us) = (0.0, 0.0);
+    if gr_ok {
+        ctx.finish()?;
+        sum.check()?;
+        wrong += check_buf(&gr_out, n, 0)?;
+        (gr_us, gr_g_us) = time_op(ctx, boot, sum, rounds, |s| {
+            s.gather_rows(rp, gp, start, part, n, wire)
+        })?;
+        wrong += check_buf(&gr_out, n, 0)?;
+    }
+    eprintln!(
+        "rank {rank}: own_rs ({rs_us:.2} us direct, {rs_g_us:.2} us graph) \
+         gather_rows={gr_ok} ({gr_us:.2} us direct, {gr_g_us:.2} us graph), {wrong} wrong"
+    );
+    Ok(wrong)
+}
+
+/// Times `rounds` direct and CUDA-graphed runs of one collective.
+fn time_op<D, F>(
+    ctx: &D,
+    boot: &mut dyn Transport,
+    sum: &mut dyn Sum,
+    rounds: u32,
+    mut call: F,
+) -> Result<(f64, f64), Box<dyn Error>>
+where
+    D: Device + Launch<Kernel = <D as Device>::Kernel>,
+    F: FnMut(&mut dyn Sum) -> Result<bool, tessera_run::Error>,
+{
+    for _ in 0..5 {
+        call(sum)?;
+    }
+    ctx.finish()?;
+    boot.exchange(&[])?;
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        call(sum)?;
+    }
+    ctx.finish()?;
+    sum.check()?;
+    let direct = t0.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+    if !ctx.graphs() || !sum.capturable() {
+        return Ok((direct, 0.0));
+    }
+    let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
+        if !call(sum)? {
+            return Err("collective declined inside graph".into());
+        }
+        Ok(())
+    })?;
+    for _ in 0..5 {
+        ctx.replay(&graph)?;
+    }
+    ctx.finish()?;
+    boot.exchange(&[])?;
+    let tg = Instant::now();
+    for _ in 0..rounds {
+        ctx.replay(&graph)?;
+    }
+    ctx.finish()?;
+    sum.check()?;
+    Ok((direct, tg.elapsed().as_secs_f64() * 1e6 / f64::from(rounds)))
 }
 
 fn on<D>(ctx: &D, args: &Args, rounds: u32) -> Outcome

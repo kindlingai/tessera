@@ -58,6 +58,7 @@ pub trait Sum {
         _start: usize,
         _part: usize,
         _total: usize,
+        _wire: DType,
     ) -> Result<bool, Error> {
         Ok(false)
     }
@@ -219,7 +220,7 @@ pub(crate) fn grid_cross(
                 return Ok(false);
             }
             let start = step.kernel.sizes()[0];
-            grid.gather_rows(from, to, start, src.len, dst.len)
+            grid.gather_rows(from, to, start, src.len, dst.len, wire(step))
         }
         _ => Ok(false),
     }

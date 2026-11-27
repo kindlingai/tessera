@@ -614,7 +614,9 @@ pub(crate) fn pick_graph<'a>(
         && filled >= *min
     {
         let parts = device.division();
-        if parts.ranks() > 1 && (0..parts.ranks()).all(|r| parts.rows(filled, r).1 > 0) {
+        let ranks = parts.ranks();
+        let each = parts.rows(filled, 0).1;
+        if ranks > 1 && each > 0 && (1..ranks).all(|r| parts.rows(filled, r).1 == each) {
             return g;
         }
     }

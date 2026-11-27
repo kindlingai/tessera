@@ -25,6 +25,40 @@ fn rates_round_trip() {
     let bytes = profile.to_bytes();
     assert_eq!(Profile::from_bytes(&bytes), Some(profile));
     assert_eq!(Profile::from_bytes(&bytes[..bytes.len() - 1]), None);
+    let key = |kernel, r, w| {
+        Profile::key(&tessera_lower::Step {
+            kernel,
+            reads: vec![tessera_lower::Slot::floats(0, r)],
+            write: tessera_lower::Slot::floats(1, w),
+            also: vec![],
+            covers: vec![],
+            zone: 0,
+            rule: "collective",
+            site: None,
+            lane: 0,
+            table: None,
+            index_table: None,
+        })
+    };
+    let rs = |start| {
+        let k = tessera_lower::kernels::ReduceScatter {
+            len: 512,
+            start,
+            total: 1024,
+            wire: tessera_mem::DType::Bf16,
+        };
+        key(tessera_lower::KernelRef::new(k), 1024, 512)
+    };
+    let gr = |start| {
+        let k = tessera_lower::kernels::GatherRows {
+            len: 1024,
+            start,
+            wire: tessera_mem::DType::Bf16,
+        };
+        key(tessera_lower::KernelRef::new(k), 512, 1024)
+    };
+    assert_eq!(rs(0), rs(512));
+    assert_eq!(gr(0), gr(512));
 }
 
 #[test]

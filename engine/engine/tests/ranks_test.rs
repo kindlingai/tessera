@@ -173,8 +173,17 @@ fn agree_mode(graph: fn() -> Graph, moe_tp: bool, owned: bool) {
             kernels.contains_key("gather_rows"),
             "missing GR: {kernels:?}"
         );
-        // A 1-row decode step drops back to plain all_reduce.
-        let decode = [row(0, 1, 6)];
+        // Odd batches and 1-row decode use all_reduce.
+        let odd = [
+            row(0, 1, 6),
+            row(0, 2, 7),
+            row(0, 3, 8),
+            row(0, 4, 9),
+            row(0, 5, 10),
+        ];
+        assert_eq!(lead.step(&odd).unwrap(), alone.step(&odd).unwrap());
+        assert!(lead.kernels().contains_key("all_reduce"));
+        let decode = [row(0, 1, 11)];
         assert_eq!(lead.step(&decode).unwrap(), alone.step(&decode).unwrap());
         assert!(lead.kernels().contains_key("all_reduce"));
     } else {
