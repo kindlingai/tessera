@@ -255,6 +255,15 @@ pub fn own_rows_attn(g: &Graph) -> Result<Graph, VerifyError> {
     own_rows_with(g, true)
 }
 
+/// Whether node `at` sits inside a row-owned attention region.
+fn in_owned_attn(g: &Graph, at: usize, owned_attn: &[bool]) -> bool {
+    let at = at as u32;
+    g.regions
+        .iter()
+        .enumerate()
+        .any(|(ri, r)| owned_attn[ri] && r.start.0 <= at && at < r.end.0)
+}
+
 fn own_rows_with(g: &Graph, attn: bool) -> Result<Graph, VerifyError> {
     let mut out = g.clone();
     let mut wire = None;
@@ -285,13 +294,21 @@ fn own_rows_with(g: &Graph, attn: bool) -> Result<Graph, VerifyError> {
         if enter_regions(&mut out, at, wire, &owned_attn) {
             continue;
         }
-        let Err(error) = retype_node(&mut out, at) else {
+        let retyped = retype_node(&mut out, at);
+        let bad_int = retyped.is_ok()
+            && owned(&out, NodeId(at as u32))
+            && !out.nodes[at].ty.dtype.is_float()
+            && !in_owned_attn(&out, at, &owned_attn);
+        if retyped.is_ok() && !bad_int {
             at += 1;
             continue;
-        };
+        }
         let args = out.nodes[at].args.clone();
         let Some(from) = args.into_iter().find(|a| owned(&out, *a)) else {
-            return Err(failed(at, error));
+            return Err(failed(
+                at,
+                retyped.expect_err("non-float owned needs owned arg"),
+            ));
         };
         let (whole, new) = gathered(&mut out, from, at, at, wire);
         let reader = at + usize::from(new);
