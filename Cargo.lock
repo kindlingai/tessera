@@ -2318,7 +2318,6 @@ dependencies = [
  "tessera-trace",
  "tessera-turns",
  "tessera-wasm",
- "thiserror",
 ]
 
 [[package]]
