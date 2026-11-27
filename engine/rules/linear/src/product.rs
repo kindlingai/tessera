@@ -3,12 +3,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
-use tessera_codegen::{Dialect, hash};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::kernels::{add_operand_forms, finish};
 use tessera_lower::sites;
 use tessera_lower::sites::{After, Near, Picked};
-use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree};
+use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree, made_hash};
 
 /// Kernel, schedule, operands, flags, and extra tag.
 pub(crate) type Variant = (
@@ -115,7 +114,7 @@ impl Product {
 
     /// The tree under an entry name that hashes its text.
     pub(crate) fn source(&self, mut body: Body, kind: &str) -> Source {
-        let hashed = hash(&body.text().render(Dialect::Cuda));
+        let hashed = made_hash(&body);
         body.entry = format!("{kind}_{}_{hashed:x}", self.form.name());
         Source::Made(body)
     }

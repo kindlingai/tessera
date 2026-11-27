@@ -145,17 +145,33 @@ TESSERA_FN void pause() {
 
 // Wall clock ticks, at hipDeviceAttributeWallClockRate kHz.
 TESSERA_FN u64 clock_ticks() {
-    return wall_clock64();
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__)
+    return static_cast<u64>(__builtin_amdgcn_s_sendmsg_rtnl(0x83));
+#else
+    return static_cast<u64>(__builtin_amdgcn_s_memrealtime());
+#endif
 }
 
 #endif
 
 TESSERA_FN u32 cas(u32* p, u32 want, u32 put) {
+#if defined(TESSERA_HIP)
+    __hip_atomic_compare_exchange_strong(p, &want, put, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                         __HIP_MEMORY_SCOPE_AGENT);
+    return want;
+#else
     return atomicCAS(p, want, put);
+#endif
 }
 
 TESSERA_FN void fence_sys() {
+#if defined(TESSERA_HIP)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#else
     __threadfence_system();
+#endif
 }
 
 // Flag-gated wait and move clock accumulators for collectives.
@@ -429,7 +445,13 @@ TESSERA_FN bool leader() {
 }
 
 TESSERA_FN u32 blocks() {
+#if defined(TESSERA_HIP)
+    const u16* wg = reinterpret_cast<const u16*>(__builtin_amdgcn_dispatch_ptr());
+    const u32* gd = reinterpret_cast<const u32*>(wg);
+    return (gd[3] / wg[2]) * (gd[4] / wg[3]) * (gd[5] / wg[4]);
+#else
     return gridDim.x * gridDim.y * gridDim.z;
+#endif
 }
 
 }  // namespace prim
