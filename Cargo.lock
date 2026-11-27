@@ -1853,9 +1853,20 @@ dependencies = [
  "tessera-host",
  "tessera-lower",
  "tessera-mem",
- "tessera-run",
  "tessera-testkit",
  "thiserror",
+]
+
+[[package]]
+name = "tessera-device-grid"
+version = "0.1.0"
+dependencies = [
+ "tessera-device",
+ "tessera-engine-comm",
+ "tessera-gpukit",
+ "tessera-lower",
+ "tessera-mem",
+ "tessera-run",
 ]
 
 [[package]]
@@ -1871,6 +1882,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-device-rules"
+version = "0.1.0"
+dependencies = [
+ "tessera-device",
+ "tessera-graph",
+ "tessera-lower",
+ "tessera-mem",
+ "tessera-testkit",
+]
+
+[[package]]
 name = "tessera-dl"
 version = "0.1.0"
 
@@ -1880,6 +1902,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "tessera-device",
+ "tessera-device-grid",
  "tessera-engine-comm",
  "tessera-engine-hooks",
  "tessera-engine-settings",
@@ -2038,7 +2061,7 @@ dependencies = [
  "serde_json",
  "tessera-bundle",
  "tessera-checkpoint",
- "tessera-device",
+ "tessera-device-rules",
  "tessera-engine-settings",
  "tessera-gpukit",
  "tessera-graph",
@@ -2207,7 +2230,7 @@ dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
  "tessera-codegen",
- "tessera-device",
+ "tessera-device-grid",
  "tessera-engine",
  "tessera-engine-settings",
  "tessera-graph",
@@ -2257,6 +2280,7 @@ dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
  "tessera-device",
+ "tessera-device-grid",
  "tessera-engine",
  "tessera-engine-comm",
  "tessera-frontend-comm",
@@ -2315,8 +2339,8 @@ version = "0.1.0"
 dependencies = [
  "tessera-attention",
  "tessera-cpu",
- "tessera-device",
  "tessera-device-linear",
+ "tessera-device-rules",
  "tessera-kernels",
  "tessera-linear",
 ]

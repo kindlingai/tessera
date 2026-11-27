@@ -1,7 +1,7 @@
 //! The resident-decoder recipe: one grid per step, as the graph.
 
 use std::path::Path;
-use tessera_device::whole;
+use tessera_device_grid::whole;
 use tessera_engine::wasm::Module;
 use tessera_engine::{Backend, Engine};
 use tessera_graph::Graph;

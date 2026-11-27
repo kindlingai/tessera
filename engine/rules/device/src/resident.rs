@@ -27,7 +27,7 @@ const LINK: u32 = 2;
 /// The first arena a plan's items name.
 pub const USER: u32 = LINK + REGIONS as u32;
 /// A first grid's pools start at this ordinal.
-pub(crate) const BASE: u64 = 1;
+pub const BASE: u64 = 1;
 
 const CLOCK: &str = include_str!("clock.kernel");
 
@@ -167,7 +167,7 @@ struct LaunchSlot {
 }
 
 /// Where each record sits in the control arena.
-pub(crate) struct Places {
+pub struct Places {
     pub launch: u64,
     pub status: u64,
     pub items: u64,
@@ -178,7 +178,7 @@ pub(crate) struct Places {
 }
 
 /// Builds the host control arena bytes and record offsets.
-pub(crate) fn build_control(
+pub fn build_control(
     plan: &Plan,
     pool_places: &[Place],
     [rank, ranks, base]: [u64; 3],

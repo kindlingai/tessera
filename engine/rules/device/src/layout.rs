@@ -204,7 +204,7 @@ fn form_kinds() -> Decl {
 }
 
 /// Plain form name as a `dtype` code.
-pub(crate) fn dtype_code(name: &str) -> u32 {
+pub fn dtype_code(name: &str) -> u32 {
     match name {
         "f32" => F32,
         "bf16" => BF16,
@@ -217,7 +217,7 @@ pub(crate) fn dtype_code(name: &str) -> u32 {
 }
 
 /// Packed form name as a `form_kind`. Rotated forms share one.
-pub(crate) fn form_kind(name: &str) -> u32 {
+pub fn form_kind(name: &str) -> u32 {
     let base = name.strip_suffix("_rot").unwrap_or(name);
     let found = kinds().find(|k| k.1.name() == base);
     found.map_or(0, |k| k.2)

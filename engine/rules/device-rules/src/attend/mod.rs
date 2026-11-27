@@ -4,8 +4,8 @@
 mod attend_test;
 
 use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule, f32_only};
 use std::sync::OnceLock;
+use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
 use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::kept::{self, Layout};
@@ -75,7 +75,7 @@ fn attend_entry(
 ) -> Source {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
     let base = *CUDA.get_or_init(|| flatten_cuda("mla.kernel", KERNEL));
-    let text = crate::cuda_prefixed(base, defs);
+    let text = tessera_device::cuda_prefixed(base, defs);
     Source::Fixed {
         text: ByBackend::from_fn(|_| text),
         entry,

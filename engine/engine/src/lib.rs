@@ -48,7 +48,7 @@ pub(crate) use tessera_engine_hooks::Hooks;
 pub use tessera_engine_hooks::{Error, Event, Place, Read, Reason, Request, Row, Sink};
 
 // The front end reaches the engine crates only through these.
-pub use tessera_device::{arx, p2p, sums, whole};
+pub use tessera_device_grid::{arx, p2p, sums, whole};
 pub use tessera_engine_comm as comm;
 #[doc(hidden)]
 pub use tessera_engine_settings as settings;

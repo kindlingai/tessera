@@ -7,7 +7,7 @@ use tessera_checkpoint::hessian::{
     DenseEntry, ExpertShard, HessianMeta, Inputs, dense_name, expert_name, inputs_name,
     pack_tiles_bytes, route_name, triu_len, write_dense, write_experts, write_inputs, write_route,
 };
-use tessera_device::calib::{sort_cpu, syrk_dense_cpu, syrk_tiles_cpu};
+use tessera_device_rules::calib::{sort_cpu, syrk_dense_cpu, syrk_tiles_cpu};
 use tessera_graph::{Bf16, CalibTap, F16};
 
 /// Maps a dense calibration tap to its `HESSIAN.md` tensor name.

@@ -1,8 +1,8 @@
 //! Grouped SYRK and deterministic expert sort kernels and CPU references.
 
 use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule};
 use std::sync::OnceLock;
+use tessera_device::{CUDA_LACKS, cuda_rule};
 use tessera_graph::Bf16;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
@@ -168,7 +168,7 @@ fn gemm_source(k: &PickedBf16) -> Source {
     if let Some(gm) = k.group_m {
         defs.push(("PBF16_GM", gm as usize));
     }
-    crate::cuda_source_with(cuda_source(), entry, defs)
+    tessera_device::cuda_source_with(cuda_source(), entry, defs)
 }
 
 /// Pass 1 of deterministic expert sort: per-block histograms.

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 use tessera_bundle::mla::rules as mla_rules;
 use tessera_checkpoint::{Offer, open as open_ckpt};
-use tessera_device::calib::{
+use tessera_device_rules::calib::{
     MAX_EXPERTS, SORT_BLOCKS, TILE, cuda_source, sort_cpu, syrk_dense_cpu, syrk_tiles_cpu,
 };
 use tessera_engine_settings::{Backend, Pick, Settings};

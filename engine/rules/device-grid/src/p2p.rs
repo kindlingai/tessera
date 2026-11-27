@@ -1,8 +1,8 @@
 //! Direct GPU-to-GPU all-reduce over IPC and SM stores.
 
-use crate::resident::{Error, Status, backend, persistent};
-use crate::{Options, flatten};
 use std::time::{Duration, Instant};
+use tessera_device::resident::{Error, Status, backend, persistent};
+use tessera_device::{Options, flatten};
 use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, IpcHandle, cached_context};

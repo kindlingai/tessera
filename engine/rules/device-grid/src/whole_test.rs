@@ -1,12 +1,12 @@
-use crate::layout::{
-    ARENAS, BF16, BYTES, F32, FORM, Form, INPUT, Item, KV, Kept, KvTables, NONE, OUTPUT, Ref,
-    SCRATCH, Table, form_kind,
-};
-use crate::proxy::Op;
-use crate::resident::{Plan, USER, build_control};
 use crate::whole::{
     RefillCache, TableBufs, fill_pages, format_summary, pack_into, plan, prepare_source,
 };
+use tessera_device::layout::{
+    ARENAS, BF16, BYTES, F32, FORM, Form, INPUT, Item, KV, Kept, KvTables, NONE, OUTPUT, Ref,
+    SCRATCH, Table, form_kind,
+};
+use tessera_device::proxy::Op;
+use tessera_device::resident::{Plan, USER, build_control};
 use tessera_gpukit::device::KernelStats;
 use tessera_lower::{ByBackend, Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
 use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, marks};
@@ -293,4 +293,12 @@ fn caches_refill_records() {
     let mut updated = sample_bufs();
     updated.synth[1] = 2;
     assert!(!cache.needs_refill(&updated));
+}
+
+#[test]
+fn sum_kernel_flattens() {
+    let options = tessera_device::Options::plain(tessera_device::Backend::Cuda);
+    let sum = tessera_device::flatten("sum.cu", include_str!("sum.cu"), &|_| None, &options);
+    let text = sum.unwrap().text;
+    assert!(text.contains("stage_bf16") && text.contains("cvt.rn.bf16x2.f32"));
 }

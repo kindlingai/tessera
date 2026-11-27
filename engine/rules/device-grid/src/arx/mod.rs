@@ -1,8 +1,8 @@
 //! Dual-root RoCE all-reduce over pinned memory and a host proxy.
 
-use crate::resident::{Error, backend, persistent};
-use crate::{Options, flatten};
 use std::time::Duration;
+use tessera_device::resident::{Error, backend, persistent};
+use tessera_device::{Options, flatten};
 use tessera_engine_comm::{ArxLink, ArxMem};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};

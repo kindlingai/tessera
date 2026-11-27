@@ -1,15 +1,15 @@
 //! A recipe's resident step: one grid per launch, sums inside.
 
-use crate::layout::{
-    BYTES, FORM, Form, INPUT, Item, Kept, NONE, OUTPUT, Ref, SCRATCH, dtype_code, form_kind,
-};
-use crate::proxy::Op;
-use crate::resident::{BASE, Error, LanePlan, Plan, Resident, USER, backend, persistent};
 use crate::sums::pool;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::Duration;
+use tessera_device::layout::{
+    BYTES, FORM, Form, INPUT, Item, Kept, NONE, OUTPUT, Ref, SCRATCH, dtype_code, form_kind,
+};
+use tessera_device::proxy::Op;
+use tessera_device::resident::{BASE, Error, LanePlan, Plan, Resident, USER, backend, persistent};
 use tessera_engine_comm::{Link, ShmLink};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats, cached_context, cached_source};
@@ -259,8 +259,8 @@ pub(crate) fn plan(
         .ok_or_else(|| Error::Plan(format!("{} is not resident", kernel.name())))?;
     let lane = |c: &Collective| {
         let elem = match c {
-            Collective::Sum => crate::layout::F32,
-            Collective::SumBf16 => crate::layout::BF16,
+            Collective::Sum => tessera_device::layout::F32,
+            Collective::SumBf16 => tessera_device::layout::BF16,
         };
         LanePlan {
             op: Op::Sum,

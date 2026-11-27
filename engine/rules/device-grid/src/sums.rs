@@ -1,9 +1,9 @@
 //! A plan's sums through a persistent grid and its proxy.
 
-use crate::proxy::Op;
-use crate::resident::{Error, LanePlan, Plan, PoolPlan, Resident, persistent};
-use crate::{Options, flatten};
 use std::time::Duration;
+use tessera_device::proxy::Op;
+use tessera_device::resident::{Error, LanePlan, Plan, PoolPlan, Resident, persistent};
+use tessera_device::{Options, flatten};
 use tessera_engine_comm::Link;
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
@@ -62,9 +62,9 @@ fn plan_with(ranks: u32, threads: u32, share: u32) -> Plan {
     Plan {
         pools: vec![pool(ranks)],
         lanes: vec![
-            lane(Op::Sum, crate::layout::BF16),
-            lane(Op::Gather, crate::layout::F32),
-            lane(Op::Sum, crate::layout::F32),
+            lane(Op::Sum, tessera_device::layout::BF16),
+            lane(Op::Gather, tessera_device::layout::F32),
+            lane(Op::Sum, tessera_device::layout::F32),
         ],
         items: Vec::new(),
         forms: Vec::new(),
@@ -283,7 +283,7 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
-    let options = Options::plain(crate::resident::backend::<D>()?);
+    let options = Options::plain(tessera_device::resident::backend::<D>()?);
     let most = knobs
         .get("grid_sum", "threads")
         .map_or(THREADS, |t| t as u32);

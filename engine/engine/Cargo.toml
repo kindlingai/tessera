@@ -8,11 +8,12 @@ description = "Runs graphs: a decode loop over a stepper, or one forward launch"
 
 [features]
 default = []
-cuda = ["tessera-run/cuda", "tessera-device/cuda"]
-rocm = ["tessera-run/rocm", "tessera-device/rocm"]
+cuda = ["tessera-run/cuda", "tessera-device/cuda", "tessera-device-grid/cuda"]
+rocm = ["tessera-run/rocm", "tessera-device/rocm", "tessera-device-grid/rocm"]
 
 [dependencies]
 tessera-device = { workspace = true }
+tessera-device-grid = { workspace = true }
 tessera-engine-comm = { workspace = true }
 tessera-engine-hooks = { workspace = true }
 tessera-engine-settings = { workspace = true }

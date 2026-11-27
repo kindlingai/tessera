@@ -19,7 +19,7 @@ const POOLS: usize = 0xFF;
 
 /// One pool's offset in each region, and its slot sizes.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Place {
+pub struct Place {
     pub send: usize,
     pub recv: usize,
     pub flags: usize,

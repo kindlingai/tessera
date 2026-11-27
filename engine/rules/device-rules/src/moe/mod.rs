@@ -1,8 +1,8 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
 use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule};
 use std::sync::OnceLock;
+use tessera_device::{CUDA_LACKS, cuda_rule};
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Rotated;
@@ -44,7 +44,7 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     } else if let Some(mb) = k.gen_min_blocks {
         defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
-    crate::cuda_source_with(cuda_source(), entry, defs)
+    tessera_device::cuda_source_with(cuda_source(), entry, defs)
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]

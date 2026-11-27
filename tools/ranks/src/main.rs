@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use tessera_bundle::Weights;
-use tessera_device::p2p::Schedule;
-use tessera_device::sums::{self, Sum};
+use tessera_device_grid::p2p::Schedule;
+use tessera_device_grid::sums::{self, Sum};
 use tessera_engine_comm::{Fabric, ShmLink, Transport};
 use tessera_frontend_comm::{
     CAPACITY, Sums, meet, p2p, ports, shared, shm, sum_wire_flag, sums_flag,

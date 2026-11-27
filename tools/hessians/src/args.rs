@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tessera_checkpoint::hessian::sha256_hex;
-use tessera_device::calib::TILE;
+use tessera_device_rules::calib::TILE;
 
 /// Layer sets as given, before the layer count is known.
 #[derive(Clone, Debug, Default)]

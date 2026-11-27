@@ -2,7 +2,7 @@
 
 use super::module_test::codes;
 use std::path::Path;
-use tessera_device::whole;
+use tessera_device_grid::whole;
 use tessera_engine::wasm::Module;
 use tessera_engine::{Allowed, Backend, Engine, Steps};
 use tessera_graph::Graph;

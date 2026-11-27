@@ -223,3 +223,20 @@ fn mla_attend_knobs() {
     assert!(text[tessera_lower::Backend::Cuda].contains("#define MLA_MIN_BLOCKS 4"));
     assert_eq!(d_tuned[1].kernel.needs().group_threads, 128);
 }
+
+#[test]
+fn kernel_flattens() {
+    let options = tessera_device::Options::plain(tessera_device::Backend::Cuda);
+    let flat = tessera_device::flatten("mla.cu", KERNEL, &|_| None, &options).unwrap();
+    for entry in [
+        "GQA_DEF(tessera_gqa_attend_fp8,",
+        "GQA_DEF(tessera_gqa_attend_bf16,",
+        "GQA_DEF(tessera_gqa_attend_f32,",
+        "tessera_gqa_reduce(",
+        "tessera_indexer_fp8",
+        "tessera_indexer_bf16",
+        "tessera_indexer_f32",
+    ] {
+        assert!(flat.text.contains(entry), "missing {entry}");
+    }
+}

@@ -4,7 +4,7 @@ use crate::Args;
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
-use tessera_device::whole;
+use tessera_device_grid::whole;
 use tessera_engine::wasm::{Module, Trace};
 use tessera_engine::{Engine, Place, Row};
 use tessera_engine_comm::{ShmLink, Transport};

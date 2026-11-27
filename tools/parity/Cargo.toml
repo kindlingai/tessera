@@ -8,14 +8,14 @@ description = "Every model against its reference, the interpreter and the device
 
 [features]
 default = []
-cuda = ["tessera-run/cuda", "tessera-device/cuda"]
-rocm = ["tessera-run/rocm", "tessera-device/rocm"]
+cuda = ["tessera-run/cuda", "tessera-device-grid/cuda"]
+rocm = ["tessera-run/rocm", "tessera-device-grid/rocm"]
 
 [dependencies]
 serde_json = "1"
 tessera-bundle = { workspace = true }
 tessera-checkpoint = { workspace = true }
-tessera-device = { workspace = true }
+tessera-device-grid = { workspace = true }
 tessera-engine = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-interp = { workspace = true }
