@@ -52,6 +52,8 @@ pub(crate) fn fill_d2d(runner: &mut dyn Run, dst: Slot, copy: D2dCopy) -> Result
     Ok(())
 }
 
+pub(crate) const FNV_SEED: u32 = 2166136261;
+
 pub(crate) fn fnv_u32(h: &mut u32, v: u32) {
     for b in v.to_le_bytes() {
         *h = (*h ^ b as u32).wrapping_mul(16777619);
@@ -317,7 +319,7 @@ pub(crate) fn run_speculate<D, S>(
         stats: SpecStats::default(),
         sim_emitted: 0,
         stopped: false,
-        hash: 2166136261,
+        hash: FNV_SEED,
     };
     let mut request = spec_req.request;
     let mut sampler = Sampler::new(request.sampling);

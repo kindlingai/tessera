@@ -1,14 +1,13 @@
 //! Generic continuous-batching MTP and dual speculative decoding.
 
-use crate::batch_dual::{DualPeer, push_tail};
+use crate::batch_dual::DualPeer;
 use crate::dual::DualState;
 use crate::mtp_draft::{MtpDrafter, MtpJob, draft_mtp_batch, take_cols};
-use crate::spec_loop::{fnv_u32, span};
+use crate::spec_loop::{FNV_SEED, fnv_u32, span};
 use std::collections::VecDeque;
-use tessera_engine_comm::{Reader, Writer};
 use tessera_engine_hooks::Kept;
 use tessera_engine_hooks::Sink;
-use tessera_engine_hooks::sample::{Sampler, Sampling, Target, accept, take};
+use tessera_engine_hooks::sample::{Sampler, Target, accept, take};
 use tessera_engine_hooks::{Error, Event, Hooks, Reason, Request, Row, TapsBuf, TapsIn, VerifyOut};
 use tessera_run::Error as RunError;
 
@@ -16,15 +15,14 @@ pub(crate) mod admit;
 #[cfg(test)]
 mod admit_test;
 
-/// Wire tag identifying a batched speculative round header.
-const BATCH_STEP_TAG: u32 = 2;
-
 /// Default maximum rows per prefill chunk.
 pub(crate) const DEFAULT_CHUNK: usize = tessera_engine_settings::FAST_MAX_ROWS;
 
 mod mode;
 #[cfg(test)]
 mod mode_test;
+mod wire;
+use wire::{decode_round, encode_round};
 
 /// Shared coordinator and follower lifecycle for batched speculative loops.
 pub(crate) trait RoundHost<'a> {
@@ -119,7 +117,7 @@ impl<'a> BatchCore<'a> {
             free,
             kept,
             admit: Box::new(admit::Headroom::default()),
-            hash: 2166136261,
+            hash: FNV_SEED,
         }
     }
 
@@ -152,6 +150,27 @@ impl<'a> BatchCore<'a> {
             Some(kept) => kept.finish(slot, history),
             None => self.free.push(slot),
         }
+    }
+
+    /// Picks a slot for the front waiting request.
+    pub(crate) fn admit_front(
+        &mut self,
+        (gated, busy, charge): (bool, bool, bool),
+        pick: impl FnOnce(&mut Kept, &[u32]) -> Option<(u32, usize)>,
+    ) -> Option<(u32, usize)> {
+        let Some(kept) = &mut self.kept else {
+            return self.free.pop().map(|slot| (slot, 0));
+        };
+        let (front, _) = self.waiting.front()?;
+        let extra = if charge { front.tokens.len() } else { 0 };
+        if gated
+            && !self
+                .admit
+                .admit(admit::Ask::of(kept.totals().pool, busy, extra))
+        {
+            return None;
+        }
+        pick(kept, &front.tokens)
     }
 
     pub(crate) fn pop_admitted(&mut self, slot: u32, skip: usize) -> Admitted {
@@ -243,35 +262,20 @@ pub(crate) fn retire_from<T>(
     slots: &[u32],
     slot_of: impl Fn(&T) -> u32,
 ) -> Vec<T> {
-    let mut gone = Vec::new();
-    if slots.is_empty() {
-        return gone;
-    }
-    let mut i = 0;
-    while i < active.len() {
-        if slots.contains(&slot_of(&active[i])) {
-            gone.push(active.remove(i));
-        } else {
-            i += 1;
-        }
-    }
-    gone
+    active
+        .extract_if(.., |t| slots.contains(&slot_of(t)))
+        .collect()
 }
 
 /// Removes `active` entries marked true in `finished` and returns them.
 pub(crate) fn retire_finished<T>(active: &mut Vec<T>, finished: &[bool]) -> Vec<T> {
-    let mut gone = Vec::new();
-    let mut idx = 0usize;
-    let mut orig = 0usize;
-    while idx < active.len() {
-        if finished[orig] {
-            gone.push(active.remove(idx));
-        } else {
-            idx += 1;
-        }
-        orig += 1;
-    }
-    gone
+    let mut orig = 0;
+    active
+        .extract_if(.., |_| {
+            orig += 1;
+            finished[orig - 1]
+        })
+        .collect()
 }
 
 /// Prefill chunk length, keeping sampled final chunks one row.
@@ -573,29 +577,15 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
         let mut out = Vec::new();
         let can_reuse = self.can_reuse();
         let page = self.core.target.lanes().map_or(0, |l| l.page);
-        while let Some((front, _)) = self.core.waiting.front() {
-            let (slot, skip) = match &mut self.core.kept {
-                Some(kept) => {
-                    let busy =
-                        !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
-                    let extra = if can_reuse { 0 } else { front.tokens.len() };
-                    let ask = admit::Ask::of(kept.totals().pool, busy, extra);
-                    if page > 0 && !self.core.admit.admit(ask) {
-                        break;
-                    }
-                    let Some(pair) =
-                        crate::batch_dual::admit_one(kept, &front.tokens, can_reuse, page)
-                    else {
-                        break;
-                    };
-                    pair
-                }
-                None => {
-                    let Some(slot) = self.core.free.pop() else {
-                        break;
-                    };
-                    (slot, 0)
-                }
+        while !self.core.waiting.is_empty() {
+            let busy = !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
+            let Some((slot, skip)) = self
+                .core
+                .admit_front((page > 0, busy, !can_reuse), |kept, toks| {
+                    crate::batch_dual::admit_one(kept, toks, can_reuse, page)
+                })
+            else {
+                break;
             };
             out.push(self.core.pop_admitted(slot, skip));
         }
@@ -713,13 +703,7 @@ impl BatchMtp<'_> {
                         seq.m_tap_buf.extend_from_slice(&mt);
                     }
                 } else {
-                    if self
-                        .mode
-                        .tail(self.active.len() + self.prefilling.len() + 1)
-                    {
-                        let dt = self.read_dual_d_taps(&taps, len)?;
-                        push_tail(&mut seq.d_buf, &dt, d_w);
-                    }
+                    self.prefill_tail(&mut seq.d_buf, &taps, len)?;
                     self.run_mtp_prefill_chunk(seq.slot, pos0 as u32, shifted, &taps, d_w, m_w)?;
                     seq.mtp_valid = pos0 + len;
                 }
@@ -765,20 +749,12 @@ impl BatchMtp<'_> {
             self.solo_draft(idx)?;
             return Ok(());
         }
-        if let Some((d_w, _)) = dual_widths
-            && self
-                .mode
-                .tail(self.active.len() + self.prefilling.len() + 1)
-        {
-            let dt = self.read_dual_d_taps(&taps, len)?;
-            push_tail(&mut seq.d_buf, &dt, d_w);
-        }
+        self.prefill_tail(&mut seq.d_buf, &taps, len)?;
         let avail = self.depth.min(act.room(self.core.max_ctx));
         if avail >= 2 && self.drafter.lanes().is_some() {
             self.ensure_slot_pages(act.slot, n + avail - 1)?;
         }
         act.drafts = if avail > 0 {
-            let dual_stride = dual_widths.map(|(d_w, m_w)| (d_w, d_w + m_w));
             let job = MtpJob {
                 slot: act.slot,
                 old_start: pos0 as u32,
@@ -786,16 +762,10 @@ impl BatchMtp<'_> {
                 tokens: &shifted,
                 tap_row_off: 0,
             };
-            let got = draft_mtp_batch(
-                self.core.target,
-                self.drafter,
-                &[job],
-                &taps,
-                dual_stride,
-                avail,
-            )?
-            .pop()
-            .unwrap_or_default();
+            let got = self
+                .draft_jobs(&[job], &taps, avail)?
+                .pop()
+                .unwrap_or_default();
             act.mtp_valid = n;
             got
         } else {
@@ -856,28 +826,32 @@ impl BatchMtp<'_> {
             });
         if promote {
             let job = jobs.remove(0);
-            let d_w = dual_info.expect("dual info").0;
             let (d_all, m_all) = self.split_dual_taps(raw_taps, rows.len())?;
-            let lo = job.tap_row_off * d_w;
-            let hi = (job.tap_row_off + job.committed.len()) * d_w;
-            push_tail(&mut self.active[job.active_idx].d_tail, &d_all[lo..hi], d_w);
+            let peer = self.dual.as_ref().expect("dual peer");
+            let seq = &mut self.active[job.active_idx];
+            peer.push_rows(
+                &mut seq.d_tail,
+                &d_all,
+                job.tap_row_off,
+                job.committed.len(),
+            );
             self.promote_solo(job, &m_all)?;
         } else if !jobs.is_empty() {
-            if let Some((d_w, _)) = dual_info
+            if let Some(peer) = &self.dual
                 && self.mode.tail(survivors + self.prefilling.len())
             {
                 let d_all = self.read_dual_d_taps(&raw_taps, rows.len())?;
                 for job in &jobs {
-                    let lo = job.tap_row_off * d_w;
-                    let hi = (job.tap_row_off + job.committed.len()) * d_w;
-                    push_tail(&mut self.active[job.active_idx].d_tail, &d_all[lo..hi], d_w);
+                    let seq = &mut self.active[job.active_idx];
+                    peer.push_rows(
+                        &mut seq.d_tail,
+                        &d_all,
+                        job.tap_row_off,
+                        job.committed.len(),
+                    );
                 }
             }
             let chain_n = jobs.iter().map(|j| j.avail).min().unwrap_or(0);
-            let dual_stride = self
-                .dual
-                .as_ref()
-                .map(|p| (p.d_width, p.d_width + p.m_width));
             let mtp_jobs: Vec<MtpJob<'_>> = jobs
                 .iter()
                 .map(|j| MtpJob {
@@ -893,14 +867,7 @@ impl BatchMtp<'_> {
                     self.ensure_slot_pages(j.slot, j.new_start + chain_n - 1)?;
                 }
             }
-            let drafts_all = draft_mtp_batch(
-                self.core.target,
-                self.drafter,
-                &mtp_jobs,
-                &raw_taps,
-                dual_stride,
-                chain_n,
-            )?;
+            let drafts_all = self.draft_jobs(&mtp_jobs, &raw_taps, chain_n)?;
             for (job, drafts) in jobs.into_iter().zip(drafts_all) {
                 let seq = &mut self.active[job.active_idx];
                 seq.drafts = drafts;
@@ -909,6 +876,35 @@ impl BatchMtp<'_> {
         }
         for seq in retire_finished(&mut self.active, &finished) {
             self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
+        }
+        Ok(())
+    }
+
+    /// Runs the batched MTP draft for `jobs` over `taps`.
+    fn draft_jobs(
+        &mut self,
+        jobs: &[MtpJob<'_>],
+        taps: &TapsBuf,
+        depth: usize,
+    ) -> Result<Vec<Vec<u32>>, Error> {
+        let stride = self
+            .dual
+            .as_ref()
+            .map(|p| (p.d_width, p.d_width + p.m_width));
+        draft_mtp_batch(self.core.target, self.drafter, jobs, taps, stride, depth)
+    }
+
+    /// Keeps the DFlash tail of a prefill chunk.
+    fn prefill_tail(&self, buf: &mut Vec<f32>, taps: &TapsBuf, rows: usize) -> Result<(), Error> {
+        let Some(peer) = &self.dual else {
+            return Ok(());
+        };
+        if self
+            .mode
+            .tail(self.active.len() + self.prefilling.len() + 1)
+        {
+            let dt = self.read_dual_d_taps(taps, rows)?;
+            peer.push_rows(buf, &dt, 0, rows);
         }
         Ok(())
     }
@@ -942,53 +938,4 @@ impl BatchMtp<'_> {
         }
         Ok(())
     }
-}
-
-pub(crate) fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) -> Vec<u8> {
-    let mut w = Writer(Vec::new());
-    w.u32(BATCH_STEP_TAG)
-        .u32(hash)
-        .u32s(cancelled)
-        .u32(admitted.len() as u32);
-    for a in admitted {
-        w.u32(a.slot)
-            .u32(a.skip as u32)
-            .u32(a.request.max_tokens as u32)
-            .u32s(&a.request.tokens)
-            .u32s(&a.request.stop);
-        a.request.sampling.encode(&mut w);
-    }
-    w.0
-}
-
-pub(crate) fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>)> {
-    let mut r = Reader(bytes);
-    if r.u32()? != BATCH_STEP_TAG {
-        return None;
-    }
-    let hash = r.u32()?;
-    let cancelled = r.u32s()?;
-    let n = r.u32()? as usize;
-    let mut admitted = Vec::with_capacity(n);
-    for _ in 0..n {
-        let slot = r.u32()?;
-        let skip = r.u32()? as usize;
-        let max_tokens = r.u32()? as usize;
-        let tokens = r.u32s()?;
-        let stop = r.u32s()?;
-        let sampling = Sampling::decode(&mut r)?;
-        admitted.push(Admitted {
-            slot,
-            skip,
-            request: Request {
-                tokens,
-                max_tokens,
-                stop,
-                sampling,
-                ..Request::default()
-            },
-            sink: None,
-        });
-    }
-    Some((hash, cancelled, admitted))
 }

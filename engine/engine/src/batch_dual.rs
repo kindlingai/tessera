@@ -1,6 +1,5 @@
 //! Multi-slot DFlash decoding and solo DFlash/MTP promotion.
 
-use crate::batch_spec::admit::Ask;
 use crate::batch_spec::{
     ActiveSeq, Admitted, BatchCore, BatchMtp, DraftJob, RoundHost, batch_methods, drive_follow,
     drive_step, notify_kept, prefill_len, queue_request, retire_finished, retire_from, verify_rows,
@@ -32,6 +31,14 @@ pub(crate) struct DualPeer<'a> {
     pub(crate) d_width: usize,
     pub(crate) m_width: usize,
     pub(crate) block: usize,
+}
+
+impl DualPeer<'_> {
+    /// Appends `count` rows of `d_all` from `first`.
+    pub(crate) fn push_rows(&self, buf: &mut Vec<f32>, d_all: &[f32], first: usize, count: usize) {
+        let w = self.d_width;
+        push_tail(buf, &d_all[first * w..(first + count) * w], w);
+    }
 }
 
 /// Appends `src` rows to `buf`, keeping at most `DFLASH_TAIL_WIN` rows.
@@ -748,26 +755,21 @@ impl<'a> RoundHost<'a> for BatchDFlash<'a> {
             return Vec::new();
         }
         let mut out = Vec::new();
-        while let Some((req, _)) = self.core.waiting.front() {
-            let limit = self.admit_limit(req.tokens.len());
-            let (slot, skip) = if let Some(kept) = &mut self.core.kept {
-                if self.core.target.lanes().is_some() {
-                    let busy =
-                        !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
-                    let ask = Ask::of(kept.totals().pool, busy, req.tokens.len());
-                    if !self.core.admit.admit(ask) {
-                        break;
-                    }
-                }
-                let Some((slot, skip)) = kept.admit(&req.tokens, limit) else {
-                    break;
-                };
-                (slot, skip)
-            } else {
-                let Some(slot) = self.core.free.pop() else {
-                    break;
-                };
-                (slot, 0)
+        let reuse = self.reuse;
+        while !self.core.waiting.is_empty() {
+            let busy = !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
+            let gated = self.core.target.lanes().is_some();
+            let Some((slot, skip)) = self.core.admit_front((gated, busy, true), |kept, toks| {
+                kept.admit(
+                    toks,
+                    if reuse {
+                        toks.len().saturating_sub(1)
+                    } else {
+                        0
+                    },
+                )
+            }) else {
+                break;
             };
             self.admitted_skips.push_back(skip);
             out.push(self.core.pop_admitted(slot, 0));
