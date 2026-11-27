@@ -501,3 +501,82 @@ fn variants_hold_chosen() {
         assert!(v.ways.iter().any(|w| w.1 == v.chosen), "{v:?}");
     }
 }
+
+#[test]
+fn bf16_edges_stay() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_seqs = 1;
+    cfg.stack.max_context = 256;
+    cfg.stack.ffn = 256;
+    cfg.index.as_mut().unwrap().keep = 128;
+    let g_mla = mla::stepper::<mla::RotatedMoe>(&cfg);
+
+    let mut q_cfg = Config::qwen3_small();
+    q_cfg.stack.heads = 16;
+    q_cfg.kv_heads = 4;
+    q_cfg.stack.head_dim = 128;
+    q_cfg.stack.hidden = 2048;
+    q_cfg.stack.ffn = 2048;
+    q_cfg.stack.layers = 1;
+    let g_qwen = stepper::<Norm, Swiglu>(&q_cfg);
+
+    let mut r_mla = Recipe {
+        pins: Pins::all(BF16_FORM)
+            .pin("*q_a", named("mxfp8").unwrap())
+            .pin("*kv_a", named("mxfp8").unwrap())
+            .pin("*dense*.down", named("mxfp8").unwrap())
+            .pin("*q_b", named("int4_g32").unwrap())
+            .pin("*.o", named("int4_g32").unwrap())
+            .pin("*moe*.gate", named("trellis_k3_pmcgx").unwrap())
+            .pin("*moe*.up", named("trellis_k2_mul1").unwrap())
+            .pin("*moe*.down", named("trellis_k3_pmcgx").unwrap())
+            .pin("*shared*", named("trellis_k4_rot").unwrap())
+            .pin("*norm*", tessera_lower::form::F32_FORM)
+            .kept(BF16_FORM),
+        ..Default::default()
+    };
+    let mut r_qwen = Recipe {
+        pins: Pins::all(BF16_FORM)
+            .pin("*norm*", tessera_lower::form::F32_FORM)
+            .kept(BF16_FORM),
+        ..Default::default()
+    };
+    for s in [
+        "@activation=bf16",
+        "@residual=f32",
+        "@router=f32",
+        "@logits=f32",
+        "@softmax=f32",
+    ] {
+        r_mla.dtype.push(tessera_lower::Dtype::parse(s).unwrap());
+        r_qwen.dtype.push(tessera_lower::Dtype::parse(s).unwrap());
+    }
+    r_mla.settle();
+    r_qwen.settle();
+
+    let gpu = Platform {
+        backend: "cuda".into(),
+        name: "Test GPU".into(),
+        units: 128,
+        bandwidth: 1e12,
+        ..Platform::assumed(Limits::assumed())
+    };
+    for (tag, g, recipe, rows, want_casts) in [
+        ("glm53 m=1", &g_mla, &r_mla, 1u64, 2usize),
+        ("glm53 m=64", &g_mla, &r_mla, 64u64, 2usize),
+        ("qwen3 m=1", &g_qwen, &r_qwen, 1u64, 0usize),
+        ("qwen3 m=64", &g_qwen, &r_qwen, 64u64, 0usize),
+    ] {
+        let dev = Device::stored(gpu.clone(), &Settings::default())
+            .unwrap()
+            .with(recipe);
+        let plan = lower(g, 0, &[(Seqs, 1), (Rows, rows), (Context, 256)], &dev).unwrap();
+        let casts: Vec<&str> = plan
+            .steps
+            .iter()
+            .map(|s| s.kernel.name())
+            .filter(|n| matches!(*n, "widen" | "narrow"))
+            .collect();
+        assert_eq!(casts.len(), want_casts, "{tag}: unexpected casts {casts:?}");
+    }
+}

@@ -2,8 +2,8 @@
 
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order, View};
-use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Load, Needs, T, Term, Tree, knob};
+use tessera_lower::form::{Load as Stored, plain, writable};
+use tessera_lower::{Draft, Kernel, Load, Needs, Source, T, Term, Tree, knob};
 
 /// Elements one wide load brings per lane.
 const WIDE: u32 = 4;
@@ -22,9 +22,9 @@ const MODE_WIDE: u32 = 2;
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 fn stacked(
-    x: Buf<F32>,
+    #[form(x_form)] x: Buf<Dyn>,
     #[form(form)] w: Buf<Dyn>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     len: u32,
     rows: u32,
     n: u32,
@@ -33,7 +33,9 @@ fn stacked(
     first: u32,
     col_step: u32,
     k_step: u32,
+    #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
     #[build] mode: u32,
     #[build] ahead: u32,
 ) {
@@ -86,7 +88,7 @@ fn stacked(
 /// `x[b, rows, k]` times block `b` of a stored matrix.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    stacked(self.form, self.mode, self.ahead),
+    stacked(self.x_form, self.form, self.out_form, self.mode, self.ahead),
     name = self.form.suffixed(match self.mode {
         MODE_LANES => "stacked_lanes",
         MODE_WIDE => "stacked_wide",
@@ -95,6 +97,8 @@ fn stacked(
     threads = if self.mode == MODE_LANES { self.len * LANES } else { self.len },
     work = self.len * self.k,
     accepts = stacked_accepts,
+    emits = stacked_emits,
+    source = stacked_source,
     needs = if self.mode == MODE_LANES { Needs::lanes() } else { Needs::default() },
     order = Order::PerConfig,
     load = stacked_load,
@@ -110,13 +114,39 @@ pub(crate) struct Stacked {
     /// Elements between columns, and along `k`.
     pub col_step: usize,
     pub k_step: usize,
+    pub x_form: &'static dyn Stored,
     pub form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
     pub mode: u32,
     pub ahead: u32,
 }
 
 fn stacked_accepts(k: &Stacked, input: usize, form: &dyn Stored) -> bool {
-    k.form.taken(input, 1, form)
+    match input {
+        0 => form.name() == k.x_form.name(),
+        1 => form.name() == k.form.name(),
+        _ => false,
+    }
+}
+
+fn stacked_emits(k: &Stacked, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn stacked_source(k: &Stacked) -> Source {
+    let base = match k.mode {
+        MODE_LANES => "stacked_lanes",
+        MODE_WIDE => "stacked_wide",
+        _ => "stacked",
+    };
+    let name = match (k.x_form.name(), k.out_form.name()) {
+        ("f32", "f32") => format!("plan_{base}_{}", k.form.name()),
+        (a, b) => format!("plan_{base}_{}_{a}_{b}", k.form.name()),
+    };
+    Source::named(
+        stacked_ir(k.x_form, k.form, k.out_form, k.mode, k.ahead),
+        name,
+    )
 }
 
 fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
@@ -131,10 +161,12 @@ fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
         WIDE as usize
     };
     let products = k.len / k.n;
-    let mut trip = stacked_ir(k.form, k.mode, k.ahead).trip();
+    let x_elem = k.x_form.bytes(1);
+    let y_elem = k.out_form.bytes(1);
+    let mut trip = stacked_ir(k.x_form, k.form, k.out_form, k.mode, k.ahead).trip();
     if k.mode != MODE_LANES {
         // Threads on columns of one row share its x.
-        let shared = (4 * width) as f64 * (1.0 - 1.0 / k.n.min(LANES) as f64);
+        let shared = (x_elem * width) as f64 * (1.0 - 1.0 / k.n.min(LANES) as f64);
         trip.width -= shared / trip.loads;
     }
     Some(Load {
@@ -143,11 +175,11 @@ fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
         trips: k.k as f64 / step as f64,
         trip,
         reads: vec![
-            (4 * products * k.k) as f64,
+            (x_elem * products * k.k) as f64,
             k.form.bytes(products / k.rows * k.n * k.k) as f64,
         ],
-        written: (4 * k.len) as f64,
-        flight: ((4 + k.form.bytes(1)) * width * flight) as f64,
+        written: (y_elem * k.len) as f64,
+        flight: ((x_elem + k.form.bytes(1)) * width * flight) as f64,
         ..Load::default()
     })
 }
@@ -207,6 +239,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         true => (1, b.width),
         false => (b.width, 1),
     };
+    let (x_form, out_form) = (plain(tree.node(x).form), writable(node.form));
     let form = tree.node(b.leaf).form;
     let mode = if !b.swapped && k.is_multiple_of(WIDE as usize) && form.pairs() == 0 {
         MODE_LANES
@@ -228,7 +261,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         first: b.first * b.width,
         col_step,
         k_step,
+        x_form,
         form,
+        out_form,
         mode,
         ahead,
     };

@@ -223,3 +223,48 @@ fn mla_attend_knobs() {
     assert!(text[tessera_lower::Backend::Cuda].contains("#define MLA_MIN_BLOCKS 4"));
     assert_eq!(d_tuned[1].kernel.needs().group_threads, 128);
 }
+
+#[test]
+fn attend_bf16_io_defines() {
+    for (mla, heads, kv_heads, width) in [
+        (true, 32, 1, MLA_WIDTH as u64),
+        (false, 16, 4, GQA_WIDTH as u64),
+    ] {
+        let mut g = ring_graph(heads, kv_heads, width, mla);
+        g.entries[0].inputs[0].ty.dtype = DType::Bf16;
+        g.nodes[0].ty.dtype = DType::Bf16;
+        let dev = Device::default().pinned(Pins::default().kept(BF16_FORM).outputs(BF16_FORM));
+        let parts = dev.division();
+        let tree = Tree::upto(
+            &g,
+            0,
+            Wants::ALL,
+            &[(Rows, 1), (Seqs, 2), (Context, 4096)],
+            &[],
+            &dev.pins,
+            dev.kept,
+            &parts,
+            0,
+        )
+        .unwrap();
+        let drafts = if mla {
+            check_mla(&tree, tree.outputs[0].0).unwrap().unwrap()
+        } else {
+            check_gqa(&tree, tree.outputs[0].0).unwrap().unwrap()
+        };
+        assert_eq!(drafts.len(), 2);
+        let Source::Fixed { text: a_txt, .. } = drafts[0].kernel.source() else {
+            panic!("expected fixed source");
+        };
+        let Source::Fixed { text: r_txt, .. } = drafts[1].kernel.source() else {
+            panic!("expected fixed source");
+        };
+        let cuda_a = a_txt[tessera_lower::Backend::Cuda];
+        let cuda_r = r_txt[tessera_lower::Backend::Cuda];
+        assert!(drafts[0].kernel.accepts(0, BF16_FORM));
+        assert!(drafts[0].kernel.accepts(5, BF16_FORM));
+        assert!(cuda_a.contains("#define X_BF16 1"));
+        assert!(!cuda_a.contains("#define Y_BF16 1"));
+        assert!(cuda_r.contains("#define Y_BF16 1"));
+    }
+}

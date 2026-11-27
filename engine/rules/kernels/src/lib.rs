@@ -27,8 +27,25 @@ pub use rope::Rope;
 pub use softmax::Softmax;
 
 use tessera_codegen::prelude::LANES;
+use tessera_lower::form::{Load as Stored, plain, writable};
 pub(crate) use tessera_lower::knob as __knob;
 use tessera_work::{Load, Ops};
+
+/// Coerces input and output forms to supported plain/writable float forms.
+pub(crate) fn io_pair(
+    in_form: &'static dyn Stored,
+    out_form: &'static dyn Stored,
+) -> (&'static dyn Stored, &'static dyn Stored) {
+    (plain(in_form), writable(out_form))
+}
+
+/// Unique entry name for a kernel specialized on `(in_form, out_form)`.
+pub(crate) fn io_name(base: &str, in_form: &dyn Stored, out_form: &dyn Stored) -> String {
+    match (in_form.name(), out_form.name()) {
+        ("f32", "f32") => format!("plan_{base}"),
+        (a, b) => format!("plan_{base}_{a}_{b}"),
+    }
+}
 
 /// Elements one wide load brings a lane.
 pub(crate) const WIDE: u32 = 4;

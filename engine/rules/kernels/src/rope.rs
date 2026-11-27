@@ -1,9 +1,11 @@
 //! Rotary positions: a table of angles, then the rotation.
 
+use crate::io_name;
 use tessera_codegen::prelude::*;
 use tessera_graph::{Pairs, Stage};
+use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::sites;
-use tessera_lower::{Draft, Kernel, Read, Shape, T, Tree, knob};
+use tessera_lower::{Draft, Kernel, Read, Shape, Source, T, Tree, knob};
 
 knob!("rope", "threads", 1, 1024);
 
@@ -21,11 +23,12 @@ fn line_or_grid(len: usize, threads: usize) -> Shape {
 /// One thread per position, head and pair, rotating in place.
 #[kernel]
 fn rope<const ADJACENT: bool>(
-    mut x: BufMut<F32>,
+    #[form(form)] mut x: BufMut<Dyn>,
     freqs: Buf<F32>,
     positions: u32,
     heads: u32,
     width: u32,
+    #[build] form: &'static dyn Stored,
 ) {
     let pairs = width / 2;
     if gid() >= positions * heads * pairs {
@@ -91,13 +94,16 @@ pub(crate) struct Angles {
 /// Rotates pairs in place, by the second input's angles.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    rope,
+    rope(self.form),
     variant = self.adjacent,
     name = match self.adjacent {
         true => "rope_adjacent",
         false => "rope",
     },
     threads = line_or_grid(self.positions * self.heads * self.width / 2, self.threads),
+    accepts = rope_accepts,
+    emits = rope_emits,
+    source = rope_source,
     overwrites,
 )]
 pub struct Rope {
@@ -106,6 +112,25 @@ pub struct Rope {
     pub width: usize,
     pub adjacent: bool,
     pub threads: usize,
+    pub form: &'static dyn Stored,
+}
+
+fn rope_accepts(k: &Rope, input: usize, form: &dyn Stored) -> bool {
+    form.name() == if input == 0 { k.form.name() } else { "f32" }
+}
+
+fn rope_emits(k: &Rope, form: &dyn Stored) -> bool {
+    form.name() == k.form.name()
+}
+
+fn rope_source(k: &Rope) -> Source {
+    let base = if k.adjacent { "rope_adjacent" } else { "rope" };
+    let body = if k.adjacent {
+        rope_ir::<true>(k.form)
+    } else {
+        rope_ir::<false>(k.form)
+    };
+    Source::named(body, io_name(base, k.form, k.form))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -116,13 +141,16 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             turned,
         },
         x,
-        operand: Some((at, positions)),
+        operand: Some((pos_t, positions)),
         len,
         width,
     } = tree.site(at)?
     else {
         return None;
     };
+    let xf = plain(tree.node(x).form);
+    let of = writable(tree.node(at).form);
+    let form = if xf.name() == of.name() { of } else { F32_FORM };
     let threads = tree.knobs.get("rope", "threads").unwrap_or(0);
     let angles = Angles {
         count: positions,
@@ -137,9 +165,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         width,
         adjacent: pairs == Pairs::Adjacent,
         threads,
+        form,
     };
     Some(vec![
-        Draft::new(angles, [at], positions * width),
+        Draft::new(angles, [pos_t], positions * width),
         Draft::new(rope, [Read::Node(x), Read::Draft(0)], len),
     ])
 }
