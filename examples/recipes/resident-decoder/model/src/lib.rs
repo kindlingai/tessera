@@ -56,11 +56,11 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     ];
     let ops = ["rms_norm", "rope_halves", "attend"];
     let reads = found.iter().map(Found::read);
-    let threads = site.knob(NAME, "threads").unwrap_or(THREADS as usize);
+    let threads = step.knob(NAME, "threads").unwrap_or(THREADS as usize);
     if !threads.is_multiple_of(32) {
         return None;
     }
-    let warps = site.knob(NAME, "warps").unwrap_or(32);
+    let warps = step.knob(NAME, "warps").unwrap_or(32);
     if warps < threads / 32 {
         return None;
     }
