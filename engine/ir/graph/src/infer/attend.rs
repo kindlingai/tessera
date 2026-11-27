@@ -2,7 +2,7 @@
 
 use crate::dims::Dim;
 use crate::infer::{
-    ErrorKind, TypeError, front, key_lists, need, poly, row_ids, same, same_shape, valued,
+    ErrorKind, TypeError, front, groups, key_lists, need, row_ids, same, same_shape, valued,
 };
 use crate::node::Attend;
 use crate::types::{Placement, TensorType};
@@ -20,13 +20,7 @@ pub(crate) fn heads_fit(
         ErrorKind::Shape,
         || format!("keys {} and values {} differ", k.shape, v.shape),
     )?;
-    let heads = poly(dims, &q.shape.0[q_heads])?.as_const();
-    let kv_heads = poly(dims, &k.shape.0[2])?.as_const();
-    if let (Some(h), Some(kv)) = (heads, kv_heads) {
-        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
-            format!("{h} query heads do not group over {kv} key heads")
-        })?;
-    }
+    let kv_heads = groups(dims, &q.shape.0[q_heads], &k.shape.0[2], "query", "key")?;
     need(
         q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype,
         ErrorKind::DType,

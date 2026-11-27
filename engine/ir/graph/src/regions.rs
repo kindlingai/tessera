@@ -8,10 +8,7 @@ fn inside(r: &Region, id: NodeId) -> bool {
 }
 
 fn fail(i: usize, msg: String) -> Result<(), TypeError> {
-    Err(TypeError {
-        kind: ErrorKind::Region,
-        message: format!("region {i}: {msg}"),
-    })
+    Err(ErrorKind::Region.err(format!("region {i}: {msg}")))
 }
 
 /// Checks each region's range, inputs, outputs and nesting.

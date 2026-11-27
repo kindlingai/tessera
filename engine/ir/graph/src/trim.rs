@@ -1,7 +1,7 @@
 //! Steps compute rows past their last append only where returned.
 
 use crate::dims::{Dim, DimExpr, DimName, Shape};
-use crate::infer::{ErrorKind, TypeError, infer};
+use crate::infer::{ErrorKind, infer};
 use crate::node::{Composite, EntryKind, Graph, Node, NodeId, Op, Port, Role, Select, View};
 use crate::types::{DType, TensorType};
 use crate::verify::{VerifyError, verify};
@@ -20,10 +20,7 @@ enum Need {
 pub fn trim(g: &Graph, entry: usize) -> Result<Graph, VerifyError> {
     let top = |message: String| VerifyError {
         node: None,
-        error: TypeError {
-            kind: ErrorKind::Shape,
-            message,
-        },
+        error: ErrorKind::Shape.err(message),
     };
     let rows = g.dims.iter().find(|d| d.name == Rows);
     let step = g.entries.get(entry).map(|e| e.kind) == Some(EntryKind::Step);

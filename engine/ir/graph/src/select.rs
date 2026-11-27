@@ -52,10 +52,8 @@ fn gather(table: &TensorType, ids: &TensorType) -> Result<TensorType, TypeError>
             axis: axis - 1 + lead,
         },
         Partial | Routed | Owned { .. } => {
-            return Err(TypeError {
-                kind: ErrorKind::Placement,
-                message: format!("gather cannot read a {:?} table", table.placement),
-            });
+            return Err(ErrorKind::Placement
+                .err(format!("gather cannot read a {:?} table", table.placement)));
         }
     };
     let mut shape = ids.shape.0.clone();

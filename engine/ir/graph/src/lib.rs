@@ -1,6 +1,5 @@
 //! The model graph: typed nodes, symbolic shapes, a JSON form.
 
-mod attend;
 mod chain;
 mod dims;
 mod infer;
