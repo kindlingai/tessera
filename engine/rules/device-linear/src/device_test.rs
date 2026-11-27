@@ -388,6 +388,10 @@ fn fast_mm_loads() {
         (6144, 576, 16, "mxfp8", "tessera_mm_mxfp8_r16_sk", true),
         (2048, 4096, 256, "mxfp8", "tessera_mm_mxfp8_r64", true),
         (12288, 6144, 24, "mxfp8", "tessera_mm_mxfp8_r64_sk", true),
+        (4096, 6144, 4, "int4_g32", "tessera_mm_int4_r16", false),
+        (4096, 512, 8, "int4_g32", "tessera_mm_int4_r16_sk", false),
+        (4096, 6144, 256, "int4_g32", "tessera_mm_int4_r64", false),
+        (4096, 2048, 32, "int4_g32", "tessera_mm_int4_r64_sk", false),
     ];
     for (k, n, m, form, want_entry, want_e4m3) in cases {
         let (_, entry, _, load) = mm_draft(&linear(&rows, k, n), m, form, Knobs::default(), false)
