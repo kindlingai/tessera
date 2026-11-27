@@ -10,7 +10,7 @@ use tessera_engine_settings::Settings;
 /// FNV-1a 128-bit offset basis and prime.
 const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-const VERSION: &[u8] = b"tessera-rtc-v1";
+const VERSION: &[u8] = b"tessera-rtc-v2";
 
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 static CURRENT: Mutex<Option<DiskCache>> = Mutex::new(None);
@@ -81,9 +81,17 @@ impl DiskCache {
     }
 
     /// Stable 128-bit hex key for one compile invocation.
-    pub(crate) fn key(&self, backend: &str, arch: &str, base: &[&str], source: &str) -> String {
+    pub(crate) fn key(
+        &self,
+        backend: &str,
+        compiler: &str,
+        arch: &str,
+        base: &[&str],
+        source: &str,
+    ) -> String {
         let mut h = hash_part(OFFSET, VERSION);
         h = hash_part(h, backend.as_bytes());
+        h = hash_part(h, compiler.as_bytes());
         h = hash_part(h, arch.as_bytes());
         let count = (base.len() + self.flags.len()) as u64;
         h = hash_bytes(h, &count.to_le_bytes());
@@ -101,27 +109,30 @@ impl DiskCache {
     pub(crate) fn path(
         &self,
         backend: &str,
+        compiler: &str,
         arch: &str,
         ext: &str,
         base: &[&str],
         source: &str,
     ) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
-        let key = self.key(backend, arch, base, source);
+        let key = self.key(backend, compiler, arch, base, source);
         Some(dir.join(format!("{key}.{ext}")))
     }
 
     /// Loads a cached image, or builds and stores one atomically.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_or<E>(
         &self,
         backend: &str,
+        compiler: &str,
         arch: &str,
         ext: &str,
         base: &[&str],
         source: &str,
         build: impl FnOnce(&[&str]) -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
-        let path = self.path(backend, arch, ext, base, source);
+        let path = self.path(backend, compiler, arch, ext, base, source);
         if let Some(ref at) = path
             && let Ok(bytes) = std::fs::read(at)
             && !bytes.is_empty()

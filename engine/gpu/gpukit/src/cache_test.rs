@@ -8,14 +8,14 @@ fn caches_compiled_images() {
     let base = ["--gpu-architecture=compute_121", "--std=c++17"];
     let mut builds = 0usize;
     let first = plain
-        .load_or::<()>("cuda", "compute_121", "ptx", &base, "kernel_a", |opts| {
+        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |opts| {
             builds += 1;
             assert_eq!(opts, base);
             Ok(b"PTX_A".to_vec())
         })
         .unwrap();
     let second = plain
-        .load_or::<()>("cuda", "compute_121", "ptx", &base, "kernel_a", |_| {
+        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |_| {
             builds += 1;
             Ok(b"PTX_STALE".to_vec())
         })
@@ -24,26 +24,27 @@ fn caches_compiled_images() {
         (first, second, builds),
         (b"PTX_A".to_vec(), b"PTX_A".to_vec(), 1)
     );
-    // Extra flags change the options and cache key.
+    assert_ne!(
+        plain.key("cuda", "13.1", "compute_121", &base, "ka"),
+        plain.key("cuda", "13.2", "compute_121", &base, "ka")
+    );
     let tuned = DiskCache::new(Some(dir.clone()), vec!["--maxrregcount=128".into()]);
     assert_ne!(
-        plain.key("cuda", "compute_121", &base, "kernel_a"),
-        tuned.key("cuda", "compute_121", &base, "kernel_a")
+        plain.key("cuda", "13.1", "compute_121", &base, "ka"),
+        tuned.key("cuda", "13.1", "compute_121", &base, "ka")
     );
     let fast = tuned
-        .load_or::<()>("cuda", "compute_121", "ptx", &base, "kernel_a", |opts| {
+        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |opts| {
             builds += 1;
             assert_eq!(opts.last(), Some(&"--maxrregcount=128"));
             Ok(b"PTX_TUNED".to_vec())
         })
         .unwrap();
     assert_eq!((fast, builds), (b"PTX_TUNED".to_vec(), 2));
-    // Atomic rename leaves only final images.
     let entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|name| name.ends_with(".ptx")));
+    assert!(entries.len() == 2 && entries.iter().all(|n| n.ends_with(".ptx")));
     let _ = std::fs::remove_dir_all(&dir);
 }

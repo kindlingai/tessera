@@ -68,6 +68,48 @@ fn rocm_ready() -> bool {
     false
 }
 
+/// Parses a CUDA target into `(major, minor, suffix)`.
+pub fn cuda_arch(target: &str) -> Result<(u32, u32, &'static str), crate::Error> {
+    let raw = target.trim();
+    let stripped = raw
+        .strip_prefix("compute_")
+        .or_else(|| raw.strip_prefix("sm_"))
+        .unwrap_or(raw);
+    let (body, suffix) = match stripped.as_bytes().last().copied() {
+        Some(b'a') => (&stripped[..stripped.len() - 1], "a"),
+        Some(b'f') => (&stripped[..stripped.len() - 1], "f"),
+        _ => (stripped, ""),
+    };
+    let (major, minor) = match body.split_once('.') {
+        Some((hi, lo)) => (hi.parse::<u32>(), lo.parse::<u32>()),
+        None if body.len() >= 2 => {
+            let (hi, lo) = body.split_at(body.len() - 1);
+            (hi.parse::<u32>(), lo.parse::<u32>())
+        }
+        None => {
+            return Err(crate::Error::Cuda(format!(
+                "invalid CUDA target {target:?}"
+            )));
+        }
+    };
+    let (Ok(major), Ok(minor)) = (major, minor) else {
+        return Err(crate::Error::Cuda(format!(
+            "invalid CUDA target {target:?}"
+        )));
+    };
+    if major == 0 || minor > 9 {
+        return Err(crate::Error::Cuda(format!(
+            "invalid CUDA target {target:?}"
+        )));
+    }
+    // Blackwell targets require arch-specific PTX for MXFP8 MMA.
+    let suffix = match suffix.is_empty() && major >= 12 {
+        true => "a",
+        false => suffix,
+    };
+    Ok((major, minor, suffix))
+}
+
 /// Whether a hosted CI runner is running this process.
 #[allow(clippy::disallowed_methods, reason = "the one variable tests read")]
 fn ci() -> bool {

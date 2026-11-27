@@ -81,7 +81,7 @@ pub fn sizing() {
 
 /// Whether `open` gives runners that only count bytes.
 pub fn counting() -> bool {
-    SIZED.lock().expect("sizes").is_some()
+    SIZED.lock().expect("sizes").is_some() || crate::check::active()
 }
 
 /// The peak bytes of runners live together since `sizing`.
@@ -114,37 +114,49 @@ pub fn attic(settings: &Settings) -> u64 {
     tessera_gpukit::attic::available(settings)
 }
 
-/// A runner that counts the bytes `Held` allocates.
-pub(crate) struct Sizer {
+/// Dry-run runner that adopts plans through `on_plan` without executing.
+struct Passive<F> {
     base: Base,
     platform: Platform,
-    /// This runner's entry in `SIZED`.
+    label: &'static str,
+    on_plan: F,
+}
+
+impl<F: FnMut(&Plan) + Send> Passive<F> {
+    fn adopt(&mut self, plan: &Plan) {
+        self.base.adopt(plan);
+        (self.on_plan)(plan);
+    }
+}
+
+/// Opens a dry-run runner that never allocates or executes.
+pub(crate) fn passive<F>(
+    plan: &Plan,
+    platform: Platform,
+    label: &'static str,
+    on_plan: F,
+) -> Box<dyn Run>
+where
+    F: FnMut(&Plan) + Send + 'static,
+{
+    let mut runner = Passive {
+        base: Base::default(),
+        platform,
+        label,
+        on_plan,
+    };
+    runner.adopt(plan);
+    Box::new(runner)
+}
+
+/// Byte counter dropped when its sizing runner closes.
+struct Counter {
     at: usize,
-    /// Each zone's scratch buffers, grown as plans need.
     scratch: HashMap<u32, Vec<u64>>,
 }
 
-impl Sizer {
-    /// A sizer for `plan`, if sizing is on.
-    pub(crate) fn open(plan: &Plan, settings: &Settings) -> Option<Box<dyn Run>> {
-        let at = {
-            let mut sized = SIZED.lock().expect("sizes");
-            let tracked = sized.as_mut()?;
-            tracked.live.push(None);
-            tracked.live.len() - 1
-        };
-        let mut sizer = Sizer {
-            base: Base::default(),
-            platform: platform(settings),
-            at,
-            scratch: HashMap::new(),
-        };
-        sizer.count(plan);
-        Some(Box::new(sizer))
-    }
-
+impl Counter {
     fn count(&mut self, plan: &Plan) {
-        self.base.adopt(plan);
         let mut owned = vec![0u8; plan.buffers.len()];
         for l in &plan.weights {
             owned[l.slot.buffer as usize] = 1;
@@ -185,7 +197,7 @@ impl Sizer {
     }
 }
 
-impl Drop for Sizer {
+impl Drop for Counter {
     fn drop(&mut self) {
         if let Ok(mut sized) = SIZED.lock()
             && let Some(tracked) = sized.as_mut()
@@ -196,7 +208,29 @@ impl Drop for Sizer {
     }
 }
 
-impl Run for Sizer {
+/// Opens a sizing-only runner for `plan`.
+pub(crate) struct Sizer;
+
+impl Sizer {
+    /// A sizer for `plan`, if sizing is on.
+    pub(crate) fn open(plan: &Plan, settings: &Settings) -> Option<Box<dyn Run>> {
+        let at = {
+            let mut sized = SIZED.lock().expect("sizes");
+            let tracked = sized.as_mut()?;
+            tracked.live.push(None);
+            tracked.live.len() - 1
+        };
+        let mut counter = Counter {
+            at,
+            scratch: HashMap::new(),
+        };
+        Some(passive(plan, platform(settings), "sizing only", move |p| {
+            counter.count(p);
+        }))
+    }
+}
+
+impl<F: FnMut(&Plan) + Send> Run for Passive<F> {
     fn base(&self) -> &Base {
         &self.base
     }
@@ -206,7 +240,7 @@ impl Run for Sizer {
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        self.count(plan);
+        self.adopt(plan);
         Ok(())
     }
 
@@ -220,8 +254,8 @@ impl Run for Sizer {
 
     fn device(&self) -> String {
         format!(
-            "{} {}, sizing only",
-            self.platform.backend, self.platform.name
+            "{} {}, {}",
+            self.platform.backend, self.platform.name, self.label
         )
     }
 

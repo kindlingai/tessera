@@ -1,6 +1,7 @@
 //! Runs lowered plans on the host or a GPU.
 
 mod cache;
+pub mod check;
 mod cpu;
 mod device;
 mod grid;
@@ -137,7 +138,7 @@ use tessera_lower::{Arg, Plan};
 
 /// This build's GPU, when it can run kernels here.
 pub fn gpu() -> Option<Backend> {
-    tessera_gpukit::backend::picked()
+    check::backend().or_else(tessera_gpukit::backend::picked)
 }
 
 /// Applies cache, device and compiler settings to the GPU runtime.
@@ -209,6 +210,9 @@ impl tessera_gpukit::backend::OnGpu for Free {
 
 /// The platform a runner for `settings` would report.
 pub(crate) fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
+    if let Some(platform) = check::platform() {
+        return Some(platform);
+    }
     configure(settings);
     tessera_gpukit::backend::dispatch(settings.gpu(), Asked).ok()?
 }
@@ -246,6 +250,9 @@ impl<D: tessera_gpukit::device::Device> Pinning for Pin<D> {
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
+    if let Some(checker) = check::open(&plan) {
+        return Ok(checker);
+    }
     if let Some(sizer) = sizer::Sizer::open(&plan, settings) {
         return Ok(sizer);
     }

@@ -221,7 +221,7 @@ pub trait Api: Sync + Sized + 'static {
         1e9
     }
     /// A loadable image of `source` for this device.
-    fn compile(ctx: &Context<Self>, source: &str) -> Result<Vec<u8>, Error>;
+    fn compile(ctx: &Context<Self>, name: &str, source: &str) -> Result<Vec<u8>, Error>;
 
     /// Fills a handle through `f`, then checks its code.
     fn out(&self, what: &str, f: impl FnOnce(&mut Handle) -> c_int) -> Result<Handle, Error> {
@@ -619,7 +619,7 @@ impl<A: Api> Context<A> {
 
     /// Compile for this device and resolve `entry`.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
-        let image = A::compile(self, source)?;
+        let image = A::compile(self, entry, source)?;
         self.load_module(&image)?.function(entry)
     }
 }

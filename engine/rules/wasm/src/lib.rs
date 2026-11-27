@@ -235,7 +235,7 @@ impl Asking {
             }
             Answer::Offers(Some(entries)) => {
                 let made = site::drafts(entries, self.kernels, tree, &reads);
-                let err = made.is_none().then_some("offer did not fit site");
+                let err = made.as_ref().err().map(String::as_str);
                 if log {
                     self.sink.record(&input, Some(&output), err);
                     if let Some(msg) = err
@@ -244,10 +244,7 @@ impl Asking {
                         self.warn(&input, msg);
                     }
                 }
-                match made {
-                    Some(drafts) => Some(Ok(drafts)),
-                    None => Some(Err("offer did not fit site".into())),
-                }
+                Some(made)
             }
         }
     }

@@ -756,3 +756,55 @@ fn ask_carries_config() {
     let with = lower(&graph(false), 0, &[(Rows, 4)], &cfg).unwrap();
     assert_eq!(rules(&with), ["wasm_matmul"]);
 }
+
+/// Dumps one rejected offer and returns the recorded `error`.
+fn dump_offer_error(site: &str, g: &Graph, offer: Value) -> String {
+    let dir = tessera_testkit::scratch(&format!("wasm-err-{site}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dump = dir.join("sites.jsonl");
+    let bytes = module(&manifest(ABI, site), &offer, "");
+    let trace = tessera_wasm::Trace {
+        dump: Some(dump.clone()),
+        favor: None,
+    };
+    let loaded = tessera_wasm::Module::open_with(&bytes, trace).unwrap();
+    let device = compiling().adding(loaded.rules[0]);
+    let _ = lower(g, 0, &[(Rows, 4)], &device).unwrap();
+    let text = std::fs::read_to_string(&dump).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    first["error"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn bad_offers_pinpoint_reason() {
+    let mut bad_kernel = matmul();
+    bad_kernel["kernel"] = json!("missing_gemm");
+    let err = dump_offer_error("matmul", &graph(false), json!([bad_kernel]));
+    assert!(
+        err.contains("missing_gemm") && err.contains("wasm_gemm"),
+        "{err}"
+    );
+
+    let mut bad_read = matmul();
+    bad_read["reads"] = json!([0, 9]);
+    let err = dump_offer_error("matmul", &graph(false), json!([bad_read]));
+    assert!(
+        err.contains("read index 9") && err.contains("2 inputs"),
+        "{err}"
+    );
+
+    let mut bad_draft = act(json!({"draft": 3}), 32);
+    bad_draft["len"] = json!(128);
+    let err = dump_offer_error("mlp", &graph(true), json!([matmul(), bad_draft]));
+    assert!(
+        err.contains("draft index 3") && err.contains("1 earlier drafts"),
+        "{err}"
+    );
+
+    let mut dup_a = matmul();
+    let mut dup_b = act(json!({"draft": 0}), 32);
+    (dup_a["writes"], dup_b["writes"]) = (json!(0), json!(0));
+    let err = dump_offer_error("layer", &layer(), json!([dup_a, dup_b]));
+    assert!(err.contains("output 0 written more than once"), "{err}");
+}

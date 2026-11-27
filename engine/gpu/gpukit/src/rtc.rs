@@ -19,6 +19,7 @@ type Compile = unsafe extern "C" fn(Program, c_int, *const *const c_char) -> c_i
 type Size = unsafe extern "C" fn(Program, *mut usize) -> c_int;
 type Read = unsafe extern "C" fn(Program, *mut c_char) -> c_int;
 type Destroy = unsafe extern "C" fn(*mut Program) -> c_int;
+type Version = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;
 
 const SUCCESS: c_int = 0;
 
@@ -46,6 +47,7 @@ pub(crate) struct Fns {
     log_size: Size,
     log: Read,
     destroy: Destroy,
+    version: Option<Version>,
 }
 
 impl Rtc {
@@ -65,6 +67,7 @@ impl Rtc {
             log_size: self.sym(&lib, "GetProgramLogSize")?,
             log: self.sym(&lib, "GetProgramLog")?,
             destroy: self.sym(&lib, "DestroyProgram")?,
+            version: self.sym(&lib, "Version").ok(),
         })
     }
 
@@ -85,12 +88,36 @@ impl Rtc {
         (self.error)(format!("{}{call} failed ({code})", self.prefix))
     }
 
-    /// Compiles `source` with `options` to the device's code.
-    pub fn compile(&'static self, source: &str, options: &[&str]) -> Result<Vec<u8>, Error> {
+    /// Reports `(major, minor)` from the runtime compiler library.
+    pub fn version(&'static self) -> Option<(i32, i32)> {
+        let fns = self.library().ok()?;
+        let version = fns.version?;
+        let (mut major, mut minor) = (0, 0);
+        let code = unsafe { version(&mut major, &mut minor) };
+        (code == SUCCESS).then_some((major, minor))
+    }
+
+    /// Stable compiler version tag for cache keys.
+    pub fn version_tag(&'static self) -> String {
+        match self.version() {
+            Some((major, minor)) => format!("{major}.{minor}"),
+            None => "unknown".into(),
+        }
+    }
+
+    /// Compiles `source` named `name` with `options` to code.
+    pub fn compile(
+        &'static self,
+        name: &str,
+        source: &str,
+        options: &[&str],
+    ) -> Result<Vec<u8>, Error> {
         let lib = self.library()?;
         let c_src = CString::new(source)
             .map_err(|e| (self.error)(format!("kernel source has a NUL: {e}")))?;
-        let c_name = CString::new("kernel.cu").expect("static name");
+        let unit = if name.is_empty() { "kernel.cu" } else { name };
+        let c_name =
+            CString::new(unit).map_err(|e| (self.error)(format!("kernel name has a NUL: {e}")))?;
         let mut program: Program = std::ptr::null_mut();
         let code = unsafe {
             (lib.create)(

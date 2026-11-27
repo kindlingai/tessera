@@ -86,7 +86,7 @@ pub use tessera_mem::{block, trellis};
 // The front end's name for `mtp`.
 pub use tessera_models::mtp as mtp_model;
 pub use tessera_models::*;
-pub use tessera_run::{Grid, Ranks, gpu, pinning, select, sizer};
+pub use tessera_run::{Grid, Ranks, check, gpu, pinning, select, sizer};
 pub use tessera_trace::{Linear, Norm, Vector};
 pub use tessera_turns as turns;
 pub use tessera_wasm as wasm;

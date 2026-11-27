@@ -271,12 +271,24 @@ impl Api for Runtime {
         self.check(code, "hipMemcpyAsync")
     }
 
-    fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
+    fn compile(ctx: &Context, name: &str, source: &str) -> Result<Vec<u8>, Error> {
         ctx.set_current()?;
         let arch = ctx.arch();
+        let compiler = hip::HIPRTC.version_tag();
+        let unit = match name.is_empty() {
+            true => "kernel.hip".into(),
+            false if name.contains('.') => name.to_string(),
+            false => format!("{name}.hip"),
+        };
         // Without --offload-arch, hiprtc targets the current device.
-        cache::current().load_or("rocm", &arch, "hsaco", &["-std=c++17"], source, |opts| {
-            hip::HIPRTC.compile(source, opts)
-        })
+        cache::current().load_or(
+            "rocm",
+            &compiler,
+            &arch,
+            "hsaco",
+            &["-std=c++17"],
+            source,
+            |opts| hip::HIPRTC.compile(&unit, source, opts),
+        )
     }
 }

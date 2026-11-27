@@ -1,5 +1,6 @@
 //! `tesserax [--recipe <src>] [--model <dir | hf:<owner>/<name>[@<revision>]>] <verb>`.
 
+mod check;
 mod fetch;
 mod mcp;
 #[cfg(test)]
@@ -31,6 +32,8 @@ const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>>] [--mo
   size [--ctx <tokens>] [--slots <n>] [--boot]
                  print the memory the model needs and this machine has, as
                  JSON. --boot loads it and runs one step to measure
+  check-kernels [--arch <sm_XX>] [--max-spills <bytes>] [--file <path>] [--json]
+                 compile planned or standalone CUDA kernels offline with NVRTC and ptxas
   teleport [--from <dir>] [--root <dir>] <user@host | local>...
                  copy this build to other machines over ssh
   --version      print version, commit, target and GPU features";
@@ -53,6 +56,7 @@ fn run(given: &[String]) -> Result<(), Stop> {
         ("mcp", _) => mcp::run(origin, rest),
         ("teleport", _) => teleport::run(rest),
         ("size", _) => size::run(origin, rest),
+        ("check-kernels", _) => check::run(origin, rest),
         ("-h" | "--help" | "help", _) => Err(Stop::Usage),
         // Other words are a prompt for the default model.
         _ if origin.is_none() => task::route(&args),

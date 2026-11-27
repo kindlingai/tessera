@@ -351,15 +351,35 @@ impl Api for Driver {
         self.check(code, "cuMemcpyDtoDAsync")
     }
 
-    fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
+    fn compile(ctx: &Context, name: &str, source: &str) -> Result<Vec<u8>, Error> {
         let (major, minor) = ctx.compute_capability();
-        // Blackwell architecture-specific PTX (e.g., block-scaled MXFP8 MMA).
-        let suffix = if major >= 12 { "a" } else { "" };
-        let arch = format!("compute_{major}{minor}{suffix}");
-        let gpu_arch = format!("--gpu-architecture={arch}");
-        let base = [gpu_arch.as_str(), "--std=c++17", "--diag-suppress=177"];
-        cache::current().load_or("cuda", &arch, "ptx", &base, source, |opts| {
-            driver::NVRTC.compile(source, opts)
-        })
+        compile_ptx(&format!("sm_{major}{minor}"), name, source)
     }
+}
+
+/// Normalizes a target string to `compute_XY[a|f]` for NVRTC.
+pub(super) fn compute_arch(target: &str) -> Result<String, Error> {
+    let (major, minor, suffix) = crate::backend::cuda_arch(target)?;
+    Ok(format!("compute_{major}{minor}{suffix}"))
+}
+
+/// Reports the loaded NVRTC `(major, minor)` version, if present.
+pub fn nvrtc_version() -> Option<(i32, i32)> {
+    driver::NVRTC.version()
+}
+
+/// Compiles CUDA `source` to PTX without a GPU context.
+pub fn compile_ptx(target: &str, name: &str, source: &str) -> Result<Vec<u8>, Error> {
+    let arch = compute_arch(target)?;
+    let gpu_arch = format!("--gpu-architecture={arch}");
+    let base = [gpu_arch.as_str(), "--std=c++17", "--diag-suppress=177"];
+    let compiler = driver::NVRTC.version_tag();
+    let unit = match name.is_empty() {
+        true => "kernel.cu".into(),
+        false if name.contains('.') => name.to_string(),
+        false => format!("{name}.cu"),
+    };
+    cache::current().load_or("cuda", &compiler, &arch, "ptx", &base, source, |opts| {
+        driver::NVRTC.compile(&unit, source, opts)
+    })
 }

@@ -148,12 +148,15 @@ fn input(tree: &Tree, t: T) -> Input {
 }
 
 /// A count's argument. Varying dimensions wait for launch.
-fn arg(tree: &Tree, nodes: &[T], count: Count) -> Option<Arg> {
+fn arg(tree: &Tree, nodes: &[T], count: Count) -> Result<Arg, String> {
     let (dim, mul): (DimName, usize) = match count {
-        Count::Fixed(n) => return Some(Arg::count(n as usize)),
+        Count::Fixed(n) => return Ok(Arg::count(n as usize)),
         Count::Dim { dim, mul } => (dim, mul),
     };
-    let most = tree.size(dim)? as usize * mul;
+    let Some(size) = tree.size(dim) else {
+        return Err(format!("count dim {dim:?} has no size at site"));
+    };
+    let most = size as usize * mul;
     let varies = |t: &T| {
         let extents = &tree.node(*t).extents;
         extents
@@ -169,16 +172,16 @@ fn arg(tree: &Tree, nodes: &[T], count: Count) -> Option<Arg> {
         },
         false => Extent::Fixed(most),
     };
-    Some(Arg::size(extent))
+    Ok(Arg::size(extent))
 }
 
-/// The entries as drafts. `None` if they do not fit.
+/// The entries as drafts, or why they did not fit.
 pub(crate) fn drafts(
     entries: Vec<Entry>,
     kernels: &'static [Fixed],
     tree: &Tree,
     from: &Reads,
-) -> Option<Vec<Draft>> {
+) -> Result<Vec<Draft>, String> {
     let mut drafts: Vec<Draft> = Vec::with_capacity(entries.len());
     let (mut sums, mut written) = (0, vec![None; from.outputs.len()]);
     for entry in entries {
@@ -192,36 +195,69 @@ pub(crate) fn drafts(
                 (launch(&offer, kernels, tree, from, made)?, offer.writes)
             }
             Entry::Sum(sum) => {
-                let len = drafts.get(sum.all_reduce)?.len;
+                let Some(prev) = drafts.get(sum.all_reduce) else {
+                    return Err(format!(
+                        "all_reduce draft {} out of range ({} earlier drafts)",
+                        sum.all_reduce,
+                        drafts.len()
+                    ));
+                };
+                let len = prev.len;
                 // Ranks pair sums by order, so each length must match.
-                let at = *from.sums.get(sums)?;
-                if tree.elements(at) != len {
-                    return None;
+                let Some(&at) = from.sums.get(sums) else {
+                    return Err(format!(
+                        "extra all_reduce #{sums} (site expects {})",
+                        from.sums.len()
+                    ));
+                };
+                let want = tree.elements(at);
+                if want != len {
+                    return Err(format!(
+                        "all_reduce #{sums} length {len} does not match site length {want}"
+                    ));
                 }
                 sums += 1;
                 let read = [Read::Draft(sum.all_reduce)];
-                let wire = tree.wire(at)?;
+                let Some(wire) = tree.wire(at) else {
+                    return Err(format!("all_reduce #{sums} has no sum wire dtype at site"));
+                };
                 (Draft::new(AllReduce { len, wire }, read, len), sum.writes)
             }
         };
-        if let Some(o) = writes
-            && written.get_mut(o)?.replace(drafts.len()).is_some()
-        {
-            return None;
+        if let Some(o) = writes {
+            let Some(slot) = written.get_mut(o) else {
+                return Err(format!(
+                    "writes index {o} out of range (site has {} outputs)",
+                    from.outputs.len()
+                ));
+            };
+            if slot.replace(drafts.len()).is_some() {
+                return Err(format!("output {o} written more than once"));
+            }
         }
         drafts.push(draft);
     }
     if sums != from.sums.len() {
-        return None;
+        return Err(format!(
+            "offer placed {sums} all_reduce(s), site requires {}",
+            from.sums.len()
+        ));
     }
     // One output defaults to the last entry.
     if let [last @ None] = written.as_mut_slice() {
         *last = drafts.len().checked_sub(1);
     }
     for (o, d) in written.into_iter().enumerate() {
-        drafts[d?].writes = Some(from.outputs[o]);
+        let Some(idx) = d else {
+            return Err(format!(
+                "output {o} was not written (site has {} outputs, {} entries)",
+                from.outputs.len(),
+                drafts.len()
+            ));
+        };
+        drafts[idx].writes = Some(from.outputs[o]);
     }
-    Some(drafts)
+    Ok(drafts)
 }
 
 /// One offer's launch, after `made` earlier drafts.
@@ -231,19 +267,69 @@ fn launch(
     tree: &Tree,
     from: &Reads,
     made: usize,
-) -> Option<Draft> {
-    let fixed = kernels.iter().find(|k| k.name == offer.kernel)?;
+) -> Result<Draft, String> {
+    let Some(fixed) = kernels.iter().find(|k| k.name == offer.kernel) else {
+        let names: Vec<_> = kernels.iter().map(|k| k.name).collect();
+        return Err(format!(
+            "unknown kernel {:?} (manifest declares: [{}])",
+            offer.kernel,
+            names.join(", ")
+        ));
+    };
     let mut reads = Vec::with_capacity(offer.reads.len());
     let mut kept = None;
     for place in &offer.reads {
         reads.push(match *place {
-            Place::Read(i) => Read::Node(*from.nodes.get(i)?),
+            Place::Read(i) => {
+                let Some(&node) = from.nodes.get(i) else {
+                    return Err(format!(
+                        "kernel {}: read index {i} out of range (site has {} inputs)",
+                        offer.kernel,
+                        from.nodes.len()
+                    ));
+                };
+                Read::Node(node)
+            }
             Place::Draft { draft } if draft < made => Read::Draft(draft),
-            Place::Draft { .. } => return None,
-            Place::Part { part: [i, 0] } => Read::Node(*from.nodes.get(i)?),
-            Place::Part { part: [i, p] } => Read::Node(*from.scales(i)?.get(p - 1)?),
+            Place::Draft { draft } => {
+                return Err(format!(
+                    "kernel {}: draft index {draft} out of range ({made} earlier drafts)",
+                    offer.kernel
+                ));
+            }
+            Place::Part { part: [i, 0] } => {
+                let Some(&node) = from.nodes.get(i) else {
+                    return Err(format!(
+                        "kernel {}: part [{i}, 0] out of range (site has {} inputs)",
+                        offer.kernel,
+                        from.nodes.len()
+                    ));
+                };
+                Read::Node(node)
+            }
+            Place::Part { part: [i, p] } => {
+                let Some(scales) = from.scales(i) else {
+                    return Err(format!(
+                        "kernel {}: input {i} has no scale parts",
+                        offer.kernel
+                    ));
+                };
+                let Some(&node) = scales.get(p - 1) else {
+                    return Err(format!(
+                        "kernel {}: part [{i}, {p}] out of range (expected part 0..=2)",
+                        offer.kernel
+                    ));
+                };
+                Read::Node(node)
+            }
             Place::Kept { kept: i } => {
-                let k = from.kept.get(i)?;
+                let Some(k) = from.kept.get(i) else {
+                    return Err(format!(
+                        "kernel {}: kept index {i} out of range (site has {} kept buffers)",
+                        offer.kernel,
+                        from.kept.len()
+                    ));
+                };
                 kept = Some(*k);
                 Read::Kept(k.index)
             }
@@ -251,7 +337,8 @@ fn launch(
     }
     let mut args = Vec::with_capacity(offer.counts.len());
     for count in &offer.counts {
-        args.push(arg(tree, &from.nodes, *count)?);
+        let built = arg(tree, &from.nodes, *count).map_err(|e| format!("{}: {e}", offer.kernel))?;
+        args.push(built);
     }
     let mut text = Text::new(fixed, offer, args);
     text.kept = kept.map(|k| {
@@ -259,5 +346,5 @@ fn launch(
         let values = values.into_iter().map(|v| Arg::count(v as usize));
         (tree.kept, values.collect())
     });
-    Some(Draft::new(text, reads, offer.len))
+    Ok(Draft::new(text, reads, offer.len))
 }
