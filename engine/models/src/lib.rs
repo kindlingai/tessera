@@ -8,6 +8,7 @@ pub mod eg2;
 pub mod flux2;
 pub mod gemma4;
 pub mod hy4;
+pub mod inkling2;
 pub mod keys;
 pub mod mla;
 pub mod mtp;

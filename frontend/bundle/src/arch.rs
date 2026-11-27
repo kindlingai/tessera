@@ -217,12 +217,25 @@ pub(crate) fn parse_keys<C>(
 pub(crate) fn open_streamed<C>(
     ask: &Ask,
     is_step: bool,
-    mut cfg: C,
+    cfg: C,
     stack: impl FnOnce(&mut C) -> &mut tessera_engine::Stack,
     make_rules: impl FnOnce(&C, bool) -> Vec<Rule>,
     traces: [fn(&C) -> Graph; 4],
 ) -> Result<Built> {
     let offer = crate::offer(ask.dir, ask.manifest)?;
+    streamed(offer, ask, is_step, cfg, stack, make_rules, traces)
+}
+
+/// `open_streamed` over an offer already open.
+pub(crate) fn streamed<C>(
+    offer: Box<dyn Offer>,
+    ask: &Ask,
+    is_step: bool,
+    mut cfg: C,
+    stack: impl FnOnce(&mut C) -> &mut tessera_engine::Stack,
+    make_rules: impl FnOnce(&C, bool) -> Vec<Rule>,
+    traces: [fn(&C) -> Graph; 4],
+) -> Result<Built> {
     let rotated = crate::mla::has_rotated_experts(&offer.slices());
     let mut rules = make_rules(&cfg, rotated);
     let st = stack(&mut cfg);
@@ -251,7 +264,24 @@ pub(crate) fn push_routed_mlp(
     rotated: bool,
 ) {
     let (shared_dst, shared_src) = shared;
-    let (routed_dst, routed_pfx, experts_src) = routed;
+    for (f, s) in MLP {
+        rules.push((format!("{shared_dst}.{f}"), format!("{shared_src}.{s}")));
+    }
+    push_routed(rules, routed, rotated);
+}
+
+const MLP: [(&str, &str); 3] = [
+    ("gate", "gate_proj"),
+    ("up", "up_proj"),
+    ("down", "down_proj"),
+];
+
+/// Routed SwiGLU expert rules for one layer.
+pub(crate) fn push_routed(
+    rules: &mut Vec<(String, String)>,
+    (routed_dst, routed_pfx, experts_src): (&str, &str, &str),
+    rotated: bool,
+) {
     if rotated {
         for side in ["signs_in", "signs_out"] {
             rules.push((
@@ -260,12 +290,7 @@ pub(crate) fn push_routed_mlp(
             ));
         }
     }
-    for (f, s) in [
-        ("gate", "gate_proj"),
-        ("up", "up_proj"),
-        ("down", "down_proj"),
-    ] {
-        rules.push((format!("{shared_dst}.{f}"), format!("{shared_src}.{s}")));
+    for (f, s) in MLP {
         if rotated {
             let set = format!("{experts_src}.{f}");
             for end in ["su", "sv"] {

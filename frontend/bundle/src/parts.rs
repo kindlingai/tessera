@@ -5,6 +5,7 @@ use crate::arch::{self, Arch};
 use crate::names::Rule;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use tessera_checkpoint::Offer;
 use tessera_engine::DimName::{self, Context, Layers, Seqs};
 use tessera_engine::wasm::Module;
 use tessera_engine::{Graph, Pins, Weight};
@@ -104,7 +105,22 @@ pub(crate) fn from_streamed<C>(
     make_rules: impl FnOnce(&C, bool) -> Vec<Rule>,
     traces: [fn(&C) -> Graph; 2],
 ) -> Result<Part> {
-    let offer = crate::offer(&cut.dir, cut.manifest)?;
+    from_opened(cut, cfg, layers, make_rules, traces, crate::offer)
+}
+
+/// How a part opens its checkpoint.
+pub(crate) type Open = fn(&Path, Option<&str>) -> Result<Box<dyn Offer>>;
+
+/// `from_streamed`, its checkpoint opened by `open`.
+pub(crate) fn from_opened<C>(
+    cut: &Cut,
+    cfg: C,
+    layers: u64,
+    make_rules: impl FnOnce(&C, bool) -> Vec<Rule>,
+    traces: [fn(&C) -> Graph; 2],
+    open: Open,
+) -> Result<Part> {
+    let offer = open(&cut.dir, cut.manifest)?;
     let rotated = crate::mla::has_rotated_experts(&offer.slices());
     let rules = make_rules(&cfg, rotated);
     let graph = traces[usize::from(rotated)](&cfg);
@@ -119,7 +135,7 @@ pub(crate) fn from_streamed<C>(
         Some(pins),
         Some(cut.json.to_string()),
         move |g, shares| {
-            let offer = crate::offer(&dir, manifest.as_deref())?;
+            let offer = open(&dir, manifest.as_deref())?;
             crate::pull_shared(g, offer.as_ref(), layers, &[&rules, &user], shares)
         },
     ))

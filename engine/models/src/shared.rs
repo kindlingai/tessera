@@ -484,13 +484,31 @@ pub(crate) fn routed_calib<E: ExpertSet>(
     routed.add(&shared)
 }
 
+/// Joins an expert's gate and up branches.
+pub type Join<'a> = dyn Fn(Tensor, Tensor) -> Tensor + 'a;
+
+/// SwiGLU's join.
+fn swish(gate: Tensor, up: Tensor) -> Tensor {
+    gate.act(Act::Silu).mul(&up)
+}
+
 /// Routed experts, however they are stored.
 pub trait ExpertSet: Weights {
+    /// Picked experts mixed by `gates`, joined by `join`.
+    fn apply_with(
+        &self,
+        m: &Model,
+        h: &Tensor,
+        picks: [&Tensor; 2],
+        join: &Join,
+    ) -> (Tensor, Option<Tensor>);
     /// Each row's picked experts `ids`, mixed by `gates`.
-    fn apply(&self, m: &Model, h: &Tensor, picks: [&Tensor; 2]) -> Tensor;
+    fn apply(&self, m: &Model, h: &Tensor, picks: [&Tensor; 2]) -> Tensor {
+        self.apply_with(m, h, picks, &swish).0
+    }
     /// Same as `apply`, also exposing per-pick down input when plain.
     fn apply_calib(&self, m: &Model, h: &Tensor, picks: [&Tensor; 2]) -> (Tensor, Option<Tensor>) {
-        (self.apply(m, h, picks), None)
+        self.apply_with(m, h, picks, &swish)
     }
     /// Rotates a tap into the experts' input gauge, when present.
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
@@ -510,19 +528,16 @@ pub struct PlainExperts {
 }
 
 impl ExpertSet for PlainExperts {
-    fn apply(&self, m: &Model, h: &Tensor, picks: [&Tensor; 2]) -> Tensor {
-        self.apply_calib(m, h, picks).0
-    }
-
-    fn apply_calib(
+    fn apply_with(
         &self,
         m: &Model,
         h: &Tensor,
         [ids, gates]: [&Tensor; 2],
+        join: &Join,
     ) -> (Tensor, Option<Tensor>) {
         // One output row per pick, each on its own expert.
         let on = |set: &Linears, x: &Tensor| x.matmul_rows(&m.pick(set, ids));
-        let inner = on(&self.gate, h).act(Act::Silu).mul(&on(&self.up, h));
+        let inner = join(on(&self.gate, h), on(&self.up, h));
         let picks = h.ty().rank() as u32 - 1;
         let out = on(&self.down, &inner).mix(picks, gates);
         (out, Some(inner))
@@ -558,7 +573,13 @@ pub struct CodedExperts {
 }
 
 impl ExpertSet for CodedExperts {
-    fn apply(&self, m: &Model, h: &Tensor, [ids, gates]: [&Tensor; 2]) -> Tensor {
+    fn apply_with(
+        &self,
+        m: &Model,
+        h: &Tensor,
+        [ids, gates]: [&Tensor; 2],
+        join: &Join,
+    ) -> (Tensor, Option<Tensor>) {
         let picks = h.ty().rank() as u32 - 1;
         // One copy of each signed row per picked expert.
         let lead = h.ty().shape.0[..picks as usize].to_vec();
@@ -574,9 +595,9 @@ impl ExpertSet for CodedExperts {
         };
         let gate = on(&slots, &self.gate, [&self.gate_su, &self.gate_sv]);
         let up = on(&slots, &self.up, [&self.up_su, &self.up_sv]);
-        let inner = gate.act(Act::Silu).mul(&up);
+        let inner = join(gate, up);
         let out = on(&inner, &self.down, [&self.down_su, &self.down_sv]);
-        out.mul_vector(&self.signs_out).mix(picks, gates)
+        (out.mul_vector(&self.signs_out).mix(picks, gates), None)
     }
 
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
