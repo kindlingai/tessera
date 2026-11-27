@@ -1,13 +1,13 @@
 //! Dual-root RoCE link driven by a host proxy thread.
 
 use crate::fabric::Fabric;
+use crate::pace::{Pace, Spinning, Step};
 use crate::pin::Pinning;
 use crate::verbs::{Engine, Region};
 use crate::{Error, Transport};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
 /// Send buffer bytes per parity.
 pub const SEND_BYTES: usize = 32 << 20;
@@ -31,10 +31,6 @@ const MODE_SCATTER_PIECE: u64 = 3;
 /// Flag value encoding matching arx.cu (`seq * 16 + piece + 1`).
 const FLAG_STRIDE: u64 = 16;
 const PIECES: u64 = 8;
-
-/// Busy spin before idle naps.
-const SPIN_IDLE: Duration = Duration::from_millis(200);
-const NAP: Duration = Duration::from_micros(200);
 
 /// Device addresses and topology exposed to GPU kernels.
 #[derive(Clone, Copy, Debug)]
@@ -162,7 +158,7 @@ fn record_fault(engine: &Engine, fault: &Mutex<Option<String>>, err: Error) {
 }
 
 fn run_proxy(mut engine: Engine, fault: Arc<Mutex<Option<String>>>) {
-    if let Err(err) = proxy_loop(&mut engine) {
+    if let Err(err) = proxy_loop(&mut engine, Spinning::default()) {
         record_fault(&engine, &fault, err);
     }
 }
@@ -195,13 +191,11 @@ fn post_work(engine: &mut Engine, sends: &[usize], base: usize) -> Result<(u64, 
     Ok((seq, len))
 }
 
-fn proxy_loop(engine: &mut Engine) -> Result<(), Error> {
+fn proxy_loop(engine: &mut Engine, mut pace: impl Pace) -> Result<(), Error> {
     let mut seq = 0u64;
     let mut ring_done = 0u64;
     let mut relayed = 0u64;
     let mut own_bytes = [0usize; 2];
-    let mut last_busy = Instant::now();
-    let mut idle_spins = 0u32;
     let sends = engine.wiring.sends.clone();
     let relay = engine.wiring.relay;
     while engine.regions[3].word(CTL_STOP).load(Ordering::Acquire) == 0 {
@@ -213,7 +207,7 @@ fn proxy_loop(engine: &mut Engine) -> Result<(), Error> {
                 let slot = engine.slot(par, prev);
                 let flag = flag_val(relayed, PIECES - 1);
                 engine.post(to, (1, slot), own_bytes[par], slot, prev, flag)?;
-                idle_spins = 0;
+                pace.worked();
             }
         }
         let ring_base = CTL_RING + (ring_done as usize % RING_CAP) * WORK_WORDS;
@@ -221,26 +215,20 @@ fn proxy_loop(engine: &mut Engine) -> Result<(), Error> {
             .word(ring_base + WORK_WORDS - 1)
             .load(Ordering::Acquire);
         if tag == ring_done + 1 {
-            if idle_spins >= 1024 {
-                last_busy = Instant::now();
-            }
-            idle_spins = 0;
+            pace.worked();
             ring_done += 1;
             let (w_seq, len) = post_work(engine, &sends, ring_base)?;
             own_bytes[(w_seq & 1) as usize] = len;
             seq = seq.max(w_seq);
             continue;
         }
-        idle_spins = idle_spins.wrapping_add(1);
-        if idle_spins.is_multiple_of(1024) {
-            engine.poll()?;
-            if relay.is_some() && relayed < seq {
-                last_busy = Instant::now();
-            } else if last_busy.elapsed() > SPIN_IDLE {
-                thread::sleep(NAP);
+        match pace.idle(relay.is_some() && relayed < seq) {
+            Step::Spin => std::hint::spin_loop(),
+            Step::Poll => engine.poll()?,
+            Step::Nap(nap) => {
+                engine.poll()?;
+                thread::sleep(nap);
             }
-        } else {
-            std::hint::spin_loop();
         }
     }
     Ok(())

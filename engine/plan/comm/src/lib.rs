@@ -5,6 +5,7 @@ mod fabric;
 mod ibv;
 mod link;
 mod memory;
+mod pace;
 mod pin;
 mod shm;
 #[cfg(test)]
@@ -110,3 +111,5 @@ mod comm_test;
 mod fabric_test;
 #[cfg(test)]
 mod ibv_test;
+#[cfg(test)]
+mod pace_test;
