@@ -630,3 +630,62 @@ fn fused_slice_ln() {
         }
     }
 }
+
+/// Rows of `width` floats, clipped to length 1.
+fn clip_rows(width: u64) -> Graph {
+    let m = Model::new(vec![Dim::bounded(Rows, 1024), Dim::fixed(HeadDim, width)]);
+    let [x] = m.entry(EntryKind::Forward, [floats([Rows, HeadDim])]);
+    m.finish([(Role::Logits, &x.l2_clip(1.0, 1e-3))])
+}
+
+#[test]
+fn lane_clip_is_picked() {
+    // The chip table prices both kernels.
+    let metal = Platform {
+        backend: "metal".into(),
+        arch: "apple9".into(),
+        name: "Apple M3 Pro".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let device = Device::guess(&host()).on(metal);
+    let shapes = [
+        (8, 128),
+        (24, 128),
+        (24, 16),
+        (4, 256),
+        (256, 128),
+        (768, 128),
+    ];
+    for (rows, width) in shapes {
+        let plan = lower(&clip_rows(width), 0, &[(Rows, rows)], &device).unwrap();
+        assert_eq!(plan.steps[0].rule, "lane_l2_clip", "{rows}x{width}");
+    }
+    // A row off the four-float grid stays scalar.
+    let plan = lower(&clip_rows(18), 0, &[(Rows, 8)], &device).unwrap();
+    assert_eq!(plan.steps[0].rule, "l2_clip");
+}
+
+#[test]
+fn lane_clip_matches() {
+    // Rows cycle: zero, shorter than 1, longer than 1.
+    const SCALE: [f32; 3] = [0.0, 0.01, 1.0];
+    for width in [16usize, 128, 144, 256] {
+        let x: Vec<f32> = (0..5 * width)
+            .map(|i| SCALE[i / width % 3] * ((i * 37 % 23) as f32 - 11.0) / 11.0)
+            .collect();
+        let inputs = [Tensor::f32(vec![5, width], x)];
+        let g = clip_rows(width as u64);
+        let want = run(&g, &[], 0, &inputs).unwrap();
+        let want = want[0].floats().unwrap();
+        assert!(want[..width].iter().all(|v| *v == 0.0));
+        for settings in runs() {
+            let device = Device::guess(&settings).favoring("lane_l2_clip");
+            let plan = lower(&g, 0, &[(Rows, 5)], &device).unwrap();
+            assert_eq!(plan.steps[0].rule, "lane_l2_clip");
+            let mut runner = open(plan, &settings).unwrap();
+            let got = runner.run(&[inputs[0].view()]).unwrap();
+            let off = max_abs_diff(got[0].floats().unwrap(), want);
+            assert!(off < 1e-6, "width {width} is off by {off:e}");
+        }
+    }
+}
