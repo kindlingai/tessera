@@ -2,7 +2,7 @@
 
 use crate::decoder::{HeadNorm, Layer, Mlp, Swiglu, rope_theta};
 pub use crate::dflash_shard::shard;
-use crate::keys::{At, Keys};
+use crate::keys::{At, Keys, Offered};
 use crate::shared::{Dense, PreRotated, Rotated, Stack, join_rows, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
@@ -42,6 +42,65 @@ pub struct BridgeConfig {
     pub rank: u64,
     pub top_k: u64,
     pub eps: f32,
+}
+
+const DF: &str = "dflash_config";
+const BRIDGE: &str = "dflash_config.selected_prefix_code_bridge";
+
+impl ConvConfig {
+    fn read(k: &mut Keys, hidden: u64) -> Option<Self> {
+        let [taps, group_size] = k.group(DF, ["conv_kernel_size", "conv_group_size"])?;
+        if taps == 0 || group_size == 0 || !hidden.is_multiple_of(group_size) {
+            k.misfit("conv_group_size", "conv_group_size must divide hidden_size");
+        }
+        Some(Self { taps, group_size })
+    }
+}
+
+impl SelectorConfig {
+    fn read(k: &mut Keys) -> Option<Self> {
+        let svd_rank = k.or(&["dflash_config.selector_svd_rank"], None);
+        let [rank, top_k] = k.group(DF, ["selector_rank", "selector_top_k"])?;
+        if rank == 0 || top_k == 0 {
+            k.misfit("selector_top_k", "selector rank and top_k must be positive");
+        }
+        Some(Self {
+            rank,
+            top_k,
+            svd_rank,
+        })
+    }
+}
+
+impl TieredHeadConfig {
+    fn read(k: &mut Keys) -> Option<Self> {
+        let [hi_dim, lo_dim] = k.group("dflash_config.tiered_head", ["hi_dim", "lo_dim"])?;
+        (hi_dim > 0 && lo_dim > 0).then_some(Self { hi_dim, lo_dim })
+    }
+}
+
+impl BridgeConfig {
+    fn read(k: &mut Keys, eps: f32) -> Option<Self> {
+        let [code_size, rank] = (k.group(BRIDGE, ["code_size", "rank"]))
+            .or_else(|| k.group("dspine_config", ["transfer_rank", "message_size"]))?;
+        let top_k = k.or(
+            &[
+                "dflash_config.selected_prefix_last_write_refine.head_topk",
+                "dspine_config.top_k",
+            ],
+            16u64,
+        );
+        let eps = k.or(&[format!("{BRIDGE}.eps")], eps);
+        if code_size == 0 || rank == 0 || top_k == 0 {
+            k.misfit(BRIDGE, "bridge sizes must be positive");
+        }
+        Some(Self {
+            code_size,
+            rank,
+            top_k,
+            eps,
+        })
+    }
 }
 
 /// Target model dimensions a drafter inherits when omitted.
@@ -168,96 +227,11 @@ impl Config {
             .or::<Option<bool>>(&["dflash_config.causal"], None)
             .or_else(|| k.or::<Option<bool>>(&["dflash_config.draft_block_causal"], None))
             .or_else(|| k.or::<Option<bool>>(&["is_causal"], None));
-        let taps: Option<u64> = k.or(&["dflash_config.conv_kernel_size"], None);
-        let group_size: Option<u64> = k.or(&["dflash_config.conv_group_size"], None);
-        let conv = match (taps, group_size) {
-            (Some(taps), Some(group_size)) => {
-                if taps == 0 || group_size == 0 || !hidden.is_multiple_of(group_size) {
-                    k.misfit("conv_group_size", "conv_group_size must divide hidden_size");
-                }
-                Some(ConvConfig { taps, group_size })
-            }
-            (None, None) => None,
-            _ => {
-                k.misfit("conv_kernel_size", "conv needs both kernel and group size");
-                None
-            }
-        };
-        let rank: Option<u64> = k.or(&["dflash_config.selector_rank"], None);
-        let top_k: Option<u64> = k.or(&["dflash_config.selector_top_k"], None);
-        let svd_rank: Option<u64> = k.or(&["dflash_config.selector_svd_rank"], None);
-        let selector = match (rank, top_k) {
-            (Some(rank), Some(top_k)) => {
-                if rank == 0 || top_k == 0 {
-                    k.misfit("selector_top_k", "selector rank and top_k must be positive");
-                }
-                Some(SelectorConfig {
-                    rank,
-                    top_k,
-                    svd_rank,
-                })
-            }
-            (None, None) => None,
-            _ => {
-                k.misfit("selector_rank", "selector needs both rank and top_k");
-                None
-            }
-        };
-        let th_hi: Option<u64> = k.or(&["dflash_config.tiered_head.hi_dim"], None);
-        let th_lo: Option<u64> = k.or(&["dflash_config.tiered_head.lo_dim"], None);
-        let tiered_head = match (th_hi, th_lo) {
-            (Some(hi_dim), Some(lo_dim)) if hi_dim > 0 && lo_dim > 0 => {
-                Some(TieredHeadConfig { hi_dim, lo_dim })
-            }
-            _ => None,
-        };
+        let conv = ConvConfig::read(k, hidden);
+        let selector = SelectorConfig::read(k);
+        let tiered_head = TieredHeadConfig::read(k);
         let shared_tap_gauge: bool = k.or(&["dflash_config.shared_tap_gauge"], false);
-        let bridge_code: Option<u64> = k.or(
-            &[
-                "dflash_config.selected_prefix_code_bridge.code_size",
-                "dspine_config.transfer_rank",
-            ],
-            None,
-        );
-        let bridge_rank: Option<u64> = k.or(
-            &[
-                "dflash_config.selected_prefix_code_bridge.rank",
-                "dspine_config.message_size",
-            ],
-            None,
-        );
-        let bridge = match (bridge_code, bridge_rank) {
-            (Some(code_size), Some(rank)) => {
-                let top_k = k.or(
-                    &[
-                        "dflash_config.selected_prefix_last_write_refine.head_topk",
-                        "dspine_config.top_k",
-                    ],
-                    16u64,
-                );
-                let b_eps = k.or(&["dflash_config.selected_prefix_code_bridge.eps"], eps);
-                if code_size == 0 || rank == 0 || top_k == 0 {
-                    k.misfit(
-                        "selected_prefix_code_bridge",
-                        "bridge sizes must be positive",
-                    );
-                }
-                Some(BridgeConfig {
-                    code_size,
-                    rank,
-                    top_k,
-                    eps: b_eps,
-                })
-            }
-            (None, None) => None,
-            _ => {
-                k.misfit(
-                    "selected_prefix_code_bridge",
-                    "bridge needs code_size and rank",
-                );
-                None
-            }
-        };
+        let bridge = BridgeConfig::read(k, eps);
         let causal = explicit_causal.unwrap_or(bridge.is_some());
         let output_multiplier = k.or(&["dflash_config.output_multiplier"], 1.0f32);
         let logit_softcap = k
@@ -308,28 +282,23 @@ impl Config {
         max_context: u64,
     ) -> Self {
         let target_layers: Vec<u64> = (0..target.layers).collect();
-        let sizes = [target.vocab, target.hidden, 1, 4, 8, 32];
-        Self {
-            stack: Stack::sized(sizes, max_seqs, max_context),
-            kv_heads: 2,
-            rope_theta: 1e4,
-            eps: 1e-6,
-            tied: target.tied,
-            block_size,
-            mask_token,
-            target_hidden: target.hidden,
-            target_layers,
-            sliding_window: None,
-            causal: false,
-            conv: None,
-            selector: None,
-            bridge: None,
-            tiered_head: None,
-            shared_tap_gauge: false,
-            output_multiplier: 1.0,
-            logit_softcap: None,
-            quant: DraftQuant::MxFp8,
-        }
+        let root = json!({
+            (LAYERS.name): 1,
+            (HEADS.name): 4,
+            (HEAD_DIM.name): 8,
+            (FFN.name): 32,
+            (KV_HEADS.name): 2,
+            (ROPE_THETA.name): 1e4,
+            (EPS.name): 1e-6,
+            "block_size": block_size,
+            "mask_token_id": mask_token,
+            "target_layer_ids": target_layers,
+        });
+        let offers = [Offered::value("toy", root)];
+        let mut k = Keys::new(&offers);
+        let c = Self::read(&mut k, target, max_seqs, max_context);
+        k.finish().expect("toy dflash config");
+        c
     }
 
     /// 1-based layer positions for `Stack::taps` (offset +1000 for gauge taps).

@@ -16,10 +16,13 @@ impl Offered {
     /// The JSON text `json`, named `name`.
     pub fn parse(name: &str, json: &str) -> Result<Self, String> {
         let root = serde_json::from_str(json).map_err(|e| format!("{name}: {e}"))?;
-        Ok(Self {
-            name: name.into(),
-            root,
-        })
+        Ok(Self::value(name, root))
+    }
+
+    /// The JSON value `root`, named `name`.
+    pub fn value(name: &str, root: Value) -> Self {
+        let name = name.into();
+        Self { name, root }
     }
 }
 
@@ -100,6 +103,28 @@ impl<'a> Keys<'a> {
     /// The first of `paths` an offer holds, else `default`.
     pub fn or<T: DeserializeOwned>(&mut self, paths: &[impl AsRef<str>], default: T) -> T {
         self.find(paths).flatten().unwrap_or(default)
+    }
+
+    /// All `names` under `at`, else `None`. Partial is a misfit.
+    pub fn group<T: DeserializeOwned, const N: usize>(
+        &mut self,
+        at: &str,
+        names: [&str; N],
+    ) -> Option<[T; N]> {
+        let mut held = Vec::with_capacity(N);
+        for name in names {
+            if let Some(value) = self.or::<Option<T>>(&[join(at, name)], None) {
+                held.push(value);
+            }
+        }
+        if held.is_empty() {
+            return None;
+        }
+        let all = held.try_into().ok();
+        if all.is_none() {
+            self.misfit(at, format!("needs all of {}", names.join(", ")));
+        }
+        all
     }
 
     /// `key` from the first object in `at` holding it. Required.
