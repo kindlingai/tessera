@@ -32,10 +32,10 @@ jobs:
           BIG_PR_LINES: 5000
         run: |
           # README.md changes inside the generated crate table skip review.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
-            | tools/scripts/review-paths.sh \
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" > "$RUNNER_TEMP/files"
+          tools/scripts/review-paths.sh < "$RUNNER_TEMP/files" \
             | tools/scripts/protected.sh > "$RUNNER_TEMP/hits"
-          tools/scripts/big-pr.sh >> "$RUNNER_TEMP/hits"
+          tools/scripts/big-pr.sh < "$RUNNER_TEMP/files" >> "$RUNNER_TEMP/hits"
           cat "$RUNNER_TEMP/hits"
           tools/scripts/protected-label.sh < "$RUNNER_TEMP/hits"
       - name: Rerun CI's success job

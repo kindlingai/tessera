@@ -1,0 +1,3 @@
+# Regexes for the paths of generated files, one a line. big-pr.sh
+# leaves these files out of the line count.
+(^|/)Cargo\.lock$
