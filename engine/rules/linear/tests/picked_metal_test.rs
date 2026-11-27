@@ -41,7 +41,7 @@ struct Set {
 /// Rows on picked experts. `post`: 0, 1 signs, 2 gate.
 fn picked_graph(rotated: bool, post: u32, repeat: usize) -> Graph {
     let mut dims = vec![
-        Dim::bounded(Rows, 64),
+        Dim::bounded(Rows, 256),
         Dim::fixed(Hidden, INP as u64),
         Dim::fixed(Ffn, OUT as u64),
         Dim::fixed(Experts, COUNT as u64),
@@ -122,10 +122,14 @@ fn platform(backend: &'static str, arch: &str) -> Platform {
     })
 }
 
-fn plan(g: &Graph, form: &str, on: Platform) -> Plan {
+fn plan_rows(g: &Graph, form: &str, rows: u64, on: Platform) -> Plan {
     let pins = Pins::default().pin("codes", named(form).unwrap());
     let device = Device::guess(&host()).on(on).pinned(pins);
-    lower(g, 0, &[(Rows, 8)], &device).unwrap()
+    lower(g, 0, &[(Rows, rows)], &device).unwrap()
+}
+
+fn plan(g: &Graph, form: &str, on: Platform) -> Plan {
+    plan_rows(g, form, 8, on)
 }
 
 /// The entry of each launch the Metal rule took.
@@ -166,6 +170,16 @@ fn uniform_takes_general_entry() {
     }
     let plain = plan(&picked(false, false), "trellis_mix_pmcgx", apple());
     assert_eq!(entries(&plain), [GENERAL]);
+}
+
+#[test]
+fn prefill_takes_mma() {
+    let pf16 = plan_rows(&picked(true, true), "trellis_mix_pmcgx", 64, apple());
+    assert_eq!(entries(&pf16), ["tm_pick_group", "tm_pickmix_pf16_pmcgx_t"]);
+    let pf32 = plan_rows(&picked(true, false), "trellis_mix_pmcgx", 80, apple());
+    assert_eq!(entries(&pf32), ["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"]);
+    let plain = plan_rows(&picked(false, false), "trellis_k3_pmcgx", 80, apple());
+    assert_eq!(entries(&plain), ["tm_pick_group", "tm_pick_pf32_gen"]);
 }
 
 #[test]
@@ -210,20 +224,50 @@ fn metal_picked_matches_cpu() {
     let su = fill_f32(vec![COUNT, INP], &mut draws);
     let sv = fill_f32(vec![COUNT, OUT], &mut draws);
     let signs = fill_f32(vec![OUT], &mut draws);
-    let cases = [
-        (true, true, 0, 1, MIXED),
-        (true, true, 1, 1, MIXED),
-        (true, true, 2, 2, MIXED),
-        (true, false, 0, 1, GENERAL),
-        (false, true, 1, 2, GENERAL),
-        (false, false, 0, 1, GENERAL),
-    ];
     for side in [1u32, INPUT_SIDE] {
-        for (mixed, rotated, post, repeat, want_entry) in cases {
+        for (mixed, rotated, post, repeat, rows, want_entries) in [
+            (true, true, 0, 1, 5usize, vec![MIXED]),
+            (true, true, 1, 1, 5, vec![MIXED]),
+            (true, true, 2, 2, 5, vec![MIXED]),
+            (true, false, 0, 1, 5, vec![GENERAL]),
+            (false, true, 1, 2, 5, vec![GENERAL]),
+            (false, false, 0, 1, 5, vec![GENERAL]),
+            (
+                true,
+                true,
+                0,
+                1,
+                64,
+                vec!["tm_pick_group", "tm_pickmix_pf16_pmcgx_t"],
+            ),
+            (
+                true,
+                true,
+                1,
+                2,
+                40,
+                vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
+            ),
+            (
+                true,
+                true,
+                2,
+                2,
+                40,
+                vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
+            ),
+            (
+                false,
+                false,
+                0,
+                1,
+                80,
+                vec!["tm_pick_group", "tm_pick_pf32_gen"],
+            ),
+        ] {
             let (form_name, bytes) = pack_experts(side, mixed, &mut draws);
             let form = named(form_name).unwrap();
             let g = picked_graph(rotated, post, repeat);
-            let rows = 5usize;
             let x = fill_f32(vec![rows, INP], &mut draws);
             let id_vals: Vec<u32> = (0..rows * repeat)
                 .map(|i| ((i * 3 + 1) % COUNT) as u32)
@@ -255,8 +299,8 @@ fn metal_picked_matches_cpu() {
             if device.platform.backend == "metal" {
                 assert_eq!(
                     entries(&plan),
-                    [want_entry],
-                    "side={side} mixed={mixed} rot={rotated} post={post} rep={repeat}"
+                    want_entries,
+                    "side={side} mixed={mixed} rot={rotated} post={post} rep={repeat} rows={rows}"
                 );
             }
             let mut runner = open(plan, &settings).unwrap();
@@ -273,7 +317,7 @@ fn metal_picked_matches_cpu() {
             let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
             assert!(
                 cos > 0.99999,
-                "side={side} mixed={mixed} rot={rotated} post={post} rep={repeat}: cos {cos}"
+                "side={side} mixed={mixed} rot={rotated} post={post} rep={repeat} rows={rows}: cos {cos}"
             );
         }
     }

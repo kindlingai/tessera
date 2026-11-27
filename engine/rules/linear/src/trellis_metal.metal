@@ -16,6 +16,7 @@ constant uint TM_PMCG2 = 0xBCA14C51u;
 constant float TM_INV_SQRT128 = 0.08838834764831844f;
 constant uint TM_XS_STRIDE = 132u;
 constant uint TM_WS_STRIDE = 20u;
+constant uint TM_MAX_GROUP_EXPERTS = 1024u;
 
 enum TmBook : uint {
     TM_BOOK_MCG = 0u,
@@ -388,30 +389,29 @@ static void tm_dec4_body(
     tm_dec_finish(acc0, acc1, m, n, ks, p, ob, simd, lane, cc, rr, turned, svh, out, xs);
 }
 
-// Prefill tile-streaming matmul with 8x8 f32 simdgroup MMA.
-template <uint K, uint BOOK, uint TM>
-static inline void tm_pf_body(
+// Accumulates contiguous or indexed rows via 8x8 MMA.
+template <uint K, uint BOOK, uint TM, bool INDEXED>
+static inline void tm_pf_tile(
     device const float *x,
-    device const uchar *w,
-    device const float *suh,
-    device const float *svh,
-    device float *out,
-    uint m,
-    uint n,
+    device const float *su,
+    TmWalk walk,
+    TmWordMap wm,
     uint k,
-    uint turned,
-    uint tg_x,
-    uint tg_y,
-    uint tid,
+    uint r0,
+    uint nr,
+    uint repeat,
+    bool turned,
+    uint simd,
+    uint lane,
+    uint wr0,
+    threadgroup float *wown,
     threadgroup float xs[TM * 8u][TM_XS_STRIDE],
-    threadgroup float ws[8][16 * TM_WS_STRIDE]) {
+    threadgroup const uint *row_ids) {
     constexpr uint bm = TM * 8u;
-    uint nblk = n >> 7u;
-    uint ob = tg_x;
-    uint r0 = tg_y * bm;
-    if (ob >= nblk || r0 >= m) return;
-    uint nr = min(bm, m - r0);
-    TM_START(1u, ob, 0u)
+    constexpr uint tw = 8u * K;
+    uint wr1 = wr0 + TM_WS_STRIDE;
+    uint wr8 = wr0 + 8u * TM_WS_STRIDE;
+    uint wr9 = wr8 + TM_WS_STRIDE;
 
     simdgroup_float8x8 acc[TM][2];
     for (uint tm = 0u; tm < TM; tm++) {
@@ -419,20 +419,16 @@ static inline void tm_pf_body(
         acc[tm][1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
-    threadgroup float *wown = ws[simd];
-    uint wr0 = (rr << 1u) * TM_WS_STRIDE + cc;
-    uint wr1 = wr0 + TM_WS_STRIDE;
-    uint wr8 = wr0 + 8u * TM_WS_STRIDE;
-    uint wr9 = wr8 + TM_WS_STRIDE;
-
+    device const uchar *gb = walk.at;
     for (uint b = 0u; b < walk.blocks; b++) {
         if (b > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
         uint col = (b << 7u) + (lane << 2u);
-        float4 sc = turned ? *(device const float4 *)(suh + col) : float4(1.0f);
+        float4 sc = turned ? *(device const float4 *)(su + col) : float4(1.0f);
         for (uint r = simd; r < bm; r += 8u) {
             float4 v = float4(0.0f);
             if (r < nr) {
-                v = *(device const float4 *)(x + ulong(r0 + r) * k + col);
+                uint xr = INDEXED ? (row_ids[r] / repeat) : (r0 + r);
+                v = *(device const float4 *)(x + ulong(xr) * k + col);
                 if (turned) v = tm_turn_in(v, sc, lane);
             }
             tm_put4(&xs[r][lane << 2u], v);
@@ -475,6 +471,37 @@ static inline void tm_pf_body(
         simdgroup_store(acc[tm][1], &xs[tm * 8u][simd * 16u + 8u], TM_XS_STRIDE);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Prefill tile-streaming matmul with 8x8 f32 simdgroup MMA.
+template <uint K, uint BOOK, uint TM>
+static inline void tm_pf_body(
+    device const float *x,
+    device const uchar *w,
+    device const float *suh,
+    device const float *svh,
+    device float *out,
+    uint m,
+    uint n,
+    uint k,
+    uint turned,
+    uint tg_x,
+    uint tg_y,
+    uint tid,
+    threadgroup float xs[TM * 8u][TM_XS_STRIDE],
+    threadgroup float ws[8][16 * TM_WS_STRIDE]) {
+    constexpr uint bm = TM * 8u;
+    uint nblk = n >> 7u;
+    uint ob = tg_x;
+    uint r0 = tg_y * bm;
+    if (ob >= nblk || r0 >= m) return;
+    uint nr = min(bm, m - r0);
+    TM_START(1u, ob, 0u)
+    (void)tw; (void)gb;
+
+    uint wr0 = (rr << 1u) * TM_WS_STRIDE + cc;
+    tm_pf_tile<K, BOOK, TM, false>(
+        x, suh, walk, wm, k, r0, nr, 1u, turned != 0u, simd, lane, wr0, ws[simd], xs, nullptr);
 
     uint base = (ob << 7u) + (lane << 2u);
     float4 sc = turned ? *(device const float4 *)(svh + base) : float4(1.0f);
@@ -765,3 +792,157 @@ kernel void tm_picked_gen(TM_PICKED_ARGS) {
         TM_PICKED_BOOK(TM_BOOK_MCG)
     }
 }
+
+// Groups routed row indices by expert id into `meta`.
+kernel void tm_pick_group(
+    device const uint *ids [[buffer(0)]],
+    device uint *meta [[buffer(1)]],
+    constant uint &rows [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &first [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint tg_counts[TM_MAX_GROUP_EXPERTS + 1u];
+    threadgroup atomic_uint tg_cursor[TM_MAX_GROUP_EXPERTS + 1u];
+    uint buckets = count + 1u;
+    for (uint e = tid; e < buckets; e += 256u) {
+        atomic_store_explicit(&tg_counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = tid; r < rows; r += 256u) {
+        uint raw_id = ids[r];
+        uint b = (raw_id >= first && raw_id - first < count) ? (raw_id - first) : count;
+        atomic_fetch_add_explicit(&tg_counts[b], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device uint *counts = meta;
+    device uint *offsets = meta + buckets;
+    device uint *order = meta + 2u * buckets;
+    if (tid == 0u) {
+        uint sum = 0u;
+        for (uint b = 0u; b < buckets; b++) {
+            uint c = atomic_load_explicit(&tg_counts[b], memory_order_relaxed);
+            counts[b] = c;
+            offsets[b] = sum;
+            atomic_store_explicit(&tg_cursor[b], sum, memory_order_relaxed);
+            sum += c;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = tid; r < rows; r += 256u) {
+        uint raw_id = ids[r];
+        uint b = (raw_id >= first && raw_id - first < count) ? (raw_id - first) : count;
+        uint pos = atomic_fetch_add_explicit(&tg_cursor[b], 1u, memory_order_relaxed);
+        order[pos] = r;
+    }
+}
+
+// Grouped-expert prefill using 8x8 f32 simdgroup MMA tiles.
+template <uint K, uint BOOK, uint TM, bool TURNED>
+static inline void tm_pick_pf_body(
+    device const float *x, device const uchar *w, device const uchar *mat,
+    device const uint *order, device const float *su, device const float *sv,
+    device const float *extra, device float *out,
+    uint n, uint k, uint repeat, uint post, uint e, uint ob,
+    uint start, uint cnt, uint tid,
+    threadgroup float xs[TM * 8u][TM_XS_STRIDE],
+    threadgroup float ws[8][16 * TM_WS_STRIDE],
+    threadgroup uint row_ids[TM * 8u]) {
+    constexpr uint bm = TM * 8u;
+    uint simd = tid >> 5u, lane = tid & 31u, cc = lane >> 2u, rr = lane & 3u;
+    TmWalk walk = tm_picked_walk<K>(w, mat, n, k, ob);
+    TmWordMap wm = tm_word_map<K, BOOK>(lane);
+    threadgroup float *wown = ws[simd];
+    uint wr0 = (rr << 1u) * TM_WS_STRIDE + cc;
+    uint base = (ob << 7u) + (lane << 2u);
+    float4 sv_sc = TURNED ? *(device const float4 *)(sv + ulong(e) * n + base) : float4(1.0f);
+    float4 ex1 = (TURNED && post == 1u) ? *(device const float4 *)(extra + base) : float4(1.0f);
+
+    for (uint base_r = 0u; base_r < cnt; base_r += bm) {
+        uint nr = min(bm, cnt - base_r);
+        if (base_r > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < nr) row_ids[tid] = order[start + base_r + tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tm_pf_tile<K, BOOK, TM, true>(
+            x, su + ulong(e) * k, walk, wm, k, 0u, nr, repeat, TURNED, simd, lane, wr0, wown, xs, row_ids);
+        for (uint r = simd; r < nr; r += 8u) {
+            uint rr_idx = row_ids[r];
+            float4 y = tm_get4(&xs[r][lane << 2u]);
+            if constexpr (TURNED) {
+                y = tm_turn_out(y, sv_sc, lane);
+                if (post == 1u) y *= ex1;
+                else if (post == 2u) {
+                    float4 ex = *(device const float4 *)(extra + ulong(rr_idx) * n + base);
+                    y = (y / (1.0f + exp(-y))) * ex;
+                }
+            }
+            *(device float4 *)(out + ulong(rr_idx) * n + base) = y;
+        }
+    }
+}
+
+// Loads bucket metadata and zeros off-rank rows.
+#define TM_PICK_PF_START(TM)                                                                 \
+    threadgroup float xs[TM * 8u][TM_XS_STRIDE];                                             \
+    threadgroup float ws[8][16 * TM_WS_STRIDE];                                              \
+    threadgroup uint row_ids[TM * 8u];                                                       \
+    (void)rows; (void)first;                                                                 \
+    uint ob = tg.x;                                                                          \
+    uint b = tg.y;                                                                           \
+    uint buckets = count + 1u;                                                               \
+    if (ob >= (n >> 7u) || b >= buckets) return;                                             \
+    uint cnt = ids[b];                                                                       \
+    if (cnt == 0u) return;                                                                   \
+    uint start = ids[buckets + b];                                                           \
+    device const uint *order = ids + 2u * buckets;                                           \
+    if (b == count) {                                                                        \
+        for (uint i = 0u; i < cnt; i++) {                                                    \
+            uint r = order[start + i];                                                       \
+            if (tid < 128u) out[ulong(r) * n + (ob << 7u) + tid] = 0.0f;                     \
+        }                                                                                    \
+        return;                                                                              \
+    }                                                                                        \
+    uint e = b;                                                                              \
+    uint ek;                                                                                 \
+    device const uchar *mat = tm_picked_mat(w, n, k, bits, e, ek);
+
+#define TM_PICK_PF_K(BOOK, TM, TURNED, POST)                                                 \
+    if (ek == 2u)                                                                            \
+        tm_pick_pf_body<2u, BOOK, TM, TURNED>(                                               \
+            x, w, mat, order, su, sv, extra, out, n, k, repeat, POST, e, ob, start, cnt, tid, xs, ws, row_ids); \
+    else if (ek == 3u)                                                                       \
+        tm_pick_pf_body<3u, BOOK, TM, TURNED>(                                               \
+            x, w, mat, order, su, sv, extra, out, n, k, repeat, POST, e, ob, start, cnt, tid, xs, ws, row_ids); \
+    else                                                                                     \
+        tm_pick_pf_body<4u, BOOK, TM, TURNED>(                                               \
+            x, w, mat, order, su, sv, extra, out, n, k, repeat, POST, e, ob, start, cnt, tid, xs, ws, row_ids);
+
+#define TM_PICK_PF_BOOK(BOOK, TM)                                                            \
+    if (turned) {                                                                            \
+        TM_PICK_PF_K(BOOK, TM, true, post)                                                   \
+    } else {                                                                                 \
+        TM_PICK_PF_K(BOOK, TM, false, 0u)                                                    \
+    }
+
+#define TM_PICKMIX_PF_KERNEL(NAME, TM)                                                       \
+    kernel void NAME(TM_PICKED_ARGS) {                                                       \
+        (void)book; (void)turned;                                                            \
+        TM_PICK_PF_START(TM)                                                                 \
+        TM_PICK_PF_K(TM_BOOK_PMCGX, TM, true, post)                                          \
+    }
+
+#define TM_PICK_PF_GEN_KERNEL(NAME, TM)                                                      \
+    kernel void NAME(TM_PICKED_ARGS) {                                                       \
+        TM_PICK_PF_START(TM)                                                                 \
+        if (book == TM_BOOK_PMCGX) {                                                         \
+            TM_PICK_PF_BOOK(TM_BOOK_PMCGX, TM)                                               \
+        } else if (book == TM_BOOK_MUL1) {                                                   \
+            TM_PICK_PF_BOOK(TM_BOOK_MUL1, TM)                                                \
+        } else {                                                                             \
+            TM_PICK_PF_BOOK(TM_BOOK_MCG, TM)                                                 \
+        }                                                                                    \
+    }
+
+TM_PICKMIX_PF_KERNEL(tm_pickmix_pf16_pmcgx_t, 2u)
+TM_PICKMIX_PF_KERNEL(tm_pickmix_pf32_pmcgx_t, 4u)
+TM_PICK_PF_GEN_KERNEL(tm_pick_pf16_gen, 2u)
+TM_PICK_PF_GEN_KERNEL(tm_pick_pf32_gen, 4u)
