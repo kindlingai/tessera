@@ -3,4 +3,5 @@ steps = [
   { do = "define", with = "tessera_serve::task::Entry", like = "frontend/serve/src/task/embed.rs" },
   { do = "list", at = "frontend/serve/src/task/mod.rs", like = "frontend/serve/src/task/embed.rs" },
   { do = "run", pkg = "tessera-serve", mode = "test" },
+  { do = "run", pkg = "tessera-cli", mode = "bin", args = ["--model", "<dir>", "serve", "--task", "<task>"] },
 ]
