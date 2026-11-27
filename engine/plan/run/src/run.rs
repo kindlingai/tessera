@@ -606,6 +606,12 @@ fn filed<R: Run + ?Sized>(
     let len = file.bytes();
     file.read(&mut into[..len], reads)
         .map_err(|e| Error::WeightRead(weight, e))?;
+    if !loaded.iter().all(|l| form.fits(l.slot.len, &into[..len])) {
+        return Err(Error::WeightSize {
+            weight,
+            form: form.name(),
+        });
+    }
     if rest.is_empty() {
         return Ok(true);
     }

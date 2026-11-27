@@ -572,6 +572,27 @@ impl<const K: u32> Form for Trellis<K> {
     }
 }
 
+/// Little-endian u32 at byte offset `at`.
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+/// Checks tile and 128-channel entry geometry for mixed sets.
+fn mixed_shape_ok(shape: &Shape) -> bool {
+    if shape.inp == 0 || shape.out == 0 || shape.side > INPUT_SIDE {
+        return false;
+    }
+    if !shape.inp.is_multiple_of(16) || !shape.out.is_multiple_of(16) {
+        return false;
+    }
+    if shape.inp > 16 && !shape.out.is_multiple_of(ENTRY) {
+        return false;
+    }
+    let input_side = (shape.side & 0xFFFF) == INPUT_SIDE;
+    !(input_side && shape.out > ENTRY && !shape.inp.is_multiple_of(ENTRY))
+}
+
 /// A mixed set's table: each matrix's offset and width.
 fn table(bytes: &[u8]) -> Vec<(usize, usize)> {
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
@@ -616,12 +637,55 @@ impl Form for TrellisMix {
             return false;
         }
         let shape = Shape::read(bytes);
-        let count = u32::from_le_bytes(bytes[HEAD..HEAD + 4].try_into().expect("4 bytes")) as usize;
-        let head = (MIX_TABLE + MIX_ROW * count).next_multiple_of(16);
-        let elems = count
-            .checked_mul(shape.inp)
-            .and_then(|n| n.checked_mul(shape.out));
-        elems == Some(elements) && bytes.len() >= head
+        if !mixed_shape_ok(&shape) {
+            return false;
+        }
+        let Some(count) = read_u32(bytes, HEAD).map(|n| n as usize) else {
+            return false;
+        };
+        let Some(matrix_elems) = shape.inp.checked_mul(shape.out) else {
+            return false;
+        };
+        if count == 0 || count.checked_mul(matrix_elems) != Some(elements) {
+            return false;
+        }
+        let Some(head) = count
+            .checked_mul(MIX_ROW)
+            .and_then(|n| MIX_TABLE.checked_add(n))
+            .and_then(|n| n.checked_next_multiple_of(16))
+        else {
+            return false;
+        };
+        if bytes.len() < head {
+            return false;
+        }
+        let tiles = matrix_elems / 256;
+        for m in 0..count {
+            let at = MIX_TABLE + MIX_ROW * m;
+            let (Some(lo), Some(hi), Some(k)) = (
+                read_u32(bytes, at),
+                read_u32(bytes, at + 4),
+                read_u32(bytes, at + 8),
+            ) else {
+                return false;
+            };
+            if !(2..=4).contains(&k) {
+                return false;
+            }
+            let Ok(offset) = usize::try_from(u64::from(lo) | u64::from(hi) << 32) else {
+                return false;
+            };
+            let Some(len) = tiles.checked_mul(32 * k as usize) else {
+                return false;
+            };
+            let Some(end) = offset.checked_add(len) else {
+                return false;
+            };
+            if offset < head || !offset.is_multiple_of(16) || end > bytes.len() {
+                return false;
+            }
+        }
+        true
     }
     fn offset(&self, index: usize) -> usize {
         match index {

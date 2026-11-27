@@ -1,8 +1,8 @@
 use crate::block_test::same_part;
 use crate::form::Form;
 use crate::trellis::{
-    Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, alloc_mixed, form_for, mixed_for, packed,
-    parse_form, parse_mix_form, rotated,
+    Codebook, HEAD, INPUT_SIDE, MIX_ROW, MIX_TABLE, TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_MIX_PMCGX,
+    alloc_mixed, form_for, mixed_for, packed, parse_form, parse_mix_form, rotated,
 };
 use tessera_graph::F16;
 
@@ -179,4 +179,67 @@ fn mix_names_parse() {
     assert_eq!(parse_mix_form("trellis_k3_pmcgx"), None);
     assert_eq!(parse_mix_form("trellis_mix_rot"), None);
     assert_eq!(parse_form("trellis_k3_pmcgx"), Some((3, 2)));
+}
+
+/// Validates mixed-width bounds, widths, offsets, and geometry.
+#[test]
+fn mixed_fits_validation() {
+    let mix = &TRELLIS_MIX_PMCGX;
+    let elems = 2 * 128 * 128;
+    let (valid, offsets) = alloc_mixed(128, 128, 1, &[2, 4]);
+    assert!(mix.fits(elems, &valid));
+
+    let (valid_in, _) = alloc_mixed(128, 256, INPUT_SIDE, &[3, 2, 4]);
+    assert!(mix.fits(3 * 128 * 256, &valid_in));
+
+    // Truncated 4-bit matrix still above 2-bit lower bound.
+    let mut trunc = valid.clone();
+    trunc.truncate(valid.len() - 64);
+    assert!(mix.fits_size(elems, trunc.len()));
+    assert!(!mix.fits(elems, &trunc));
+
+    // Unsupported widths in table entries.
+    for bad_k in [0u32, 1, 5, u32::MAX] {
+        let mut buf = valid.clone();
+        buf[MIX_TABLE + 8..MIX_TABLE + 12].copy_from_slice(&bad_k.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted width {bad_k}");
+    }
+
+    // Offset inside header, misaligned, out-of-bounds, or overflowing.
+    let bad_offsets = [0u64, HEAD as u64, offsets[0] as u64 + 4, u64::MAX - 15];
+    for off in bad_offsets {
+        let mut buf = valid.clone();
+        buf[MIX_TABLE..MIX_TABLE + 8].copy_from_slice(&off.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted offset {off}");
+    }
+    let mut past = valid.clone();
+    let near_end = (past.len() - 64) as u64;
+    past[MIX_TABLE + MIX_ROW..MIX_TABLE + MIX_ROW + 8].copy_from_slice(&near_end.to_le_bytes());
+    assert!(!mix.fits(elems, &past));
+
+    // Bad header geometry and side values.
+    for (inp, out, side) in [
+        (0u32, 128u32, 1u32),
+        (15, 128, 1),
+        (32, 32, 1),
+        (16, 256, INPUT_SIDE),
+        (128, 128, 99),
+    ] {
+        let mut buf = valid.clone();
+        buf[0..4].copy_from_slice(&inp.to_le_bytes());
+        buf[4..8].copy_from_slice(&out.to_le_bytes());
+        buf[8..12].copy_from_slice(&side.to_le_bytes());
+        let target = 2usize.saturating_mul(inp as usize * out as usize);
+        assert!(
+            !mix.fits(target, &buf),
+            "accepted shape ({inp},{out},{side})"
+        );
+    }
+
+    // Zero or inflated matrix count.
+    for bad_count in [0u32, 3, u32::MAX] {
+        let mut buf = valid.clone();
+        buf[HEAD..HEAD + 4].copy_from_slice(&bad_count.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted count {bad_count}");
+    }
 }
