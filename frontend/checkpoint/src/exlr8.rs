@@ -1,35 +1,27 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
 use crate::exlr8_experts as experts;
-use crate::exlr8_shard::{Shard, layer_prefix, past};
+use crate::exlr8_pack::{
+    BF16, FP8_BLOCK, FP8_ROW, FP32, ROWS, TRELLIS, block_form, blocks, fp8_row_bf16, open_local,
+    pack_turned, plain,
+};
+use crate::exlr8_shard::{Dense, Groups, Shard, layer_prefix, past};
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored, narrow};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tessera_engine::storage::Form;
+use std::sync::{Arc, Mutex};
 use tessera_engine::trellis::Codebook;
 pub use tessera_engine::trellis::rotated;
-use tessera_engine::{E4M3, F16, block, trellis};
-
-/// Record field 0: how the matrix is stored.
-const TRELLIS: i64 = 1;
-const INT4: i64 = 2;
-const MXFP8: i64 = 3;
-const FP8_BLOCK: i64 = 4;
-const FP8_ROW: i64 = 5;
-const BF16: i64 = 6;
-const FP32: i64 = 7;
-const ROWS: i64 = 9;
-const INT2: i64 = 10;
+use tessera_engine::{F16, trellis};
 
 /// A matrix's record: format, shape, trellis width, sharded side.
-struct Record {
-    format: i64,
-    out: usize,
-    inp: usize,
-    k: u32,
-    side: i64,
+pub(crate) struct Record {
+    pub(crate) format: i64,
+    pub(crate) out: usize,
+    pub(crate) inp: usize,
+    pub(crate) k: u32,
+    pub(crate) side: i64,
 }
 
 fn record(f: &File, name: &str) -> Result<Record, Error> {
@@ -48,10 +40,6 @@ fn halves(f: &File, name: &str) -> Result<Vec<f32>, Error> {
     Ok(F16::floats(&f.bytes(name)?))
 }
 
-fn e4m3(bits: u8) -> f32 {
-    f32::from(E4M3(bits))
-}
-
 /// Tensor `stem` in a known codebook, and that codebook.
 pub(crate) fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
     for book in Codebook::ALL {
@@ -64,7 +52,7 @@ pub(crate) fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
 }
 
 /// Row trellis `name`, each value through `each`.
-fn rows<T: Clone + Send>(
+pub(crate) fn rows<T: Clone + Send>(
     f: &File,
     name: &str,
     r: &Record,
@@ -143,97 +131,31 @@ pub fn codes(f: &File, name: &str) -> Result<Vec<f32>, Error> {
     }
 }
 
-/// A matrix in a format other than trellis, as `[out][in]`.
-fn plain(f: &File, name: &str, r: &Record, format: i64) -> Result<Vec<f32>, Error> {
-    let inp = r.inp;
-    let fp8 = || f.bytes(&format!("{name}.fp8"));
-    if let Some(form) = block_form(format) {
-        return Ok(form.unpack_all(&blocks(f, name, r, (0, r.out))?));
-    }
-    match format {
-        FP8_ROW => {
-            let scale = f.floats(&format!("{name}.scale"))?;
-            let row = |(i, c): (usize, &u8)| e4m3(*c) * scale[i / inp];
-            Ok(fp8()?.iter().enumerate().map(row).collect())
-        }
-        // One scale per 128 by 128 block.
-        FP8_BLOCK => {
-            let scale = f.floats(&format!("{name}.scale"))?;
-            let at = |i: usize| scale[i / inp / 128 * inp.div_ceil(128) + i % inp / 128];
-            let value = |(i, c): (usize, &u8)| e4m3(*c) * at(i);
-            Ok(fp8()?.iter().enumerate().map(value).collect())
-        }
-        BF16 => f.floats(&format!("{name}.bf16")),
-        FP32 => f.floats(&format!("{name}.fp32")),
-        ROWS => rows(f, name, r, |x| *x),
-        other => Err(Error::DType(format!("{name} is in exlr8 format {other}"))),
-    }
-}
-
-/// The block form a format's planes join into.
-fn block_form(format: i64) -> Option<&'static dyn Form> {
-    match format {
-        INT4 => Some(&block::INT4_G32),
-        INT2 => Some(&block::INT2_G32),
-        MXFP8 => Some(&block::MXFP8),
-        _ => None,
-    }
-}
-
-/// Rows `first..first + count` of a block form matrix.
-fn blocks(
-    f: &File,
-    name: &str,
-    r: &Record,
-    (first, count): (usize, usize),
-) -> Result<Vec<u8>, Error> {
-    // One scale and 32 codes per 32 inputs.
-    let (scale_part, code_part, scale_bytes, code_bytes) = match r.format {
-        INT4 => ("s4", "q4", 2, 16),
-        INT2 => ("s2", "q2", 2, 8),
-        _ => ("e8m0", "fp8", 1, 32),
-    };
-    let scales = f.bytes(&format!("{name}.{scale_part}"))?;
-    let codes = f.bytes(&format!("{name}.{code_part}"))?;
-    if !r.inp.is_multiple_of(32) || first + count > r.out {
-        return Err(Error::DType(format!("{name}: {count} rows of {}", r.inp)));
-    }
-    // Input-side int4 shards hold 128 inputs of every output.
-    let grouped = r.format == INT4 && r.side == trellis::INPUT_SIDE as i64;
-    let groups = r.inp / 32;
-    let mut out = Vec::with_capacity(count * groups * (scale_bytes + code_bytes));
-    for o in first..first + count {
-        for g in 0..groups {
-            let at = match grouped {
-                true => (g / 4 * r.out + o) * 4 + g % 4,
-                false => o * groups + g,
-            };
-            out.extend_from_slice(&scales[at * scale_bytes..(at + 1) * scale_bytes]);
-            out.extend_from_slice(&codes[at * code_bytes..(at + 1) * code_bytes]);
-        }
-    }
-    Ok(out)
-}
-
 /// A trellis matrix as a rotated file, rotations after codes.
 fn turned(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
-    let mut bytes = codes_packed(f, name, rows)?;
-    bytes.extend(f.bytes(&format!("{name}.suh"))?);
-    let svh = f.bytes(&format!("{name}.svh"))?;
-    match rows {
-        Some((first, count)) => bytes.extend_from_slice(&svh[2 * first..2 * (first + count)]),
-        None => bytes.extend(svh),
+    let r = record(f, name)?;
+    if r.format != TRELLIS {
+        let what = format!("{name} is in exlr8 format {}, not trellis", r.format);
+        return Err(Error::DType(what));
     }
-    Ok(bytes)
+    pack_turned(f, name, r.out, r.inp, r.k, r.side, rows)
+}
+
+/// How a release lays out its dense shards.
+enum Layout {
+    Dense(Dense),
+    Groups(Groups),
 }
 
 /// An exlr8 release, read by HF tensor name.
 pub struct Release {
     /// A directory, or a URL prefix ending in `/`.
     at: Where,
-    files: RefCell<HashMap<String, File>>,
-    /// GLM's and later layouts: layer files under `dense/`.
-    dense: Option<Dense>,
+    files: Mutex<HashMap<String, Arc<File>>>,
+    /// Cached slice inventory across all shards.
+    slices: Mutex<Option<Vec<Slice>>>,
+    /// Release layout: `dense/` single-group or multi-group.
+    layout: Layout,
     /// Fallback trellis width for routed experts without a manifest.
     width: u32,
 }
@@ -243,40 +165,6 @@ const VOCAB: &str = "dense/exlr8-vocab";
 
 /// Every tensor outside the routed experts, by HF name.
 const WHOLE: &str = "model-nonexperts";
-
-/// Names in the `dense/` layout.
-struct Dense {
-    /// Before a layer's index, from the files' `tensor_prefix`.
-    prefix: String,
-    /// Prefix added to unrenamed tensors in `VOCAB`.
-    vocab_prefix: String,
-    /// Vocabulary file stems and their HF names.
-    vocab: Vec<(String, String)>,
-    /// Single dense file when layers are not split per file.
-    single: Option<String>,
-    /// Files that hold whole HF names.
-    extras: Vec<String>,
-    /// Whether the extras hold plain tensors only.
-    plain: bool,
-    /// The manifest's width for each `(layer, matrix)` stored at several.
-    widths: HashMap<(usize, String), u32>,
-    /// The manifest's expert widths, by layer and projection.
-    experts: experts::Widths,
-}
-
-impl Dense {
-    /// Layer `layer`'s stored name for `local`, at its picked width.
-    fn stored(&self, layer: usize, local: &str) -> String {
-        let Some((matrix, part)) = local.rsplit_once('.') else {
-            return local.into();
-        };
-        match self.widths.get(&(layer, matrix.to_string())) {
-            Some(k) => format!("{matrix}.k{k}.{part}"),
-            None => local.into(),
-        }
-    }
-}
-
 enum Where {
     Dir(PathBuf),
     Url(String),
@@ -329,11 +217,12 @@ impl Release {
     fn new(at: Where) -> Self {
         let mut release = Self {
             at,
-            files: RefCell::new(HashMap::new()),
-            dense: None,
+            files: Mutex::new(HashMap::new()),
+            slices: Mutex::new(None),
+            layout: Layout::Groups(Groups::fallback()),
             width: 3,
         };
-        release.dense = release.read_dense().ok();
+        release.layout = release.detect_layout();
         release
     }
 
@@ -352,6 +241,33 @@ impl Release {
             widths: HashMap::new(),
             experts: experts::Widths::default(),
         })
+    }
+
+    fn detect_layout(&self) -> Layout {
+        if let Ok(Some(g)) = self.with(VOCAB, |f| Groups::read(f, "dense/")) {
+            return Layout::Groups(g);
+        }
+        if let Ok(d) = self.read_dense() {
+            return Layout::Dense(d);
+        }
+        if let Ok(Some(g)) = self.with("exlr8-vocab", |f| Groups::read(f, "")) {
+            return Layout::Groups(g);
+        }
+        Layout::Groups(Groups::fallback())
+    }
+
+    fn dense(&self) -> Option<&Dense> {
+        match &self.layout {
+            Layout::Dense(d) => Some(d),
+            Layout::Groups(_) => None,
+        }
+    }
+
+    fn dense_mut(&mut self) -> Option<&mut Dense> {
+        match &mut self.layout {
+            Layout::Dense(d) => Some(d),
+            Layout::Groups(_) => None,
+        }
     }
 
     /// The `dense/` layout's names, if the release has that layout.
@@ -486,8 +402,7 @@ impl Release {
             }
         }
         let dense = self
-            .dense
-            .as_mut()
+            .dense_mut()
             .ok_or_else(|| bad("no dense/ files".into()))?;
         dense.widths.clear();
         dense.experts.clear();
@@ -502,18 +417,20 @@ impl Release {
             }
         }
         dense.experts.parse(&m["layers"]).map_err(bad)?;
+        *self.slices.lock().expect("exlr8 slices") = None;
         Ok(self)
     }
 
     /// Fallback trellis width for routed experts without a manifest.
     pub fn width(mut self, k: u32) -> Self {
         self.width = k;
+        *self.slices.lock().expect("exlr8 slices") = None;
         self
     }
 
     /// Trellis width for one layer's expert projection.
     fn expert_width(&self, layer: usize, shared: bool, proj: experts::Proj) -> u32 {
-        match &self.dense {
+        match self.dense() {
             Some(d) => d.experts.get(layer, shared, proj, self.width),
             None if shared => experts::shared_width(self.width),
             None => self.width,
@@ -522,7 +439,7 @@ impl Release {
 
     /// Each routed expert's width, where a projection mixes them.
     fn expert_mix(&self, layer: usize, proj: experts::Proj) -> Option<&[u32]> {
-        self.dense.as_ref()?.experts.mixed(layer, proj)
+        self.dense()?.experts.mixed(layer, proj)
     }
 
     /// Trellis forms for one routed layer's projections.
@@ -601,21 +518,27 @@ impl Release {
         Ok(bytes)
     }
 
+    /// Whether `file` holds tensor or matrix `local`.
+    fn has_tensor(&self, file: &str, local: &str) -> bool {
+        let stem = match local.rsplit_once('.') {
+            Some((m, part)) if ["weight", "codes", "suh", "svh"].contains(&part) => m,
+            _ => local,
+        };
+        let record = format!("{stem}.record");
+        self.with(file, |f| {
+            Ok(f.shape(local).is_some() || f.shape(&record).is_some())
+        })
+        .unwrap_or(false)
+    }
+
     /// The file holding `name`, and the name inside it.
     fn place(&self, name: &str) -> (String, String) {
-        if let Some(d) = &self.dense {
-            return self.dense_place(d, name);
-        }
-        if let Some(rest) = name.strip_prefix("language_model.layers.") {
-            let (layer, local) = rest.split_once('.').expect("a layer index");
-            let layer: usize = layer.parse().expect("a layer index");
-            return (format!("exlr8-dense-text-{layer:03}"), local.into());
-        }
-        match name {
-            "language_model.embed_tokens.weight" => {
-                ("exlr8-vocab".into(), "embed_tokens.weight".into())
+        match &self.layout {
+            Layout::Dense(d) => self.dense_place(d, name),
+            Layout::Groups(g) => {
+                let vocab = g.vocab_file();
+                g.place(name, |local| self.has_tensor(&vocab, local))
             }
-            _ => ("exlr8-dense-global-000".into(), name.into()),
         }
     }
 
@@ -624,16 +547,20 @@ impl Release {
         file: &str,
         read: impl FnOnce(&File) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut files = self.files.borrow_mut();
-        if !files.contains_key(file) {
-            let name = format!("{file}.safetensors");
-            let opened = match &self.at {
-                Where::Dir(dir) => File::open(&dir.join(name))?,
-                Where::Url(base) => File::remote(&format!("{base}{name}"))?,
-            };
-            files.insert(file.into(), opened);
-        }
-        read(&files[file])
+        let found = self.files.lock().expect("exlr8 files").get(file).cloned();
+        let f = match found {
+            Some(f) => f,
+            None => {
+                let name = format!("{file}.safetensors");
+                let fresh = Arc::new(match &self.at {
+                    Where::Dir(dir) => File::open(&dir.join(name))?,
+                    Where::Url(base) => File::remote(&format!("{base}{name}"))?,
+                });
+                let mut files = self.files.lock().expect("exlr8 files");
+                files.entry(file.into()).or_insert(fresh).clone()
+            }
+        };
+        read(&f)
     }
 
     /// Packed bytes of `name`, or `range` rows `(first, count)`.
@@ -672,7 +599,10 @@ impl Release {
                 }
                 Ok(all.into_flattened())
             }
-            Ok(r) if r.format == FP8_BLOCK || r.format == FP8_ROW => {
+            Ok(r) if r.format == FP8_ROW => {
+                fp8_row_bf16(f, &matrix, r.out, r.inp, range.unwrap_or((0, r.out)))
+            }
+            Ok(r) if r.format == FP8_BLOCK => {
                 let floats = plain(f, &matrix, &r, r.format)?;
                 let slice = match range {
                     Some((first, count)) => &floats[first * r.inp..(first + count) * r.inp],
@@ -731,7 +661,7 @@ impl Release {
 impl Release {
     /// A routed layer and expert name in the `dense/` layout.
     fn expert<'a>(&self, name: &'a str) -> Option<(usize, &'a str)> {
-        experts::split(name, &self.dense.as_ref()?.prefix)
+        experts::split(name, &self.dense()?.prefix)
     }
 
     /// The `dense/` file holding `name`, and its stored name.
@@ -751,54 +681,71 @@ impl Release {
                 return (VOCAB.into(), format!("{stem}{end}"));
             }
         }
-        let matrix = name
-            .strip_suffix(".weight")
-            .or_else(|| name.strip_suffix(".codes"))
-            .unwrap_or(name);
         for extra in &d.extras {
-            let holds = |f: &File| {
-                Ok(f.shape(name).is_some() || f.shape(&format!("{matrix}.record")).is_some())
-            };
-            if self.with(extra, holds).unwrap_or(false) {
+            if self.has_tensor(extra, name) {
                 return (extra.clone(), name.into());
             }
         }
         (VOCAB.into(), name.into())
     }
 
+    /// Whether shard `file` exists without parsing its header.
+    fn exists(&self, file: &str) -> bool {
+        match &self.at {
+            Where::Dir(dir) => dir.join(format!("{file}.safetensors")).is_file(),
+            Where::Url(_) => self.with(file, |_| Ok(())).is_ok(),
+        }
+    }
+
+    /// Opens unopened local shards in parallel.
+    fn open_shards(&self, shards: &[Shard]) {
+        let Where::Dir(dir) = &self.at else {
+            return;
+        };
+        let missing: Vec<&str> = {
+            let files = self.files.lock().expect("exlr8 files");
+            shards
+                .iter()
+                .map(|s| s.file.as_str())
+                .filter(|f| !files.contains_key(*f))
+                .collect()
+        };
+        if missing.len() <= 1 {
+            return;
+        }
+        let opened = open_local(dir, &missing);
+        let mut files = self.files.lock().expect("exlr8 files");
+        for (name, f) in opened {
+            files.entry(name).or_insert(f);
+        }
+    }
+
     /// Every shard, and how its names become HF names.
     fn shards(&self) -> Vec<Shard> {
-        let (mut out, layers, prefix) = match &self.dense {
-            Some(d) => {
-                let vocab = Shard {
-                    renames: d.vocab.clone(),
-                    ..Shard::new(VOCAB.into(), d.vocab_prefix.clone())
-                };
-                let mut out = vec![vocab];
-                for extra in &d.extras {
-                    out.push(Shard {
-                        plain: d.plain,
-                        ..Shard::new(extra.clone(), String::new())
-                    });
-                }
-                (out, "dense/exlr8-dense-", d.prefix.as_str())
+        let d = match &self.layout {
+            Layout::Groups(g) => {
+                return g.shards(|file| self.exists(file));
             }
-            None => (
-                vec![
-                    Shard::new("exlr8-vocab".into(), "language_model.".into()),
-                    Shard::new("exlr8-dense-global-000".into(), String::new()),
-                ],
-                "exlr8-dense-text-",
-                "language_model.layers.",
-            ),
+            Layout::Dense(d) => d,
         };
+        let vocab = Shard {
+            renames: d.vocab.clone(),
+            ..Shard::new(VOCAB.into(), d.vocab_prefix.clone())
+        };
+        let mut out = vec![vocab];
+        for extra in &d.extras {
+            out.push(Shard {
+                plain: d.plain,
+                ..Shard::new(extra.clone(), String::new())
+            });
+        }
         for layer in 0.. {
-            let file = format!("{layers}{layer:03}");
-            if self.with(&file, |_| Ok(())).is_err() {
+            let file = format!("dense/exlr8-dense-{layer:03}");
+            if !self.exists(&file) {
                 break;
             }
-            let mut shard = Shard::new(file, format!("{prefix}{layer}."));
-            for ((at, matrix), k) in self.dense.iter().flat_map(|d| &d.widths) {
+            let mut shard = Shard::new(file, format!("{}{layer}.", d.prefix));
+            for ((at, matrix), k) in &d.widths {
                 if *at == layer {
                     shard.picked.push((matrix.clone(), *k));
                 }
@@ -811,7 +758,6 @@ impl Release {
     /// A shard's slices, keeping each matrix in its compact form.
     fn offered(f: &File, shard: &Shard) -> Vec<Slice> {
         let raw = f.slices();
-        let shape = |name: &str| raw.iter().find(|s| s.name == name).map(|s| s.shape.clone());
         let mut out = Vec::new();
         for s in &raw {
             let Some(stem) = s.name.strip_suffix(".record") else {
@@ -823,7 +769,7 @@ impl Release {
             let name = |part: &str| shard.name(&format!("{matrix}.{part}"));
             let r = record(f, stem);
             let rows = r.as_ref().is_ok_and(|r| r.format == ROWS);
-            let side = |s: &str| shape(&format!("{stem}.{s}")).filter(|_| !rows);
+            let side = |s: &str| f.shape(&format!("{stem}.{s}")).filter(|_| !rows);
             let (Some(suh), Some(svh)) = (side("suh"), side("svh")) else {
                 // Other formats decode to the HF weight.
                 if let Ok(r) = r {
@@ -843,7 +789,7 @@ impl Release {
             let Ok((tensor, book)) = coded(f, &format!("{stem}.trellis")) else {
                 continue;
             };
-            let Some(entries) = shape(&tensor) else {
+            let Some(entries) = f.shape(&tensor) else {
                 continue;
             };
             let k = (entries[0] * entries[1] * 8 / (inp * outp)) as u32;
@@ -900,12 +846,18 @@ impl Release {
 
 impl Offer for Release {
     fn slices(&self) -> Vec<Slice> {
+        if let Some(cached) = self.slices.lock().expect("exlr8 slices").as_ref() {
+            return cached.clone();
+        }
+        let shards = self.shards();
+        self.open_shards(&shards);
         let mut out = Vec::new();
-        for shard in self.shards() {
+        for shard in shards {
             let slices = self.with(&shard.file, |f| Ok(Self::offered(f, &shard)));
             out.extend(slices.unwrap_or_default());
         }
-        let Some(dense) = &self.dense else {
+        let Some(dense) = self.dense() else {
+            *self.slices.lock().expect("exlr8 slices") = Some(out.clone());
             return out;
         };
         // Routed layers keep their experts apart.
@@ -949,6 +901,7 @@ impl Offer for Release {
             });
             out.extend(found.unwrap_or_default());
         }
+        *self.slices.lock().expect("exlr8 slices") = Some(out.clone());
         out
     }
 

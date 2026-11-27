@@ -1,9 +1,9 @@
-use crate::exlr8::Release;
+use crate::exlr8::{self, Release};
 use crate::{Offer, Stored};
 use std::path::Path;
 use tessera_engine::block::{INT4_G32, MXFP8};
 use tessera_engine::storage::Form;
-use tessera_engine::{E4M3, F16, trellis};
+use tessera_engine::{Bf16, E4M3, F16, trellis};
 
 /// One tensor: name, safetensors dtype, shape, bytes.
 pub(crate) type Tensor<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
@@ -369,5 +369,267 @@ fn remote_manifest_loads() {
     assert!(slices.iter().all(|s| !s.name.contains(".k2")));
     let _ = ureq::get(&format!("{base}/stop")).call();
     server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Builds a synthetic `qwen3_vl` multi-group exlr8 v2 release.
+fn write_qwen3_vl(dir: &Path) {
+    let bf16 = |xs: &[f32]| -> Vec<u8> {
+        xs.iter()
+            .flat_map(|x| Bf16::from(*x).0.to_le_bytes())
+            .collect()
+    };
+    let tr4 = |side: i64| {
+        let mut r = record(1, 128, 128, side);
+        r[24..32].copy_from_slice(&4i64.to_le_bytes());
+        r
+    };
+    let meta = [("format", "exlr8-v2"), ("model_profile", "qwen3_vl")];
+    let k4_out = ramp(8192, 3);
+    let k4_in = ramp(8192, 5);
+    let side = halves(&[0.5; 128]);
+    write_meta(
+        &dir.join("exlr8-vocab.safetensors"),
+        &meta,
+        &[
+            ("embed_tokens.record", "I64", vec![8], record(5, 4, 4, 1)),
+            ("embed_tokens.checksum", "U64", vec![1], vec![0u8; 8]),
+            ("__pad.0", "U8", vec![8], vec![0u8; 8]),
+            ("embed_tokens.fp8", "U8", vec![4, 4], ramp(16, 7)),
+            (
+                "embed_tokens.scale",
+                "F32",
+                vec![4],
+                floats(&[0.5, 1.0, 2.0, 4.0]),
+            ),
+            ("norm.weight", "BF16", vec![4], bf16(&[1.0, 2.0, 3.0, 4.0])),
+        ],
+    );
+    write_meta(
+        &dir.join("exlr8-dense-text-000.safetensors"),
+        &meta,
+        &[
+            ("self_attn.q_proj.record", "I64", vec![8], tr4(1)),
+            ("self_attn.q_proj.trellis", "U8", vec![1, 8192], k4_out),
+            ("self_attn.q_proj.suh", "F16", vec![128], side.clone()),
+            ("self_attn.q_proj.svh", "F16", vec![128], side.clone()),
+            ("self_attn.o_proj.record", "I64", vec![8], tr4(2)),
+            ("self_attn.o_proj.trellis", "U8", vec![1, 8192], k4_in),
+            ("self_attn.o_proj.suh", "F16", vec![128], side.clone()),
+            ("self_attn.o_proj.svh", "F16", vec![128], side.clone()),
+            ("self_attn.q_norm.weight", "BF16", vec![4], bf16(&[1.5; 4])),
+        ],
+    );
+    write_meta(
+        &dir.join("exlr8-dense-text-001.safetensors"),
+        &meta,
+        &[
+            ("mlp.gate_proj.record", "I64", vec![8], record(2, 2, 64, 1)),
+            ("mlp.gate_proj.q4", "U8", vec![2, 32], ramp(64, 11)),
+            (
+                "mlp.gate_proj.s4",
+                "F16",
+                vec![2, 2],
+                halves(&[0.5, 1.0, 2.0, 4.0]),
+            ),
+            ("mlp.down_proj.record", "I64", vec![8], record(2, 2, 128, 2)),
+            ("mlp.down_proj.q4", "U8", vec![1, 2, 64], ramp(128, 13)),
+            (
+                "mlp.down_proj.s4",
+                "F16",
+                vec![1, 2, 4],
+                halves(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            ),
+        ],
+    );
+    write_meta(
+        &dir.join("exlr8-dense-vision-000.safetensors"),
+        &meta,
+        &[
+            ("attn.qkv.record", "I64", vec![8], tr4(1)),
+            ("attn.qkv.trellis", "U8", vec![1, 8192], ramp(8192, 9)),
+            ("attn.qkv.suh", "F16", vec![128], side.clone()),
+            ("attn.qkv.svh", "F16", vec![128], side.clone()),
+            ("mlp.linear_fc1.record", "I64", vec![8], record(5, 6, 4, 1)),
+            ("mlp.linear_fc1.fp8", "U8", vec![6, 4], ramp(24, 5)),
+            ("mlp.linear_fc1.scale", "F32", vec![6], floats(&[0.25; 6])),
+            ("norm1.bias", "BF16", vec![4], bf16(&[0.5; 4])),
+        ],
+    );
+    write_meta(
+        &dir.join("exlr8-dense-global-000.safetensors"),
+        &meta,
+        &[
+            (
+                "model.visual.patch_embed.proj.weight",
+                "BF16",
+                vec![2, 3, 2, 2, 2],
+                bf16(&[0.25; 48]),
+            ),
+            (
+                "model.visual.pos_embed.record",
+                "I64",
+                vec![8],
+                record(6, 4, 4, 0),
+            ),
+            (
+                "model.visual.pos_embed.bf16",
+                "BF16",
+                vec![4, 4],
+                bf16(&[2.0; 16]),
+            ),
+            (
+                "model.visual.merger.linear_fc2.record",
+                "I64",
+                vec![8],
+                tr4(2),
+            ),
+            (
+                "model.visual.merger.linear_fc2.trellis",
+                "U8",
+                vec![1, 8192],
+                ramp(8192, 11),
+            ),
+            (
+                "model.visual.merger.linear_fc2.suh",
+                "F16",
+                vec![128],
+                side.clone(),
+            ),
+            ("model.visual.merger.linear_fc2.svh", "F16", vec![128], side),
+        ],
+    );
+}
+
+fn check_qwen3_vl(release: &Release) {
+    let slices = release.slices();
+    let find = |n: &str| slices.iter().find(|s| s.name == n).expect(n);
+    assert!(
+        slices
+            .iter()
+            .all(|s| !s.name.contains("checksum") && !s.name.contains("__pad"))
+    );
+    let k4 = Stored::Form(&trellis::TRELLIS_K4_ROT);
+    assert_eq!(
+        find("model.language_model.embed_tokens.weight").stored,
+        Stored::BF16
+    );
+    assert_eq!(
+        find("model.language_model.norm.weight").stored,
+        Stored::BF16
+    );
+    assert_eq!(
+        find("model.language_model.layers.0.self_attn.q_proj.weight").stored,
+        k4
+    );
+    assert_eq!(
+        find("model.language_model.layers.0.self_attn.o_proj.weight").stored,
+        k4
+    );
+    assert_eq!(
+        find("model.language_model.layers.1.mlp.gate_proj.weight").stored,
+        Stored::Form(&INT4_G32)
+    );
+    assert_eq!(
+        find("model.language_model.layers.1.mlp.down_proj.weight").stored,
+        Stored::Form(&INT4_G32)
+    );
+    assert_eq!(find("model.visual.blocks.0.attn.qkv.weight").stored, k4);
+    assert_eq!(
+        find("model.visual.blocks.0.mlp.linear_fc1.weight").stored,
+        Stored::BF16
+    );
+    assert_eq!(
+        find("model.visual.blocks.0.mlp.linear_fc1.weight").shape,
+        [6, 4]
+    );
+    assert_eq!(
+        find("model.visual.patch_embed.proj.weight").shape,
+        [2, 3, 2, 2, 2]
+    );
+    assert_eq!(find("model.visual.pos_embed.weight").shape, [4, 4]);
+    assert_eq!(find("model.visual.merger.linear_fc2.weight").stored, k4);
+    // Streaming FP8_ROW matches floats, whole and row-sliced.
+    let emb_f = release
+        .floats("model.language_model.embed_tokens.weight")
+        .unwrap();
+    let emb_p = Offer::packed(release, "model.language_model.embed_tokens.weight").unwrap();
+    let emb_r =
+        Offer::packed_rows(release, "model.language_model.embed_tokens.weight", (1, 2)).unwrap();
+    assert_eq!(emb_p.len(), 32);
+    assert_eq!(emb_r, &emb_p[8..24]);
+    let got: Vec<f32> = emb_p
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| f32::from(Bf16(u16::from_le_bytes(*b))))
+        .collect();
+    let want: Vec<f32> = emb_f.iter().map(|x| f32::from(Bf16::from(*x))).collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        release.floats("model.language_model.norm.weight").unwrap(),
+        [1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        Offer::packed(release, "model.visual.patch_embed.proj.weight")
+            .unwrap()
+            .len(),
+        96
+    );
+    assert_eq!(
+        release.floats("model.visual.pos_embed.weight").unwrap(),
+        [2.0; 16]
+    );
+    // Side-IN trellis and int4_g32 unpack bit-exact.
+    let o_name = "model.language_model.layers.0.self_attn.o_proj.weight";
+    let o_packed = Offer::packed(release, o_name).unwrap();
+    assert_eq!(
+        trellis::TRELLIS_K4_ROT.unpack_all(&o_packed),
+        release.floats(o_name).unwrap()
+    );
+    let d_name = "model.language_model.layers.1.mlp.down_proj.weight";
+    let d_packed = Offer::packed(release, d_name).unwrap();
+    assert_eq!(
+        INT4_G32.unpack_all(&d_packed),
+        release.floats(d_name).unwrap()
+    );
+    assert_eq!(
+        release.floats("model.visual.blocks.0.norm1.bias").unwrap(),
+        [0.5; 4]
+    );
+}
+
+fn check_fp8_lut(dir: &Path) {
+    let (rows, inp) = (257usize, 384usize);
+    let codes: Vec<u8> = (0..rows * inp).map(|i| ((i * 37) % 256) as u8).collect();
+    let scales: Vec<f32> = (0..rows).map(|r| 0.01 * (r as f32 + 1.0)).collect();
+    let pdir = dir.join("lut");
+    write(
+        &pdir.join("dense/exlr8-vocab.safetensors"),
+        &[
+            (
+                "embed_tokens.record",
+                "I64",
+                vec![8],
+                record(5, rows, inp, 1),
+            ),
+            ("embed_tokens.fp8", "U8", vec![rows, inp], codes.clone()),
+            ("embed_tokens.scale", "F32", vec![rows], floats(&scales)),
+        ],
+    );
+    let packed = Offer::packed(&Release::open(&pdir), "model.embed_tokens.weight").unwrap();
+    let want: Vec<u8> = (0..rows * inp)
+        .flat_map(|i| Bf16::from(e4m3(codes[i]) * scales[i / inp]).0.to_le_bytes())
+        .collect();
+    assert_eq!(packed, want);
+}
+
+#[test]
+fn qwen3_vl_release() {
+    let dir = tessera_testkit::scratch(&format!("{}-qwen3vl-exlr8", std::process::id()));
+    write_qwen3_vl(&dir);
+    assert!(exlr8::is_release(&dir));
+    check_qwen3_vl(&Release::open(&dir));
+    check_fp8_lut(&dir);
     std::fs::remove_dir_all(dir).unwrap();
 }

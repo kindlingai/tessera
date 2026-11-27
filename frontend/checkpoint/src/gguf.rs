@@ -4,7 +4,8 @@ use crate::Error;
 use crate::offer::{Offer, Slice, Stored};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use tessera_engine::block;
 use tessera_engine::storage::{self, Form};
@@ -352,9 +353,9 @@ impl Gguf {
     pub fn bytes(&self, name: &str) -> Result<(GgufType, usize, Vec<u8>), Error> {
         let entry = self.entry(name)?;
         let mut bytes = vec![0; entry.bytes];
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(self.data + entry.offset))?;
-        file.read_exact(&mut bytes).map_err(format)?;
+        self.file
+            .read_exact_at(&mut bytes, self.data + entry.offset)
+            .map_err(format)?;
         Ok((entry.ty, entry.elements, bytes))
     }
 
