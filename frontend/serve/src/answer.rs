@@ -69,14 +69,16 @@ fn fresh_id(kind: Kind) -> String {
     format!("{prefix}-{:x}{n:x}", wire::now())
 }
 
-/// A tool-call id unique within this process.
-fn call_id(call: &ToolCall) -> String {
-    if let Some(id) = &call.id {
-        return id.clone();
-    }
+/// Generates a fresh tool-call id unique within this process.
+fn next_call_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("call_{:x}{n:x}", wire::now())
+}
+
+/// A tool-call id unique within this process.
+fn call_id(call: &ToolCall) -> String {
+    call.id.clone().unwrap_or_else(next_call_id)
 }
 
 /// Formats one tool call in OpenAI's JSON shape.
@@ -432,6 +434,8 @@ impl Started {
         let mut stream = parser.stream(self.parsing.tools, self.parsing.thinking);
         let mut events = Vec::new();
         let mut calls = 0usize;
+        let mut active_call: Option<usize> = None;
+        let mut suppress_call = false;
         let mut reasoning = 0usize;
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
@@ -461,6 +465,40 @@ impl Started {
                         let chunk = format_call(&tc, Some(calls));
                         calls += 1;
                         json!({"tool_calls": [chunk]})
+                    }
+                    ResponseEvent::ToolCallStart { id, kind, name } => {
+                        if !self.parsing.parallel_tools && calls > 0 {
+                            suppress_call = true;
+                            continue;
+                        }
+                        suppress_call = false;
+                        let idx = calls;
+                        calls += 1;
+                        active_call = Some(idx);
+                        let cid = id.unwrap_or_else(next_call_id);
+                        json!({"tool_calls": [{
+                            "index": idx,
+                            "id": cid,
+                            "type": kind,
+                            "function": {"name": name, "arguments": ""},
+                        }]})
+                    }
+                    ResponseEvent::ToolCallArgs(args) => {
+                        if suppress_call || args.is_empty() {
+                            continue;
+                        }
+                        let Some(idx) = active_call else {
+                            continue;
+                        };
+                        json!({"tool_calls": [{
+                            "index": idx,
+                            "function": {"arguments": args},
+                        }]})
+                    }
+                    ResponseEvent::ToolCallEnd => {
+                        active_call = None;
+                        suppress_call = false;
+                        continue;
                     }
                 };
                 let choice = self.delta_choice(delta, None);

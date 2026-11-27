@@ -1,7 +1,8 @@
+use super::stream::stream_test::collect_calls;
 use crate::{ResponseEvent, ResponseParser};
 use serde_json::json;
 
-const GEMMA4_CFG: &str = r#"{
+pub(super) const GEMMA4_CFG: &str = r#"{
   "response_template": {
     "fields": {
       "content": {"close": ["<turn|>", "<|tool_response>", "<eos>"], "content": "text"},
@@ -52,42 +53,6 @@ fn parses_delimited_calls() {
         (cont.reasoning.as_str(), cont.content.as_str()),
         ("done", "15C")
     );
-}
-
-#[test]
-fn streams_split_tokens() {
-    let parser = ResponseParser::from_config(GEMMA4_CFG).unwrap().unwrap();
-    let pieces = [
-        "<|chan",
-        "nel>thought\n",
-        "plan",
-        "<channel|>",
-        "Hi ",
-        "<|tool_",
-        "call>call:get_",
-        "temp{loc:<|\"|>",
-        "Paris",
-        "<|\"|>}<tool_",
-        "call|>",
-    ];
-    let mut stream = parser.stream(true, false);
-    let mut events = Vec::new();
-    for piece in pieces {
-        stream.push(piece, &mut events);
-    }
-    stream.finish(&mut events);
-    assert_eq!(
-        events.first(),
-        Some(&ResponseEvent::Reasoning("plan".into()))
-    );
-    assert!(events.contains(&ResponseEvent::Content("Hi ".into())));
-    let call = events.iter().find_map(|e| match e {
-        ResponseEvent::ToolCall(tc) => Some(tc),
-        _ => None,
-    });
-    let call = call.expect("tool call event");
-    assert_eq!(call.function.name, "get_temp");
-    assert_eq!(call.function.arguments, json!({"loc": "Paris"}));
 }
 
 #[test]
@@ -173,14 +138,18 @@ fn deepseek_family_default() {
         stream.push(piece, &mut events);
     }
     stream.finish(&mut events);
-    let mut names = Vec::new();
-    for event in &events {
-        match event {
-            ResponseEvent::ToolCall(tc) => names.push(tc.function.name.as_str()),
-            other => assert_eq!(other, &ResponseEvent::Content("Sure.".into())),
-        }
-    }
-    assert_eq!(names, ["get_weather", "ping"]);
+    assert_eq!(
+        events.first(),
+        Some(&ResponseEvent::Content("Sure.".into()))
+    );
+    let calls = collect_calls(&events);
+    assert_eq!(
+        calls,
+        [
+            ("get_weather".into(), json!({"city": "Paris"})),
+            ("ping".into(), json!({})),
+        ]
+    );
 }
 
 #[test]

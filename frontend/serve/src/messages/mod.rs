@@ -610,6 +610,42 @@ fn emit_event(
             let delta = json!({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": s}});
             send("content_block_delta", delta)
         }
+        ResponseEvent::ToolCallStart { id, name, .. } => {
+            *called = true;
+            if let Some((_, idx)) = open.take()
+                && !send(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": idx}),
+                )
+            {
+                return false;
+            }
+            let idx = *next_idx;
+            *next_idx += 1;
+            *open = Some(("tool_use", idx));
+            let id = id.unwrap_or_else(|| next_id("toolu"));
+            let start = json!({"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}});
+            send("content_block_start", start)
+        }
+        ResponseEvent::ToolCallArgs(raw) => {
+            if raw.is_empty() {
+                return true;
+            }
+            let Some(("tool_use", idx)) = *open else {
+                return true;
+            };
+            let delta = json!({"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": raw}});
+            send("content_block_delta", delta)
+        }
+        ResponseEvent::ToolCallEnd => {
+            if let Some(("tool_use", idx)) = open.take() {
+                return send(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": idx}),
+                );
+            }
+            true
+        }
         ResponseEvent::ToolCall(tc) => {
             *called = true;
             if let Some((_, idx)) = open.take()

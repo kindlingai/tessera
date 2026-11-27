@@ -121,7 +121,8 @@ fn chat_tool_calls() {
     let mock = Arc::new(MockGenerator {
         pieces: vec![
             "<|channel>thought\ncheck<channel|>".into(),
-            "<|tool_call>call:ping{a:<|\"|>ok<|\"|>}<tool_call|>".into(),
+            "<|tool_call>call:ping{a:<|\"|>o".into(),
+            "k<|\"|>}<tool_call|><|tool_call>call:go{}<tool_call|>".into(),
         ],
         ..MockGenerator::default()
     });
@@ -152,10 +153,38 @@ fn chat_tool_calls() {
     );
     body["stream"] = json!(true);
     body["stream_options"] = json!({"include_usage": true});
-    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body.clone()));
     assert_eq!(s_status, 200);
-    assert!(sse.contains("\"tool_calls\"") && sse.contains("\"finish_reason\":\"tool_calls\""));
-    assert!(sse.contains("\"reasoning_tokens\":1"));
+    assert!(
+        sse.contains("\"finish_reason\":\"tool_calls\"") && sse.contains("\"reasoning_tokens\":1")
+    );
+    let (mut args, mut chunks) = ([String::new(), String::new()], [0usize; 2]);
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        for item in v["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let i = item["index"].as_u64().unwrap() as usize;
+            if item["function"]["name"].is_null() {
+                args[i].push_str(item["function"]["arguments"].as_str().unwrap());
+                chunks[i] += 1;
+            }
+        }
+    }
+    assert!(
+        chunks[0] >= 2 && serde_json::from_str::<Value>(&args[0]).unwrap() == json!({"a": "ok"})
+    );
+    assert_eq!(serde_json::from_str::<Value>(&args[1]).unwrap(), json!({}));
+    body["parallel_tool_calls"] = json!(false);
+    let (s2, sse2) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s2, 200);
+    assert!(!sse2.contains("\"go\"") && !sse2.contains("\"index\":1"));
 }
 
 #[test]

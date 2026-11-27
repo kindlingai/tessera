@@ -3,6 +3,7 @@
 mod formats;
 #[cfg(test)]
 mod response_test;
+mod stream;
 
 use crate::template::{FunctionCall, Message, Template, ToolCall, spaced};
 use fancy_regex::Regex;
@@ -11,6 +12,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
+use stream::{StepOutcome, TagDelims, ToolState, parse_json};
 
 pub use formats::Markers;
 
@@ -20,6 +22,13 @@ pub enum ResponseEvent {
     Content(String),
     Reasoning(String),
     ToolCall(ToolCall),
+    ToolCallStart {
+        id: Option<String>,
+        kind: String,
+        name: String,
+    },
+    ToolCallArgs(String),
+    ToolCallEnd,
 }
 
 /// A full parsed assistant response.
@@ -160,7 +169,10 @@ enum Body {
     Text,
     Json(ContentArgs),
     /// One object entry per `key`/`value` match.
-    Tags(Regex),
+    Tags {
+        regex: Regex,
+        delims: Option<TagDelims>,
+    },
 }
 
 impl Body {
@@ -174,7 +186,11 @@ impl Body {
                 let pat = args
                     .pattern
                     .ok_or("tags content needs content_args.pattern")?;
-                Body::Tags(Regex::new(&pat)?)
+                let delims = TagDelims::from_pattern(&pat);
+                Body::Tags {
+                    regex: Regex::new(&pat)?,
+                    delims,
+                }
             }
             _ => Body::Text,
         })
@@ -184,7 +200,7 @@ impl Body {
         match self {
             Body::Text => Some(Value::String(body.to_string())),
             Body::Json(args) => parse_json(body.trim(), args),
-            Body::Tags(regex) => {
+            Body::Tags { regex, .. } => {
                 let mut map = Map::new();
                 for caps in regex.captures_iter(body) {
                     let caps = caps.ok()?;
@@ -355,6 +371,7 @@ impl ResponseParser {
             calls: false,
             buf: String::new(),
             lead: false,
+            tool: ToolState::Start,
         }
     }
 
@@ -365,11 +382,34 @@ impl ResponseParser {
         stream.push(text, &mut events);
         stream.finish(&mut events);
         let mut out = ParsedResponse::default();
+        let mut open: Option<(Option<String>, String, String, String)> = None;
         for event in events {
             match event {
                 ResponseEvent::Content(s) => out.content.push_str(&s),
                 ResponseEvent::Reasoning(s) => out.reasoning.push_str(&s),
                 ResponseEvent::ToolCall(tc) => out.tool_calls.push(tc),
+                ResponseEvent::ToolCallStart { id, kind, name } => {
+                    open = Some((id, kind, name, String::new()));
+                }
+                ResponseEvent::ToolCallArgs(frag) => {
+                    if let Some((_, _, _, args)) = &mut open {
+                        args.push_str(&frag);
+                    }
+                }
+                ResponseEvent::ToolCallEnd => {
+                    if let Some((id, kind, name, raw)) = open.take() {
+                        let arguments = if raw.trim().is_empty() {
+                            Value::Object(Map::new())
+                        } else {
+                            serde_json::from_str(&raw).unwrap_or(Value::String(raw))
+                        };
+                        out.tool_calls.push(ToolCall {
+                            id,
+                            kind,
+                            function: FunctionCall { name, arguments },
+                        });
+                    }
+                }
             }
         }
         out
@@ -405,6 +445,8 @@ pub struct ResponseStream<'a> {
     buf: String,
     /// Drops newlines that open the content after a thinking block.
     lead: bool,
+    /// Active incremental tool-call state.
+    tool: ToolState,
 }
 
 impl<'a> ResponseStream<'a> {
@@ -435,8 +477,19 @@ impl<'a> ResponseStream<'a> {
 
     /// Flushes remaining buffered text when generation ends.
     pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
-        if self.buf.is_empty() || self.mode == Mode::Closed {
+        if self.mode == Mode::Closed {
             self.buf.clear();
+            return;
+        }
+        if self.mode == Mode::ToolCall
+            && let Some(spec) = &self.parser.tool_calls
+            && (self.tool.started() || !self.buf.is_empty())
+        {
+            let rest = std::mem::take(&mut self.buf);
+            self.tool.finish(spec, &rest, out);
+            return;
+        }
+        if self.buf.is_empty() {
             return;
         }
         let mut rest = std::mem::take(&mut self.buf);
@@ -448,13 +501,6 @@ impl<'a> ResponseStream<'a> {
             if rest.is_empty() {
                 return;
             }
-        }
-        if self.mode == Mode::ToolCall
-            && let Some(spec) = &self.parser.tool_calls
-            && let Some(calls) = parse_tool(spec, &rest)
-        {
-            out.extend(calls.into_iter().map(ResponseEvent::ToolCall));
-            return;
         }
         match self.mode {
             Mode::Thinking => out.push(ResponseEvent::Reasoning(rest)),
@@ -565,21 +611,18 @@ impl<'a> ResponseStream<'a> {
             self.mode = Mode::Text;
             return true;
         };
-        let Some((at, len)) = find_close(&self.buf, &spec.close) else {
-            return false;
-        };
-        let block = self.buf[..at].to_string();
-        let raw_end = at + len;
-        match parse_tool(spec, &block) {
-            Some(calls) => out.extend(calls.into_iter().map(ResponseEvent::ToolCall)),
-            None => out.push(ResponseEvent::Content(self.buf[..raw_end].to_string())),
+        match self.tool.step(spec, &mut self.buf, out) {
+            StepOutcome::Wait => false,
+            StepOutcome::Continue => true,
+            StepOutcome::Done => {
+                self.tool = ToolState::Start;
+                self.mode = match self.calls {
+                    true => Mode::Calls,
+                    false => Mode::Text,
+                };
+                true
+            }
         }
-        self.buf.drain(..raw_end);
-        self.mode = match self.calls {
-            true => Mode::Calls,
-            false => Mode::Text,
-        };
-        true
     }
 
     fn step_calls(&mut self) -> bool {
@@ -789,203 +832,4 @@ fn to_call(value: Value) -> Option<ToolCall> {
         kind,
         function: FunctionCall { name, arguments },
     })
-}
-
-/// Parses JSON with optional custom string delimiters and bare keys.
-fn parse_json(input: &str, args: &ContentArgs) -> Option<Value> {
-    if args.string_delims.is_empty() && !args.unquoted_keys {
-        return serde_json::from_str(input).ok();
-    }
-    let mut cursor = Cursor {
-        src: input,
-        pos: 0,
-        args,
-    };
-    let value = cursor.value()?;
-    cursor.skip_ws();
-    cursor.rest().is_empty().then_some(value)
-}
-
-struct Cursor<'a> {
-    src: &'a str,
-    pos: usize,
-    args: &'a ContentArgs,
-}
-
-impl<'a> Cursor<'a> {
-    fn rest(&self) -> &'a str {
-        &self.src[self.pos..]
-    }
-
-    fn skip_ws(&mut self) {
-        let trimmed = self.rest().trim_start();
-        self.pos = self.src.len() - trimmed.len();
-    }
-
-    fn eat(&mut self, ch: u8) -> bool {
-        if self.rest().as_bytes().first() == Some(&ch) {
-            self.pos += 1;
-            return true;
-        }
-        false
-    }
-
-    fn value(&mut self) -> Option<Value> {
-        self.skip_ws();
-        if let Some(s) = self.delim_string() {
-            return Some(Value::String(s));
-        }
-        let &first = self.rest().as_bytes().first()?;
-        match first {
-            b'{' => self.object(),
-            b'[' => self.array(),
-            b'"' => self.quoted().map(Value::String),
-            b't' if self.rest().starts_with("true") => {
-                self.pos += 4;
-                Some(Value::Bool(true))
-            }
-            b'f' if self.rest().starts_with("false") => {
-                self.pos += 5;
-                Some(Value::Bool(false))
-            }
-            b'n' if self.rest().starts_with("null") => {
-                self.pos += 4;
-                Some(Value::Null)
-            }
-            b'-' | b'0'..=b'9' => self.number(),
-            _ => None,
-        }
-    }
-
-    fn delim_string(&mut self) -> Option<String> {
-        for [open, close] in &self.args.string_delims {
-            if let Some(after) = self.rest().strip_prefix(open.as_str()) {
-                let end = after.find(close.as_str())?;
-                let text = after[..end].to_string();
-                self.pos += open.len() + end + close.len();
-                return Some(text);
-            }
-        }
-        None
-    }
-
-    fn quoted(&mut self) -> Option<String> {
-        let bytes = self.rest().as_bytes();
-        if bytes.first() != Some(&b'"') {
-            return None;
-        }
-        let mut i = 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => i += 2,
-                b'"' => {
-                    let text: String = serde_json::from_str(&self.rest()[..=i]).ok()?;
-                    self.pos += i + 1;
-                    return Some(text);
-                }
-                _ => i += 1,
-            }
-        }
-        None
-    }
-
-    fn key(&mut self) -> Option<String> {
-        self.skip_ws();
-        if let Some(s) = self.delim_string() {
-            return Some(s);
-        }
-        if self.rest().starts_with('"') {
-            return self.quoted();
-        }
-        if !self.args.unquoted_keys {
-            return None;
-        }
-        let bytes = self.rest().as_bytes();
-        let mut end = 0;
-        while end < bytes.len() {
-            match bytes[end] {
-                b':' => break,
-                b'{' | b'}' | b'[' | b']' | b',' => return None,
-                _ => end += 1,
-            }
-        }
-        let key = self.rest()[..end].trim();
-        if key.is_empty() {
-            return None;
-        }
-        let out = key.to_string();
-        self.pos += end;
-        Some(out)
-    }
-
-    fn object(&mut self) -> Option<Value> {
-        if !self.eat(b'{') {
-            return None;
-        }
-        let mut map = Map::new();
-        self.skip_ws();
-        if self.eat(b'}') {
-            return Some(Value::Object(map));
-        }
-        loop {
-            let k = self.key()?;
-            self.skip_ws();
-            if !self.eat(b':') {
-                return None;
-            }
-            let v = self.value()?;
-            map.insert(k, v);
-            self.skip_ws();
-            if self.eat(b',') {
-                self.skip_ws();
-                if self.eat(b'}') {
-                    return Some(Value::Object(map));
-                }
-                continue;
-            }
-            if self.eat(b'}') {
-                return Some(Value::Object(map));
-            }
-            return None;
-        }
-    }
-
-    fn array(&mut self) -> Option<Value> {
-        if !self.eat(b'[') {
-            return None;
-        }
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.eat(b']') {
-            return Some(Value::Array(items));
-        }
-        loop {
-            items.push(self.value()?);
-            self.skip_ws();
-            if self.eat(b',') {
-                self.skip_ws();
-                if self.eat(b']') {
-                    return Some(Value::Array(items));
-                }
-                continue;
-            }
-            if self.eat(b']') {
-                return Some(Value::Array(items));
-            }
-            return None;
-        }
-    }
-
-    fn number(&mut self) -> Option<Value> {
-        let bytes = self.rest().as_bytes();
-        let mut end = 0;
-        while end < bytes.len()
-            && matches!(bytes[end], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-        {
-            end += 1;
-        }
-        let num: serde_json::Number = serde_json::from_str(&self.rest()[..end]).ok()?;
-        self.pos += end;
-        Some(Value::Number(num))
-    }
 }
