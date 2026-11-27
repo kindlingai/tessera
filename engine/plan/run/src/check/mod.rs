@@ -7,12 +7,16 @@ use crate::Error;
 use crate::kernels::group;
 use crate::overrides;
 use crate::run::Run;
+use std::cell::RefCell;
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::fs::OpenOptions;
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tessera_engine_settings::{Backend, Settings};
 use tessera_gpukit::platform::{Asked, Platform};
 use tessera_gpukit::{Error as GpuError, Limits};
@@ -21,20 +25,28 @@ use tessera_lower::{Plan, Source, Step};
 /// Resource counts reported by `ptxas -v` for one entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PtxStats {
-    pub regs: u32,
+    pub regs: Option<u32>,
     pub smem: u32,
-    pub stack_bytes: u32,
-    pub spill_stores: u32,
-    pub spill_loads: u32,
+    pub stack_bytes: Option<u32>,
+    pub spill_stores: Option<u32>,
+    pub spill_loads: Option<u32>,
     pub barriers: u32,
 }
 
 impl PtxStats {
-    /// Worst local-memory spill footprint reported for this entry.
-    pub fn spill_bytes(self) -> u32 {
-        self.stack_bytes
-            .max(self.spill_stores)
-            .max(self.spill_loads)
+    /// Worst measured spill footprint when all spill fields are present.
+    pub fn spill_bytes(self) -> Option<u32> {
+        let stack = self.stack_bytes?;
+        let stores = self.spill_stores?;
+        let loads = self.spill_loads?;
+        Some(stack.max(stores).max(loads))
+    }
+
+    /// True when any measured spill field is non-zero.
+    fn has_spill(self) -> bool {
+        self.stack_bytes.is_some_and(|n| n > 0)
+            || self.spill_stores.is_some_and(|n| n > 0)
+            || self.spill_loads.is_some_and(|n| n > 0)
     }
 }
 
@@ -99,7 +111,7 @@ impl CheckReport {
     pub fn spilling(&self) -> usize {
         self.kernels
             .iter()
-            .filter(|k| k.stats.is_some_and(|s| s.spill_bytes() > 0))
+            .filter(|k| k.stats.is_some_and(PtxStats::has_spill))
             .count()
     }
 }
@@ -152,15 +164,66 @@ struct Collected {
 }
 
 struct Captured {
+    id: u64,
+    closed: bool,
     platform: Platform,
     entries: BTreeMap<(String, u64), Collected>,
 }
 
-static ACTIVE: Mutex<Option<Captured>> = Mutex::new(None);
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static ACTIVE: RefCell<Option<Arc<Mutex<Captured>>>> = const { RefCell::new(None) };
+}
+
+/// Check session handle forwarded to an intended loader thread.
+#[derive(Clone)]
+pub struct Scope(Arc<Mutex<Captured>>);
+
+struct ScopeGuard {
+    id: u64,
+    prev: Option<Arc<Mutex<Captured>>>,
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        let _ = ACTIVE.try_with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let same = slot
+                .as_ref()
+                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
+            if same {
+                *slot = self.prev.take();
+            }
+        });
+    }
+}
+
+impl Scope {
+    /// Runs `f` with this check session active on this thread.
+    pub fn run<R>(self, f: impl FnOnce() -> R) -> R {
+        let id = self.0.lock().expect("check session").id;
+        let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(self.0));
+        let _guard = ScopeGuard { id, prev };
+        f()
+    }
+}
+
+/// Returns the current thread's check session scope, if active.
+pub fn current_scope() -> Option<Scope> {
+    ACTIVE.with(|cell| {
+        let slot = cell.borrow();
+        let arc = slot.as_ref()?;
+        let guard = arc.lock().ok()?;
+        (!guard.closed).then(|| Scope(arc.clone()))
+    })
+}
 
 /// Guard holding an active offline kernel collection session.
 pub struct Session {
+    id: u64,
+    handle: Arc<Mutex<Captured>>,
     live: bool,
 }
 
@@ -168,38 +231,91 @@ impl Session {
     /// Ends collection and verifies all captured kernels.
     pub fn finish(mut self, cfg: &CheckConfig) -> Result<CheckReport, Error> {
         self.live = false;
-        let captured = ACTIVE.lock().expect("check session").take();
-        let entries: Vec<Collected> = captured
-            .map(|c| c.entries.into_values().collect())
-            .unwrap_or_default();
+        let owned = ACTIVE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let same = slot
+                .as_ref()
+                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
+            if same {
+                slot.take();
+                true
+            } else {
+                false
+            }
+        });
+        let mut captured = self.handle.lock().expect("check session");
+        let was_closed = captured.closed;
+        captured.closed = true;
+        if !owned || was_closed {
+            return Err(GpuError::Cuda(
+                "offline kernel check session was lost before finish".into(),
+            )
+            .into());
+        }
+        let entries: Vec<Collected> = std::mem::take(&mut captured.entries)
+            .into_values()
+            .collect();
+        drop(captured);
         verify_collected(entries, cfg)
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.live
-            && let Ok(mut guard) = ACTIVE.lock()
-        {
-            *guard = None;
+        if !self.live {
+            return;
         }
+        if let Ok(mut captured) = self.handle.lock() {
+            captured.closed = true;
+        }
+        let _ = ACTIVE.try_with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let same = slot
+                .as_ref()
+                .is_some_and(|c| c.lock().is_ok_and(|g| g.id == self.id));
+            if same {
+                *slot = None;
+            }
+        });
     }
 }
 
 /// Starts offline kernel collection for CUDA `target`.
 pub fn start(target: &str) -> Result<Session, Error> {
     let platform = target_platform(target)?;
-    let mut guard = ACTIVE.lock().expect("check session");
-    *guard = Some(Captured {
-        platform,
-        entries: BTreeMap::new(),
-    });
-    Ok(Session { live: true })
+    ACTIVE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|c| c.lock().is_ok_and(|g| !g.closed))
+        {
+            return Err(
+                GpuError::Cuda("an offline kernel check session is already active".into()).into(),
+            );
+        }
+        let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+        let handle = Arc::new(Mutex::new(Captured {
+            id,
+            closed: false,
+            platform,
+            entries: BTreeMap::new(),
+        }));
+        *slot = Some(handle.clone());
+        Ok(Session {
+            id,
+            handle,
+            live: true,
+        })
+    })
 }
 
-/// Whether offline kernel verification mode is active.
+/// Whether offline kernel verification mode is active on this thread.
 pub(crate) fn active() -> bool {
-    ACTIVE.lock().expect("check session").is_some()
+    ACTIVE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|c| c.lock().is_ok_and(|g| !g.closed))
+    })
 }
 
 /// Active synthetic GPU backend while checking offline.
@@ -209,24 +325,32 @@ pub(crate) fn backend() -> Option<Backend> {
 
 /// Active synthetic GPU platform while checking offline.
 pub(crate) fn platform() -> Option<Platform> {
-    ACTIVE
-        .lock()
-        .expect("check session")
-        .as_ref()
-        .map(|c| c.platform.clone())
+    ACTIVE.with(|cell| {
+        let slot = cell.borrow();
+        let arc = slot.as_ref()?;
+        let guard = arc.lock().ok()?;
+        (!guard.closed).then(|| guard.platform.clone())
+    })
 }
 
 /// Opens a capture runner if offline verification is active.
 pub(crate) fn open(plan: &Plan) -> Option<Box<dyn Run>> {
-    let platform = platform()?;
+    let arc = ACTIVE.with(|cell| cell.borrow().clone())?;
+    let platform = {
+        let guard = arc.lock().expect("check session");
+        if guard.closed {
+            return None;
+        }
+        guard.platform.clone()
+    };
     Some(crate::sizer::passive(
         plan,
         platform,
         "offline check",
-        |p| {
-            let mut guard = ACTIVE.lock().expect("check session");
-            if let Some(captured) = guard.as_mut() {
-                collect_plan(p, &mut captured.entries);
+        move |p| {
+            let mut guard = arc.lock().expect("check session");
+            if !guard.closed {
+                collect_plan(p, &mut guard.entries);
             }
         },
     ))
@@ -329,10 +453,27 @@ fn check_source(
     };
     let ptx_text = String::from_utf8_lossy(&unit);
     let found = ptx_entries(&ptx_text);
+    if entry.is_none() && found.is_empty() {
+        kernels.push(KernelResult {
+            entry: name.to_string(),
+            rule: "file".into(),
+            kind: "file",
+            dynamic_shared: 0,
+            threads: 0,
+            ptx_bytes: unit.len(),
+            stats: None,
+            error: Some(format!("missing `.entry` kernel in PTX for `{name}`")),
+        });
+        return Ok(CheckReport {
+            arch: sm,
+            nvrtc,
+            ptxas: ptxas_str,
+            kernels,
+        });
+    }
     let wanted: Vec<String> = match entry {
         Some(e) => vec![e.to_string()],
-        None if !found.is_empty() => found.clone(),
-        None => vec![name.to_string()],
+        None => found.clone(),
     };
     let assembled = ptxas
         .as_deref()
@@ -464,18 +605,45 @@ fn eval_entry(
         );
     }
     let stats = match assembled {
-        None => None,
+        None => {
+            if let Some(limit) = max_spills {
+                return (
+                    None,
+                    Some(format!(
+                        "--max-spills {limit} B requested without ptxas stats for `{entry}`"
+                    )),
+                );
+            }
+            return (None, None);
+        }
         Some(Err(e)) => return (None, Some(e.clone())),
         Some(Ok(map)) => map.get(entry).copied(),
     };
-    if let (Some(limit), Some(s)) = (max_spills, stats) {
-        let spill = s.spill_bytes();
+    if let Some(limit) = max_spills {
+        let Some(s) = stats else {
+            return (
+                None,
+                Some(format!(
+                    "missing ptxas stats for `{entry}` under --max-spills {limit} B"
+                )),
+            );
+        };
+        let Some(spill) = s.spill_bytes() else {
+            return (
+                Some(s),
+                Some(format!(
+                    "ptxas reported partial spill stats for `{entry}` under --max-spills {limit} B"
+                )),
+            );
+        };
         if spill > limit {
             return (
                 Some(s),
                 Some(format!(
                     "spill {spill} B exceeds --max-spills {limit} B (stack={} B, stores={} B, loads={} B)",
-                    s.stack_bytes, s.spill_stores, s.spill_loads
+                    s.stack_bytes.unwrap_or(0),
+                    s.spill_stores.unwrap_or(0),
+                    s.spill_loads.unwrap_or(0)
                 )),
             );
         }
@@ -528,6 +696,11 @@ fn ptx_entries(ptx: &str) -> Vec<String> {
 
 fn resolve_ptxas(cfg: &CheckConfig) -> Result<Option<PathBuf>, Error> {
     if !cfg.run_ptxas {
+        if cfg.max_spills.is_some() {
+            return Err(
+                GpuError::Cuda("--max-spills cannot be combined with --no-ptxas".into()).into(),
+            );
+        }
         return Ok(None);
     }
     if let Some(path) = &cfg.ptxas {
@@ -574,11 +747,37 @@ fn find_ptxas() -> Option<PathBuf> {
     versions.pop()
 }
 
-struct TempFile(PathBuf);
+struct TempDir(PathBuf);
 
-impl Drop for TempFile {
+impl TempDir {
+    /// Creates an exclusive private directory under `base`.
+    fn create(base: &Path) -> Result<Self, String> {
+        let pid = std::process::id();
+        for attempt in 0..64u32 {
+            let mut h = RandomState::new().build_hasher();
+            pid.hash(&mut h);
+            NEXT_TMP.fetch_add(1, Ordering::Relaxed).hash(&mut h);
+            attempt.hash(&mut h);
+            let dir = base.join(format!("tessera-check-{pid}-{:016x}", h.finish()));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("create ptxas temp dir: {e}")),
+            }
+        }
+        Err("create ptxas temp dir: exhausted unique names".into())
+    }
+}
+
+impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -588,21 +787,24 @@ fn run_ptxas(
     ptx: &[u8],
     temp: Option<&Path>,
 ) -> Result<HashMap<String, PtxStats>, String> {
-    let dir = temp.unwrap_or_else(|| Path::new("/tmp"));
-    let pid = std::process::id();
-    let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-    let ptx_path = TempFile(dir.join(format!(".tessera-check-{pid}-{seq}.ptx")));
-    let cubin_path = TempFile(dir.join(format!(".tessera-check-{pid}-{seq}.cubin")));
+    let dir = TempDir::create(temp.unwrap_or_else(|| Path::new("/tmp")))?;
+    let ptx_path = dir.0.join("input.ptx");
+    let cubin_path = dir.0.join("output.cubin");
     // NVRTC includes a trailing NUL byte that ptxas rejects.
     let end = ptx.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    std::fs::write(&ptx_path.0, &ptx[..end]).map_err(|e| format!("write ptx temp: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ptx_path)
+        .and_then(|mut file| file.write_all(&ptx[..end]))
+        .map_err(|e| format!("write ptx temp: {e}"))?;
     let output = Command::new(ptxas)
         .arg("--gpu-name")
         .arg(sm_arch)
         .arg("-v")
         .arg("-o")
-        .arg(&cubin_path.0)
-        .arg(&ptx_path.0)
+        .arg(&cubin_path)
+        .arg(&ptx_path)
         .output()
         .map_err(|e| format!("spawn ptxas: {e}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -620,37 +822,49 @@ fn num_before(segment: &str, marker: &str) -> Option<u32> {
     head.split_whitespace().last()?.parse().ok()
 }
 
+fn merge_max(slot: &mut Option<u32>, value: u32) {
+    *slot = Some(slot.map_or(value, |prev| prev.max(value)));
+}
+
 /// Parses `ptxas -v` stderr lines into per-entry resource stats.
 fn parse_ptxas(stderr: &str) -> HashMap<String, PtxStats> {
     let mut map: HashMap<String, PtxStats> = HashMap::new();
-    let mut current: Option<String> = None;
+    let mut current: Option<(String, PtxStats, bool)> = None;
     let mut in_props = false;
+    let flush = |cur: &mut Option<(String, PtxStats, bool)>,
+                 map: &mut HashMap<String, PtxStats>| {
+        if let Some((name, stats, true)) = cur.take() {
+            map.insert(name, stats);
+        }
+    };
     for line in stderr.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.split("Compiling entry function '").nth(1)
             && let Some(name) = rest.split('\'').next()
         {
-            current = Some(name.to_string());
-            map.entry(name.to_string()).or_default();
+            flush(&mut current, &mut map);
+            current = Some((name.to_string(), PtxStats::default(), false));
             in_props = false;
             continue;
         }
-        let Some(ref entry) = current else {
+        let Some((ref entry, ref mut stats, ref mut seen)) = current else {
             continue;
         };
         if let Some(prop_fn) = trimmed.split("Function properties for ").nth(1) {
             in_props = prop_fn.trim() == entry;
             continue;
         }
-        let stats = map.entry(entry.clone()).or_default();
         if in_props && trimmed.contains("stack frame") {
             for part in trimmed.split(',') {
                 if let Some(n) = num_before(part, "bytes stack frame") {
-                    stats.stack_bytes = stats.stack_bytes.max(n);
+                    merge_max(&mut stats.stack_bytes, n);
+                    *seen = true;
                 } else if let Some(n) = num_before(part, "bytes spill stores") {
-                    stats.spill_stores = stats.spill_stores.max(n);
+                    merge_max(&mut stats.spill_stores, n);
+                    *seen = true;
                 } else if let Some(n) = num_before(part, "bytes spill loads") {
-                    stats.spill_loads = stats.spill_loads.max(n);
+                    merge_max(&mut stats.spill_loads, n);
+                    *seen = true;
                 }
             }
             in_props = false;
@@ -659,16 +873,21 @@ fn parse_ptxas(stderr: &str) -> HashMap<String, PtxStats> {
         if let Some(rest) = trimmed.split("Used ").nth(1) {
             for part in rest.split(',') {
                 if let Some(n) = num_before(part, "registers") {
-                    stats.regs = n;
+                    stats.regs = Some(n);
+                    *seen = true;
                 } else if let Some(n) = num_before(part, "bytes smem") {
                     stats.smem = n;
+                    *seen = true;
                 } else if let Some(n) = num_before(part, "barriers") {
                     stats.barriers = n;
+                    *seen = true;
                 } else if let Some(n) = num_before(part, "bytes cumulative stack size") {
-                    stats.stack_bytes = stats.stack_bytes.max(n);
+                    merge_max(&mut stats.stack_bytes, n);
+                    *seen = true;
                 }
             }
         }
     }
+    flush(&mut current, &mut map);
     map
 }

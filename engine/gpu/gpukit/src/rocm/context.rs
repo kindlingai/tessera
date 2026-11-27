@@ -281,14 +281,16 @@ impl Api for Runtime {
             false => format!("{name}.hip"),
         };
         // Without --offload-arch, hiprtc targets the current device.
-        cache::current().load_or(
-            "rocm",
-            &compiler,
-            &arch,
-            "hsaco",
-            &["-std=c++17"],
+        let key = cache::CacheKey {
+            backend: "rocm",
+            compiler: &compiler,
+            arch: &arch,
+            unit: &unit,
+            base: &["-std=c++17"],
             source,
-            |opts| hip::HIPRTC.compile(&unit, source, opts),
-        )
+        };
+        cache::current().load_or(key, "hsaco", |opts| {
+            hip::HIPRTC.compile(&unit, source, opts)
+        })
     }
 }

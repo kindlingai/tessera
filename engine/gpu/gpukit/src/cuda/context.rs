@@ -379,7 +379,15 @@ pub fn compile_ptx(target: &str, name: &str, source: &str) -> Result<Vec<u8>, Er
         false if name.contains('.') => name.to_string(),
         false => format!("{name}.cu"),
     };
-    cache::current().load_or("cuda", &compiler, &arch, "ptx", &base, source, |opts| {
+    let key = cache::CacheKey {
+        backend: "cuda",
+        compiler: &compiler,
+        arch: &arch,
+        unit: &unit,
+        base: &base,
+        source,
+    };
+    cache::current().load_or(key, "ptx", |opts| {
         driver::NVRTC.compile(&unit, source, opts)
     })
 }

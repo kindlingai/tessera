@@ -807,4 +807,48 @@ fn bad_offers_pinpoint_reason() {
     (dup_a["writes"], dup_b["writes"]) = (json!(0), json!(0));
     let err = dump_offer_error("layer", &layer(), json!([dup_a, dup_b]));
     assert!(err.contains("output 0 written more than once"), "{err}");
+
+    let sharded = shard(&split_layer(), &Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
+    let sum_kernels = json!([
+        {"name": "wasm_gemm", "entry": "gemm", "metal": GEMM_METAL, "cuda": GEMM_CUDA},
+        {"name": "wasm_act", "entry": "act", "metal": ACT_METAL, "cuda": ACT_CUDA},
+        {"name": "wasm_add", "entry": "add", "metal": ADD_METAL, "cuda": ADD_CUDA},
+    ]);
+    let add = json!({
+        "kernel": "wasm_add", "reads": [0, {"draft": 3}], "len": 256,
+        "counts": [{"dim": "Rows", "mul": 64}], "shape": {"line": 256},
+        "work": 256, "guess": 1e-15,
+    });
+    let mut bad_down = gemm(json!([{"draft": 1}, 2]), 64, 16);
+    bad_down["len"] = json!(128);
+    let sum_offers = json!([
+        gemm(json!([0, 1]), 16, 64),
+        act(json!({"draft": 0}), 16),
+        bad_down,
+        {"all_reduce": 2},
+        add,
+    ]);
+    let dir = tessera_testkit::scratch(&format!("wasm-err-sum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dump = dir.join("sites.jsonl");
+    let bytes = module(&declare(ABI, "layer", sum_kernels), &sum_offers, "");
+    let trace = tessera_wasm::Trace {
+        dump: Some(dump.clone()),
+        favor: None,
+    };
+    let loaded = tessera_wasm::Module::open_with(&bytes, trace).unwrap();
+    let device = compiling()
+        .adding(loaded.rules[0])
+        .zoned(Cluster::two("a", "b"))
+        .ranked(vec![0, 1])
+        .as_rank(0);
+    let _ = lower(&sharded, 0, &[(Rows, 4)], &device).unwrap();
+    let text = std::fs::read_to_string(&dump).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let err = first["error"].as_str().unwrap();
+    assert!(err.contains("all_reduce #0 length 128"), "{err}");
 }

@@ -75,72 +75,64 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Compile inputs that determine one cached image.
+#[derive(Clone, Copy)]
+pub(crate) struct CacheKey<'a> {
+    pub backend: &'a str,
+    pub compiler: &'a str,
+    pub arch: &'a str,
+    pub unit: &'a str,
+    pub base: &'a [&'a str],
+    pub source: &'a str,
+}
+
 impl DiskCache {
     pub(crate) fn new(dir: Option<PathBuf>, flags: Vec<String>) -> Self {
         Self { dir, flags }
     }
 
     /// Stable 128-bit hex key for one compile invocation.
-    pub(crate) fn key(
-        &self,
-        backend: &str,
-        compiler: &str,
-        arch: &str,
-        base: &[&str],
-        source: &str,
-    ) -> String {
+    pub(crate) fn key(&self, input: CacheKey<'_>) -> String {
         let mut h = hash_part(OFFSET, VERSION);
-        h = hash_part(h, backend.as_bytes());
-        h = hash_part(h, compiler.as_bytes());
-        h = hash_part(h, arch.as_bytes());
-        let count = (base.len() + self.flags.len()) as u64;
+        h = hash_part(h, input.backend.as_bytes());
+        h = hash_part(h, input.compiler.as_bytes());
+        h = hash_part(h, input.arch.as_bytes());
+        h = hash_part(h, input.unit.as_bytes());
+        let count = (input.base.len() + self.flags.len()) as u64;
         h = hash_bytes(h, &count.to_le_bytes());
-        for flag in base {
+        for flag in input.base {
             h = hash_part(h, flag.as_bytes());
         }
         for flag in &self.flags {
             h = hash_part(h, flag.as_bytes());
         }
-        h = hash_part(h, source.as_bytes());
+        h = hash_part(h, input.source.as_bytes());
         format!("{h:032x}")
     }
 
     /// Cache file path for one compile, if caching is enabled.
-    pub(crate) fn path(
-        &self,
-        backend: &str,
-        compiler: &str,
-        arch: &str,
-        ext: &str,
-        base: &[&str],
-        source: &str,
-    ) -> Option<PathBuf> {
+    pub(crate) fn path(&self, input: CacheKey<'_>, ext: &str) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
-        let key = self.key(backend, compiler, arch, base, source);
+        let key = self.key(input);
         Some(dir.join(format!("{key}.{ext}")))
     }
 
     /// Loads a cached image, or builds and stores one atomically.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_or<E>(
         &self,
-        backend: &str,
-        compiler: &str,
-        arch: &str,
+        input: CacheKey<'_>,
         ext: &str,
-        base: &[&str],
-        source: &str,
         build: impl FnOnce(&[&str]) -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
-        let path = self.path(backend, compiler, arch, ext, base, source);
+        let path = self.path(input, ext);
         if let Some(ref at) = path
             && let Ok(bytes) = std::fs::read(at)
             && !bytes.is_empty()
         {
             return Ok(bytes);
         }
-        let mut opts: Vec<&str> = Vec::with_capacity(base.len() + self.flags.len());
-        opts.extend_from_slice(base);
+        let mut opts: Vec<&str> = Vec::with_capacity(input.base.len() + self.flags.len());
+        opts.extend_from_slice(input.base);
         for flag in &self.flags {
             opts.push(flag.as_str());
         }

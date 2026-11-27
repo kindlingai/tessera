@@ -216,11 +216,11 @@ pub(crate) fn drafts(
                         "all_reduce #{sums} length {len} does not match site length {want}"
                     ));
                 }
-                sums += 1;
                 let read = [Read::Draft(sum.all_reduce)];
                 let Some(wire) = tree.wire(at) else {
                     return Err(format!("all_reduce #{sums} has no sum wire dtype at site"));
                 };
+                sums += 1;
                 (Draft::new(AllReduce { len, wire }, read, len), sum.writes)
             }
         };

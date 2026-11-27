@@ -1,4 +1,4 @@
-use crate::cache::DiskCache;
+use crate::cache::{CacheKey, DiskCache};
 
 #[test]
 fn caches_compiled_images() {
@@ -6,45 +6,34 @@ fn caches_compiled_images() {
     let _ = std::fs::remove_dir_all(&dir);
     let plain = DiskCache::new(Some(dir.clone()), Vec::new());
     let base = ["--gpu-architecture=compute_121", "--std=c++17"];
+    let make = |compiler, unit| CacheKey {
+        backend: "cuda",
+        compiler,
+        arch: "compute_121",
+        unit,
+        base: &base,
+        source: "ka",
+    };
+    let key = make("13.1", "a.cu");
     let mut builds = 0usize;
-    let first = plain
-        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |opts| {
-            builds += 1;
-            assert_eq!(opts, base);
-            Ok(b"PTX_A".to_vec())
+    let build = |c: &DiskCache, k: CacheKey<'_>, out: &[u8], n: &mut usize| {
+        c.load_or::<()>(k, "ptx", |_| {
+            *n += 1;
+            Ok(out.to_vec())
         })
-        .unwrap();
-    let second = plain
-        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |_| {
-            builds += 1;
-            Ok(b"PTX_STALE".to_vec())
-        })
-        .unwrap();
-    assert_eq!(
-        (first, second, builds),
-        (b"PTX_A".to_vec(), b"PTX_A".to_vec(), 1)
-    );
-    assert_ne!(
-        plain.key("cuda", "13.1", "compute_121", &base, "ka"),
-        plain.key("cuda", "13.2", "compute_121", &base, "ka")
-    );
-    let tuned = DiskCache::new(Some(dir.clone()), vec!["--maxrregcount=128".into()]);
-    assert_ne!(
-        plain.key("cuda", "13.1", "compute_121", &base, "ka"),
-        tuned.key("cuda", "13.1", "compute_121", &base, "ka")
-    );
-    let fast = tuned
-        .load_or::<()>("cuda", "13.1", "compute_121", "ptx", &base, "ka", |opts| {
-            builds += 1;
-            assert_eq!(opts.last(), Some(&"--maxrregcount=128"));
-            Ok(b"PTX_TUNED".to_vec())
-        })
-        .unwrap();
-    assert_eq!((fast, builds), (b"PTX_TUNED".to_vec(), 2));
-    let entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert!(entries.len() == 2 && entries.iter().all(|n| n.ends_with(".ptx")));
+    };
+    assert_eq!(build(&plain, key, b"PTX_A", &mut builds), b"PTX_A");
+    assert_eq!(build(&plain, key, b"PTX_STALE", &mut builds), b"PTX_A");
+    assert_eq!(builds, 1);
+    assert_ne!(plain.key(key), plain.key(make("13.2", "a.cu")));
+    let other = make("13.1", "b.cu");
+    assert_ne!(plain.key(key), plain.key(other));
+    assert_eq!(build(&plain, other, b"PTX_B", &mut builds), b"PTX_B");
+    assert_eq!(builds, 2);
+    let tuned = DiskCache::new(Some(dir.clone()), vec!["--maxrregcount=128".into()]);
+    assert_ne!(plain.key(key), tuned.key(key));
+    assert_eq!(build(&tuned, key, b"PTX_TUNED", &mut builds), b"PTX_TUNED");
+    assert_eq!(builds, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }

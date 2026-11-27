@@ -13,6 +13,9 @@ fn normalizes_cuda_targets() {
     assert!(compute_arch("").is_err());
     assert!(compute_arch("sm_bad").is_err());
     assert!(compute_arch("0.1").is_err());
+    assert!(compute_arch("sm_12é").is_err());
+    assert!(compute_arch("12é").is_err());
+    assert!(compute_arch("sm_🚀").is_err());
 }
 
 #[test]

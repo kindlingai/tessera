@@ -71,6 +71,11 @@ fn rocm_ready() -> bool {
 /// Parses a CUDA target into `(major, minor, suffix)`.
 pub fn cuda_arch(target: &str) -> Result<(u32, u32, &'static str), crate::Error> {
     let raw = target.trim();
+    if raw.is_empty() || !raw.is_ascii() {
+        return Err(crate::Error::Cuda(format!(
+            "invalid CUDA target {target:?}"
+        )));
+    }
     let stripped = raw
         .strip_prefix("compute_")
         .or_else(|| raw.strip_prefix("sm_"))
@@ -80,6 +85,11 @@ pub fn cuda_arch(target: &str) -> Result<(u32, u32, &'static str), crate::Error>
         Some(b'f') => (&stripped[..stripped.len() - 1], "f"),
         _ => (stripped, ""),
     };
+    if !body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return Err(crate::Error::Cuda(format!(
+            "invalid CUDA target {target:?}"
+        )));
+    }
     let (major, minor) = match body.split_once('.') {
         Some((hi, lo)) => (hi.parse::<u32>(), lo.parse::<u32>()),
         None if body.len() >= 2 => {
