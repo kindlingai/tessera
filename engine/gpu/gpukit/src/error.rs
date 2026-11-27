@@ -5,6 +5,7 @@ pub enum Error {
     #[error("gpu error: {0}")]
     Gpu(&'static str),
     /// Shader or pipeline compilation failure, with the compiler message.
+    #[cfg(target_os = "macos")]
     #[error("shader compile failed: {0}")]
     Compile(String),
     /// CUDA driver, module, or launch failure, with the driver message.
@@ -15,6 +16,7 @@ pub enum Error {
     #[error("rocm: {0}")]
     Rocm(String),
     /// A Metal device, buffer or dispatch failure.
+    #[cfg(target_os = "macos")]
     #[error("metal: {0}")]
     Metal(String),
 }

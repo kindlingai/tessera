@@ -225,8 +225,11 @@ jobs:
       - if: matrix.features == ''
         run: cargo package --manifest-path target/publish/Cargo.toml --workspace --allow-dirty --no-verify
       # One binary holds every crate, so unused `pub` items fail.
-      - run: cargo run -q -p tessera-publish -- --lint
-      - run: cargo check --manifest-path target/publish-lint/Cargo.toml --workspace --tests --features "${{ matrix.features }}"
+      # Linux without a backend has no GPU, so skip it there.
+      - if: matrix.features != ''
+        run: cargo run -q -p tessera-publish -- --lint
+      - if: matrix.features != ''
+        run: cargo check --manifest-path target/publish-lint/Cargo.toml --workspace --tests --features "${{ matrix.features }}"
 
   grammar:
     # The llguidance guide, behind its off-by-default feature.
