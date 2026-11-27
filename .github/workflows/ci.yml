@@ -428,8 +428,8 @@ jobs:
         run: tools/scripts/pr-comment.sh "$RUNNER_TEMP/checks.md"
 
   platforms:
-    # The platform table against nvcc, cuobjdump and clang's amdgcn
-    # backend, without a GPU.
+    # The platform table and every planned kernel against nvcc,
+    # cuobjdump and clang's amdgcn backend, without a GPU.
     needs: changes
     if: needs.changes.outputs.build == 'true'
     # CUDA 13.0 packages target 24.04. Newer glibc breaks nvcc.
@@ -453,6 +453,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
+      - run: cargo nextest run -p tessera-models --test kernels_test --profile ci --no-capture
 
   docker:
     # Each image runs without a GPU and finds the libraries tesserax

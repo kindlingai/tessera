@@ -1,6 +1,7 @@
 name: macOS
 
-# The Metal backend. Pull requests run clippy and the platform table.
+# The Metal backend. Pull requests run clippy, the platform table and
+# a compile of every planned kernel.
 # Pushes to main and the daily run add the workspace tests. The daily
 # run also keeps main's build cache current for pull requests.
 on:
@@ -37,3 +38,4 @@ jobs:
       - if: ${{ !inputs.light }}
         run: cargo nextest run --workspace --profile ci
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
+      - run: cargo nextest run -p tessera-models --test kernels_test --profile ci --no-capture
