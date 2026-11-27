@@ -218,21 +218,22 @@ impl Buffers<'_> {
         self.slots[v.0 as usize].expect("written before it is read")
     }
 
-    /// Packs weights into one contiguous arena per zone.
+    /// Packs whole and sharded weights into separate arenas per zone.
     fn pack_weights(&mut self) {
-        let mut items: Vec<(u32, u32, Option<u8>, usize)> = Vec::new();
+        let mut items: Vec<(u32, bool, u32, Option<u8>, usize)> = Vec::new();
         for (v, value) in self.s.values.iter().enumerate() {
+            let shared = value.share.is_some();
             match value.home {
-                Home::Weight(w) => items.push((value.zone, w, None, v)),
-                Home::Part(w, p) => items.push((value.zone, w, Some(p), v)),
+                Home::Weight(w) => items.push((value.zone, shared, w, None, v)),
+                Home::Part(w, p) => items.push((value.zone, shared, w, Some(p), v)),
                 Home::Kept { .. } | Home::Input(_) | Home::Temp => {}
             }
         }
         items.sort_unstable();
-        let mut arenas: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+        let mut arenas: BTreeMap<(u32, bool), (u32, usize)> = BTreeMap::new();
         type Key = (u32, u32, Option<u8>, &'static str, usize, Option<Share>);
         let mut seen: Vec<(Key, Slot)> = Vec::new();
-        for (zone, weight, part, v) in items {
+        for (zone, shared, weight, part, v) in items {
             let value = self.s.values[v];
             let key: Key = (
                 zone,
@@ -246,11 +247,11 @@ impl Buffers<'_> {
                 self.slots[v] = Some(*existing);
                 continue;
             }
-            let (buffer, cursor) = match arenas.get_mut(&zone) {
+            let (buffer, cursor) = match arenas.get_mut(&(zone, shared)) {
                 Some(entry) => entry,
                 None => {
                     let buf = self.buffer(0, zone);
-                    arenas.entry(zone).or_insert((buf, 0))
+                    arenas.entry((zone, shared)).or_insert((buf, 0))
                 }
             };
             let offset = *cursor;

@@ -547,7 +547,7 @@ pub(crate) fn retype_node(out: &mut Graph, i: usize) -> Result<(), crate::infer:
         out.kept[k as usize].placement = match rows {
             Placement::Split { axis } => Placement::Split { axis: axis + 1 },
             // Kept rows never follow a share of the rows.
-            Placement::Owned => out.kept[k as usize].placement,
+            Placement::Owned { .. } => out.kept[k as usize].placement,
             p => p,
         };
     } else if let Op::Delta(d) = out.nodes[i].op

@@ -1,6 +1,6 @@
 //! Lowers an engine's graph under another recipe, without its runner.
 
-use crate::ranks::{Variant, pick_graph};
+use crate::ranks::{Variant, Variants, pick_graph};
 use crate::{Engine, Error, Row, launch_of};
 use serde::Deserialize;
 use tessera_graph::DimName::{Context, Segments};
@@ -70,7 +70,7 @@ pub(crate) fn sample_at(
 
 /// The engine fields that lowering reads.
 pub(crate) struct Lowering<'a> {
-    pub graphs: (&'a Graph, &'a Variant, &'a Variant),
+    pub graphs: Variants<'a>,
     pub full: usize,
     pub taps: bool,
     pub slots: usize,
@@ -119,6 +119,7 @@ pub struct Probe {
     graph: Graph,
     owned: Variant,
     split: Variant,
+    split_owned: Variant,
     full: usize,
     taps: bool,
     slots: usize,
@@ -131,7 +132,7 @@ impl Probe {
     pub fn explain(&self, recipe: &Recipe, launch: Launch) -> Result<Lowered, Error> {
         let device = self.device.clone().with(recipe);
         let view = Lowering {
-            graphs: (&self.graph, &self.owned, &self.split),
+            graphs: (&self.graph, &self.owned, &self.split, &self.split_owned),
             full: self.full,
             taps: self.taps,
             slots: self.slots,
@@ -149,6 +150,7 @@ impl Engine {
             graph: self.graph.clone(),
             owned: self.owned.clone(),
             split: self.split.clone(),
+            split_owned: self.split_owned.clone(),
             full: self.full,
             taps: self.taps.is_some(),
             slots: self.slots,

@@ -28,7 +28,7 @@ pub use node::{
     Output, Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order, sums_ranks};
-pub use own::own_rows;
+pub use own::{own_rows, own_rows_attn};
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};

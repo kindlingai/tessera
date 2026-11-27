@@ -316,7 +316,10 @@ fn own_args<'a>(
     r: usize,
 ) -> Vec<Cow<'a, Tensor>> {
     let ty = |a: &NodeId| &g.node(*a).ty;
-    let owned = n.args.iter().find(|a| ty(a).placement == Placement::Owned);
+    let owned = n
+        .args
+        .iter()
+        .find(|a| ty(a).placement == Placement::Owned { axis: 0 });
     let lead = owned.map(|a| (&ty(a).shape.0[0], n.args.iter().position(|b| b == a)));
     let mut out = Vec::with_capacity(args.len());
     for (at, (a, t)) in n.args.iter().zip(args).enumerate() {
@@ -426,9 +429,9 @@ fn run_on(
                 want[axis as usize] = part(parts, axis, whole[axis as usize], r)?.1;
             }
         }
-        if n.ty.placement == Placement::Owned {
+        if let Placement::Owned { axis } = n.ty.placement {
             for (r, want) in wants.iter_mut().enumerate() {
-                want[0] = parts.rows(whole[0], r).1;
+                want[axis as usize] = parts.rows(whole[axis as usize], r).1;
             }
         }
         let mut outs: Vec<Tensor> = Vec::with_capacity(ranks);

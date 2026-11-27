@@ -213,6 +213,87 @@ fn split_batch_matches_one() {
 }
 
 #[test]
+fn own_attn_glm53() {
+    use tessera_graph::{
+        Composite, DimExpr, DimName, Op, Parts, Row, Stage, own_rows_attn, shard, split_batch, trim,
+    };
+    let base = trim(
+        &mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+        0,
+    )
+    .unwrap();
+    let sharded = shard(&base, &Parts::even(2)).unwrap().graph;
+    for g in [
+        own_rows_attn(&sharded).unwrap(),
+        own_rows_attn(&split_batch(&sharded, 0).unwrap()).unwrap(),
+    ] {
+        let is = |n: &tessera_graph::Node, s: Stage| n.op == Op::Row(Row(vec![s]));
+        let row_ar = g
+            .nodes
+            .iter()
+            .filter(|n| is(n, Stage::AllReduce) && n.ty.shape.0[0] != DimExpr::Dim(DimName::Picks))
+            .count();
+        assert_eq!(row_ar, 0, "unexpected row all_reduce");
+        assert!(g.nodes.iter().any(|n| is(n, Stage::ReduceScatter)));
+        assert!(g.nodes.iter().any(|n| is(n, Stage::GatherRows)));
+        for r in g.regions.iter().filter(|r| r.kind == Composite::Attention) {
+            let span = &g.nodes[r.start.0 as usize..r.end.0 as usize];
+            assert!(!span.iter().any(|n| is(n, Stage::ReduceScatter)));
+            assert!(!span.iter().any(|n| is(n, Stage::AllReduce)));
+        }
+    }
+}
+
+#[test]
+fn split_owned_matches_one() {
+    for (graph, moe_tp) in [
+        (
+            (|| stepper::<Norm, Swiglu>(&Config::qwen3_small())) as fn() -> Graph,
+            false,
+        ),
+        (
+            || mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+            false,
+        ),
+        (wide_glm53, true),
+    ] {
+        let [[s0, s1], [c0, c1]] = loopback_links();
+        let tune = |e: &mut Engine| {
+            e.set_split_rows(4);
+            e.set_own_rows(2);
+        };
+        let follower = std::thread::spawn(move || {
+            let mut e = opened(graph, Some([s1, c1]), &Recipe::default(), 16, moe_tp);
+            tune(&mut e);
+            e.follow().unwrap();
+        });
+        let mut lead = opened(graph, Some([s0, c0]), &Recipe::default(), 16, moe_tp);
+        tune(&mut lead);
+        let mut alone = opened(graph, None, &Recipe::default(), 16, false);
+        let rows = [row(0, 5, 0), row(0, 7, 1), row(0, 9, 2), row(0, 2, 3)];
+        assert_eq!(lead.step(&rows).unwrap(), alone.step(&rows).unwrap());
+        let kernels = lead.kernels();
+        assert!(
+            kernels.contains_key("reduce_scatter"),
+            "missing RS: {kernels:?}"
+        );
+        assert!(
+            kernels.contains_key("gather_rows"),
+            "missing GR: {kernels:?}"
+        );
+        assert!(
+            kernels.get("slice_u32").copied().unwrap_or(0) >= 2,
+            "expected split_owned plan: {kernels:?}"
+        );
+        let decode = [row(0, 1, 4)];
+        assert_eq!(lead.step(&decode).unwrap(), alone.step(&decode).unwrap());
+        assert!(lead.kernels().contains_key("all_reduce"));
+        lead.dismiss().unwrap();
+        follower.join().unwrap();
+    }
+}
+
+#[test]
 fn own_rows_matches_one() {
     agree_mode(
         || stepper::<Norm, Swiglu>(&Config::qwen3_small()),

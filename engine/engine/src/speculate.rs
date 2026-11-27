@@ -286,6 +286,9 @@ macro_rules! draft_methods {
         impl $ty {
             /// This rank's `(axis, first, count)` slice of `at`, if split.
             pub fn share(&self, at: u32) -> Option<(u32, usize, usize)> {
+                if self.core.runner.base().has_extra_weight(at) {
+                    return None;
+                }
                 self.core.runner.plan().share(at)
             }
 

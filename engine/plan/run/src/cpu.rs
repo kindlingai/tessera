@@ -175,6 +175,16 @@ impl Run for Runner {
         Ok(())
     }
 
+    fn stage_weights(&mut self, plan: &Plan) -> Result<(), Error> {
+        self.base.held.stage_weights(plan, |zone, bytes, _| {
+            Ok(Buffer::new(zone, Host::new(bytes)))
+        })?;
+        self.base.record_extra_weights(plan);
+        let mut base = self.base.plan.clone();
+        base.id = Plan::fresh();
+        self.replan(&base)
+    }
+
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
             let start = Instant::now();

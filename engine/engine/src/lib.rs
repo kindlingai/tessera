@@ -134,6 +134,7 @@ pub struct Engine {
     graph: Graph,
     pub(crate) owned: Option<(Graph, usize)>,
     pub(crate) split: Option<(Graph, usize)>,
+    pub(crate) split_owned: Option<(Graph, usize)>,
     runner: Box<dyn Run>,
     device: Device,
     plans: Cache,
@@ -215,6 +216,59 @@ fn pad_candidates(lists: &[Vec<u32>]) -> (Vec<u32>, usize) {
         flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
     }
     (flat, k)
+}
+
+/// Builds owned graph and stages whole attention weights.
+fn stage_owned(
+    base: &Graph,
+    full: usize,
+    (slots, context, min): (usize, usize, usize),
+    device: &Device,
+    runner: &mut dyn Run,
+) -> Result<(ranks::Variant, bool), Error> {
+    let Some((g, min)) = ranks::build_owned(base, min, true) else {
+        return Ok((None, false));
+    };
+    let extra: Vec<u32> = g
+        .weights
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| w.ty.placement != base.weights[*i].ty.placement)
+        .map(|(i, _)| i as u32)
+        .collect();
+    if extra.is_empty() {
+        return Ok((Some((g, min)), false));
+    }
+    let ranks = device.division().ranks();
+    let probe = vec![
+        Row {
+            slot: 0,
+            token: 0,
+            position: 0,
+        };
+        ranks
+    ];
+    let (sizes, _) = launch_of(&probe, &[0], slots, context);
+    let mut tmp = Cache::default();
+    let Ok(plan) = tmp.lower(&g, full, &sizes, device) else {
+        return Ok((ranks::build_owned(base, min, false), false));
+    };
+    let extra_bytes: u64 = plan
+        .weights
+        .iter()
+        .filter(|l| extra.contains(&l.weight))
+        .map(|l| l.slot.bytes() as u64)
+        .sum();
+    let base_bytes: u64 = runner.plan().buffers.iter().map(|&b| b as u64).sum();
+    let fits = runner
+        .base()
+        .budget()
+        .is_none_or(|b| base_bytes.saturating_add(extra_bytes) <= b);
+    if !fits {
+        return Ok((ranks::build_owned(base, min, false), false));
+    }
+    runner.stage_weights(&plan)?;
+    Ok((Some((g, min)), true))
 }
 
 /// Sizes and padded counts for `rows` returning `picks`.
@@ -331,12 +385,27 @@ impl Engine {
         let vocab = width(&graph, full, Role::Logits);
         let ring_chunk = schedule::ring_chunk(&graph);
         let stateful = graph.nodes.iter().any(|n| n.op.recurrent()) || ring_chunk > 0;
-        let owned = place.and_then(|_| ranks::build_owned(&graph, settings.own_rows));
+        let (owned, used_attn) = match place {
+            Some(_) if settings.own_rows > 0 => stage_owned(
+                &graph,
+                full,
+                (slots, context, settings.own_rows),
+                &device,
+                runner.as_mut(),
+            )?,
+            Some(_) => (ranks::build_owned(&graph, settings.own_rows, false), false),
+            None => (None, false),
+        };
         let split = place.and_then(|_| ranks::build_split(&graph, full, settings.split_rows));
+        let split_owned = split
+            .as_ref()
+            .zip(owned.as_ref())
+            .and_then(|((sg, smin), _)| ranks::build_owned(sg, *smin, used_attn));
         Ok(Self {
             graph,
             owned,
             split,
+            split_owned,
             runner,
             device,
             plans,
@@ -390,6 +459,9 @@ impl Engine {
 
     /// This rank's `(axis, first, count)` slice of `at`, if split.
     pub fn share(&self, at: u32) -> Option<(u32, usize, usize)> {
+        if self.runner.base().has_extra_weight(at) {
+            return None;
+        }
         self.runner.plan().share(at)
     }
 
@@ -528,7 +600,7 @@ impl Engine {
         let (mut sizes, [filled, _]) = launch_of(rows, picks, self.slots, self.context);
         let upto = &[Context, Segments];
         let graph = ranks::pick_graph(
-            (&self.graph, &self.owned, &self.split),
+            (&self.graph, &self.owned, &self.split, &self.split_owned),
             &self.device,
             true,
             filled,
@@ -778,7 +850,7 @@ impl Engine {
         }
         let allow = entry == self.full && !peek;
         let graph = ranks::pick_graph(
-            (&self.graph, &self.owned, &self.split),
+            (&self.graph, &self.owned, &self.split, &self.split_owned),
             &self.device,
             allow,
             filled,

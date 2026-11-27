@@ -250,7 +250,7 @@ impl Engine {
 
     fn explained(&mut self, launch: Launch) -> Result<Report, Error> {
         let view = crate::probe::Lowering {
-            graphs: (&self.graph, &self.owned, &self.split),
+            graphs: (&self.graph, &self.owned, &self.split, &self.split_owned),
             full: self.full,
             taps: self.taps.is_some(),
             slots: self.slots,
@@ -285,7 +285,7 @@ impl Engine {
         let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
         let upto = &[Context, Segments];
         let graph = crate::ranks::pick_graph(
-            (&self.graph, &self.owned, &self.split),
+            (&self.graph, &self.owned, &self.split, &self.split_owned),
             &self.device,
             true,
             filled,

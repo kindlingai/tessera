@@ -11,6 +11,22 @@ use tessera_mem::{Buffer, View, ViewMut};
 /// Bytes a buffer holds at least, as zero-byte allocations fail.
 const LEAST: usize = 4;
 
+/// Allocates and zeroes a device buffer for `holds`.
+pub(crate) fn alloc_buf<D: Device>(
+    ctx: &D,
+    unified: bool,
+    bytes: usize,
+    holds: Holds,
+) -> Result<DeviceBuffer<D>, Error> {
+    let buffer = match holds {
+        Holds::Weights if unified => DeviceBuffer::pinned(ctx, bytes)?,
+        Holds::Kept => DeviceBuffer::kept(ctx, bytes)?,
+        _ => DeviceBuffer::alloc(ctx, bytes)?,
+    };
+    buffer.zero()?;
+    Ok(buffer)
+}
+
 type WeightKey = (u32, Option<u8>);
 
 /// One weight or kept entry's span inside a held buffer.
@@ -342,6 +358,93 @@ impl Held {
         Cow::Owned(out)
     }
 
+    /// Uploads `bytes` to every matching held place of `(weight, part)`.
+    pub fn upload_held(
+        &mut self,
+        weight: u32,
+        part: Option<u8>,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let Some(places) = self.weights.get(&(weight, part)) else {
+            return Ok(());
+        };
+        let targets: Vec<Place> = places
+            .iter()
+            .copied()
+            .filter(|p| p.bytes == bytes.len())
+            .collect();
+        for p in targets {
+            self.all[p.buffer].backing_mut().upload(p.offset, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Stages missing weight arenas from `plan` without rebinding.
+    pub(crate) fn stage_weights(
+        &mut self,
+        plan: &Plan,
+        mut alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
+    ) -> Result<(), Error> {
+        let count = plan.buffers.len();
+        let mut weights: Vec<Vec<(WeightKey, usize, usize)>> = vec![Vec::new(); count];
+        for l in &plan.weights {
+            let entry = ((l.weight, l.part), l.slot.start(), l.slot.bytes());
+            weights[l.slot.buffer as usize].push(entry);
+        }
+        for (b, entries) in weights.iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let zone = plan.zone(b as u32);
+            let covered = self.weights.get(&entries[0].0).is_some_and(|places| {
+                places.iter().any(|p| {
+                    self.all[p.buffer].zone == zone
+                        && entries.iter().all(|&(key, _, bytes)| {
+                            self.weights.get(&key).is_some_and(|list| {
+                                list.iter()
+                                    .any(|q| q.buffer == p.buffer && q.bytes == bytes)
+                            })
+                        })
+                })
+            });
+            if covered {
+                continue;
+            }
+            let fresh = self.bind_weights(zone, plan.buffers[b], entries, &mut alloc)?;
+            // Drop smaller weight arenas wholly covered by `fresh`.
+            let mut old_bufs = Vec::new();
+            for &(key, _, bytes) in entries {
+                if let Some(list) = self.weights.get(&key) {
+                    for p in list {
+                        if p.buffer != fresh
+                            && p.bytes == bytes
+                            && self.all[p.buffer].zone == zone
+                            && !old_bufs.contains(&p.buffer)
+                        {
+                            old_bufs.push(p.buffer);
+                        }
+                    }
+                }
+            }
+            for ob in old_bufs {
+                let subset = self.weights.iter().all(|(key, list)| {
+                    !list.iter().any(|p| p.buffer == ob)
+                        || list.iter().filter(|p| p.buffer == ob).all(|p| {
+                            self.weights.get(key).is_some_and(|l| {
+                                l.iter().any(|q| q.buffer == fresh && q.bytes == p.bytes)
+                            })
+                        })
+                });
+                if subset {
+                    for list in self.weights.values_mut() {
+                        list.retain(|p| p.buffer != ob);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Binds `plan`'s buffers. Returns true if any buffer dropped.
     pub fn bind(
         &mut self,
@@ -529,7 +632,6 @@ impl Held {
         self.all.push(buf);
         for &(key, offset, bytes) in entries {
             let list = self.weights.entry(key).or_default();
-            list.retain(|p| p.bytes == bytes);
             let place = Place {
                 buffer: at,
                 offset,

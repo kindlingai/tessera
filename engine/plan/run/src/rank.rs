@@ -599,6 +599,13 @@ impl<T: Transport> Run for Rank<T> {
         }
     }
 
+    fn stage_weights(&mut self, plan: &Plan) -> Result<(), Error> {
+        if let Some(grid) = &mut self.grid {
+            let _ = grid.pause();
+        }
+        self.runner.run_mut().stage_weights(plan)
+    }
+
     fn upload_weight(
         &mut self,
         weight: u32,

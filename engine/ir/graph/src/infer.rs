@@ -55,7 +55,7 @@ pub(crate) fn elements(dims: &[Dim], s: &Shape) -> Result<Poly, TypeError> {
     s.elements(dims).map_err(undeclared)
 }
 
-fn same(dims: &[Dim], a: &DimExpr, b: &DimExpr) -> Result<bool, TypeError> {
+pub(crate) fn same(dims: &[Dim], a: &DimExpr, b: &DimExpr) -> Result<bool, TypeError> {
     Ok(poly(dims, a)? == poly(dims, b)?)
 }
 
@@ -78,21 +78,6 @@ pub(crate) fn front(s: &Shape, n: usize) -> Shape {
 
 fn finite(x: f32, what: &str) -> Result<(), TypeError> {
     need(x.is_finite(), ErrorKind::Value, || format!("{what} is {x}"))
-}
-
-/// The output axis with the same elements before it.
-fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Option<u32>, TypeError> {
-    let before = elements(dims, &Shape(from.0[..axis as usize].to_vec()))?;
-    let one = Poly::constant(1);
-    let mut prefix = one.clone();
-    for (b, e) in to.0.iter().enumerate() {
-        let size = poly(dims, e)?;
-        if prefix == before && size != one {
-            return Ok(Some(b as u32));
-        }
-        prefix = prefix.product(&size);
-    }
-    Ok(None)
 }
 
 /// The type `op` gives `args`, or why they don't fit.
@@ -154,8 +139,8 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             append(&g.dims, kept, args)
         }
         Op::Select(s) => select::select(&g.dims, s, args),
-        Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
-        Op::View(v) => view(&g.dims, v, args[0]),
+        Op::View(View::Concat) => select::concat(&g.dims, args[0], args[1]),
+        Op::View(v) => select::view(&g.dims, v, args[0]),
         Op::Mean(axis) => mean(*axis, args[0]),
         Op::Mix(axis) => mix(&g.dims, *axis, args[0], args[1]),
         Op::Cast(dtype) => {
@@ -221,10 +206,18 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         (Split { axis }, Replicated) if (n..last).contains(&axis) => Split { axis },
         (Partial, Replicated) => Partial,
         // A whole weight serves any share of the rows.
-        (Owned, Replicated) if lead == 0 && x.rank() >= 2 => Owned,
+        (Owned { axis }, Replicated) if axis < last && ((axis as usize) >= own || axis == 0) => {
+            let out_axis = if (axis as usize) < own {
+                axis
+            } else {
+                (lead + axis as usize - own) as u32
+            };
+            Owned { axis: out_axis }
+        }
         (Split { axis }, Split { axis: k }) if axis == last && k == n + 1 => Partial,
-        // Both split along one shared batch axis: each part alone.
+        // Both split or owned along one shared batch axis.
         (Split { axis }, Split { axis: k }) if axis == k && (axis as usize) < own => Split { axis },
+        (Owned { axis }, Owned { axis: k }) if axis == k && (axis as usize) < own => Owned { axis },
         (xp, wp) => {
             return Err(TypeError {
                 kind: ErrorKind::Placement,
@@ -243,7 +236,12 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
 }
 
 /// Keys match values, heads group, split by query head.
-fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Result<(), TypeError> {
+fn heads_fit(
+    dims: &[Dim],
+    [q, k, v]: [&TensorType; 3],
+    q_heads: usize,
+    ragged: bool,
+) -> Result<(), TypeError> {
     // Values may be narrower than keys, as in MLA.
     need(
         same_shape(dims, &front(&k.shape, 3), &front(&v.shape, 3))?,
@@ -266,8 +264,15 @@ fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Resul
     let split = [q_heads as u32, 2, 2].map(|axis| Placement::Split { axis });
     // One key head serves query heads split any way.
     let shared = kv_heads == Some(1) && p[1..] == [Placement::Replicated; 2] && p[0] == split[0];
+    // Replicated caches serve owned query rows directly.
+    let owned = ragged
+        && p == [
+            Placement::Owned { axis: 0 },
+            Placement::Replicated,
+            Placement::Replicated,
+        ];
     need(
-        p == [Placement::Replicated; 3] || p == split || shared,
+        p == [Placement::Replicated; 3] || p == split || shared || owned,
         ErrorKind::Placement,
         || format!("attention needs whole or head-split tensors, got {p:?}"),
     )
@@ -313,7 +318,7 @@ fn attend(dims: &[Dim], op: &Attend, a: &[&TensorType]) -> Result<TensorType, Ty
         }
         2
     };
-    heads_fit(dims, [q, k, v], q_heads)?;
+    heads_fit(dims, [q, k, v], q_heads, op.ragged)?;
     if let Some(i) = op.ids_arg() {
         key_lists(dims, a[i], q, q_heads)?;
     }
@@ -423,7 +428,7 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             q.shape, k.shape, v.shape
         )
     })?;
-    heads_fit(dims, [v, q, k], 2)?;
+    heads_fit(dims, [v, q, k], 2, false)?;
     delta_gates(dims, v, &a[3..5], 3)?;
     Ok(v.clone())
 }
@@ -499,11 +504,21 @@ fn key_lists(dims: &[Dim], ids: &TensorType, q: &TensorType, lead: usize) -> Res
     need(ids.dtype.is_int(), ErrorKind::DType, || {
         format!("key lists must be integers, got {:?}", ids.dtype)
     })?;
-    need(
-        ids.placement == Placement::Replicated,
-        ErrorKind::Placement,
-        || "key lists must be replicated".into(),
-    )
+    let placed = match q.placement {
+        Placement::Owned { axis: 0 } => {
+            matches!(
+                ids.placement,
+                Placement::Replicated | Placement::Owned { axis: 0 }
+            )
+        }
+        _ => ids.placement == Placement::Replicated,
+    };
+    need(placed, ErrorKind::Placement, || {
+        format!(
+            "key lists {:?} do not match queries {:?}",
+            ids.placement, q.placement
+        )
+    })
 }
 
 /// Queries' type with the values' width.
@@ -530,7 +545,12 @@ fn positions(
         format!("positions must be integers, got {:?}", pos.dtype)
     })?;
     let last = x.rank() as u32 - 1;
-    let placed = pos.placement == Placement::Replicated && p != Placement::Split { axis: last };
+    let placed = pos.placement == Placement::Replicated
+        && match p {
+            Placement::Split { axis } => axis != last,
+            Placement::Owned { axis } => axis == 0 && axis != last,
+            _ => true,
+        };
     need(placed, ErrorKind::Placement, || {
         format!("{p:?} rows cannot follow {:?} positions", pos.placement)
     })
@@ -694,10 +714,12 @@ fn place(
             ErrorKind::Placement,
             || format!("{s:?} needs partial sums over rows, got {p:?}"),
         )
-        .map(|()| Placement::Owned),
-        Place::Join => need(p == Placement::Owned, ErrorKind::Placement, || {
-            format!("{s:?} needs owned rows, got {p:?}")
-        })
+        .map(|()| Placement::Owned { axis: 0 }),
+        Place::Join => need(
+            p == Placement::Owned { axis: 0 },
+            ErrorKind::Placement,
+            || format!("{s:?} needs owned rows, got {p:?}"),
+        )
         .map(|()| Placement::Replicated),
     }
 }
@@ -729,11 +751,15 @@ fn combine(
         (Routed, Routed) => Ok(Routed),
         (Routed, Replicated) | (Replicated, Routed) if !sum => Ok(Routed),
         // A rank takes its own rows of a whole operand.
-        (Owned, Replicated) => Ok(Owned),
-        (Owned, Owned) | (Replicated, Owned) if lead == 0 => Ok(Owned),
-        (_, Owned) => Err(TypeError {
+        (Owned { axis: 0 }, Replicated) => Ok(Owned { axis: 0 }),
+        (Owned { axis: 0 }, Owned { axis: 0 }) | (Replicated, Owned { axis: 0 }) if lead == 0 => {
+            Ok(Owned { axis: 0 })
+        }
+        (Owned { axis }, Replicated) if (axis as usize) < lead => Ok(Owned { axis }),
+        (Owned { axis: a }, Owned { axis: b }) if b + lead as u32 == a => Ok(Owned { axis: a }),
+        (_, Owned { .. }) | (Owned { .. }, _) => Err(TypeError {
             kind: ErrorKind::Placement,
-            message: format!("{s:?} cannot spread owned rows over {p:?}"),
+            message: format!("{s:?} cannot combine {p:?} with {q:?}"),
         }),
         (a, b) if shift(b, lead) == a && a != Partial => Ok(a),
         (Split { axis }, Replicated) if (axis as usize) < lead => Ok(p),
@@ -773,7 +799,7 @@ fn collapse(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
         format!("no axis {axis} in {}", x.shape)
     })?;
     need(
-        x.placement != Placement::Owned,
+        !matches!(x.placement, Placement::Owned { .. }),
         ErrorKind::Placement,
         || "a mean cannot read owned rows".into(),
     )?;
@@ -825,119 +851,13 @@ fn blocks(dims: &[Dim], width: &DimExpr, block: u32) -> Result<bool, TypeError> 
 
 fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
     let ok = match p {
-        Placement::Replicated | Placement::Owned => true,
-        Placement::Split { axis } => axis < last,
+        Placement::Replicated => true,
+        Placement::Split { axis } | Placement::Owned { axis } => axis < last,
         Placement::Partial | Placement::Routed => false,
     };
     need(ok, ErrorKind::Placement, || {
         format!("{s:?} needs whole rows, got {p:?}")
     })
-}
-
-fn view(dims: &[Dim], v: &View, x: &TensorType) -> Result<TensorType, TypeError> {
-    let mut out = x.clone();
-    if x.placement == Placement::Owned {
-        let kept = match v {
-            View::Reshape(s) => same(dims, &x.shape.0[0], &s.0[0])?,
-            View::Slice { axis, .. } | View::Expand { axis, .. } => *axis != 0,
-            View::Permute(perm) => perm.first() == Some(&0),
-            View::Concat => true,
-        };
-        need(kept, ErrorKind::Placement, || {
-            format!("{v:?} moves the leading axis of owned rows")
-        })?;
-    }
-    match v {
-        View::Reshape(s) => {
-            need(
-                elements(dims, &x.shape)? == elements(dims, s)?,
-                ErrorKind::Shape,
-                || format!("reshape {} to {s} changes the element count", x.shape),
-            )?;
-            if let Placement::Split { axis } = x.placement {
-                let to = moved_axis(dims, &x.shape, s, axis)?;
-                need(to.is_some(), ErrorKind::Placement, || {
-                    format!("reshape {} to {s} breaks split axis {axis}", x.shape)
-                })?;
-                out.placement = Placement::Split {
-                    axis: to.expect("checked"),
-                };
-            }
-            out.shape = s.clone();
-        }
-        View::Slice { axis, start, len } => {
-            let a = *axis as usize;
-            need(a < x.rank(), ErrorKind::Shape, || {
-                format!("no axis {a} in {}", x.shape)
-            })?;
-            let end = poly(dims, start)?.sum(&poly(dims, len)?);
-            let size = poly(dims, &x.shape.0[a])?;
-            let fits = match (end.as_const(), size.as_const()) {
-                (Some(e), Some(s)) => e <= s,
-                _ => size.covers(&end),
-            };
-            need(fits, ErrorKind::Shape, || {
-                format!("slice {start}+{len} runs past axis {a} of {}", x.shape)
-            })?;
-            need(
-                x.placement != Placement::Split { axis: *axis },
-                ErrorKind::Placement,
-                || "slice along the split axis".into(),
-            )?;
-            out.shape.0[a] = len.clone();
-        }
-        View::Expand { axis, to } => {
-            let a = *axis as usize;
-            let one = a < x.rank() && poly(dims, &x.shape.0[a])? == Poly::constant(1);
-            need(one, ErrorKind::Shape, || {
-                format!("axis {a} of {} is not size one", x.shape)
-            })?;
-            poly(dims, to)?;
-            out.shape.0[a] = to.clone();
-        }
-        View::Concat => unreachable!("concat takes two arguments"),
-        View::Permute(perm) => {
-            let mut seen: Vec<u32> = perm.clone();
-            seen.sort();
-            need(
-                seen.iter().copied().eq(0..x.rank() as u32),
-                ErrorKind::Shape,
-                || format!("{perm:?} does not permute {}", x.shape),
-            )?;
-            out.shape = Shape(
-                perm.iter()
-                    .map(|&i| x.shape.0[i as usize].clone())
-                    .collect(),
-            );
-            if let Placement::Split { axis } = x.placement {
-                let to = perm.iter().position(|&i| i == axis).expect("checked");
-                out.placement = Placement::Split { axis: to as u32 };
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn concat(dims: &[Dim], a: &TensorType, b: &TensorType) -> Result<TensorType, TypeError> {
-    let lead = a.rank().saturating_sub(1);
-    let fits = a.rank() >= 1
-        && a.rank() == b.rank()
-        && same_shape(dims, &front(&a.shape, lead), &front(&b.shape, lead))?;
-    need(fits, ErrorKind::Shape, || {
-        format!("{} and {} differ before the last axis", a.shape, b.shape)
-    })?;
-    need(a.dtype == b.dtype, ErrorKind::DType, || {
-        format!("concat mixes {:?} and {:?}", a.dtype, b.dtype)
-    })?;
-    let split = Placement::Split { axis: lead as u32 };
-    need(
-        a.placement == b.placement && a.placement != split,
-        ErrorKind::Placement,
-        || format!("concat cannot join {:?} and {:?}", a.placement, b.placement),
-    )?;
-    let mut out = a.clone();
-    out.shape.0[lead] = a.shape.0[lead].clone() + b.shape.0[lead].clone();
-    Ok(out)
 }
 
 /// `slots` and `positions`: one integer each per row of `rows`.
@@ -978,7 +898,7 @@ fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorTy
         kept.placement == shift(rows.placement, 1)
             && !matches!(
                 rows.placement,
-                Placement::Partial | Placement::Routed | Placement::Owned
+                Placement::Partial | Placement::Routed | Placement::Owned { .. }
             ),
         ErrorKind::Placement,
         || {

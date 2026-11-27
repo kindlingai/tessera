@@ -3,7 +3,6 @@
 use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
-use crate::held::Holds;
 use crate::kernels::{self, Kernels};
 use crate::lanes::LaneSync;
 use crate::marks;
@@ -636,14 +635,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     if let Some(g) = sum.as_deref_mut() {
                         g.pause()?;
                     }
-                    // Weights pin when unified. Kept rows borrow carveout when enabled.
-                    let buffer = match holds {
-                        Holds::Weights if unified => DeviceBuffer::pinned(ctx, bytes)?,
-                        Holds::Kept => DeviceBuffer::kept(ctx, bytes)?,
-                        _ => DeviceBuffer::alloc(ctx, bytes)?,
-                    };
-                    // Kernels may read what they are about to write.
-                    buffer.zero()?;
+                    let buffer = crate::held::alloc_buf(ctx, unified, bytes, holds)?;
                     Ok(Buffer::new(zone, buffer))
                 });
         if let Err(e) = bound {
@@ -783,6 +775,20 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
         self.replan_with(plan, None)
+    }
+
+    fn stage_weights(&mut self, plan: &Plan) -> Result<(), Error> {
+        let (ctx, uni) = (self.ctx, self.ctx.unified());
+        self.base.held.stage_weights(plan, |zone, bytes, h| {
+            Ok(Buffer::new(
+                zone,
+                crate::held::alloc_buf(ctx, uni, bytes, h)?,
+            ))
+        })?;
+        self.base.record_extra_weights(plan);
+        let mut base = self.base.plan.clone();
+        base.id = Plan::fresh();
+        self.replan(&base)
     }
 
     fn refresh(&mut self) -> Result<Vec<Reload>, Error> {

@@ -199,7 +199,10 @@ fn owned_rows_gather_late() {
     // One before the second split matmul, one for the output.
     assert_eq!(count(Stage::GatherRows), 2);
     // The second layer's norm and add run on owned rows.
-    let owned = g.nodes.iter().filter(|n| n.ty.placement == Owned);
+    let owned = g
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.ty.placement, Owned { .. }));
     assert_eq!(owned.count(), 5);
     let out = g.entries[0].outputs[0].node;
     assert_eq!(g.node(out).ty.placement, Replicated);

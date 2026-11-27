@@ -57,8 +57,10 @@ pub enum Placement {
     Partial,
     /// Each row lives on one rank. The others hold zeros.
     Routed,
-    /// Each rank holds only its share of the leading axis.
-    Owned,
+    /// Each rank holds only its share of this axis.
+    Owned {
+        axis: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

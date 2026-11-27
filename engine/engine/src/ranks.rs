@@ -110,6 +110,9 @@ impl Engine {
         if let Some((_, min)) = &mut self.split {
             *min = rows;
         }
+        if let Some((_, min)) = &mut self.split_owned {
+            *min = rows;
+        }
     }
 
     /// Sets the minimum row count for row ownership across ranks.
@@ -576,7 +579,7 @@ pub(crate) fn build_split(graph: &Graph, entry: usize, min: usize) -> Option<(Gr
 }
 
 /// Builds the row-owned graph and its minimum row threshold.
-pub(crate) fn build_owned(graph: &Graph, min: usize) -> Option<(Graph, usize)> {
+pub(crate) fn build_owned(graph: &Graph, min: usize, attn: bool) -> Option<(Graph, usize)> {
     let has_sum = graph.nodes.iter().any(|n| {
         matches!(
             &n.op,
@@ -586,15 +589,30 @@ pub(crate) fn build_owned(graph: &Graph, min: usize) -> Option<(Graph, usize)> {
     if !has_sum {
         return None;
     }
-    tessera_graph::own_rows(graph).ok().map(|g| (g, min))
+    let out = if attn {
+        tessera_graph::own_rows_attn(graph)
+    } else {
+        tessera_graph::own_rows(graph)
+    };
+    out.ok().map(|g| (g, min))
 }
 
 /// Optional transformed graph paired with its minimum row count.
 pub(crate) type Variant = Option<(Graph, usize)>;
 
-/// Picks split, owned, or base graph for `filled` rows.
+/// Graph variants selected per launch: base, owned, split, split-owned.
+pub(crate) type Variants<'a> = (&'a Graph, &'a Variant, &'a Variant, &'a Variant);
+
+fn even_rows(device: &Device, rows: usize) -> bool {
+    let parts = device.division();
+    let ranks = parts.ranks();
+    let each = parts.rows(rows, 0).1;
+    ranks > 1 && each > 0 && (1..ranks).all(|r| parts.rows(rows, r).1 == each)
+}
+
+/// Picks split-owned, split, owned, or base graph for `filled` rows.
 pub(crate) fn pick_graph<'a>(
-    (base, owned, split): (&'a Graph, &'a Variant, &'a Variant),
+    (base, owned, split, split_owned): Variants<'a>,
     device: &Device,
     allow_split: bool,
     filled: usize,
@@ -606,19 +624,22 @@ pub(crate) fn pick_graph<'a>(
         && filled >= *min
         && filled.is_multiple_of(2)
     {
-        sizes.push((tessera_graph::HALF_ROWS, (filled / 2) as u64));
+        let half = filled / 2;
+        sizes.push((tessera_graph::HALF_ROWS, half as u64));
+        if let Some((sg, _)) = split_owned
+            && owned.as_ref().is_some_and(|(_, om)| *om > 0 && half >= *om)
+            && even_rows(device, half)
+        {
+            return sg;
+        }
         return g;
     }
     if let Some((g, min)) = owned
         && *min > 0
         && filled >= *min
+        && even_rows(device, filled)
     {
-        let parts = device.division();
-        let ranks = parts.ranks();
-        let each = parts.rows(filled, 0).1;
-        if ranks > 1 && each > 0 && (1..ranks).all(|r| parts.rows(filled, r).1 == each) {
-            return g;
-        }
+        return g;
     }
     base
 }

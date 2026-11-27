@@ -4,7 +4,7 @@ use crate::extent::Extent;
 use crate::tree::{Node, RING_CHUNK, T, Term, Tree};
 use crate::{Error, Size};
 use std::collections::HashMap;
-use tessera_graph::{DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, View};
+use tessera_graph::{DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, Select, View};
 
 /// Ring capacity for sliding-window kept `index`, if smaller than context.
 pub fn sliding_ring(g: &Graph, index: u32) -> Option<usize> {
@@ -60,29 +60,78 @@ pub fn sliding_ring(g: &Graph, index: u32) -> Option<usize> {
     (ring < context).then_some(ring)
 }
 
-/// Restricts axis 0 of `extents` to this rank's owned rows.
+/// Restricts the owned axis of `extents` to this rank's share.
 pub(crate) fn own_extents(
     n: &tessera_graph::Node,
     extents: &mut [Extent],
     parts: &Parts,
     rank: u32,
 ) -> Result<(), Error> {
-    if n.ty.placement != Placement::Owned || parts.ranks() <= 1 {
+    let Placement::Owned { axis } = n.ty.placement else {
+        return Ok(());
+    };
+    if parts.ranks() <= 1 {
         return Ok(());
     }
-    let whole = extents[0].most();
-    let fixed = extents[0] == Extent::Fixed(whole);
+    let a = axis as usize;
+    let whole = extents[a].most();
+    let fixed = extents[a] == Extent::Fixed(whole);
     let (_, count) = parts.rows(whole, rank as usize);
     if !fixed || count == 0 {
         return Err(Size::Split {
-            axis: 0,
+            axis: a,
             shape: n.ty.shape.clone(),
             parts: parts.clone(),
         }
         .into());
     }
-    extents[0] = Extent::Fixed(count);
+    extents[a] = Extent::Fixed(count);
     Ok(())
+}
+
+/// Slices `slot` on axis 0, pushing through rank-1 row gathers.
+fn slice_axis0(
+    tree: &mut Tree<'_>,
+    slot: T,
+    first: usize,
+    count: usize,
+    sliced: &mut HashMap<(T, usize, usize), T>,
+) -> T {
+    let key = (slot, first, count);
+    if let Some(&t) = sliced.get(&key) {
+        return t;
+    }
+    let src = tree.node(slot).clone();
+    let whole = src.shape[0];
+    let mut extents = src.extents;
+    extents[0] = Extent::Fixed(count);
+    let shape = extents.iter().map(Extent::most).collect();
+    let (term, args) = if src.term == Term::Op(Op::Select(Select::Gather))
+        && tree.node(src.args[1]).shape == [whole]
+    {
+        let cut_ids = slice_axis0(tree, src.args[1], first, count, sliced);
+        (src.term, vec![src.args[0], cut_ids])
+    } else {
+        let view = View::Slice {
+            axis: 0,
+            start: DimExpr::Const(first as u64),
+            len: DimExpr::Const(count as u64),
+        };
+        (Term::Op(Op::View(view)), vec![slot])
+    };
+    let t = tree.add(
+        Node {
+            term,
+            args,
+            shape,
+            extents,
+            form: src.form,
+            from: src.from,
+        },
+        None,
+    );
+    sliced.insert(key, t);
+    t
 }
 
 /// Slices replicated args matching an owned arg's leading axis.
@@ -99,7 +148,7 @@ pub(crate) fn slice_owned_args(
     let owned = n
         .args
         .iter()
-        .find(|a| g.node(**a).ty.placement == Placement::Owned);
+        .find(|a| g.node(**a).ty.placement == Placement::Owned { axis: 0 });
     let Some(owned) = owned else {
         return;
     };
@@ -114,34 +163,6 @@ pub(crate) fn slice_owned_args(
         if count == whole && first == 0 {
             continue;
         }
-        let key = (*slot, first, count);
-        let cut = match sliced.get(&key) {
-            Some(&t) => t,
-            None => {
-                let src = tree.node(*slot).clone();
-                let mut extents = src.extents;
-                extents[0] = Extent::Fixed(count);
-                let shape = extents.iter().map(Extent::most).collect();
-                let view = View::Slice {
-                    axis: 0,
-                    start: DimExpr::Const(first as u64),
-                    len: DimExpr::Const(count as u64),
-                };
-                let t = tree.add(
-                    Node {
-                        term: Term::Op(Op::View(view)),
-                        args: vec![*slot],
-                        shape,
-                        extents,
-                        form: src.form,
-                        from: src.from,
-                    },
-                    None,
-                );
-                sliced.insert(key, t);
-                t
-            }
-        };
-        *slot = cut;
+        *slot = slice_axis0(tree, *slot, first, count, sliced);
     }
 }
