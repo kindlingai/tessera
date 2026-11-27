@@ -5,6 +5,7 @@ mod device_test;
 mod gemv;
 pub(crate) mod mm;
 mod moe;
+mod norm_mx8;
 mod stacked;
 #[cfg(test)]
 mod stacked_test;

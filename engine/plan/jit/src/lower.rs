@@ -346,6 +346,12 @@ impl Lowerer<'_, '_> {
                                 };
                                 self.call(st, &[ptr, len, at, v]);
                             }
+                            tessera_codegen::form::Read::U8 => {
+                                let Val::S(v) = self.expr_as(&combined, Ty::U32, t)? else {
+                                    return Err("a four-wide value stored by index".into());
+                                };
+                                self.call("st_u8", &[ptr, len, at, v]);
+                            }
                             other => return Err(format!("cannot write form {other:?}")),
                         }
                         Ok(())

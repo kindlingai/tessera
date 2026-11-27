@@ -580,3 +580,69 @@ fn bf16_edges_stay() {
         assert_eq!(casts.len(), want_casts, "{tag}: unexpected casts {casts:?}");
     }
 }
+
+#[test]
+fn mxfp8_edges_stay() {
+    assert!(tessera_lower::Dtype::parse("@norm=mxfp8").is_ok());
+    assert!(tessera_lower::Dtype::parse("@kept=mxfp8").is_err());
+
+    let mut q_cfg = Config::qwen3_small();
+    q_cfg.stack.heads = 16;
+    q_cfg.kv_heads = 4;
+    q_cfg.stack.head_dim = 128;
+    q_cfg.stack.hidden = 2048;
+    q_cfg.stack.ffn = 2048;
+    q_cfg.stack.layers = 1;
+    let g_qwen = stepper::<Norm, Swiglu>(&q_cfg);
+
+    let mxfp8 = named("mxfp8").unwrap();
+    let mut recipe = Recipe {
+        pins: Pins::all(mxfp8)
+            .pin("embed", BF16_FORM)
+            .pin("head", BF16_FORM)
+            .pin("*norm*", tessera_lower::form::F32_FORM)
+            .kept(BF16_FORM),
+        ..Default::default()
+    };
+    for s in [
+        "@activation=bf16",
+        "@norm=mxfp8",
+        "tail@norm=bf16",
+        "@residual=f32",
+        "@router=f32",
+        "@logits=f32",
+        "@softmax=f32",
+    ] {
+        recipe.dtype.push(tessera_lower::Dtype::parse(s).unwrap());
+    }
+    recipe.settle();
+
+    let limits = Limits {
+        group_bytes: 48 * 1024,
+        dynamic_group_bytes: 99 * 1024,
+        ..Limits::assumed()
+    };
+    let mut sm121 = Platform {
+        backend: "cuda".into(),
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        units: 48,
+        bandwidth: 273e9,
+        ..Platform::assumed(limits)
+    };
+    sm121.row.as_mut().unwrap().mxfp8_tile = Some([16, 8, 32]);
+    let dev = Device::stored(sm121, &Settings::default())
+        .unwrap()
+        .with(&recipe);
+    let plan = lower(&g_qwen, 0, &[(Seqs, 1), (Rows, 128), (Context, 256)], &dev).unwrap();
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert!(
+        names.contains(&"fast_norm_mxfp8"),
+        "expected fast_norm_mxfp8 in {names:?}"
+    );
+    let preps = names.iter().filter(|&&n| n == "fast_mm_mxfp8_prep").count();
+    assert!(
+        preps <= 2,
+        "expected <= 2 preps (o + down), got {preps}: {names:?}"
+    );
+}

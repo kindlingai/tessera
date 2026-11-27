@@ -161,6 +161,7 @@ writers! {
     st_bf16 = st_bf16: f32, Bf16;
     st_fp8 = st_fp8: f32, Fp8;
     st_u32 = st_u32: u32, U32;
+    st_u8 = st_u8: u32, U8;
 }
 
 macro_rules! tiles {
@@ -383,6 +384,10 @@ pub extern "C" fn round_f16(x: f32) -> f32 {
 
 pub extern "C" fn round_e4m3(x: f32) -> f32 {
     lockstep::round_e4m3(x)
+}
+
+pub extern "C" fn to_e4m3(x: f32) -> u32 {
+    lockstep::to_e4m3(x)
 }
 
 /// Lane arrays, as compiled code keeps them on its stack.

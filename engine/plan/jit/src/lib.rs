@@ -89,6 +89,7 @@ helpers! {
     st_bf16(P, P, P, F32);
     st_fp8(P, P, P, F32);
     st_u32(P, P, P, I32);
+    st_u8(P, P, P, I32);
     word(P, P, P) -> I32;
     half(P, P, P) -> I32;
     exp(F32) -> F32;
@@ -105,6 +106,7 @@ helpers! {
     bf16_pair(F32, F32) -> I32;
     round_f16(F32) -> F32;
     round_e4m3(F32) -> F32;
+    to_e4m3(F32) -> I32;
     shfl_xor(P, P, P, P, P);
     sum32(P, P, P, P);
     tiles_new(P, P, P, P) -> P;
