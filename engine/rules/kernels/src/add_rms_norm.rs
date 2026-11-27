@@ -1,180 +1,23 @@
 //! Fused residual add and RMS norm, per warp or block.
 
 use crate::lane_norm::{
-    BLOCK_THREADS, CACHE_SLOTS, CACHE_TRIPS, block_sum, block_sum_inline, cache_trips, row_needs,
-    row_shape, use_block,
+    RowSpec, block_threads, cache_trips, row_body, row_launches, row_needs, row_shape, row_tag,
+    use_block,
 };
 use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
-use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, ToArg, Tree, sites};
-
-/// Sums two or three rows, optionally saves sum, norms sum.
-#[kernel]
-#[allow(clippy::too_many_arguments)]
-fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
-    #[form(a_form)] a: Buf<Dyn>,
-    #[form(b_form)] b: Buf<Dyn>,
-    #[form(c_form)] c: Buf<Dyn>,
-    #[form(w_form)] w: Buf<Dyn>,
-    #[form(out_form)] mut out: BufMut<Dyn>,
-    #[form(sum_form)] mut sum_out: BufMut<Dyn>,
-    rows: u32,
-    width: u32,
-    eps: f32,
-    #[build] a_form: &'static dyn Stored,
-    #[build] b_form: &'static dyn Stored,
-    #[build] c_form: &'static dyn Stored,
-    #[build] w_form: &'static dyn Stored,
-    #[build] out_form: &'static dyn Stored,
-    #[build] sum_form: &'static dyn Stored,
-    #[build] add3: bool,
-    #[build] weighted: bool,
-    #[build] save_sum: bool,
-    #[build] reload_sum: bool,
-    #[build] block: bool,
-    #[build] use_cache: bool,
-    #[build] cached: u32,
-) {
-    let group_w = if block { BLOCK_THREADS } else { LANES as u32 };
-    let row = gid() / group_w;
-    if row >= rows {
-        return;
-    }
-    let at = row as u64 * width as u64;
-    let first = if block { lid() } else { lane() };
-    let mut buf = [0.0f32; CACHE_SLOTS];
-    let mut acc = 0.0f32;
-    if use_cache {
-        for t in (0..cached).unroll(CACHE_TRIPS) {
-            let i = first * WIDE + t * (group_w * WIDE);
-            if i < width {
-                let va = a.load4(at + i as u64);
-                let vb = b.load4(at + i as u64);
-                let mut s = F32x4::zero();
-                s.x = va.x + vb.x;
-                s.y = va.y + vb.y;
-                s.z = va.z + vb.z;
-                s.w = va.w + vb.w;
-                if add3 {
-                    let vc = c.load4(at + i as u64);
-                    s.x += vc.x;
-                    s.y += vc.y;
-                    s.z += vc.z;
-                    s.w += vc.w;
-                }
-                if save_sum {
-                    sum_out.store4(at + i as u64, s);
-                }
-                let idx = (t * WIDE) as usize;
-                buf[idx] = s.x;
-                buf[idx + 1] = s.y;
-                buf[idx + 2] = s.z;
-                buf[idx + 3] = s.w;
-                acc += s.x * s.x;
-                acc += s.y * s.y;
-                acc += s.z * s.z;
-                acc += s.w * s.w;
-            }
-        }
-    } else {
-        for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
-            let va = a.load4(at + i as u64);
-            let vb = b.load4(at + i as u64);
-            let mut s = F32x4::zero();
-            s.x = va.x + vb.x;
-            s.y = va.y + vb.y;
-            s.z = va.z + vb.z;
-            s.w = va.w + vb.w;
-            if add3 {
-                let vc = c.load4(at + i as u64);
-                s.x += vc.x;
-                s.y += vc.y;
-                s.z += vc.z;
-                s.w += vc.w;
-            }
-            if save_sum {
-                sum_out.store4(at + i as u64, s);
-            }
-            acc += s.x * s.x;
-            acc += s.y * s.y;
-            acc += s.z * s.z;
-            acc += s.w * s.w;
-        }
-    }
-    acc = sum32(acc);
-    let tot = if block { block_sum(acc) } else { acc };
-    let inv = rsqrt(tot / width as f32 + eps);
-    if use_cache {
-        for t in (0..cached).unroll(CACHE_TRIPS) {
-            let i = first * WIDE + t * (group_w * WIDE);
-            if i < width {
-                let idx = (t * WIDE) as usize;
-                let mut g = F32x4::zero();
-                if weighted {
-                    g = w.load4(i as u64);
-                } else {
-                    g.x = 1.0;
-                    g.y = 1.0;
-                    g.z = 1.0;
-                    g.w = 1.0;
-                }
-                let mut o = F32x4::zero();
-                o.x = buf[idx] * inv * g.x;
-                o.y = buf[idx + 1] * inv * g.y;
-                o.z = buf[idx + 2] * inv * g.z;
-                o.w = buf[idx + 3] * inv * g.w;
-                out.store4(at + i as u64, o);
-            }
-        }
-    } else {
-        for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
-            let mut s = F32x4::zero();
-            if reload_sum {
-                s = sum_out.load4(at + i as u64);
-            } else {
-                let va = a.load4(at + i as u64);
-                let vb = b.load4(at + i as u64);
-                s.x = va.x + vb.x;
-                s.y = va.y + vb.y;
-                s.z = va.z + vb.z;
-                s.w = va.w + vb.w;
-                if add3 {
-                    let vc = c.load4(at + i as u64);
-                    s.x += vc.x;
-                    s.y += vc.y;
-                    s.z += vc.z;
-                    s.w += vc.w;
-                }
-            }
-            let mut g = F32x4::zero();
-            if weighted {
-                g = w.load4(i as u64);
-            } else {
-                g.x = 1.0;
-                g.y = 1.0;
-                g.z = 1.0;
-                g.w = 1.0;
-            }
-            let mut o = F32x4::zero();
-            o.x = s.x * inv * g.x;
-            o.y = s.y * inv * g.y;
-            o.z = s.z * inv * g.z;
-            o.w = s.w * inv * g.w;
-            out.store4(at + i as u64, o);
-        }
-    }
-}
+use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, Tree, sites};
 
 /// Fused add + RMS norm over `rows` of `width`, one launch.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = add_norm_name(self),
     launches = add_norm_launches,
-    shape = row_shape(self.rows, self.block),
+    shape = row_shape(self.rows, self.width, self.block),
     work = self.rows * self.width,
-    needs = row_needs(self.block),
+    needs = row_needs(self.width, self.block),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
     accepts = add_norm_accepts,
@@ -253,59 +96,33 @@ fn add_norm_emits_at(k: &AddLaneNorm, output: usize, form: &dyn Stored) -> bool 
 }
 
 fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
-    let cached = cache_trips(k.width, k.block);
-    let mut body = add_norm_lanes_ir::<WIDE, AHEAD>(
-        k.a_form,
-        k.b_form,
-        k.c_form,
-        k.w_form,
-        k.out_form,
-        k.sum_form,
-        k.add3,
-        k.weighted,
-        k.save_sum,
-        k.reload_sum(),
-        k.block,
-        cached > 0,
-        cached,
-    );
-    if !k.add3 {
-        body.params.retain(|p| p.name() != "c");
-    }
-    if !k.weighted {
-        body.params.retain(|p| p.name() != "w");
-    }
-    if !k.save_sum {
-        body.params.retain(|p| p.name() != "sum_out");
-    }
-    body
+    row_body(RowSpec {
+        width: k.width,
+        block: k.block,
+        a_form: k.a_form,
+        b_form: k.b_form,
+        c_form: k.c_form,
+        w_form: k.w_form,
+        out_form: k.out_form,
+        sum_form: k.sum_form,
+        add2: true,
+        add3: k.add3,
+        weighted: k.weighted,
+        keep_w: k.weighted,
+        save_sum: k.save_sum,
+        reload_sum: k.reload_sum(),
+    })
 }
 
 fn add_norm_launches(k: &AddLaneNorm, step: &Step) -> Vec<Launch> {
     let body = add_norm_body(k);
-    let scalar = |name: &str| match name {
-        "rows" => k.rows.arg(),
-        "width" => k.width.arg(),
-        "eps" => k.eps.arg(),
-        other => panic!("AddLaneNorm has no field `{other}`"),
-    };
-    vec![Launch::of(
-        &body,
-        step,
-        false,
-        &scalar,
-        row_shape(k.rows, k.block),
-    )]
+    row_launches(&body, step, k.rows, k.width, k.eps, k.block)
 }
 
 fn add_norm_source(k: &AddLaneNorm) -> Source {
     let body = add_norm_body(k);
     let base = k.name();
-    let cached = cache_trips(k.width, k.block);
-    let tag = match cached {
-        0 => String::new(),
-        n => format!("_c{n}"),
-    };
+    let tag = row_tag(k.width, k.block);
     let mut forms = vec![k.a_form.name(), k.b_form.name()];
     if k.add3 {
         forms.push(k.c_form.name());
@@ -343,11 +160,8 @@ fn add_norm_load(k: &AddLaneNorm, _: usize) -> Option<Load> {
     if k.add3 {
         flight += k.c_form.bytes((WIDE * AHEAD) as usize) as f64;
     }
-    let per_row = if k.block {
-        BLOCK_THREADS as usize
-    } else {
-        LANES
-    };
+    let threads = block_threads(k.width) as usize;
+    let per_row = if k.block { threads } else { LANES };
     let trips = if cache_trips(k.width, k.block) > 0 {
         1.0
     } else {
@@ -355,7 +169,7 @@ fn add_norm_load(k: &AddLaneNorm, _: usize) -> Option<Load> {
     };
     Some(Load {
         threads: k.rows * per_row,
-        group: BLOCK_THREADS as usize,
+        group: threads,
         trips,
         trip: body.trip(),
         reads,

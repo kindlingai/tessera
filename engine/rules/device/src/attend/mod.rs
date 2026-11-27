@@ -35,7 +35,7 @@ impl AttendKind {
     }
 
     fn smem(self) -> usize {
-        if self == Self::Mla { 43_008 } else { 18_432 }
+        if self == Self::Mla { 47_104 } else { 18_432 }
     }
 
     fn threads(self) -> usize {
@@ -43,7 +43,7 @@ impl AttendKind {
     }
 
     fn tile_keys(self) -> usize {
-        16
+        if self == Self::Mla { 32 } else { 16 }
     }
 
     fn names(self) -> (&'static str, &'static str, &'static str) {

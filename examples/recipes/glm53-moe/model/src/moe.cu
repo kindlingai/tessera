@@ -764,17 +764,22 @@ static __device__ __forceinline__ void fc1_pf_body(
 #if GLM53_USE_MX8
   (void)x; (void)plan; (void)signs; (void)gsu; (void)usu; (void)is_sh; (void)r0_sh; (void)rs;
   u32 nv4 = ((n + 7u) >> 3u) * MX8_V4;
+  pf_cp_one<NT>(x_slot, sm.k.btab[0], tid, nv4);
   for (u32 c0 = 0u; c0 < nblk; c0++) {
-    pf_load_turned<NT>(x_slot + (u64)c0 * (16u * MX8_TILE), sm, tid, nv4);
+    pf_cp_one<NT>(x_slot + (u64)c0 * (16u * MX8_TILE) + 8u * MX8_TILE, sm.k.btab[1], tid, nv4);
     trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]);
-    asm volatile("cp.async.wait_group 0;");
+    asm volatile("cp.async.wait_group 1;");
     prim::block_sync();
     trellis::blk_load<K>(ubp, tid, ua, nw);
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_g, j, lane, wm, ag);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab[0], j, lane, wm, ag);
     trellis::blk_store<K>(nw, tid, sm.k.wtiles[1]);
+    asm volatile("cp.async.wait_group 0;");
     prim::block_sync();
-    if (c0 + 1u < nblk) { gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw); }
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[1], sm.k.btab_u, j, lane, wm, au);
+    if (c0 + 1u < nblk) {
+      pf_cp_one<NT>(x_slot + (u64)(c0 + 1u) * (16u * MX8_TILE), sm.k.btab[0], tid, nv4);
+      gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw);
+    }
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[1], sm.k.btab[1], j, lane, wm, au);
     if (c0 + 1u < nblk) prim::block_sync();
   }
 #else
@@ -795,14 +800,14 @@ static __device__ __forceinline__ void fc1_pf_body(
         vu[0] = xv.x * scu[0]; vu[1] = xv.y * scu[1]; vu[2] = xv.z * scu[2]; vu[3] = xv.w * scu[3];
         trellis::wht128(vg, trellis::INV_SQRT128); trellis::wht128(vu, trellis::INV_SQRT128);
       }
-      pf_store_bfrag(sm.k.btab_g, ti, j, lane, r < n, vg); pf_store_bfrag(sm.k.btab_u, ti, j, lane, r < n, vu);
+      pf_store_bfrag(sm.k.btab[0], ti, j, lane, r < n, vg); pf_store_bfrag(sm.k.btab[1], ti, j, lane, r < n, vu);
     }
     trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]); prim::block_sync();
     trellis::blk_load<K>(ubp, tid, ua, nw);
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_g, j, lane, wm, ag); prim::block_sync();
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab[0], j, lane, wm, ag); prim::block_sync();
     trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]); prim::block_sync();
     if (c0 + 1u < nblk) { gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw); }
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_u, j, lane, wm, au);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab[1], j, lane, wm, au);
     if (c0 + 1u < nblk) prim::block_sync();
   }
 #endif
@@ -824,11 +829,11 @@ static __device__ __forceinline__ void fc1_pf_body(
       a[3] = (g3 / (1.0f + __expf(-g3))) * (au[ti][3] * su.w) * sd.w;
       trellis::wht128(a, trellis::INV_SQRT128);
     }
-    pf_store_bfrag(sm.k.btab_g, ti, j, lane, true, a);
+    pf_store_bfrag(sm.k.btab[0], ti, j, lane, true, a);
   }
   prim::block_sync();
   uint4* dst4 = reinterpret_cast<uint4*>(act_dst);
-  const uint4* src4 = reinterpret_cast<const uint4*>(sm.k.btab_g);
+  const uint4* src4 = reinterpret_cast<const uint4*>(sm.k.btab[0]);
   for (u32 i = tid; i < NT * (MX8_TILE >> 2u); i += 256u) dst4[i] = src4[i];
 }
 
@@ -844,7 +849,8 @@ static __device__ __noinline__ void fc1_pf_cold(const float* x, const Plan* plan
   fc1_pf_body<K, BOOK, 8u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
 // Prefill fused gate, up and SwiGLU for 64-token slots.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(const float* x, const float* plan_in, const float* x_turned, const float* signs_in, const float* gate_su, bytes gate, const float* gate_sv, const float* up_su, bytes up, const float* up_sv, const float* down_su, bytes sh_gate, const float* sh_gate_su, const float* sh_gate_sv, bytes sh_up, const float* sh_up_su, const float* sh_up_sv, const float* sh_down_su, float* act_out, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book, u32 first, u32 shared_ffn) {
+extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(
+    const float* x, const float* plan_in, const float* x_turned, const float* signs_in, const float* gate_su, bytes gate, const float* gate_sv, const float* up_su, bytes up, const float* up_sv, const float* down_su, bytes sh_gate, const float* sh_gate_su, const float* sh_gate_sv, bytes sh_up, const float* sh_up_su, const float* sh_up_sv, const float* sh_down_su, float* act_out, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book, u32 first, u32 shared_ffn) {
   (void)picks;
   const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
   u32 n_sh = (rows + 63u) >> 6u, slot = blockIdx.y, c = blockIdx.x, chunks = ffn >> 7u;
@@ -857,7 +863,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(const float* x
   if (is_sh) { n = min(rows - r0_sh, 64u); m = 0u; gb = sh_gate; gsu = sh_gate_su; gsv = sh_gate_sv; ub = sh_up; usu = sh_up_su; usv = sh_up_sv; dsu = sh_down_su; signs = 0; k = shared_k; book = shared_book; }
   else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; m = e - first; gb = gate; gsu = gate_su + (u64)e * hidden; gsv = gate_sv + (u64)e * ffn; ub = up; usu = up_su + (u64)e * hidden; usv = up_sv + (u64)e * ffn; dsu = down_su + (u64)e * ffn; signs = signs_in; if (c == 0u && threadIdx.x == 0u) { trellis::note_hit(gb, m); trellis::note_hit(ub, m); } }
   const u32* xs = reinterpret_cast<const u32*>(x_turned) + (u64)slot * (hidden >> 7u) * (16u * MX8_TILE);
-  u32* act_dst = reinterpret_cast<u32*>(act_out) + ((u64)slot * chunks + c) * 4096u;
+  u32* act_dst = reinterpret_cast<u32*>(act_out) + ((u64)slot * chunks + c) * ACT_CHUNK;
   if (book && k == 2u) fc1_pf_hot<2u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
   else if (book && k == 3u) fc1_pf_hot<3u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
   else if (book && k == 4u) fc1_pf_hot<4u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
@@ -876,23 +882,11 @@ static __device__ __forceinline__ void fc2_pf_body(
   u64 sG = (D.input_side ? u64(D.out >> 1u) : 64ull) * u64(TB);
   bytes gb = trellis::tile_ptr<K>(D.base, D.inp, D.out, m, 0u, ob, D.input_side);
   bool aligned = (reinterpret_cast<u64>(gb) & 15ull) == 0ull;
-  u32 nw[8];
-  trellis::blk_load<K>(gb, tid, aligned, nw);
   trellis::word_map wm = trellis::map_word<K>(lane);
   float acc[NT][4];
 #pragma unroll
   for (u32 ti = 0u; ti < NT; ti++) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
-  for (u32 c = 0u; c < upto; c++) {
-    if (c > 0u) prim::block_sync();
-    pf_stage_fc2_act<NT>(act_slot + (u64)c * 4096u, sm.k.btab, tid);
-    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
-#if GLM53_USE_MX8
-    asm volatile("cp.async.wait_group 0;");
-#endif
-    prim::block_sync();
-    if (c + 1u < upto) { gb += sG; trellis::blk_load<K>(gb, tid, aligned, nw); }
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab, j, lane, wm, acc);
-  }
+  pf_fc2_loop<K, BOOK, NT>(act_slot, gb, sG, aligned, upto, tid, j, lane, wm, sm, acc);
   pf_store_fc2<NT>(acc, sm, sv_p, sg_p, z, ob, hidden, picks, n,
                    [&](u32 r) { return slot_tok_at(plan, is_sh, r0_sh, rs, r); },
                    [&](u32 r) { return is_sh ? picks : (u32)plan->slot_pick[rs][r]; },
@@ -931,7 +925,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2_pf(
   const float *sv_p, *sg_p;
   if (is_sh) { n = min(rows - r0_sh, 64u); m = 0u; upto = shared_ffn >> 7u; dbytes = shared_down; sv_p = shared_down_sv; sg_p = 0; k = shared_k; book = shared_book; }
   else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; m = e - first; upto = chunks; dbytes = down; sv_p = down_sv + (u64)e * hidden; sg_p = signs_out; if (ob == 0u && threadIdx.x == 0u) trellis::note_hit(dbytes, m); }
-  const u32* act_slot = reinterpret_cast<const u32*>(act_in) + (u64)slot * chunks * 4096u;
+  const u32* act_slot = reinterpret_cast<const u32*>(act_in) + (u64)slot * chunks * ACT_CHUNK;
   u16* z = reinterpret_cast<u16*>(z_out);
   if (book && k == 2u) fc2_pf_hot<2u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, sv_p, sg_p, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
   else if (book && k == 3u) fc2_pf_hot<3u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, sv_p, sg_p, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);

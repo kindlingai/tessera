@@ -172,11 +172,14 @@ static __device__ __forceinline__ void attn_ldm_x4_t(u32 d[4], const void* s) {
 }
 static __device__ __forceinline__ void attn_cp_async16(void* dst, const void* src, u32 bytes) {
     u32 a = u32(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
                  :: "r"(a), "l"(src), "r"(bytes) : "memory");
 }
 static __device__ __forceinline__ void attn_cp_commit() {
     asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+static __device__ __forceinline__ void attn_cp_wait1() {
+    asm volatile("cp.async.wait_group 1;\n" ::: "memory");
 }
 static __device__ __forceinline__ void attn_cp_wait0() {
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -184,10 +187,10 @@ static __device__ __forceinline__ void attn_cp_wait0() {
 
 struct alignas(16) mla_smem {
     u16 kv[2][16][584];
-    float red[4][16][16];
-    u32 p16[16][8];
+    float red[4][16][32];
+    u32 p16[16][16];
     float m[16], l[16], corr[16];
-    u32 stop, valid_mask[2];
+    u32 stop, valid_mask;
 };
 
 static __device__ __forceinline__ u32 mla_pick_id(const u32* ids, u32 row, u32 picks, u32 fl,
@@ -279,9 +282,41 @@ static __device__ __forceinline__ void mla_set_mask(
     const u32* ids, u32 row, u32 picks, u32 fl, u32 from, u32 to, u32 p0, u32 p_end, u32 tid,
     u32* out_mask) {
     if (tid < 32u) {
-        bool ok = (tid < 16u) && (mla_pick_id(ids, row, picks, fl, from, to, p0 + tid, p_end) != 0xFFFFFFFFu);
+        bool ok = mla_pick_id(ids, row, picks, fl, from, to, p0 + tid, p_end) != 0xFFFFFFFFu;
         u32 m = __ballot_sync(0xFFFFFFFFu, ok);
         if (tid == 0u) *out_mask = m;
+    }
+}
+
+template <bool USE_BF16>
+static __device__ __forceinline__ void mla_qk_half(
+    const u16 (*kv)[584], const u32 q_reg[9][4], u32 krow, u32 kcol, u32 wl, float s0[4]) {
+#pragma unroll
+    for (u32 s = 0u; s < 9u; s++) {
+        u32 b0[2];
+        attn_ldm_x2(b0, &kv[krow][(wl * 9u + s) * 16u + kcol]);
+        attn_mma<USE_BF16>(s0, q_reg[s], b0);
+    }
+}
+
+template <bool USE_BF16, u32 NT>
+static __device__ __forceinline__ void mla_pv_half(
+    const u16 (*kv)[584], const u32 (*p16)[16], u32 p_off, u32 d_base, u32 vrow, u32 vcol,
+    u32 g, u32 t, float o[NT][4]) {
+    u32 ap[4] = {p16[g][p_off + t], p16[g + 8u][p_off + t],
+                 p16[g][p_off + t + 4u], p16[g + 8u][p_off + t + 4u]};
+#pragma unroll
+    for (u32 nt = 0u; nt < 8u; nt += 2u) {
+        u32 bv[4];
+        attn_ldm_x4_t(bv, &kv[vrow][d_base + nt * 8u + vcol]);
+        u32 b0[2] = {bv[0], bv[1]}, b1[2] = {bv[2], bv[3]};
+        attn_mma<USE_BF16>(o[nt], ap, b0);
+        attn_mma<USE_BF16>(o[nt + 1u], ap, b1);
+    }
+    if constexpr (NT == 9u) {
+        u32 b8[2];
+        attn_ldm_x2_t(b8, &kv[vrow][d_base + 64u]);
+        attn_mma<USE_BF16>(o[8], ap, b8);
     }
 }
 
@@ -316,7 +351,7 @@ static __device__ __forceinline__ void mla_attend_body(
     if (tid < 16u) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
     prim::block_sync();
     u32 stop = sm.stop, total_p = (stop > start) ? (stop - start) : 0u;
-    u32 per = ((((total_p + 15u) >> 4) + splits - 1u) / splits) << 4;
+    u32 per = ((((total_p + 31u) >> 5) + splits - 1u) / splits) << 5;
     u32 p_begin = start + split * per, p_end = p_begin + per;
     if (p_begin > stop) p_begin = stop;
     if (p_end > stop) p_end = stop;
@@ -353,99 +388,123 @@ static __device__ __forceinline__ void mla_attend_body(
     u32 tk = tid >> 4u, l16 = tid & 15u, d_base = warp * (NT * 8u);
     u32 krow = wg * 8u + (lane & 7u), kcol = ((lane >> 3u) & 1u) * 8u;
     u32 vrow = lane & 15u, vcol = (lane >> 4u) << 3u;
-    u32 j0 = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
+    u32 cb = wg * 8u, h = tid >> 4u, c = tid & 15u;
     uint4 pref[3];
-    mla_set_mask(ids, row, picks, from_list, from, to, p_begin, p_end, tid, &sm.valid_mask[0]);
-    if constexpr (KV_FMT == 0u) {
-        mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, j0, context, page_shift, l16, pref);
-        mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
-    } else if constexpr (KV_FMT == 1u) {
-        mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, j0, context, page_shift, l16, sm.kv[0][tk]);
+    u32 j0_init = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
+    if constexpr (KV_FMT == 1u) {
+        mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, j0_init, context, page_shift, l16, sm.kv[0][tk]);
         attn_cp_commit();
-        attn_cp_wait0();
-    } else {
-        mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, j0, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
+    } else if constexpr (KV_FMT == 0u) {
+        mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, j0_init, context, page_shift, l16, pref);
     }
-    prim::block_sync();
-    u32 st = 0u;
-    for (u32 p0 = p_begin; p0 < p_end; p0 += 16u) {
-        bool has_next = (p0 + 16u < p_end);
-        u32 nst = st ^ 1u;
-        if (has_next) {
-            u32 nj = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 16u + tk, p_end);
-            mla_set_mask(ids, row, picks, from_list, from, to, p0 + 16u, p_end, tid, &sm.valid_mask[nst]);
-            if constexpr (KV_FMT == 0u) {
-                mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj, context, page_shift, l16, pref);
-            } else if constexpr (KV_FMT == 1u) {
-                mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, nj, context, page_shift, l16, sm.kv[nst][tk]);
+    for (u32 p0 = p_begin; p0 < p_end; p0 += 32u) {
+        bool has_hi = (p0 + 16u < p_end), has_next = (p0 + 32u < p_end);
+        u32 j1 = has_hi ? mla_pick_id(ids, row, picks, from_list, from, to, p0 + 16u + tk, p_end) : 0xFFFFFFFFu;
+        mla_set_mask(ids, row, picks, from_list, from, to, p0, p_end, tid, &sm.valid_mask);
+        float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
+        if constexpr (KV_FMT == 1u) {
+            if (has_hi) {
+                mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, j1, context, page_shift, l16, sm.kv[1][tk]);
                 attn_cp_commit();
+                attn_cp_wait1();
             } else {
-                mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, nj, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[nst][tk]));
-            }
-        }
-        u32 vmask = sm.valid_mask[st];
-        if (vmask != 0u) {
-            float s0[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-            for (u32 s = 0u; s < 9u; s++) {
-                u32 b0[2];
-                attn_ldm_x2(b0, &sm.kv[st][krow][(wl * 9u + s) * 16u + kcol]);
-                attn_mma<USE_BF16>(s0, q_reg[s], b0);
-            }
-            u32 cb = wg * 8u;
-            *reinterpret_cast<float2*>(&sm.red[wl][g][cb + t * 2u]) = make_float2(s0[0], s0[1]);
-            *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][cb + t * 2u]) = make_float2(s0[2], s0[3]);
-            prim::block_sync();
-            u32 h = tid >> 4u, c = tid & 15u;
-            float v = ((vmask >> c) & 1u)
-                ? (sm.red[0][h][c] + sm.red[1][h][c] + sm.red[2][h][c] + sm.red[3][h][c]) * scale
-                : attn_neg_inf();
-            float tmax = v;
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 1u));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 2u));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 4u));
-            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 8u));
-            float om = sm.m[h], ol = sm.l[h], nm = (om > tmax) ? om : tmax;
-            float cv = (ol > 0.0f) ? __expf(om - nm) : 0.0f;
-            float pv = ((vmask >> c) & 1u) ? __expf(v - nm) : 0.0f;
-            float pv1 = __shfl_xor_sync(0xFFFFFFFFu, pv, 1u);
-            if ((c & 1u) == 0u) sm.p16[h][c >> 1u] = attn_pack2<USE_BF16>(pv, pv1);
-            float ps = pv;
-            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 1u);
-            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 2u);
-            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 4u);
-            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 8u);
-            if (c == 0u) { sm.m[h] = nm; sm.l[h] = ol * cv + ps; sm.corr[h] = cv; }
-            prim::block_sync();
-            float c0 = sm.corr[g], c1 = sm.corr[g + 8u];
-#pragma unroll
-            for (u32 nt = 0u; nt < NT; nt++) {
-                o[nt][0] *= c0; o[nt][1] *= c0; o[nt][2] *= c1; o[nt][3] *= c1;
-            }
-            u32 ap[4] = {sm.p16[g][t], sm.p16[g + 8u][t], sm.p16[g][t + 4u], sm.p16[g + 8u][t + 4u]};
-#pragma unroll
-            for (u32 nt = 0u; nt < 8u; nt += 2u) {
-                u32 bv[4];
-                attn_ldm_x4_t(bv, &sm.kv[st][vrow][d_base + nt * 8u + vcol]);
-                u32 b0[2] = {bv[0], bv[1]}, b1[2] = {bv[2], bv[3]};
-                attn_mma<USE_BF16>(o[nt], ap, b0);
-                attn_mma<USE_BF16>(o[nt + 1u], ap, b1);
-            }
-            if constexpr (NT == 9u) {
-                u32 b8[2];
-                attn_ldm_x2_t(b8, &sm.kv[st][vrow][d_base + 64u]);
-                attn_mma<USE_BF16>(o[8], ap, b8);
-            }
-        }
-        if (has_next) {
-            if constexpr (KV_FMT == 0u) {
-                mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[nst][tk]));
-            } else if constexpr (KV_FMT == 1u) {
                 attn_cp_wait0();
             }
-            prim::block_sync();
-            st = nst;
+        } else if constexpr (KV_FMT == 0u) {
+            mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
+            if (has_hi) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, j1, context, page_shift, l16, pref);
+        } else {
+            u32 j0 = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tk, p_end);
+            mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, j0, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
+            if (has_hi) mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, j1, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[1][tk]));
         }
+        prim::block_sync();
+        u32 vmask = sm.valid_mask;
+        if (vmask == 0u) {
+            if constexpr (KV_FMT == 1u) { if (has_hi) attn_cp_wait0(); }
+            if (has_next) {
+                u32 nj0 = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end);
+                if constexpr (KV_FMT == 1u) {
+                    prim::block_sync();
+                    mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, nj0, context, page_shift, l16, sm.kv[0][tk]);
+                    attn_cp_commit();
+                } else {
+                    if constexpr (KV_FMT == 0u) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj0, context, page_shift, l16, pref);
+                    prim::block_sync();
+                }
+            }
+            continue;
+        }
+        if ((vmask & 0xFFFFu) != 0u) mla_qk_half<USE_BF16>(sm.kv[0], q_reg, krow, kcol, wl, s0);
+        if (has_hi) {
+            if constexpr (KV_FMT == 1u) {
+                attn_cp_wait0();
+                prim::block_sync();
+            } else if constexpr (KV_FMT == 0u) {
+                mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[1][tk]));
+                prim::block_sync();
+            }
+            if ((vmask >> 16u) != 0u) mla_qk_half<USE_BF16>(sm.kv[1], q_reg, krow, kcol, wl, s1);
+        }
+        if constexpr (KV_FMT == 0u) {
+            if (has_next) {
+                u32 nj0 = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end);
+                mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj0, context, page_shift, l16, pref);
+            }
+        }
+        *reinterpret_cast<float2*>(&sm.red[wl][g][cb + t * 2u]) = make_float2(s0[0], s0[1]);
+        *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][cb + t * 2u]) = make_float2(s0[2], s0[3]);
+        if (has_hi) {
+            *reinterpret_cast<float2*>(&sm.red[wl][g][16u + cb + t * 2u]) = make_float2(s1[0], s1[1]);
+            *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][16u + cb + t * 2u]) = make_float2(s1[2], s1[3]);
+        }
+        prim::block_sync();
+        bool ok0 = ((vmask >> c) & 1u) != 0u;
+        bool ok1 = ((vmask >> (c + 16u)) & 1u) != 0u;
+        float v0 = ok0
+            ? (sm.red[0][h][c] + sm.red[1][h][c] + sm.red[2][h][c] + sm.red[3][h][c]) * scale
+            : attn_neg_inf();
+        float v1 = ok1
+            ? (sm.red[0][h][c + 16u] + sm.red[1][h][c + 16u] + sm.red[2][h][c + 16u] + sm.red[3][h][c + 16u]) * scale
+            : attn_neg_inf();
+        float tmax = fmaxf(v0, v1);
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 1u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 2u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 4u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 8u));
+        float om = sm.m[h], ol = sm.l[h], nm = (om > tmax) ? om : tmax;
+        float cv = (ol > 0.0f) ? __expf(om - nm) : 0.0f;
+        float pv0 = ok0 ? __expf(v0 - nm) : 0.0f;
+        float pv1 = ok1 ? __expf(v1 - nm) : 0.0f;
+        float pv0n = __shfl_xor_sync(0xFFFFFFFFu, pv0, 1u);
+        float pv1n = __shfl_xor_sync(0xFFFFFFFFu, pv1, 1u);
+        if ((c & 1u) == 0u) {
+            sm.p16[h][c >> 1u] = attn_pack2<USE_BF16>(pv0, pv0n);
+            sm.p16[h][8u + (c >> 1u)] = attn_pack2<USE_BF16>(pv1, pv1n);
+        }
+        float ps = pv0 + pv1;
+        ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 1u);
+        ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 2u);
+        ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 4u);
+        ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 8u);
+        if (c == 0u) { sm.m[h] = nm; sm.l[h] = ol * cv + ps; sm.corr[h] = cv; }
+        prim::block_sync();
+        float c0 = sm.corr[g], c1 = sm.corr[g + 8u];
+#pragma unroll
+        for (u32 nt = 0u; nt < NT; nt++) {
+            o[nt][0] *= c0; o[nt][1] *= c0; o[nt][2] *= c1; o[nt][3] *= c1;
+        }
+        if ((vmask & 0xFFFFu) != 0u) mla_pv_half<USE_BF16, NT>(sm.kv[0], sm.p16, 0u, d_base, vrow, vcol, g, t, o);
+        if constexpr (KV_FMT == 1u) {
+            if (has_next) {
+                prim::block_sync();
+                u32 nj0 = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end);
+                mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, nj0, context, page_shift, l16, sm.kv[0][tk]);
+                attn_cp_commit();
+            }
+        }
+        if ((vmask >> 16u) != 0u) mla_pv_half<USE_BF16, NT>(sm.kv[1], sm.p16, 8u, d_base, vrow, vcol, g, t, o);
+        if (has_next) prim::block_sync();
     }
     attn_store_partials<NT, OUT_W, OUT_STRIDE>(part, o, sm.m, sm.l, row, heads, h0, 16u, split, splits,
                                                d_base, g, t, tid);

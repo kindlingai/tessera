@@ -45,8 +45,9 @@ static __device__ __forceinline__ void pf_cp_async16(void* dst, const void* src)
   u32 addr = static_cast<u32>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(addr), "l"(src));
 }
-union alignas(16) Pf1Smem { struct { u32 btab_g[8u * MX8_TILE], btab_u[8u * MX8_TILE], wtiles[2][2048]; } k; float out[64][128]; };
+union alignas(16) Pf1Smem { struct { u32 btab[2][8u * MX8_TILE], wtiles[2][2048]; } k; float out[32][128]; };
 struct alignas(16) Pf1TurnSmem { u32 btab_g[8u * MX8_TILE], btab_u[8u * MX8_TILE]; };
+union alignas(16) Pf2Smem { struct { u32 btab[2][8u * MX8_TILE], wtiles[2048]; } k; float out[32][128]; };
 
 // Rotates and packs gate/up activations for one slot block.
 template <typename TokFn>
@@ -81,22 +82,21 @@ static __device__ __forceinline__ void pf_turn_slot_blk(
 }
 
 template <tessera::u32 NT>
-static __device__ __forceinline__ void pf_load_turned(
-    const u32* x_blk, Pf1Smem& sm, u32 tid, u32 nv4) {
-  const uint4* xg = reinterpret_cast<const uint4*>(x_blk);
-  const uint4* xu = xg + 8u * MX8_V4;
-  uint4* dg4 = reinterpret_cast<uint4*>(sm.k.btab_g);
-  uint4* du4 = reinterpret_cast<uint4*>(sm.k.btab_u);
+static __device__ __forceinline__ void pf_cp_one(
+    const u32* src, u32* dst, u32 tid, u32 nv4) {
+  const uint4* s4 = reinterpret_cast<const uint4*>(src);
+  uint4* d4 = reinterpret_cast<uint4*>(dst);
 #pragma unroll
   for (u32 i = tid; i < NT * MX8_V4; i += 256u) {
-    if (i < nv4) { pf_cp_async16(dg4 + i, xg + i); pf_cp_async16(du4 + i, xu + i); }
+    if (i < nv4) pf_cp_async16(d4 + i, s4 + i);
   }
   asm volatile("cp.async.commit_group;");
 }
 #else
-union alignas(16) Pf1Smem { struct { u32 btab_g[8u * MX8_TILE], btab_u[8u * MX8_TILE], wtiles[1][2048]; } k; float out[64][128]; };
+union alignas(16) Pf1Smem { struct { u32 btab[2][8u * MX8_TILE], wtiles[1][2048]; } k; float out[32][128]; };
+union alignas(16) Pf2Smem { struct { u32 btab[1][8u * MX8_TILE], wtiles[2048]; } k; float out[32][128]; };
 #endif
-union alignas(16) Pf2Smem { struct { u32 btab[8u * MX8_TILE], wtiles[2048]; } k; float out[32][128]; };
+constexpr u32 ACT_CHUNK = 8u * MX8_TILE;
 
 template <u32 SPAN>
 static __device__ __forceinline__ void pf_scatter_acc(
@@ -114,13 +114,18 @@ static __device__ __forceinline__ void pf_scatter_acc(
 // Transposes MMA accumulators via smem into per-warp row vectors.
 template <u32 NT>
 static __device__ __forceinline__ void transpose_acc(
-    const float acc[NT][4], float sm_out[64][128], float dst[NT][4], u32 n) {
+    const float acc[NT][4], float sm_out[32][128], float dst[NT][4], u32 n) {
   u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
-  pf_scatter_acc<NT>(acc, 0u, sm_out, n, (j << 4u) + (lane >> 2u), (lane & 3u) << 1u);
+  u32 col = (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
 #pragma unroll
-  for (u32 ti = 0u; ti < NT; ti++) {
-    u32 r = (ti << 3u) + j;
-    if (r < n) trellis::load4(&sm_out[r][lane << 2u], dst[ti]);
+  for (u32 t0 = 0u; t0 < NT; t0 += 4u) {
+    constexpr u32 SPAN = (NT < 4u) ? NT : 4u;
+    pf_scatter_acc<SPAN>(acc, t0, sm_out, n, col, rc);
+#pragma unroll
+    for (u32 ti = 0u; ti < SPAN; ti++) {
+      u32 r = ((t0 + ti) << 3u) + j;
+      if (r < n) trellis::load4(&sm_out[(ti << 3u) + j][lane << 2u], dst[t0 + ti]);
+    }
   }
 }
 
@@ -166,6 +171,37 @@ static __device__ __forceinline__ void pf_store_fc2(
       }
     }
   }
+}
+
+// Runs pipelined MXFP8 fc2 chunk loop across all ffn blocks.
+template <u32 K, u32 BOOK, u32 NT>
+static __device__ __forceinline__ void pf_fc2_loop(
+    const u32* act_slot, const u8* gb, u64 sG, bool aligned, u32 upto, u32 tid, u32 j, u32 lane,
+    const trellis::word_map& wm, Pf2Smem& sm, float acc[NT][4]) {
+  u32 nw[8];
+  trellis::blk_load<K>(gb, tid, aligned, nw);
+#if GLM53_USE_MX8
+  pf_stage_fc2_act<NT>(act_slot, sm.k.btab[0], tid);
+  for (u32 c = 0u; c < upto; c++) {
+    u32 st = c & 1u;
+    if (c + 1u < upto) pf_stage_fc2_act<NT>(act_slot + (u64)(c + 1u) * ACT_CHUNK, sm.k.btab[st ^ 1u], tid);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
+    if (c + 1u < upto) asm volatile("cp.async.wait_group 1;"); else asm volatile("cp.async.wait_group 0;");
+    prim::block_sync();
+    if (c + 1u < upto) { gb += sG; trellis::blk_load<K>(gb, tid, aligned, nw); }
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab[st], j, lane, wm, acc);
+    if (c + 1u < upto) prim::block_sync();
+  }
+#else
+  for (u32 c = 0u; c < upto; c++) {
+    if (c > 0u) prim::block_sync();
+    pf_stage_fc2_act<NT>(act_slot + (u64)c * ACT_CHUNK, sm.k.btab[0], tid);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
+    prim::block_sync();
+    if (c + 1u < upto) { gb += sG; trellis::blk_load<K>(gb, tid, aligned, nw); }
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab[0], j, lane, wm, acc);
+  }
+#endif
 }
 
 // Sums weighted fp16 partials in pick order per warp.
