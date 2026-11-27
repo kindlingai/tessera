@@ -378,14 +378,15 @@ impl<'a> Tree<'a> {
         // Sliced views of replicated nodes for owned readers.
         let mut sliced: HashMap<(T, usize, usize), T> = HashMap::new();
         // Spot pins, built once per label.
+        let base_pins = pins;
         let labels = (!pins.spots.is_empty()).then(|| crate::recipe::labels(g));
         let mut spotted: HashMap<&str, Pins> = HashMap::new();
         for i in (0..g.nodes.len()).filter(|i| needed[*i]) {
             let pins: &Pins = match &labels {
                 Some(l) => spotted
                     .entry(l[i].as_str())
-                    .or_insert_with(|| pins.at(&l[i])),
-                None => pins,
+                    .or_insert_with(|| base_pins.at(&l[i])),
+                None => base_pins,
             };
             let n = &g.nodes[i];
             let mut extents = sized(g, sizes, upto, &n.ty.shape)?;
@@ -425,7 +426,7 @@ impl<'a> Tree<'a> {
             let mut args = args?;
             own::slice_owned_args(&mut tree, g, n, &mut args, &mut sliced);
             let form = match &n.op {
-                Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
+                Op::Weight(w) => base_pins.form(&g.weights[*w as usize].path),
                 Op::Input { .. } => tessera_codegen::form::of(n.ty.dtype),
                 Op::View(View::Reshape(_)) => tree.node(args[0]).form,
                 _ if !n.ty.dtype.is_float() => tessera_codegen::form::of(n.ty.dtype),

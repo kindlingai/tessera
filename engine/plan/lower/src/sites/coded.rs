@@ -23,6 +23,8 @@ pub struct Coded {
     /// `1` scales by a vector, `2` by gated rows.
     pub post: u32,
     pub form: &'static dyn Stored,
+    /// Whether `x` is stored as bf16.
+    pub x_bf16: bool,
 }
 
 fn gather_of(tree: &Tree, t: T) -> Option<(T, T)> {
@@ -37,7 +39,8 @@ impl Coded {
     fn pick(tree: &Tree, [x, pick]: [T; 2], turned: bool, block: usize) -> Option<(Self, [T; 2])> {
         let (codes, ids) = gather_of(tree, pick)?;
         let named = |t: T, name: &str| tree.node(t).form.name() == name;
-        if !tree.leaf(codes) || !named(x, "f32") || !named(ids, "u32") {
+        let x_bf16 = named(x, "bf16");
+        if !tree.leaf(codes) || !(x_bf16 || named(x, "f32")) || !named(ids, "u32") {
             return None;
         }
         let &[count, n, k] = tree.node(codes).shape.as_slice() else {
@@ -62,6 +65,7 @@ impl Coded {
             turned,
             post: 0,
             form: tree.node(codes).form,
+            x_bf16,
         };
         Some((site, [codes, ids]))
     }
@@ -138,6 +142,7 @@ impl Coded {
     /// Whether `input` may be stored as `form`.
     pub fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         match input {
+            0 => form.name() == if self.x_bf16 { "bf16" } else { "f32" },
             1 => form.name() == self.form.name(),
             2 => form.name() == "u32",
             _ => form.name() == "f32",
@@ -173,7 +178,7 @@ impl Coded {
         let out = self.rows * self.n;
         let mut reads = vec![
             self.form.bytes(out * self.k) as f64,
-            (4 * (self.rows / self.repeat) * self.k) as f64,
+            (if self.x_bf16 { 2 } else { 4 } * (self.rows / self.repeat) * self.k) as f64,
             (4 * self.rows) as f64,
         ];
         if self.turned {

@@ -47,8 +47,8 @@ union alignas(16) i4_r16_smem {
     float red[4][16][17];
 };
 
-static __device__ __forceinline__ void i4_hilo_pair(const float* p, u32& hi, u32& lo) {
-    float2 v = *reinterpret_cast<const float2*>(p);
+static __device__ __forceinline__ void i4_hilo_pair(const trellis::x_t* p, u32& hi, u32& lo) {
+    float2 v = trellis::load_x2(p);
     hi = trellis::f32x2_to_f16x2(v.x, v.y);
     lo = trellis::f32x2_to_f16x2(
         v.x - trellis::f16_to_f32(hi & 0xFFFFu),
@@ -57,7 +57,7 @@ static __device__ __forceinline__ void i4_hilo_pair(const float* p, u32& hi, u32
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r16(
-    const float* x, const u8* w, const float* other, float* out,
+    const trellis::x_t* x, const u8* w, const float* other, float* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r16_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 r0 = blockIdx.y << 4u, nb = n >> 4u;
@@ -102,7 +102,7 @@ static __device__ __forceinline__ void fg_int4_r16(
                 for (u32 ti = 0u; ti < 2u; ti++) {
                     u32 tok = r0 + (ti << 3u) + g, bh[2] = {0u, 0u}, blv[2] = {0u, 0u};
                     if (tok < m) {
-                        const float* xp = x + u64(tok) * k + k_col;
+                        const trellis::x_t* xp = x + u64(tok) * k + k_col;
                         i4_hilo_pair(xp, bh[0], blv[0]);
                         i4_hilo_pair(xp + 8u, bh[1], blv[1]);
                     }
@@ -147,15 +147,15 @@ union alignas(16) i4_r64_smem {
 };
 
 static __device__ __forceinline__ void i4_load_x(
-    u32 (*sx_st)[32], const float* x, u32 r0, u32 k_sub, u32 m, u32 k, u32 r0_t, u32 col16) {
+    u32 (*sx_st)[32], const trellis::x_t* x, u32 r0, u32 k_sub, u32 m, u32 k, u32 r0_t, u32 col16) {
 #pragma unroll
     for (u32 dr = 0u; dr < 64u; dr += 32u) {
         u32 r = r0_t + dr;
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
         if (r0 + r < m) {
-            const float* xp = x + u64(r0 + r) * k + k_sub + (col16 << 3u);
-            float4 x0 = *reinterpret_cast<const float4*>(xp);
-            float4 x1 = *reinterpret_cast<const float4*>(xp + 4u);
+            const trellis::x_t* xp = x + u64(r0 + r) * k + k_sub + (col16 << 3u);
+            float4 x0 = trellis::load_x4(xp);
+            float4 x1 = trellis::load_x4(xp + 4u);
             v = make_uint4(trellis::f32x2_to_f16x2(x0.x, x0.y),
                            trellis::f32x2_to_f16x2(x0.z, x0.w),
                            trellis::f32x2_to_f16x2(x1.x, x1.y),
@@ -167,7 +167,7 @@ static __device__ __forceinline__ void i4_load_x(
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r64(
-    const float* x, const u8* w, const float* other, float* out,
+    const trellis::x_t* x, const u8* w, const float* other, float* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
     u32 g = lane >> 2u, t = lane & 3u, wn = warp & 3u, wm = warp >> 2u;
@@ -301,11 +301,11 @@ static __device__ __forceinline__ void fg_int4_r64(
 
 #define I4_PAIR(TAG, TH, BLK, SM, FN) \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG( \
-        const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) { \
+        const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) { \
         I4_RUN(SM, FN, false, 1u); \
     } \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG##_sk( \
-        const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
+        const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
         (void)ks; \
         I4_RUN(SM, FN, true, ks); \
     }

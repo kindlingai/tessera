@@ -513,6 +513,9 @@ fn picked_pf_launches(p: &PickedTrellisPfMetal, step: &Step) -> Vec<Launch> {
 /// Matches rotated or plain picked trellis matmuls of either kind.
 fn propose_picked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (site, reads) = Coded::find(tree, at, BLOCK)?;
+    if site.x_bf16 {
+        return None;
+    }
     let name = site.form.name();
     let mixed = parse_mix_form(name).map(|book| (0, book));
     let (bits, book) = parse_form(name).or(mixed)?;

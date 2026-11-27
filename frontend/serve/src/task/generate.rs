@@ -185,6 +185,7 @@ pub(crate) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
         for (site, form) in over.sites {
             recipe.pins = recipe.pins.site(site, form);
         }
+        recipe.pins.spots.extend(over.spots);
     }
     recipe.pins = kv_pin(options, recipe.pins);
     if let Some(tokens) = options.kv_cache_tokens {

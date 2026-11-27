@@ -198,6 +198,9 @@ pub(crate) fn grid_cross(
     let (src, dst) = (step.reads[0], step.write);
     match step.kernel.name() {
         AllReduce::NAME => {
+            if src.form.name() != "f32" || dst.form.name() != "f32" {
+                return Ok(false);
+            }
             grid.sum(from, to, dst.len, wire(step))?;
             Ok(true)
         }

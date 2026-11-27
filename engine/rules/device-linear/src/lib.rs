@@ -159,7 +159,10 @@ fn dtr_source(t: &TrellisMma) -> Source {
         "dtr_k4_t4" => "DTR_T4_BLK",
         _ => "DTR_GEN_BLK",
     };
-    cuda_source_with(entry, t.min_blocks.map(|v| (def, v as usize)))
+    cuda_source_with(
+        entry,
+        x_defs(t.min_blocks.map(|v| (def, v as usize)), t.x_bf16),
+    )
 }
 
 fn dtr_needs(bytes: usize) -> Needs {
@@ -205,11 +208,12 @@ macro_rules! dtr_mma_kernel {
             bits: u32,
             book: u32,
             turned: bool,
+            x_bf16: bool,
             form: &'static dyn Stored,
         }
 
         fn $accepts(k: &$name, input: usize, form: &dyn Stored) -> bool {
-            weight_accepts(input, k.form, form)
+            weight_x_accepts(input, k.x_bf16, k.form, form)
         }
     };
 }
@@ -254,7 +258,8 @@ fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
         (true, _) => &[t.k],
         (false, _) => &[],
     };
-    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], t.tile, 4, scales)
+    let x_elem = if t.x_bf16 { 2 } else { 4 };
+    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], t.tile, x_elem, scales)
 }
 
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
@@ -365,7 +370,7 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
     order = Order::PerConfig,
     source = prefill_source_with(
         "dtr_prep",
-        self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)),
+        x_defs(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)), self.x_bf16),
     ),
     launches = prep_launches,
     load = prep_load,
@@ -377,15 +382,20 @@ struct TrellisPrep {
     k: usize,
     min_blocks: Option<u32>,
     turned: bool,
+    x_bf16: bool,
 }
 
-fn prep_accepts(_: &TrellisPrep, _: usize, form: &dyn Stored) -> bool {
-    form.name() == "f32"
+fn prep_accepts(p: &TrellisPrep, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 => x_accepts(p.x_bf16, form),
+        _ => form.name() == "f32",
+    }
 }
 
 fn prep_load(p: &TrellisPrep, _: usize) -> Option<Load> {
     let groups = (p.k / BLOCK) * p.m.div_ceil(64);
-    let mut reads = vec![(4 * p.m * p.k) as f64];
+    let x_elem = if p.x_bf16 { 2 } else { 4 };
+    let mut reads = vec![(x_elem * p.m * p.k) as f64];
     if p.turned {
         reads.push((4 * p.k) as f64);
     }
@@ -498,6 +508,7 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
             k,
             min_blocks: tree.knobs.get(rule, "prep_min_blocks").map(|v| v as u32),
             turned,
+            x_bf16: d.x_bf16,
         };
         let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
         let mma = TrellisPreMma {
@@ -509,6 +520,7 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
             bits: d.bits,
             book: d.book,
             turned,
+            x_bf16: false,
             form: d.form,
         };
         return Some(Ok(vec![
@@ -533,6 +545,7 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
         bits: d.bits,
         book: d.book,
         turned,
+        x_bf16: d.x_bf16,
         form: d.form,
     };
     let red = TrellisReduce {
@@ -547,7 +560,7 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
 
 /// Rotated or plain dense trellis matmul.
 fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    match Dense::find(tree, at, BLOCK)? {
+    match Dense::find_with(tree, at, BLOCK, true)? {
         Ok(d) => trellis_drafts(tree, &d),
         Err(e) => Some(Err(e)),
     }
@@ -583,11 +596,36 @@ pub(crate) fn cuda_source_with<'a>(
     tessera_device::cuda_source_with(cuda_source(), entry, defs)
 }
 
-pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
+pub(crate) fn x_defs<'a>(
+    base: impl IntoIterator<Item = (&'a str, usize)>,
+    x_bf16: bool,
+) -> Vec<(&'a str, usize)> {
+    let mut defs: Vec<_> = base.into_iter().collect();
+    if x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
+    defs
+}
+
+pub(crate) fn x_accepts(x_bf16: bool, form: &dyn Stored) -> bool {
+    form.name() == if x_bf16 { "bf16" } else { "f32" }
+}
+
+pub(crate) fn weight_x_accepts(
+    input: usize,
+    x_bf16: bool,
+    expected: &dyn Stored,
+    form: &dyn Stored,
+) -> bool {
     match input {
+        0 => x_accepts(x_bf16, form),
         1 => form.name() == expected.name(),
         _ => form.name() == "f32",
     }
+}
+
+pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
+    weight_x_accepts(input, false, expected, form)
 }
 
 cuda_rule!("trellis_mma", check = eval_trellis);

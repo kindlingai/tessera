@@ -599,6 +599,42 @@ TESSERA_FN void load4(const float* p, float v[4]) {
     v[3] = f.w;
 }
 
+#if defined(X_BF16)
+using x_t = u16;
+#else
+using x_t = float;
+#endif
+
+// Reads two activation elements as float2.
+TESSERA_FN float2 load_x2(const x_t* p) {
+#if defined(X_BF16)
+    u32 h = *reinterpret_cast<const u32*>(p);
+    return make_float2(__uint_as_float(h << 16u), __uint_as_float(h & 0xFFFF0000u));
+#else
+    return *reinterpret_cast<const float2*>(p);
+#endif
+}
+
+// Reads four activation elements as float4.
+TESSERA_FN float4 load_x4(const x_t* p) {
+#if defined(X_BF16)
+    uint2 h = *reinterpret_cast<const uint2*>(p);
+    return make_float4(__uint_as_float(h.x << 16u), __uint_as_float(h.x & 0xFFFF0000u),
+                       __uint_as_float(h.y << 16u), __uint_as_float(h.y & 0xFFFF0000u));
+#else
+    return *reinterpret_cast<const float4*>(p);
+#endif
+}
+
+// Reads four activation elements into `v`.
+TESSERA_FN void load_x4(const x_t* p, float v[4]) {
+    float4 f = load_x4(p);
+    v[0] = f.x;
+    v[1] = f.y;
+    v[2] = f.z;
+    v[3] = f.w;
+}
+
 TESSERA_FN float half_to_f32(u32 h) {
     return f16_to_f32(h);
 }

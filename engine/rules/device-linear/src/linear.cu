@@ -75,7 +75,7 @@ using namespace tessera;
 using dtr_smem = trellis::stage_smem<float[32][128]>;
 
 template <u32 K, u32 BOOK, u32 NT, bool TURNED, bool SPLIT>
-static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, const float* suh,
+static __device__ __forceinline__ void dtr_body(const trellis::x_t* x, const u8* w, const float* suh,
                                                 const float* svh, float* out, u32 m, u32 n, u32 k,
                                                 u32 ks, dtr_smem& sm) {
     constexpr u32 TB = 32u * K;
@@ -111,7 +111,7 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
             if constexpr (TURNED) trellis::load4(suh + col, sc);
             for (u32 r = r_base; r < nr; r += wpb) {
                 float v[4];
-                trellis::load4(x + u64(r0 + r) * k + col, v);
+                trellis::load_x4(x + u64(r0 + r) * k + col, v);
                 if constexpr (TURNED) {
                     v[0] *= sc[0]; v[1] *= sc[1]; v[2] *= sc[2]; v[3] *= sc[3];
                     trellis::wht128(v, trellis::INV_SQRT128);
@@ -162,7 +162,7 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
 }
 
 template <u32 K, u32 BOOK, u32 NT>
-static __device__ __noinline__ void dtr_gen_k(const float* x, const u8* w, const float* suh,
+static __device__ __noinline__ void dtr_gen_k(const trellis::x_t* x, const u8* w, const float* suh,
                                               const float* svh, float* out, u32 m, u32 n, u32 k,
                                               u32 ks, u32 turned, dtr_smem& sm) {
     if (ks > 1u) {
@@ -175,18 +175,18 @@ static __device__ __noinline__ void dtr_gen_k(const float* x, const u8* w, const
 }
 
 template <u32 BOOK, u32 NT>
-static __device__ void dtr_gen_book(const float* x, const u8* w, const float* suh, const float* svh,
-                                    float* out, u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 turned,
-                                    dtr_smem& sm) {
+static __device__ void dtr_gen_book(const trellis::x_t* x, const u8* w, const float* suh,
+                                    const float* svh, float* out, u32 m, u32 n, u32 k, u32 ks,
+                                    u32 bits, u32 turned, dtr_smem& sm) {
     if (bits == 2u) dtr_gen_k<2u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
     else if (bits == 3u) dtr_gen_k<3u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
     else dtr_gen_k<4u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
 }
 
 template <u32 NT>
-static __device__ void dtr_gen(const float* x, const u8* w, const float* suh, const float* svh,
-                               float* out, u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book,
-                               u32 turned, dtr_smem& sm) {
+static __device__ void dtr_gen(const trellis::x_t* x, const u8* w, const float* suh,
+                               const float* svh, float* out, u32 m, u32 n, u32 k, u32 ks, u32 bits,
+                               u32 book, u32 turned, dtr_smem& sm) {
     if (book == trellis::BOOK_PMCGX) {
         dtr_gen_book<trellis::BOOK_PMCGX, NT>(x, w, suh, svh, out, m, n, k, ks, bits, turned, sm);
     } else if (book == trellis::BOOK_MUL1) {
@@ -198,8 +198,8 @@ static __device__ void dtr_gen(const float* x, const u8* w, const float* suh, co
 
 #define DTR_DEF(NAME, K, BOOK, NT, TURNED, SPLIT, MIN_BLK)                                    \
     extern "C" __global__ __launch_bounds__(256, MIN_BLK) void NAME(                          \
-        const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,   \
-        u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {                               \
+        const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out,   \
+        u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {                        \
         (void)bits;                                                                           \
         (void)book;                                                                           \
         (void)turned;                                                                         \
@@ -217,24 +217,24 @@ DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, DTR_T4_BLK)
 
 // Generic dense trellis matmul for up to 8 rows.
 extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen1(
-    const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
-    u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
+    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
+    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
     dtr_gen<1u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
 }
 
 // Generic dense trellis matmul for 16-row tiles.
 extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen2(
-    const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
-    u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
+    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
+    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
     dtr_gen<2u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
 }
 
 // Generic dense trellis matmul for 32-row tiles.
 extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen4(
-    const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
-    u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
+    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
+    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
     dtr_gen<4u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
 }
@@ -302,19 +302,19 @@ static __device__ __forceinline__ float fg_dot4(u32 h0, u32 h1, uint2 xh) {
     return trellis::f16_to_f32(p & 0xFFFFu) + trellis::f16_to_f32(p >> 16);
 }
 
-static __device__ __forceinline__ void fg_stage_chunk(u32 x_h[512], const float* x, u32 base) {
-    float4 xv = *reinterpret_cast<const float4*>(x + base + (threadIdx.x << 2));
+static __device__ __forceinline__ void fg_stage_chunk(u32 x_h[512], const trellis::x_t* x,
+                                                      u32 base) {
+    float4 xv = trellis::load_x4(x + base + (threadIdx.x << 2));
     u32 p0 = trellis::f32x2_to_f16x2(xv.x, xv.y);
     u32 p1 = trellis::f32x2_to_f16x2(xv.z, xv.w);
     *reinterpret_cast<uint2*>(x_h + (threadIdx.x << 1)) = make_uint2(p0, p1);
     prim::block_sync();
 }
 
-static __device__ __forceinline__ float fg_dot8_step(float acc, const float* x, const u16* wr,
-                                                     u32 i) {
+static __device__ __forceinline__ float fg_dot8_step(float acc, const trellis::x_t* x,
+                                                     const u16* wr, u32 i) {
     uint4 h = fg_ld_nc4(wr + i);
-    float4 x0 = *reinterpret_cast<const float4*>(x + i);
-    float4 x1 = *reinterpret_cast<const float4*>(x + i + 4u);
+    float4 x0 = trellis::load_x4(x + i), x1 = trellis::load_x4(x + i + 4u);
     acc = fmaf(__uint_as_float(h.x << 16), x0.x,
                fmaf(__uint_as_float(h.x & 0xFFFF0000u), x0.y,
                     fmaf(__uint_as_float(h.y << 16), x0.z,
@@ -325,8 +325,7 @@ static __device__ __forceinline__ float fg_dot8_step(float acc, const float* x, 
                           fmaf(__uint_as_float(h.w & 0xFFFF0000u), x1.w, acc))));
 }
 
-static __device__ __forceinline__ float fg_dot8_bf16(const float* x, const u16* wr, u32 k,
-                                                     u32 lane) {
+static __device__ __forceinline__ float fg_dot8_bf16(const trellis::x_t* x, const u16* wr, u32 k, u32 lane) {
     float acc = 0.0f;
     for (u32 i = lane << 3; i < k; i += 256u) acc = fg_dot8_step(acc, x, wr, i);
     return fg_warp_sum(acc);
@@ -387,7 +386,9 @@ static __device__ __forceinline__ u32 fg_e4m3_f16(u16 q) {
 template <u32 KS>
 struct alignas(16) fg_bf16_smem {
     u32 sxh[KS][16][36];
+#if !defined(X_BF16)
     u32 sxl[KS][16][36];
+#endif
     union {
         u32 sw[4][8][36];
         float4 red[2][32];
@@ -395,9 +396,10 @@ struct alignas(16) fg_bf16_smem {
 };
 
 template <u32 KS, bool SPLIT>
-static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, const float* other,
-                                                  float* out, u32 m, u32 n, u32 k, u32 w_stride,
-                                                  u32 x_rs, u32 o_rs, u32 r0, u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
+static __device__ __forceinline__ void fg_bf16_mm(const trellis::x_t* x, const u16* w,
+                                                  const float* other, float* out, u32 m, u32 n,
+                                                  u32 k, u32 w_stride, u32 x_rs, u32 o_rs, u32 r0,
+                                                  u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
     constexpr u32 NTILES = 4u / KS;
     constexpr u32 BN = 8u * NTILES;
     constexpr u32 BK = 64u * KS;
@@ -418,19 +420,22 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
             for (u32 dr = 0u; dr < 16u; dr += 8u) {
                 u32 r = xr + dr;
                 if (r0 + r < m) {
-                    const float* xp = x + u64(r0 + r) * x_rs + k0 + (s << 6) + xc;
+                    const trellis::x_t* xp = x + u64(r0 + r) * x_rs + k0 + (s << 6) + xc;
+#if defined(X_BF16)
+                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = *reinterpret_cast<const uint2*>(xp);
+#else
                     float4 xv = *reinterpret_cast<const float4*>(xp);
-                    u32 h0 = fg_bf16x2(xv.x, xv.y);
-                    u32 h1 = fg_bf16x2(xv.z, xv.w);
-                    u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16),
-                                       xv.y - __uint_as_float(h0 & 0xFFFF0000u));
-                    u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16),
-                                       xv.w - __uint_as_float(h1 & 0xFFFF0000u));
+                    u32 h0 = fg_bf16x2(xv.x, xv.y), h1 = fg_bf16x2(xv.z, xv.w);
+                    u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16), xv.y - __uint_as_float(h0 & 0xFFFF0000u));
+                    u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16), xv.w - __uint_as_float(h1 & 0xFFFF0000u));
                     *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(h0, h1);
                     *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(l0, l1);
+#endif
                 } else {
                     *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(0u, 0u);
+#if !defined(X_BF16)
                     *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(0u, 0u);
+#endif
                 }
             }
         }
@@ -446,11 +451,13 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
             u32 off = (ks_i << 3) + t;
             u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off], sm.sxh[kp][g][off + 4u],
                          sm.sxh[kp][g + 8u][off + 4u]};
-            u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off], sm.sxl[kp][g][off + 4u],
-                         sm.sxl[kp][g + 8u][off + 4u]};
             u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
             fg_mma_bf16(acc, ah, b);
+#if !defined(X_BF16)
+            u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off], sm.sxl[kp][g][off + 4u],
+                         sm.sxl[kp][g + 8u][off + 4u]};
             fg_mma_bf16(acc, al, b);
+#endif
         }
         prim::block_sync();
     }
@@ -479,21 +486,21 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
 
 // Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_BLK) void tessera_mm_bf16(
-    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
     fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_KS2_BLK) void tessera_mm_bf16_ks2(
-    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
     fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_SK_BLK) void tessera_mm_bf16_sk(
-    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_bf16_smem<2u> sm;
     fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, ks, sm);
@@ -505,9 +512,9 @@ union alignas(16) fg_mx_smem {
 };
 
 template <u32 NT, bool SPLIT>
-static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, const float* other,
-                                                   float* out, u32 m, u32 n, u32 k, u32 mode,
-                                                   u32 ks, fg_mx_smem& sm) {
+static __device__ __forceinline__ void fg_mxfp8_mm(const trellis::x_t* x, const u8* w,
+                                                   const float* other, float* out, u32 m, u32 n,
+                                                   u32 k, u32 mode, u32 ks, fg_mx_smem& sm) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
     u32 r0 = blockIdx.y * (NT << 3), nb = n >> 4;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -567,9 +574,8 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
                     u32 tok = r0 + (ti << 3) + g;
                     u32 bh[2] = {0u, 0u}, bl[2] = {0u, 0u};
                     if (tok < m) {
-                        const float* xp = x + u64(tok) * k + k_col;
-                        float2 v0 = *reinterpret_cast<const float2*>(xp);
-                        float2 v1 = *reinterpret_cast<const float2*>(xp + 8u);
+                        const trellis::x_t* xp = x + u64(tok) * k + k_col;
+                        float2 v0 = trellis::load_x2(xp), v1 = trellis::load_x2(xp + 8u);
                         bh[0] = trellis::f32x2_to_f16x2(v0.x, v0.y);
                         bh[1] = trellis::f32x2_to_f16x2(v1.x, v1.y);
                         bl[0] = trellis::f32x2_to_f16x2(
@@ -628,9 +634,9 @@ static __device__ __forceinline__ u16 fg_u16_odd(const u32* s, u32 byte_off) {
 }
 
 template <bool SPLIT>
-static __device__ __forceinline__ void fg_mxfp8_r64(const float* x, const u8* w, const float* other,
-                                                    float* out, u32 m, u32 n, u32 k, u32 mode,
-                                                    u32 ks, fg_mx64_smem& sm) {
+static __device__ __forceinline__ void fg_mxfp8_r64(const trellis::x_t* x, const u8* w,
+                                                    const float* other, float* out, u32 m, u32 n,
+                                                    u32 k, u32 mode, u32 ks, fg_mx64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wm = warp >> 2, wn = warp & 3u, nb = (n + 63u) >> 6;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -660,7 +666,7 @@ static __device__ __forceinline__ void fg_mxfp8_r64(const float* x, const u8* w,
                 u32 r = xr0 + dr;
                 uint2 hi = make_uint2(0u, 0u);
                 if (r0 + r < m) {
-                    float4 xv = *reinterpret_cast<const float4*>(x + u64(r0 + r) * k + k_sub + xc);
+                    float4 xv = trellis::load_x4(x + u64(r0 + r) * k + k_sub + xc);
                     hi = make_uint2(trellis::f32x2_to_f16x2(xv.x, xv.y), trellis::f32x2_to_f16x2(xv.z, xv.w));
                 }
                 *reinterpret_cast<uint2*>(&sm.sxh[r][xw]) = hi;
@@ -718,14 +724,14 @@ static __device__ __forceinline__ void fg_mxfp8_r64(const float* x, const u8* w,
 
 // Streaming MXFP8 Tensor-Core matmul, up to 8 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R8_BLK) void tessera_mm_mxfp8_r8(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K MXFP8 Tensor-Core matmul, up to 8 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R8_SK_BLK) void tessera_mm_mxfp8_r8_sk(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<1u, true>(x, w, other, out, m, n, k, mode, ks, sm);
@@ -733,7 +739,7 @@ extern "C" __global__ __launch_bounds__(128, MM_MX_R8_SK_BLK) void tessera_mm_mx
 
 // Split-K MXFP8 Tensor-Core matmul, up to 16 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R16_SK_BLK) void tessera_mm_mxfp8_r16_sk(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<2u, true>(x, w, other, out, m, n, k, mode, ks, sm);
@@ -754,7 +760,7 @@ extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R16_BLK) void tessera_mm_mxfp8_r16(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
@@ -767,14 +773,14 @@ static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, 
 
 // Staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX_R64_BLK) void tessera_mm_mxfp8_r64(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx64_smem sm;
     fg_mxfp8_r64<false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX_R64_SK_BLK) void tessera_mm_mxfp8_r64_sk(
-    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx64_smem sm;
     fg_mxfp8_r64<true>(x, w, other, out, m, n, k, mode, ks, sm);
@@ -782,7 +788,7 @@ extern "C" __global__ __launch_bounds__(256, MM_MX_R64_SK_BLK) void tessera_mm_m
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
 extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16(
-    const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
+    const trellis::x_t* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
     u32 row = blockIdx.x * GEMV_BF16_WARPS + (threadIdx.x >> 5);
     if (row >= n) return;
     u32 lane = threadIdx.x & 31u;
@@ -792,7 +798,7 @@ extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) voi
 
 // Streaming 8-BF16 narrow decode GEMV, one block per output row.
 extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16_narrow(
-    const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
+    const trellis::x_t* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
     __shared__ float part[GEMV_BF16_WARPS];
     u32 row = blockIdx.x;
     if (row >= n) return;
@@ -813,13 +819,13 @@ extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) voi
 
 // Tensor-Core BF16 stacked matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, ST_TC_BLK) void tessera_stacked_lanes_tc(
-    const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
+    const trellis::x_t* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
     u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     __shared__ fg_bf16_smem<2u> sm;
     u32 rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles;
     u32 r0 = (blockIdx.y % rtiles) << 4u;
-    const float* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
+    const trellis::x_t* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
     const u16* wb = w + u64(batch) * block + first;
     float* ob = out + u64(batch) * o_bs + u64(r0) * o_rs;
     u32 nr = min(rows - r0, 16u);
@@ -828,7 +834,7 @@ extern "C" __global__ __launch_bounds__(128, ST_TC_BLK) void tessera_stacked_lan
 
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.
 extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_lanes(
-    const float* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
+    const trellis::x_t* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
     u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     u32 idx = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
     if (idx >= len) return;
@@ -838,7 +844,7 @@ extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_
     u32 r0 = blockIdx.y * 8u;
     u32 nr = min(rows - r0, 8u);
     const u16* wr = w + u64(batch) * block + first + u64(col) * col_step;
-    const float* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
+    const trellis::x_t* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (u32 i = lane << 3; i < k; i += 256u) {
         uint4 h = fg_ld_nc4(wr + i);
@@ -849,9 +855,8 @@ extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_
 #pragma unroll
         for (u32 r = 0u; r < 8u; r++) {
             if (r >= nr) break;
-            const float* xp = xb + u64(r) * x_rs + i;
-            float4 x0 = *reinterpret_cast<const float4*>(xp);
-            float4 x1 = *reinterpret_cast<const float4*>(xp + 4u);
+            const trellis::x_t* xp = xb + u64(r) * x_rs + i;
+            float4 x0 = trellis::load_x4(xp), x1 = trellis::load_x4(xp + 4u);
             acc[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, acc[r]))));
             acc[r] = fmaf(a4, x1.x, fmaf(a5, x1.y, fmaf(a6, x1.z, fmaf(a7, x1.w, acc[r]))));
         }
@@ -866,7 +871,7 @@ extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_
 
 // Streaming chunk-tiled MXFP8 decode GEMV, one warp per output.
 extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_mxfp8(
-    const float* x, const u8* w, float* out, u32 n, u32 k) {
+    const trellis::x_t* x, const u8* w, float* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][268];
     u32 warp = threadIdx.x >> 5;
@@ -923,7 +928,7 @@ extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_m
 
 // Streaming chunk-tiled 2-row INT4_G32 decode GEMV.
 extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_int4(
-    const float* x, const u8* w, float* out, u32 n, u32 k) {
+    const trellis::x_t* x, const u8* w, float* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][296];
     u32 warp = threadIdx.x >> 5;

@@ -1,6 +1,6 @@
 //! Streaming decode GEMV for BF16, MXFP8 and INT4 weights.
 
-use super::{WARPS, cuda_needs, cuda_source_with, f32_only, trip, weight_accepts};
+use super::{WARPS, cuda_needs, cuda_source_with, f32_only, trip, weight_x_accepts};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
@@ -112,11 +112,12 @@ struct FastGemv {
     custom_warps: bool,
     min_blocks: Option<u32>,
     kind: GemvKind,
+    x_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn gemv_accepts(k: &FastGemv, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+    weight_x_accepts(input, k.x_bf16, k.form, form)
 }
 
 fn gemv_needs(k: &FastGemv) -> Needs {
@@ -134,12 +135,16 @@ fn gemv_source(k: &FastGemv) -> Source {
     if let Some(mb) = k.min_blocks {
         defs.push((k.kind.blk_def(), mb as usize));
     }
+    if k.x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
     cuda_source_with(k.kind.entry(), defs)
 }
 
 fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
     let groups = k.kind.groups(k.n, k.warps);
     let threads = k.warps * 32;
+    let x_elem = if k.x_bf16 { 2 } else { 4 };
     let step = match k.kind {
         GemvKind::Bf16 => 256.0,
         GemvKind::Bf16Narrow => (k.warps * 256) as f64,
@@ -150,7 +155,7 @@ fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
         group: threads,
         trips: k.k as f64 / step,
         trip: k.kind.trip(),
-        reads: vec![k.form.bytes(k.n * k.k) as f64, (4 * k.k) as f64],
+        reads: vec![k.form.bytes(k.n * k.k) as f64, (x_elem * k.k) as f64],
         written: (4 * k.n) as f64,
         flight: 512.0,
         ..Load::default()
@@ -223,12 +228,12 @@ fn check_gemv(
     if !tree.leaf(w) {
         return Some(Err("weight is not a direct leaf".into()));
     }
-    if tree.node(x).form.name() != "f32" {
-        return Some(Err(format!(
-            "input form {} (requires f32)",
-            tree.node(x).form.name()
-        )));
-    }
+    let x_name = tree.node(x).form.name();
+    let x_bf16 = match x_name {
+        "f32" => false,
+        "bf16" => true,
+        _ => return Some(Err(format!("input form {x_name} (requires f32 or bf16)"))),
+    };
     let form = tree.node(w).form;
     let narrow_max_n = tree
         .knobs
@@ -276,6 +281,7 @@ fn check_gemv(
         custom_warps,
         min_blocks,
         kind,
+        x_bf16,
         form,
     };
     Some(Ok(vec![Draft::new(kernel, [x, w], n)]))

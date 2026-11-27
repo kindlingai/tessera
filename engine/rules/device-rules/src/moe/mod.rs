@@ -44,6 +44,9 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     } else if let Some(mb) = k.gen_min_blocks {
         defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
+    if k.site.x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
     tessera_device::cuda_source_with(cuda_source(), entry, defs)
 }
 
