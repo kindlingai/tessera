@@ -604,35 +604,92 @@ using x_t = u16;
 #else
 using x_t = float;
 #endif
+#if defined(Y_BF16)
+using y_t = u16;
+#else
+using y_t = float;
+#endif
+#if defined(O_BF16)
+using o_t = u16;
+#else
+using o_t = float;
+#endif
 
-// Reads two activation elements as float2.
-TESSERA_FN float2 load_x2(const x_t* p) {
-#if defined(X_BF16)
+// Reads one element as float.
+TESSERA_FN float load_e(const float* p, u64 idx) { return p[idx]; }
+TESSERA_FN float load_e(const u16* p, u64 idx) { return __uint_as_float(u32(p[idx]) << 16u); }
+
+// Reads two elements as float2.
+TESSERA_FN float2 load_e2(const float* p) { return *reinterpret_cast<const float2*>(p); }
+TESSERA_FN float2 load_e2(const u16* p) {
     u32 h = *reinterpret_cast<const u32*>(p);
     return make_float2(__uint_as_float(h << 16u), __uint_as_float(h & 0xFFFF0000u));
-#else
-    return *reinterpret_cast<const float2*>(p);
-#endif
 }
 
-// Reads four activation elements as float4.
-TESSERA_FN float4 load_x4(const x_t* p) {
-#if defined(X_BF16)
+// Reads four elements as float4.
+TESSERA_FN float4 load_e4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+TESSERA_FN float4 load_e4(const u16* p) {
     uint2 h = *reinterpret_cast<const uint2*>(p);
     return make_float4(__uint_as_float(h.x << 16u), __uint_as_float(h.x & 0xFFFF0000u),
                        __uint_as_float(h.y << 16u), __uint_as_float(h.y & 0xFFFF0000u));
-#else
-    return *reinterpret_cast<const float4*>(p);
-#endif
 }
 
-// Reads four activation elements into `v`.
-TESSERA_FN void load_x4(const x_t* p, float v[4]) {
-    float4 f = load_x4(p);
+template <typename E>
+TESSERA_FN void load_e4(const E* p, float v[4]) {
+    float4 f = load_e4(p);
     v[0] = f.x;
     v[1] = f.y;
     v[2] = f.z;
     v[3] = f.w;
+}
+
+TESSERA_FN u32 f32x2_to_bf16x2(float lo, float hi) {
+    u32 out;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
+    return out;
+}
+
+// Stores one, two, or four output elements.
+TESSERA_FN void store_e(float* p, u64 idx, float v) { p[idx] = v; }
+TESSERA_FN void store_e(u16* p, u64 idx, float v) { p[idx] = f32_to_bf16(v); }
+TESSERA_FN void store_e2(float* p, float v0, float v1) {
+    *reinterpret_cast<float2*>(p) = make_float2(v0, v1);
+}
+TESSERA_FN void store_e2(u16* p, float v0, float v1) {
+    *reinterpret_cast<u32*>(p) = f32x2_to_bf16x2(v0, v1);
+}
+TESSERA_FN void store_e4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+TESSERA_FN void store_e4(u16* p, float4 v) {
+    *reinterpret_cast<uint2*>(p) =
+        make_uint2(f32x2_to_bf16x2(v.x, v.y), f32x2_to_bf16x2(v.z, v.w));
+}
+
+TESSERA_FN float2 load_x2(const x_t* p) { return load_e2(p); }
+TESSERA_FN float4 load_x4(const x_t* p) { return load_e4(p); }
+TESSERA_FN void load_x4(const x_t* p, float v[4]) { load_e4(p, v); }
+TESSERA_FN float load_o(const o_t* p, u64 idx) { return load_e(p, idx); }
+TESSERA_FN float2 load_o2(const o_t* p) { return load_e2(p); }
+TESSERA_FN void load_o4(const o_t* p, float v[4]) { load_e4(p, v); }
+TESSERA_FN void store_y(y_t* p, u64 idx, float v) { store_e(p, idx, v); }
+TESSERA_FN void store_y2(y_t* p, float v0, float v1) { store_e2(p, v0, v1); }
+TESSERA_FN void store_y4(y_t* p, float4 v) { store_e4(p, v); }
+
+// Stores a trellis MMA accumulator tile directly to `out`.
+template <u32 NT>
+TESSERA_FN void store_tile(y_t* out, u32 r0, u32 m, u32 stride, u32 col0, u32 col, u32 rc,
+                           const float acc[NT][4]) {
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        u32 r = r0 + (ti << 3u) + rc;
+        if (r < m) {
+            store_y(out, u64(r) * stride + col0 + col, acc[ti][0]);
+            store_y(out, u64(r) * stride + col0 + col + 8u, acc[ti][2]);
+        }
+        if (r + 1u < m) {
+            store_y(out, u64(r + 1u) * stride + col0 + col, acc[ti][1]);
+            store_y(out, u64(r + 1u) * stride + col0 + col + 8u, acc[ti][3]);
+        }
+    }
 }
 
 TESSERA_FN float half_to_f32(u32 h) {

@@ -67,8 +67,8 @@ using ptr_smem = trellis::stage_smem<float[128]>;
 
 template <u32 K, u32 BOOK, u32 NT, bool TURNED, bool SPLIT>
 static __device__ __forceinline__ void dtr_body(const trellis::x_t* x, const u8* w, const float* suh,
-                                                const float* svh, float* out, u32 m, u32 n, u32 k,
-                                                u32 ks, dtr_smem& sm) {
+                                                const float* svh, trellis::y_t* out, u32 m, u32 n,
+                                                u32 k, u32 ks, dtr_smem& sm) {
     constexpr u32 TB = 32u * K;
     constexpr u32 CHUNK = 4u / NT;
     u32 nblk = n >> 7u;
@@ -110,21 +110,10 @@ static __device__ __forceinline__ void dtr_body(const trellis::x_t* x, const u8*
     }
     u32 col = (j << 4u) + (lane >> 2u), c = lane & 3u;
     if constexpr (SPLIT) {
-        float* pp = out + (u64(ob) * ks + p) * m * 128u;
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 r = r0 + (ti << 3u) + (c << 1u);
-            if (r < m) { pp[u64(r) * 128u + col] = acc[ti][0]; pp[u64(r) * 128u + col + 8u] = acc[ti][2]; }
-            if (r + 1u < m) { pp[u64(r + 1u) * 128u + col] = acc[ti][1]; pp[u64(r + 1u) * 128u + col + 8u] = acc[ti][3]; }
-        }
+        trellis::y_t* pp = out + (u64(ob) * ks + p) * m * 128u;
+        trellis::store_tile<NT>(pp, r0, m, 128u, 0u, col, c << 1u, acc);
     } else if constexpr (!TURNED) {
-        u32 ob0 = ob << 7u;
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 r = r0 + (ti << 3u) + (c << 1u);
-            if (r < m) { out[u64(r) * n + ob0 + col] = acc[ti][0]; out[u64(r) * n + ob0 + col + 8u] = acc[ti][2]; }
-            if (r + 1u < m) { out[u64(r + 1u) * n + ob0 + col] = acc[ti][1]; out[u64(r + 1u) * n + ob0 + col + 8u] = acc[ti][3]; }
-        }
+        trellis::store_tile<NT>(out, r0, m, n, ob << 7u, col, c << 1u, acc);
     } else {
         prim::block_sync();
 #pragma unroll
@@ -141,8 +130,8 @@ static __device__ __forceinline__ void dtr_body(const trellis::x_t* x, const u8*
             float v[4];
             trellis::load4(&sm.out[r][lane << 2u], v);
             trellis::wht128(v, trellis::INV_SQRT128);
-            *reinterpret_cast<float4*>(out + u64(r0 + r) * n + base) =
-                make_float4(v[0] * sc[0], v[1] * sc[1], v[2] * sc[2], v[3] * sc[3]);
+            trellis::store_y4(out + u64(r0 + r) * n + base,
+                              make_float4(v[0] * sc[0], v[1] * sc[1], v[2] * sc[2], v[3] * sc[3]));
         }
     }
 }
@@ -152,8 +141,8 @@ struct dtr_run {
     template <u32 K, u32 BOOK>
     struct at {
         static __device__ __noinline__ void run(const trellis::x_t* x, const u8* w, const float* suh,
-                                                const float* svh, float* out, u32 m, u32 n, u32 k,
-                                                u32 ks, u32 turned, dtr_smem& sm) {
+                                                const float* svh, trellis::y_t* out, u32 m, u32 n,
+                                                u32 k, u32 ks, u32 turned, dtr_smem& sm) {
             if (ks > 1u) {
                 if (turned != 0u) dtr_body<K, BOOK, NT, true, true>(x, w, suh, svh, out, m, n, k, ks, sm);
                 else dtr_body<K, BOOK, NT, false, true>(x, w, suh, svh, out, m, n, k, ks, sm);
@@ -167,8 +156,8 @@ struct dtr_run {
 
 #define DTR_DEF(NAME, K, BOOK, NT, TURNED, SPLIT, MIN_BLK)                                    \
     extern "C" __global__ __launch_bounds__(256, MIN_BLK) void NAME(                          \
-        const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out,   \
-        u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {                        \
+        const trellis::x_t* x, const u8* w, const float* suh, const float* svh,               \
+        trellis::y_t* out, u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {     \
         (void)bits;                                                                           \
         (void)book;                                                                           \
         (void)turned;                                                                         \
@@ -186,8 +175,8 @@ DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, DTR_T4_BLK)
 
 #define DTR_GEN_DEF(NAME, NT)                                                                 \
     extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void NAME(                      \
-        const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out,   \
-        u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {                        \
+        const trellis::x_t* x, const u8* w, const float* suh, const float* svh,               \
+        trellis::y_t* out, u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {     \
         __shared__ dtr_smem sm;                                                               \
         trellis_dispatch<dtr_run<NT>::at>(bits, book, x, w, suh, svh, out, m, n, k, ks,       \
                                           turned, sm);                                        \
@@ -200,7 +189,7 @@ DTR_GEN_DEF(dtr_gen4, 4u)
 
 // Sums split-K partials in order and applies output rotation.
 extern "C" __global__ __launch_bounds__(256, DTR_RED_BLK) void dtr_reduce(
-    const float* part, const float* svh, float* out, u32 m, u32 n, u32 ks, u32 turned) {
+    const float* part, const float* svh, trellis::y_t* out, u32 m, u32 n, u32 ks, u32 turned) {
     u32 ob = blockIdx.x;
     if (ob >= (n >> 7u)) return;
     u32 warp = threadIdx.x >> 5u;
@@ -228,15 +217,15 @@ extern "C" __global__ __launch_bounds__(256, DTR_RED_BLK) void dtr_reduce(
             trellis::wht128(v, trellis::INV_SQRT128);
             v[0] *= sc[0]; v[1] *= sc[1]; v[2] *= sc[2]; v[3] *= sc[3];
         }
-        *reinterpret_cast<float4*>(out + u64(r) * n + base) = make_float4(v[0], v[1], v[2], v[3]);
+        trellis::store_y4(out + u64(r) * n + base, make_float4(v[0], v[1], v[2], v[3]));
     }
 }
 
 template <u32 K, u32 BOOK, bool TURNED>
 static __device__ __forceinline__ void ptr_body(
     const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
-    const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
-    u32 post, ptr_smem& sm) {
+    const trellis::o_t* extra, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat,
+    u32 first, u32 post, ptr_smem& sm) {
     constexpr u32 TB = 32u * K;
     constexpr u32 CHUNK = PTR_CHUNK;
     u32 ob = blockIdx.x;
@@ -245,7 +234,7 @@ static __device__ __forceinline__ void ptr_body(
     u32 tid = threadIdx.x;
     u32 raw = ids[r];
     if (raw < first || raw - first >= count) {
-        if (tid < 128u) out[u64(r) * n + (ob << 7u) + tid] = 0.0f;
+        if (tid < 128u) trellis::store_y(out, u64(r) * n + (ob << 7u) + tid, 0.0f);
         return;
     }
     u32 e = raw - first;
@@ -281,8 +270,8 @@ static __device__ __forceinline__ void ptr_body(
     if constexpr (!TURNED) {
         if (c == 0u) {
             u64 base = u64(r) * n + (ob << 7u) + col;
-            out[base] = acc[0][0];
-            out[base + 8u] = acc[0][2];
+            trellis::store_y(out, base, acc[0][0]);
+            trellis::store_y(out, base + 8u, acc[0][2]);
         }
     } else {
         prim::block_sync();
@@ -303,21 +292,20 @@ static __device__ __forceinline__ void ptr_body(
             v[3] *= sc[3];
             if (post == 1u) {
                 float ex[4];
-                trellis::load4(extra + base, ex);
+                trellis::load_o4(extra + base, ex);
                 v[0] *= ex[0];
                 v[1] *= ex[1];
                 v[2] *= ex[2];
                 v[3] *= ex[3];
             } else if (post == 2u) {
                 float ex[4];
-                trellis::load4(extra + u64(r) * n + base, ex);
+                trellis::load_o4(extra + u64(r) * n + base, ex);
                 v[0] = (v[0] / (1.0f + expf(-v[0]))) * ex[0];
                 v[1] = (v[1] / (1.0f + expf(-v[1]))) * ex[1];
                 v[2] = (v[2] / (1.0f + expf(-v[2]))) * ex[2];
                 v[3] = (v[3] / (1.0f + expf(-v[3]))) * ex[3];
             }
-            *reinterpret_cast<float4*>(out + u64(r) * n + base) =
-                make_float4(v[0], v[1], v[2], v[3]);
+            trellis::store_y4(out + u64(r) * n + base, make_float4(v[0], v[1], v[2], v[3]));
         }
     }
 }
@@ -326,8 +314,8 @@ template <u32 K, u32 BOOK>
 struct ptr_run {
     static __device__ __noinline__ void run(
         const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
-        const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
-        u32 turned, u32 post, ptr_smem& sm) {
+        const trellis::o_t* extra, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 count,
+        u32 repeat, u32 first, u32 turned, u32 post, ptr_smem& sm) {
         if (turned != 0u) {
             ptr_body<K, BOOK, true>(x, w, ids, su, sv, extra, out, rows, n, k, count, repeat,
                                     first, post, sm);
@@ -341,8 +329,8 @@ struct ptr_run {
 // Fast specialized PMCGX K3 rotated picked expert matmul.
 extern "C" __global__ __launch_bounds__(256, PTR_K3_MIN_BLOCKS) void ptr_k3_pmcgx_t(
     const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
-    const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
-    u32 bits, u32 book, u32 turned, u32 post) {
+    const trellis::o_t* extra, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat,
+    u32 first, u32 bits, u32 book, u32 turned, u32 post) {
     (void)bits;
     (void)book;
     (void)turned;
@@ -354,8 +342,8 @@ extern "C" __global__ __launch_bounds__(256, PTR_K3_MIN_BLOCKS) void ptr_k3_pmcg
 // Generic picked trellis expert matmul (K2/K3/K4, MCG/MUL1/PMCGX).
 extern "C" __global__ __launch_bounds__(256, PTR_GEN_MIN_BLOCKS) void ptr_gen(
     const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
-    const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
-    u32 bits, u32 book, u32 turned, u32 post) {
+    const trellis::o_t* extra, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat,
+    u32 first, u32 bits, u32 book, u32 turned, u32 post) {
     __shared__ ptr_smem sm;
     trellis_dispatch<ptr_run>(bits, book, x, w, ids, su, sv, extra, out, rows, n, k, count,
                               repeat, first, turned, post, sm);

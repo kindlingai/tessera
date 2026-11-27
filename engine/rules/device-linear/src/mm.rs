@@ -1,8 +1,8 @@
 //! Streaming BF16 and MXFP8 Tensor-Core small-batch matmul rule.
 
 use super::{
-    CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, prefill_source_with, weight_accepts,
-    weight_x_accepts, x_accepts, x_defs,
+    CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, io_defs, prefill_source_with,
+    weight_io_accepts, x_accepts, x_defs,
 };
 mod mx8;
 
@@ -60,12 +60,23 @@ impl MmKind {
         }
     }
 
-    fn source(self, min_blocks: Option<u32>, x_bf16: bool) -> tessera_lower::Source {
+    fn source(
+        self,
+        min_blocks: Option<u32>,
+        x_bf16: bool,
+        y_bf16: bool,
+        o_bf16: bool,
+    ) -> tessera_lower::Source {
         match mm_blk_def(self) {
-            None => int4_source_with(self.entry(), x_defs(None, x_bf16)),
+            None => int4_source_with(self.entry(), io_defs(None, x_bf16, y_bf16, o_bf16)),
             Some(def) => cuda_source_with(
                 self.entry(),
-                x_defs(min_blocks.map(|v| (def, v as usize)), x_bf16),
+                io_defs(
+                    min_blocks.map(|v| (def, v as usize)),
+                    x_bf16,
+                    y_bf16,
+                    o_bf16,
+                ),
             ),
         }
     }
@@ -272,15 +283,16 @@ fn mxfp8_tile_ks(
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,
     accepts = mm_accepts,
-    emits = f32_only,
+    emits = mm_emits,
     needs = mm_needs(self),
     order = Order::PerConfig,
-    source = self.kind.source(self.min_blocks, self.x_bf16),
+    source = self.kind.source(self.min_blocks, self.x_bf16, self.y_bf16, self.o_bf16),
     launches = mm_launches,
     shape = Shape::grid(self.kind.grid(self.m, self.n, self.ks), self.kind.threads()),
     load = mm_load,
     load_key = tessera_lower::load_key((
         self.m, self.n, self.k, self.ks, self.mode, self.min_blocks, self.kind, self.form.name(),
+        (self.x_bf16, self.y_bf16, self.o_bf16),
     )),
     unproven,
 )]
@@ -293,11 +305,17 @@ struct FastMm {
     min_blocks: Option<u32>,
     kind: MmKind,
     x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn mm_accepts(k: &FastMm, input: usize, form: &dyn Stored) -> bool {
-    weight_x_accepts(input, k.x_bf16, k.form, form)
+    weight_io_accepts(input, k.x_bf16, k.o_bf16, k.form, form)
+}
+
+fn mm_emits(k: &FastMm, form: &dyn Stored) -> bool {
+    x_accepts(k.y_bf16, form)
 }
 
 fn mm_needs(k: &FastMm) -> Needs {
@@ -317,19 +335,21 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
     let groups = across * down;
     let threads = k.kind.threads();
     let x_elem = if k.x_bf16 { 2 } else { 4 };
+    let o_elem = if k.o_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let passes = if k.x_bf16 { 1 } else { 2 };
     let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (x_elem * k.m * k.k) as f64];
     if matches!(k.mode, 1 | 3 | 4) {
-        reads.push((4 * k.m * k.n) as f64);
+        reads.push((o_elem * k.m * k.n) as f64);
     } else if k.mode == 2 {
-        reads.push((4 * k.n) as f64);
+        reads.push((o_elem * k.n) as f64);
     }
     let mut load = Load {
         threads: groups * threads,
         group: threads,
         trips: k.k as f64 / (k.kind.step() * k.ks as f64),
         reads,
-        written: (4 * k.ks * k.m * k.n) as f64,
+        written: (y_elem * k.ks * k.m * k.n) as f64,
         flight: 1024.0,
         ..Load::default()
     };
@@ -407,16 +427,23 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = mm_red_accepts,
-    emits = f32_only,
+    emits = mm_red_emits,
     needs = mm_red_needs(),
     order = Order::PerConfig,
     source = cuda_source_with(
         "tessera_mm_reduce",
-        self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
+        io_defs(
+            self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
+            false,
+            self.y_bf16,
+            self.o_bf16,
+        ),
     ),
     launches = mm_red_launches,
     load = mm_red_load,
-    load_key = tessera_lower::load_key((self.m, self.n, self.ks, self.mode, self.min_blocks)),
+    load_key = tessera_lower::load_key((
+        self.m, self.n, self.ks, self.mode, self.min_blocks, self.y_bf16, self.o_bf16,
+    )),
     unproven,
 )]
 struct FastMmReduce {
@@ -425,10 +452,19 @@ struct FastMmReduce {
     ks: usize,
     mode: u32,
     min_blocks: Option<u32>,
+    y_bf16: bool,
+    o_bf16: bool,
 }
 
-fn mm_red_accepts(_: &FastMmReduce, _: usize, form: &dyn Stored) -> bool {
-    form.name() == "f32"
+fn mm_red_accepts(r: &FastMmReduce, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        1 => x_accepts(r.o_bf16, form),
+        _ => form.name() == "f32",
+    }
+}
+
+fn mm_red_emits(r: &FastMmReduce, form: &dyn Stored) -> bool {
+    x_accepts(r.y_bf16, form)
 }
 
 fn mm_red_needs() -> Needs {
@@ -443,18 +479,20 @@ fn mm_red_needs() -> Needs {
 }
 
 fn mm_red_load(r: &FastMmReduce, _: usize) -> Option<Load> {
+    let o_elem = if r.o_bf16 { 2 } else { 4 };
+    let y_elem = if r.y_bf16 { 2 } else { 4 };
     let mut reads = vec![(4 * r.ks * r.m * r.n) as f64];
     if matches!(r.mode, 1 | 3 | 4) {
-        reads.push((4 * r.m * r.n) as f64);
+        reads.push((o_elem * r.m * r.n) as f64);
     } else if r.mode == 2 {
-        reads.push((4 * r.n) as f64);
+        reads.push((o_elem * r.n) as f64);
     }
     Some(Load {
         threads: (r.m * r.n).div_ceil(256) * 256,
         group: 256,
         trips: r.ks as f64,
         reads,
-        written: (4 * r.m * r.n) as f64,
+        written: (y_elem * r.m * r.n) as f64,
         flight: 512.0,
         ..Load::default()
     })
@@ -495,6 +533,8 @@ struct MmSite {
     prep_min_blocks: Option<u32>,
     reduce_min_blocks: Option<u32>,
     x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
     form: &'static dyn Stored,
 }
 
@@ -506,6 +546,8 @@ impl MmSite {
             ks: self.ks,
             mode,
             min_blocks: self.reduce_min_blocks,
+            y_bf16: self.y_bf16,
+            o_bf16: self.o_bf16,
         };
         let mut reads = vec![Read::Draft(prev)];
         if let Some(extra) = other {
@@ -525,6 +567,8 @@ impl MmSite {
                 min_blocks: self.min_blocks,
                 kind: self.kind,
                 x_bf16: self.x_bf16,
+                y_bf16: false,
+                o_bf16: false,
                 form: self.form,
             };
             return vec![
@@ -541,6 +585,8 @@ impl MmSite {
             min_blocks: self.min_blocks,
             kind: self.kind,
             x_bf16: self.x_bf16,
+            y_bf16: self.y_bf16,
+            o_bf16: self.o_bf16,
             form: self.form,
         };
         let mut reads = vec![self.x, self.w];
@@ -566,6 +612,8 @@ impl MmSite {
                 ks: self.ks,
                 mode: 0,
                 min_blocks: self.min_blocks,
+                y_bf16: false,
+                o_bf16: false,
                 form: self.form,
             };
             return vec![
@@ -585,6 +633,8 @@ impl MmSite {
             ks: 1,
             mode,
             min_blocks: self.min_blocks,
+            y_bf16: self.y_bf16,
+            o_bf16: self.o_bf16,
             form: self.form,
         };
         let mut reads = vec![Read::Draft(0), Read::Node(self.w)];
@@ -619,12 +669,14 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
     if m < 2 {
         return None;
     }
-    if node.form.name() != "f32" {
-        return Some(Err(format!(
-            "output form {} (requires f32)",
-            node.form.name()
-        )));
-    }
+    let y_name = node.form.name();
+    let y_bf16 = match y_name {
+        "f32" => false,
+        "bf16" => true,
+        _ => {
+            return Some(Err(format!("output form {y_name} (requires f32 or bf16)")));
+        }
+    };
     if !tree.leaf(w) {
         return Some(Err("weight is not a direct leaf".into()));
     }
@@ -762,6 +814,8 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         prep_min_blocks: None,
         reduce_min_blocks,
         x_bf16,
+        y_bf16,
+        o_bf16: false,
         form,
     }))
 }
@@ -798,21 +852,26 @@ fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
     Some(site)
 }
 
+fn is_plain_io(form: &dyn Stored) -> bool {
+    matches!(form.name(), "f32" | "bf16")
+}
+
 fn match_mm_add(
     tree: &Tree,
     at: T,
     pick: fn(&Tree, T) -> Option<MmSite>,
 ) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Add) || node.form.name() != "f32" {
+    if node.term != Term::Stage(Stage::Add) || !is_plain_io(node.form) {
         return None;
     }
+    let y_bf16 = node.form.name() == "bf16";
     let (a, b) = (node.args[0], *node.args.get(1)?);
     for (mat, add) in [(a, b), (b, a)] {
-        if mat == add || tree.root(mat) || tree.node(add).form.name() != "f32" {
+        if mat == add || tree.root(mat) || !is_plain_io(tree.node(add).form) {
             continue;
         }
-        let Some(site) = pick(tree, mat) else {
+        let Some(mut site) = pick(tree, mat) else {
             continue;
         };
         let add_node = tree.node(add);
@@ -824,6 +883,8 @@ fn match_mm_add(
         } else {
             continue;
         };
+        site.y_bf16 = y_bf16;
+        site.o_bf16 = add_node.form.name() == "bf16";
         return Some((site, mode, Some(add)));
     }
     None
@@ -835,38 +896,43 @@ fn match_mm_mul(
     pick: fn(&Tree, T) -> Option<MmSite>,
 ) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Mul) || node.form.name() != "f32" {
+    if node.term != Term::Stage(Stage::Mul) || !is_plain_io(node.form) {
         return None;
     }
+    let y_bf16 = node.form.name() == "bf16";
     let (a, b) = (node.args[0], *node.args.get(1)?);
     let silu = Term::Stage(Stage::Act(Act::Silu));
     for (cand, other) in [(a, b), (b, a)] {
-        if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
+        if cand == other || tree.root(cand) || !is_plain_io(tree.node(other).form) {
             continue;
         }
         let cnode = tree.node(cand);
-        if cnode.term != silu || cnode.form.name() != "f32" {
+        if cnode.term != silu || !is_plain_io(cnode.form) {
             continue;
         }
         let mat = cnode.args[0];
         if mat == other || tree.root(mat) {
             continue;
         }
-        let Some(site) = pick(tree, mat) else {
+        let Some(mut site) = pick(tree, mat) else {
             continue;
         };
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
+            site.y_bf16 = y_bf16;
+            site.o_bf16 = tree.node(other).form.name() == "bf16";
             return Some((site, 3, Some(other)));
         }
     }
     for (mat, other) in [(a, b), (b, a)] {
-        if mat == other || tree.root(mat) || tree.node(other).form.name() != "f32" {
+        if mat == other || tree.root(mat) || !is_plain_io(tree.node(other).form) {
             continue;
         }
-        let Some(site) = pick(tree, mat) else {
+        let Some(mut site) = pick(tree, mat) else {
             continue;
         };
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
+            site.y_bf16 = y_bf16;
+            site.o_bf16 = tree.node(other).form.name() == "bf16";
             return Some((site, 4, Some(other)));
         }
     }
@@ -885,11 +951,12 @@ fn match_mm_site(
         return Some(hit);
     }
     let node = tree.node(at);
-    if node.term == Term::Stage(Stage::Act(Act::Silu)) && node.form.name() == "f32" {
+    if node.term == Term::Stage(Stage::Act(Act::Silu)) && is_plain_io(node.form) {
         let mat = node.args[0];
         if !tree.root(mat)
-            && let Some(site) = pick(tree, mat)
+            && let Some(mut site) = pick(tree, mat)
         {
+            site.y_bf16 = node.form.name() == "bf16";
             return Some((site, 5, None));
         }
     }

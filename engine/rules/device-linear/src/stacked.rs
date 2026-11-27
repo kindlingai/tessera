@@ -1,10 +1,9 @@
 //! Stacked BF16 matmul and optional RoPE tail fusion.
 
 use super::{
-    THREADS, WARPS, WIDE_COLS, WIDE_THREADS, cuda_needs, cuda_source_with, trip, x_accepts, x_defs,
+    THREADS, WARPS, WIDE_COLS, WIDE_THREADS, cuda_module, cuda_needs, cuda_source_with, io_defs,
+    trip, x_accepts,
 };
-use std::sync::OnceLock;
-use tessera_device::{Backend, flatten_for};
 use tessera_graph::{DType, DimExpr, Op, Order, Pairs, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
@@ -21,17 +20,7 @@ tessera_lower::knob!("fast_stacked_lanes", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_stacked_lanes", "tc_min_blocks", 1, 16);
 tessera_lower::knob!("fast_stacked_lanes", "l64_min_blocks", 1, 16);
 
-pub(crate) fn stacked_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "stacked.kernel", STACKED))
-}
-
-fn stacked_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(stacked_source(), entry, defs)
-}
+cuda_module!(pub(crate) stacked_source, stacked_source_with, "stacked.kernel", STACKED);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RopeTail {
@@ -54,7 +43,7 @@ pub(crate) struct RopeTail {
     ],
     work = self.len * self.k,
     accepts = stacked_accepts,
-    emits = super::f32_only,
+    emits = stacked_emits,
     needs = stacked_needs(self),
     order = Order::PerConfig,
     source = stacked_source_for(self),
@@ -69,6 +58,7 @@ pub(crate) struct RopeTail {
                 r.rope_first, r.theta.to_bits(),
             )),
             self.form.name(),
+            (self.x_bf16, self.y_bf16, self.o_bf16),
         ),
     )),
     unproven,
@@ -89,6 +79,8 @@ pub(crate) struct FastStacked {
     pub min_blocks: Option<u32>,
     pub rope: Option<RopeTail>,
     pub x_bf16: bool,
+    pub y_bf16: bool,
+    pub o_bf16: bool,
     pub form: &'static dyn Stored,
 }
 
@@ -120,9 +112,14 @@ fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
     match input {
         0 => x_accepts(k.x_bf16, form),
         1 => form.name() == k.form.name(),
+        2 => x_accepts(k.o_bf16, form),
         3 => form.name() == "u32",
         _ => form.name() == "f32",
     }
+}
+
+fn stacked_emits(k: &FastStacked, form: &dyn Stored) -> bool {
+    x_accepts(k.y_bf16, form)
 }
 
 pub(crate) fn stacked_needs(k: &FastStacked) -> Needs {
@@ -152,29 +149,48 @@ pub(crate) fn stacked_source_for(k: &FastStacked) -> Source {
     match (k.wide, k.tiled_64(), k.lanes_tc()) {
         (true, true, _) => stacked_source_with(
             "tessera_stacked_wide_64",
-            x_defs(
+            io_defs(
                 k.min_blocks.map(|v| ("ST_WIDE64_BLK", v as usize)),
                 k.x_bf16,
+                k.y_bf16,
+                k.o_bf16,
             ),
         ),
         (false, true, _) => stacked_source_with(
             "tessera_stacked_lanes_64",
-            x_defs(
+            io_defs(
                 k.min_blocks.map(|v| ("ST_LANES64_BLK", v as usize)),
                 k.x_bf16,
+                k.y_bf16,
+                false,
             ),
         ),
         (true, false, _) => stacked_source_with(
             "tessera_stacked_wide",
-            x_defs(k.min_blocks.map(|v| ("ST_WIDE_BLK", v as usize)), k.x_bf16),
+            io_defs(
+                k.min_blocks.map(|v| ("ST_WIDE_BLK", v as usize)),
+                k.x_bf16,
+                k.y_bf16,
+                k.o_bf16,
+            ),
         ),
         (false, false, true) => cuda_source_with(
             "tessera_stacked_lanes_tc",
-            x_defs(k.min_blocks.map(|v| ("ST_TC_BLK", v as usize)), k.x_bf16),
+            io_defs(
+                k.min_blocks.map(|v| ("ST_TC_BLK", v as usize)),
+                k.x_bf16,
+                k.y_bf16,
+                false,
+            ),
         ),
         (false, false, false) => cuda_source_with(
             "tessera_stacked_lanes",
-            x_defs(k.min_blocks.map(|v| ("ST_LANES_BLK", v as usize)), k.x_bf16),
+            io_defs(
+                k.min_blocks.map(|v| ("ST_LANES_BLK", v as usize)),
+                k.x_bf16,
+                k.y_bf16,
+                false,
+            ),
         ),
     }
 }
@@ -222,12 +238,14 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
     };
     trip_ops.fresh = f64::from(u8::from(tiled || tc));
     let x_elem = if k.x_bf16 { 2 } else { 4 };
+    let o_elem = if k.o_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let mut reads = vec![
         (2 * k.batches * rtiles * k.n * k.k) as f64,
         (x_elem * k.batches * k.rows * k.k) as f64,
     ];
     if let Some(r) = k.rope {
-        reads.push((4 * k.batches * k.rows * r.width) as f64);
+        reads.push((o_elem * k.batches * k.rows * r.width) as f64);
         reads.push((4 * k.rows) as f64);
     }
     Some(Load {
@@ -236,7 +254,7 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
         trips,
         trip: trip_ops,
         reads,
-        written: (4 * k.len) as f64,
+        written: (y_elem * k.len) as f64,
         flight,
         ..Load::default()
     })
@@ -365,7 +383,7 @@ fn peel_rot_slice(tree: &Tree, t: T) -> Option<(T, usize, usize)> {
         return None;
     };
     let parent = n.args[0];
-    if tree.node(parent).form.name() != "f32" {
+    if tree.node(parent).form.name() != n.form.name() {
         return None;
     }
     let off = off.value(&tree.g.dims, &|d| tree.size(d))? as usize;
@@ -375,8 +393,9 @@ fn peel_rot_slice(tree: &Tree, t: T) -> Option<(T, usize, usize)> {
 
 /// Matches `concat(permute(matmul), rope)` or `concat(rope, permute(matmul))`.
 fn match_rope_concat(tree: &Tree, at: T) -> Option<(T, RopeTail, T, T)> {
+    let plain = |f: &dyn Stored| matches!(f.name(), "f32" | "bf16");
     let outer = tree.node(at);
-    if outer.term != Term::Op(Op::View(View::Concat)) || outer.form.name() != "f32" {
+    if outer.term != Term::Op(Op::View(View::Concat)) || !plain(outer.form) {
         return None;
     }
     let [a, b] = outer.args[..] else {
@@ -395,39 +414,34 @@ fn match_rope_concat(tree: &Tree, at: T) -> Option<(T, RopeTail, T, T)> {
     let Term::Op(Op::View(View::Permute(order))) = &perm.term else {
         return None;
     };
-    if order[..] != [1, 0, 2] || perm.form.name() != "f32" {
+    if order[..] != [1, 0, 2] || !plain(perm.form) {
         return None;
     }
     let mat = perm.args[0];
     if tree.root(mat) || tree.node(mat).term != Term::Op(Op::Matmul) {
         return None;
     }
-    let rope_node = tree.node(rope_t);
-    let Term::Stage(Stage::Rope {
-        theta,
-        pairs,
-        turned,
-    }) = rope_node.term
+    let rope = tree.node(rope_t);
+    let (
+        &Term::Stage(Stage::Rope {
+            theta,
+            pairs,
+            turned,
+        }),
+        &[rot_in, pos_t],
+        &[r_rows, r_heads, rope_w],
+    ) = (&rope.term, rope.args.as_slice(), rope.shape.as_slice())
     else {
         return None;
     };
-    let [rot_in, pos_t] = rope_node.args[..] else {
-        return None;
-    };
-    if rope_node.form.name() != "f32"
-        || tree.node(rot_in).form.name() != "f32"
-        || tree.node(pos_t).form.dtype() != DType::U32
-    {
-        return None;
-    }
-    let &[r_rows, r_heads, rope_w] = rope_node.shape.as_slice() else {
-        return None;
-    };
-    if rope_w == 0
-        || !rope_w.is_multiple_of(2)
-        || tree.elements(pos_t) != r_rows
-        || perm.shape[..2] != [r_rows, r_heads]
-    {
+    let ok = plain(rope.form)
+        && plain(tree.node(rot_in).form)
+        && tree.node(pos_t).form.dtype() == DType::U32
+        && rope_w > 0
+        && rope_w.is_multiple_of(2)
+        && tree.elements(pos_t) == r_rows
+        && perm.shape[..2] == [r_rows, r_heads];
+    if !ok {
         return None;
     }
     let (rot_src, rot_off, rot_stride) =
@@ -471,9 +485,10 @@ pub(crate) fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, Str
     if xb != batches || xk != k || rows == 0 {
         return None;
     }
-    if outer.form.name() != "f32" || node.form.name() != "f32" {
-        return Some(Err("stacked requires f32 output".into()));
+    if !matches!(outer.form.name(), "f32" | "bf16") || !matches!(node.form.name(), "f32" | "bf16") {
+        return Some(Err("stacked requires f32 or bf16 output".into()));
     }
+    let y_bf16 = outer.form.name() == "bf16";
     let x_name = tree.node(x).form.name();
     let x_bf16 = match x_name {
         "f32" => false,
@@ -536,9 +551,13 @@ pub(crate) fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, Str
             "stacked shape n={n} k={k} wide={wide} unsupported"
         )));
     }
-    let (rope, reads) = match rope_match {
-        Some((tail, rot, pos)) => (Some(tail), vec![x, leaf, rot, pos]),
-        None => (None, vec![x, leaf]),
+    let (rope, o_bf16, reads) = match rope_match {
+        Some((tail, rot, pos)) => (
+            Some(tail),
+            tree.node(rot).form.name() == "bf16",
+            vec![x, leaf, rot, pos],
+        ),
+        None => (None, false, vec![x, leaf]),
     };
     let len = batches * rows * out_w;
     let rule = if wide {
@@ -563,6 +582,8 @@ pub(crate) fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, Str
         min_blocks: None,
         rope,
         x_bf16,
+        y_bf16,
+        o_bf16,
         form,
     };
     let blk_knob = match (wide, k.tiled_64(), k.lanes_tc()) {

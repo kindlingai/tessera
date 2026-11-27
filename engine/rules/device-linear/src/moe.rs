@@ -1,8 +1,7 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
-use crate::{CUDA_LACKS, cuda_rule, trellis_source_with};
+use crate::{CUDA_LACKS, cuda_rule, io_defs, trellis_source_with};
 use tessera_graph::Order;
-use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Coded;
 use tessera_lower::{Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 use tessera_mem::trellis::parse_form;
@@ -36,10 +35,8 @@ fn picked_source(k: &PickedTrellis) -> Source {
     } else if let Some(mb) = k.gen_min_blocks {
         defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
-    if k.site.x_bf16 {
-        defs.push(("X_BF16", 1));
-    }
-    trellis_source_with(entry, defs)
+    let s = &k.site;
+    trellis_source_with(entry, io_defs(defs, s.x_bf16, s.y_bf16, s.o_bf16))
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -48,7 +45,7 @@ fn picked_source(k: &PickedTrellis) -> Source {
     sizes = [self.site.rows, self.site.n, self.site.k],
     work = self.site.rows * self.site.n * self.site.k,
     accepts = self.site.accepts(input, form),
-    emits = emits,
+    emits = self.site.emits(form),
     needs = needs(),
     order = Order::PerConfig,
     source = picked_source(self),
@@ -62,6 +59,7 @@ fn picked_source(k: &PickedTrellis) -> Source {
         self.site.turned,
         self.site.post,
         self.site.form.name(),
+        (self.site.x_bf16, self.site.y_bf16, self.site.o_bf16),
     )),
     unproven,
 )]
@@ -72,10 +70,6 @@ struct PickedTrellis {
     chunk: Option<u32>,
     min_blocks: Option<u32>,
     gen_min_blocks: Option<u32>,
-}
-
-fn emits(_: &PickedTrellis, form: &dyn Stored) -> bool {
-    form.name() == "f32"
 }
 
 fn needs() -> Needs {

@@ -1,4 +1,5 @@
 #include <tessera/1/core>
+#include <tessera/1/trellis>
 
 using namespace tessera;
 
@@ -31,15 +32,9 @@ static __device__ __forceinline__ void st_mma_bf16(float d[4], const u32 a[4], c
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-#if defined(X_BF16)
-using st_x_t = u16;
-#else
-using st_x_t = float;
-#endif
-
 static __device__ __forceinline__ void st_stacked_x_bf16(
-    const st_x_t* xb, u32 r0, u32 rows, u32 x_rs, u32 k0, u32 r, u32 xc, u32 xw, u32 (*sxh)[18],
-    u32 (*sxl)[18]) {
+    const trellis::x_t* xb, u32 r0, u32 rows, u32 x_rs, u32 k0, u32 r, u32 xc, u32 xw,
+    u32 (*sxh)[18], u32 (*sxl)[18]) {
 #if defined(X_BF16)
     (void)sxl;
     *reinterpret_cast<uint2*>(&sxh[r][xw]) = (r0 + r < rows)
@@ -124,9 +119,9 @@ static __device__ __forceinline__ void st_mma_tile(
 }
 
 static __device__ __forceinline__ void st_rope_tail(
-    const float* rot, const u32* pos, float* ob, u32 batch, u32 batches, u32 r0, u32 tile_rows,
-    u32 rows, u32 o_rs, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
-    u32 adjacent, float theta, u32 tid, u32 nthreads) {
+    const trellis::o_t* rot, const u32* pos, trellis::y_t* ob, u32 batch, u32 batches, u32 r0,
+    u32 tile_rows, u32 rows, u32 o_rs, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off,
+    u32 turned, u32 adjacent, float theta, u32 tid, u32 nthreads) {
     u32 nr = min(rows - r0, tile_rows);
     u32 pairs = rope_w >> 1u;
     u32 total = nr * pairs;
@@ -142,29 +137,29 @@ static __device__ __forceinline__ void st_rope_tail(
         float sn = __sinf(angle), c = __cosf(angle);
         u32 a = adjacent ? (2u * pair) : pair;
         u32 b = adjacent ? (a + 1u) : (pairs + pair);
-        const float* src = rot + (u64(row) * batches + batch) * rot_stride + rot_off;
-        float* dst = ob + u64(row) * o_rs + rope_out_off;
-        float x0 = src[a], x1 = src[b];
-        dst[a] = x0 * c - x1 * sn;
-        dst[b] = x0 * sn + x1 * c;
+        const trellis::o_t* src = rot + (u64(row) * batches + batch) * rot_stride + rot_off;
+        trellis::y_t* dst = ob + u64(row) * o_rs + rope_out_off;
+        float x0 = trellis::load_o(src, a), x1 = trellis::load_o(src, b);
+        trellis::store_y(dst, a, x0 * c - x1 * sn);
+        trellis::store_y(dst, b, x0 * sn + x1 * c);
     }
 }
 
 // Tensor-Core BF16 transposed stacked matmul, 16x32 per CTA.
 extern "C" __global__ __launch_bounds__(128, ST_WIDE_BLK) void tessera_stacked_wide(
-    const st_x_t* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
-    u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
-    u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
-    u32 adjacent, float theta) {
+    const trellis::x_t* x, const u16* w, const trellis::o_t* rot, const u32* pos,
+    trellis::y_t* out, u32 batches, u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step,
+    u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off,
+    u32 rope_out_off, u32 turned, u32 adjacent, float theta) {
     __shared__ st_stacked_smem sm;
     u32 tile = blockIdx.x, rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles, r0 = (blockIdx.y % rtiles) * 16u;
     u32 tid = threadIdx.x, wt = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 xr = tid >> 3u, xc = (tid & 7u) << 2u, xw = (tid & 7u) << 1u;
     u32 wk = tid >> 2u, wc = (tid & 3u) << 3u;
-    const st_x_t* xb = x + u64(batch) * x_bs;
+    const trellis::x_t* xb = x + u64(batch) * x_bs;
     const u16* wb = w + u64(batch) * block + first + (tile << 5u) + wc;
-    float* ob = out + u64(batch) * o_bs;
+    trellis::y_t* ob = out + u64(batch) * o_bs;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     uint4 cur = st_ld_nc4(wb + u64(wk) * k_step);
     for (u32 k0 = 0u; k0 < k; k0 += 32u) {
@@ -184,12 +179,10 @@ extern "C" __global__ __launch_bounds__(128, ST_WIDE_BLK) void tessera_stacked_w
     }
     u32 col = (tile << 5u) + (wt << 3u) + (t << 1u);
     if (r0 + g < rows) {
-        *reinterpret_cast<float2*>(ob + u64(r0 + g) * o_rs + mat_off + col) =
-            make_float2(acc[0], acc[1]);
+        trellis::store_y2(ob + u64(r0 + g) * o_rs + mat_off + col, acc[0], acc[1]);
     }
     if (r0 + g + 8u < rows) {
-        *reinterpret_cast<float2*>(ob + u64(r0 + g + 8u) * o_rs + mat_off + col) =
-            make_float2(acc[2], acc[3]);
+        trellis::store_y2(ob + u64(r0 + g + 8u) * o_rs + mat_off + col, acc[2], acc[3]);
     }
     if (tile == 0u && rope_w > 0u) {
         st_rope_tail(rot, pos, ob, batch, batches, r0, 16u, rows, o_rs, rope_w, rot_stride,
@@ -209,10 +202,10 @@ struct alignas(16) st64_k {
 // Widened 64x64 BF16 Tensor-Core stacked matmul (non-transposed or transposed).
 template <bool TRANSPOSED>
 static __device__ __forceinline__ void st_stacked_64(
-    const st_x_t* x, const u16* w, float* out, u32 batches, u32 rows, u32 n, u32 k, u32 block,
-    u32 first, u32 step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off, const float* rot,
-    const u32* pos, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
-    u32 adjacent, float theta) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 batches, u32 rows, u32 n, u32 k,
+    u32 block, u32 first, u32 step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off,
+    const trellis::o_t* rot, const u32* pos, u32 rope_w, u32 rot_stride, u32 rot_off,
+    u32 rope_out_off, u32 turned, u32 adjacent, float theta) {
     constexpr u32 SW_STRIDE = TRANSPOSED ? 34u : 40u;
     union alignas(16) st64_smem {
         st64_k<SW_STRIDE> k;
@@ -224,9 +217,9 @@ static __device__ __forceinline__ void st_stacked_64(
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 wm = warp >> 1u, wn = warp & 1u, m_base = wm << 4u, n_base = wn << 5u;
     u32 xr0 = tid >> 3u, xc = (tid & 7u) << 2u, xw = (tid & 7u) << 1u;
-    const st_x_t* xb = x + u64(batch) * x_bs;
+    const trellis::x_t* xb = x + u64(batch) * x_bs;
     const u16* wb = w + u64(batch) * block + first;
-    float* ob = out + u64(batch) * o_bs;
+    trellis::y_t* ob = out + u64(batch) * o_bs;
     u32 wr_r = tid >> 2u, wr_c = (tid & 3u) << 3u;
     u32 wk = tid >> 3u, wc = (tid & 7u) << 3u;
     uint4 cur = TRANSPOSED ? st_ld_nc4(wb + u64(wk) * step + n0 + wc)
@@ -277,11 +270,12 @@ static __device__ __forceinline__ void st_stacked_64(
             u32 r = r0 + (half << 5u) + sr + dr;
             if (r < rows) {
                 float4 v = *reinterpret_cast<const float4*>(&sm.out[sr + dr][sc4]);
-                float* d = ob + u64(r) * o_rs + mat_off + n0 + sc4;
+                trellis::y_t* d = ob + u64(r) * o_rs + mat_off + n0 + sc4;
                 if (((o_rs | o_bs | mat_off) & 3u) == 0u) {
-                    *reinterpret_cast<float4*>(d) = v;
+                    trellis::store_y4(d, v);
                 } else {
-                    d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+                    trellis::store_y(d, 0u, v.x); trellis::store_y(d, 1u, v.y);
+                    trellis::store_y(d, 2u, v.z); trellis::store_y(d, 3u, v.w);
                 }
             }
         }
@@ -296,17 +290,17 @@ static __device__ __forceinline__ void st_stacked_64(
 }
 
 extern "C" __global__ __launch_bounds__(256, ST_LANES64_BLK) void tessera_stacked_lanes_64(
-    const st_x_t* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 block,
+    u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     st_stacked_64<false>(x, w, out, 1u, rows, n, k, block, first, col_step, x_bs, x_rs, o_bs, o_rs,
                          0u, nullptr, nullptr, 0u, 0u, 0u, 0u, 0u, 0u, 0.0f);
 }
 
 extern "C" __global__ __launch_bounds__(256, ST_WIDE64_BLK) void tessera_stacked_wide_64(
-    const st_x_t* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
-    u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
-    u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
-    u32 adjacent, float theta) {
+    const trellis::x_t* x, const u16* w, const trellis::o_t* rot, const u32* pos,
+    trellis::y_t* out, u32 batches, u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step,
+    u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off,
+    u32 rope_out_off, u32 turned, u32 adjacent, float theta) {
     st_stacked_64<true>(x, w, out, batches, rows, n, k, block, first, k_step, x_bs, x_rs, o_bs,
                         o_rs, mat_off, rot, pos, rope_w, rot_stride, rot_off, rope_out_off, turned,
                         adjacent, theta);

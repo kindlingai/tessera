@@ -25,6 +25,26 @@ pub struct Coded {
     pub form: &'static dyn Stored,
     /// Whether `x` is stored as bf16.
     pub x_bf16: bool,
+    /// Whether the output is stored as bf16.
+    pub y_bf16: bool,
+    /// Whether the `post` operand is stored as bf16.
+    pub o_bf16: bool,
+}
+
+fn f32_or_bf16(tree: &Tree, t: T) -> Option<bool> {
+    match tree.node(t).form.name() {
+        "f32" => Some(false),
+        "bf16" => Some(true),
+        _ => None,
+    }
+}
+
+fn elem(bf16: bool) -> usize {
+    if bf16 { 2 } else { 4 }
+}
+
+fn named(bf16: bool, form: &dyn Stored) -> bool {
+    form.name() == if bf16 { "bf16" } else { "f32" }
 }
 
 fn gather_of(tree: &Tree, t: T) -> Option<(T, T)> {
@@ -66,14 +86,14 @@ impl Coded {
             post: 0,
             form: tree.node(codes).form,
             x_bf16,
+            y_bf16: false,
+            o_bf16: false,
         };
         Some((site, [codes, ids]))
     }
 
     fn rotated(tree: &Tree, at: T, block: usize) -> Option<(Self, Vec<T>)> {
-        if tree.node(at).form.name() != "f32" {
-            return None;
-        }
+        f32_or_bf16(tree, at)?;
         let r = tree.site::<Rotated>(at)?;
         if r.block as usize != block {
             return None;
@@ -95,10 +115,14 @@ impl Coded {
 
     /// The site at `at` and its reads, rotating `block` channels.
     pub fn find(tree: &Tree, at: T, block: usize) -> Option<(Self, Vec<T>)> {
+        let y_bf16 = f32_or_bf16(tree, at)?;
+        let (mut site, reads) = Self::find_any(tree, at, block)?;
+        site.y_bf16 = y_bf16;
+        Some((site, reads))
+    }
+
+    fn find_any(tree: &Tree, at: T, block: usize) -> Option<(Self, Vec<T>)> {
         let node = tree.node(at);
-        if node.form.name() != "f32" {
-            return None;
-        }
         if node.term == Term::Op(Op::Matmul) {
             let (site, [codes, ids]) =
                 Self::pick(tree, [node.args[0], node.args[1]], false, block)?;
@@ -113,9 +137,12 @@ impl Coded {
         let (a, b) = (node.args[0], *node.args.get(1)?);
         let silu = Term::Stage(Stage::Act(Act::Silu));
         for (cand, other) in [(a, b), (b, a)] {
-            if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
+            if cand == other || tree.root(cand) {
                 continue;
             }
+            let Some(o_bf16) = f32_or_bf16(tree, other) else {
+                continue;
+            };
             // A gated product scales by whole rows.
             let gated = tree.inner(cand, &silu).filter(|i| !tree.root(i[0]));
             let (inner, post) = match gated {
@@ -132,6 +159,7 @@ impl Coded {
             };
             if tree.elements(other) == want {
                 site.post = post;
+                site.o_bf16 = o_bf16;
                 reads.push(other);
                 return Some((site, reads));
             }
@@ -142,11 +170,22 @@ impl Coded {
     /// Whether `input` may be stored as `form`.
     pub fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         match input {
-            0 => form.name() == if self.x_bf16 { "bf16" } else { "f32" },
+            0 => named(self.x_bf16, form),
             1 => form.name() == self.form.name(),
             2 => form.name() == "u32",
+            5 => named(self.o_bf16, form),
             _ => form.name() == "f32",
         }
+    }
+
+    /// Whether the output may be stored as `form`.
+    pub fn emits(&self, form: &dyn Stored) -> bool {
+        named(self.y_bf16, form)
+    }
+
+    /// Whether any activation is stored as bf16.
+    pub fn any_bf16(&self) -> bool {
+        self.x_bf16 || self.y_bf16 || self.o_bf16
     }
 
     /// The launch arguments, absent reads standing in as `x`.
@@ -178,15 +217,15 @@ impl Coded {
         let out = self.rows * self.n;
         let mut reads = vec![
             self.form.bytes(out * self.k) as f64,
-            (if self.x_bf16 { 2 } else { 4 } * (self.rows / self.repeat) * self.k) as f64,
+            (elem(self.x_bf16) * (self.rows / self.repeat) * self.k) as f64,
             (4 * self.rows) as f64,
         ];
         if self.turned {
             reads.extend([(4 * self.rows * self.k) as f64, (4 * out) as f64]);
         }
         match self.post {
-            1 => reads.push((4 * self.n) as f64),
-            2 => reads.push((4 * out) as f64),
+            1 => reads.push((elem(self.o_bf16) * self.n) as f64),
+            2 => reads.push((elem(self.o_bf16) * out) as f64),
             _ => {}
         }
         let mut load = Load {
@@ -194,7 +233,7 @@ impl Coded {
             group: threads,
             trips: (self.k / block) as f64,
             reads,
-            written: (4 * out) as f64,
+            written: (elem(self.y_bf16) * out) as f64,
             flight: 1024.0,
             ..Load::default()
         };
