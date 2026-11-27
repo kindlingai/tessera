@@ -127,6 +127,11 @@ impl Picked {
 /// Which rows the next step feeds, within a row budget.
 pub trait Policy {
     fn pick(&mut self, seqs: &[Seq], budget: usize) -> Vec<Row>;
+
+    /// The answer to pause when the shared pool fills.
+    fn victim(&mut self, seqs: &[Seq]) -> Option<usize> {
+        seqs.len().checked_sub(1)
+    }
 }
 
 /// Decodes first, then prompts contiguously within the budget.
@@ -527,12 +532,16 @@ impl<'a> Batch<'a> {
         self.retire(seq);
     }
 
-    /// Pauses the newest active answer to free shared pages.
+    /// Pauses the policy's victim to free shared pages.
     fn preempt(&mut self) -> bool {
         if self.active.len() <= 1 {
             return false;
         }
-        let seq = self.active.pop().expect("an active answer");
+        let victim = self.policy.victim(&self.active);
+        let Some(at) = victim.filter(|at| *at < self.active.len()) else {
+            return false;
+        };
+        let seq = self.active.remove(at);
         self.pause(seq);
         true
     }
