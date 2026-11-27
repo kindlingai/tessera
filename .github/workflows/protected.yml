@@ -4,7 +4,7 @@ name: Protected files
 # so a PR cannot change its own checks. It never runs PR code.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, edited, unlabeled]
+    types: [opened, reopened, synchronize, edited, unlabeled, ready_for_review]
 
 permissions:
   actions: write
@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   human-review:
+    # A draft waits. The ready_for_review event starts the run CI's success needs.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -25,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Label changes to protected files
-        if: contains(fromJSON('["opened", "reopened", "synchronize"]'), github.event.action)
+        if: contains(fromJSON('["opened", "reopened", "synchronize", "ready_for_review"]'), github.event.action)
         run: |
           # README.md changes inside the generated crate table skip review.
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \

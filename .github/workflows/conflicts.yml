@@ -1,6 +1,6 @@
 name: Conflict notice
 
-# Each open, ready PR keeps one comment that lists the other open PRs
+# Each open PR, drafts included, keeps one comment that lists the other open PRs
 # it conflicts with, and those that change the same files without a
 # conflict, see conflict-notice.sh. It never fails a check.
 # pull_request_target runs main's copy of this file and its scripts.

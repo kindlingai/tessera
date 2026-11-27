@@ -1,9 +1,9 @@
 #!/bin/sh
-# Test-merges each pair of open, ready PRs that target MAIN.
+# Test-merges each pair of open PRs that target MAIN, drafts included.
 # Also lists files both PRs change that merge cleanly.
 # Keeps one notice comment on each PR with those lists. Deletes the
-# notice when both lists are empty, or when the PR is a draft or
-# conflicts with main. Writes only when the text changes. Fails on
+# notice when both lists are empty, or when the PR conflicts with
+# main. Writes only when the text changes. Fails on
 # errors only.
 # Each list line reads "- conflict #<n>: <files>" or "- shared #<n>: <files>".
 # Needs GH_TOKEN, GITHUB_REPOSITORY and MAIN.
@@ -26,7 +26,7 @@ query($owner: String!, $name: String!, $base: String!, $endCursor: String) {
     pullRequests(states: OPEN, baseRefName: $base, first: 100, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number isDraft headRefOid
+        number headRefOid
         comments(first: 100) {
           pageInfo { hasNextPage }
           nodes { databaseId body author { login } }
@@ -35,18 +35,18 @@ query($owner: String!, $name: String!, $base: String!, $endCursor: String) {
     }
   }
 }' >"$tmp/prs" || fail "Could not read the open PRs."
-# Lines: "<n> <head> <draft> <notice id or -> <more comments>".
+# Lines: "<n> <head> <notice id or -> <more comments>".
 jq -rs --arg marker "$marker" '[.[].data.repository.pullRequests.nodes[]][]
     | ([.comments.nodes[] | select(.author.login == "github-actions"
         and (.body | startswith($marker)))][0]) as $notice
-    | "\(.number) \(.headRefOid) \(.isDraft) \($notice.databaseId // "-") \(.comments.pageInfo.hasNextPage)"' \
+    | "\(.number) \(.headRefOid) \($notice.databaseId // "-") \(.comments.pageInfo.hasNextPage)"' \
     "$tmp/prs" >"$tmp/open" || fail "Could not parse the open PRs."
 
 # Sets nid to the notice comment id of PR $1, or to nothing.
 # Writes the notice text to $tmp/old.
 notice_id() {
     grep "^$1 " "$tmp/open" >"$tmp/line"
-    read -r _ _ _ nid more <"$tmp/line"
+    read -r _ _ nid more <"$tmp/line"
     if [ "$nid" = - ] && [ "$more" = true ]; then
         gh api --paginate "$repo/issues/$1/comments" --jq ".[] | select(.user.login == \"github-actions[bot]\"
             and (.body | startswith(\"$marker\"))) | .id" >"$tmp/id" </dev/null ||
@@ -91,13 +91,9 @@ post_notice() {
     echo "#$1: notice edited."
 }
 
-# GitHub already marks a PR that conflicts with main. Drafts wait.
+# GitHub already marks a PR that conflicts with main.
 : >"$tmp/ready"
-while read -r n sha draft _; do
-    if [ "$draft" = true ]; then
-        clear_notice "$n"
-        continue
-    fi
+while read -r n sha _; do
     git fetch -q origin "$MAIN" "$sha" || fail "Could not fetch #$n."
     code=0
     git merge-tree --write-tree "$main" "$sha" >/dev/null || code=$?

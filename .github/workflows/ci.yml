@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Jobs skip on a draft. Marking it ready starts a full run.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
 
 concurrency:
@@ -20,6 +22,7 @@ env:
 jobs:
   commits:
     # No Co-Authored-By lines crediting AI tools.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +39,7 @@ jobs:
   # The job runs on every event and skips its steps instead. A skipped
   # job here would skip every job that needs `changes`.
   tiers:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-slim
     steps:
       - if: github.event_name == 'merge_group'
@@ -51,7 +55,7 @@ jobs:
     # The build jobs skip when nothing did, and when a merge group holds
     # the tree its pull request already passed.
     needs: tiers
-    if: ${{ !cancelled() && needs.tiers.result != 'failure' }}
+    if: ${{ !cancelled() && needs.tiers.result != 'failure' && github.event.pull_request.draft != true }}
     runs-on: ubuntu-slim
     outputs:
       build: ${{ steps.reuse.outputs.build }}
@@ -285,7 +289,7 @@ jobs:
     # Near-copies of code (stickler simcheck), compared by embeddings,
     # and allow.toml pairs that allow nothing. The pull request ran it,
     # so the merge queue skips it.
-    if: github.event_name != 'merge_group'
+    if: github.event_name != 'merge_group' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -356,6 +360,7 @@ jobs:
   style:
     # Comment and prose rules (stickler style) on a PR's added lines. The job
     # fails on any hit, and does nothing on pushes, so `success` can need it.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     env:
       PULL: ${{ github.event_name == 'pull_request' }}
@@ -397,7 +402,7 @@ jobs:
 
   report:
     # One PR comment for lint, similarity, style and tests (stickler).
-    if: always() && github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.draft != true
     needs: [lint, linux, similarity, style]
     runs-on: ubuntu-latest
     permissions:
@@ -551,8 +556,8 @@ jobs:
 
   success:
     # The one check to require: every job above passed or was skipped
-    # by `changes`, and no human step is pending.
-    if: always()
+    # by `changes`, and no human step is pending. Skipped on a draft.
+    if: always() && github.event.pull_request.draft != true
     needs: [tiers, changes, commits, lint, linux, features, grammar, macos, arm64, similarity, platforms, docker, style]
     runs-on: ubuntu-slim
     steps:

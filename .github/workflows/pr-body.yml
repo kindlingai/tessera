@@ -3,7 +3,7 @@ name: PR body
 # Squash merges copy the PR body into the commit message.
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
 
 concurrency:
   group: pr-body-${{ github.ref }}
@@ -12,6 +12,7 @@ concurrency:
 jobs:
   coauthors:
     # No Co-Authored-By lines crediting AI tools.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
