@@ -141,3 +141,26 @@ fn helpers_render() {
     );
     assert!(helper.body.helpers[1].text().contains("return (float)v;"));
 }
+
+/// A packed four that is changed or stored whole.
+#[kernel]
+fn bump<F: Form>(x: Buf<F>, mut out: BufMut<F>) {
+    let mut s = x.load4(0);
+    s.x += 1.0;
+    out.store4(0, s);
+    let c = x.load4(4);
+    out.store4(4, c);
+}
+
+/// Packed fours decode before a change or a whole use.
+#[test]
+fn packed_fours_decode() {
+    let text = bump_ir::<Bf16>().text();
+    for rendered in [text.render(Dialect::Metal), text.render(Dialect::Cuda)] {
+        assert!(rendered.contains("float4 s;"), "{rendered}");
+        assert!(
+            rendered.contains("f_store4_bf16(out + 4, f_make4("),
+            "{rendered}"
+        );
+    }
+}

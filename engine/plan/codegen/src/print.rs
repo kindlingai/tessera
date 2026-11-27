@@ -201,7 +201,13 @@ impl<'a> Printer<'a> {
                 float(*x)
             }
             Expr::Bool(b) => b.to_string(),
-            Expr::Var(name) => self.c_name(name),
+            Expr::Var(name) => match self.kind(name) {
+                Kind::Wide(form) => {
+                    let base = self.c_name(name);
+                    self.decoded(form, &base)
+                }
+                _ => self.c_name(name),
+            },
             Expr::Neg(a) => format!("(-{})", self.expr(a)),
             // On an integer, `!` flips every bit.
             Expr::Not(a) => match self.ty(a) {
@@ -234,7 +240,7 @@ impl<'a> Printer<'a> {
             }
             Expr::Field(base, h) => {
                 let form = self.wide(base);
-                let base = self.expr(base);
+                let base = self.packed(base);
                 match (form, self.wgsl) {
                     (Some(form), true) => form.wgsl_part(&base, *h),
                     (Some(form), false) => form.part(&base, *h),
@@ -310,11 +316,50 @@ impl<'a> Printer<'a> {
     fn block(&mut self, stmts: &[Stmt]) {
         self.scope.push(HashMap::new());
         self.indent += 1;
-        for s in stmts {
-            self.stmt(s);
-        }
+        self.stmts(stmts);
         self.indent -= 1;
         self.scope.pop();
+    }
+
+    /// Prints `list`, decoding packed fours that later lines change.
+    pub(crate) fn stmts(&mut self, list: &[Stmt]) {
+        for (at, s) in list.iter().enumerate() {
+            match s {
+                Stmt::Let { name, init }
+                    if self.wide(init).is_some() && assigns(name, &list[at + 1..]) =>
+                {
+                    let zero = Expr::Call(Intrinsic::Zero4, Vec::new());
+                    self.stmt(&Stmt::Let {
+                        name: name.clone(),
+                        init: zero,
+                    });
+                    self.stmt(&Stmt::Assign {
+                        target: Expr::Var(name.clone()),
+                        op: None,
+                        value: init.clone(),
+                    });
+                }
+                _ => self.stmt(s),
+            }
+        }
+    }
+
+    /// A packed four as written, or any other expression.
+    fn packed(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Var(name) => self.c_name(name),
+            _ => self.expr(e),
+        }
+    }
+
+    /// The four parts of packed `base`, decoded into one value.
+    fn decoded(&mut self, form: &'static dyn Load, base: &str) -> String {
+        self.uses(Intrinsic::Make4);
+        let parts = ['x', 'y', 'z', 'w'].map(|f| match self.wgsl {
+            true => form.wgsl_part(base, f),
+            false => form.part(base, f),
+        });
+        format!("f_make4({})", parts.join(", "))
     }
 
     pub(crate) fn stmt(&mut self, s: &Stmt) {
@@ -443,24 +488,16 @@ impl<'a> Printer<'a> {
                     && let Expr::Var(name) = target
                     && matches!(self.kind(name), Kind::Value(Ty::F32x4))
                 {
-                    let (t, v) = (self.expr(target), self.expr(value));
-                    self.uses(Intrinsic::Make4);
-                    let fields = ['x', 'y', 'z', 'w'];
-                    let parts = fields.map(|f| match self.wgsl {
-                        true => form.wgsl_part("w__", f),
-                        false => form.part("w__", f),
-                    });
-                    let [p0, p1, p2, p3] = parts;
-                    if self.wgsl {
-                        let ty = form.wgsl_wide();
-                        self.line(format!(
-                            "{{ let w__: {ty} = {v}; {t} = f_make4({p0}, {p1}, {p2}, {p3}); }}"
-                        ));
-                    } else {
-                        let ty = form.wide();
-                        self.line(format!(
-                            "{{ {ty} w__ = {v}; {t} = f_make4({p0}, {p1}, {p2}, {p3}); }}"
-                        ));
+                    let (t, v) = (self.expr(target), self.packed(value));
+                    let four = self.decoded(form, "w__");
+                    match self.wgsl {
+                        true => self.line(format!(
+                            "{{ let w__: {} = {v}; {t} = {four}; }}",
+                            form.wgsl_wide()
+                        )),
+                        false => {
+                            self.line(format!("{{ {} w__ = {v}; {t} = {four}; }}", form.wide()))
+                        }
                     }
                     return;
                 }
@@ -730,6 +767,26 @@ impl<'a> Printer<'a> {
             }
         }
     }
+}
+
+/// Whether a line in `rest` assigns `name` or a part.
+fn assigns(name: &str, rest: &[Stmt]) -> bool {
+    let named = |e: &Expr| matches!(e, Expr::Var(n) if n == name);
+    for s in rest {
+        let hit = match s {
+            Stmt::Assign { target, .. } => match target {
+                Expr::Field(base, _) => named(base),
+                other => named(other),
+            },
+            Stmt::For { body, .. } | Stmt::TileEach { body, .. } => assigns(name, body),
+            Stmt::If { then, els, .. } => assigns(name, then) || assigns(name, els),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `s` uses the matrix unit.

@@ -2600,6 +2600,7 @@ dependencies = [
  "scattered-collect",
  "serde",
  "serde_json",
+ "tessera-gpukit",
  "tessera-graph",
  "tessera-interp",
  "tessera-lower",

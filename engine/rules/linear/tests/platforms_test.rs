@@ -4,13 +4,12 @@
 use tessera_kernels as _;
 
 use std::path::Path;
-use std::process::Command;
 use tessera_gpukit::platform::{backend_of, rows};
 use tessera_linear::{BF16, PARTS, Product, SCHEDULES, Schedule, Tiled};
 use tessera_lower::form::{BF16_FORM, F32_FORM};
 use tessera_lower::sites::After;
 use tessera_lower::{Dialect, Kernel, Source};
-use tessera_testkit::scratch;
+use tessera_testkit::{run, scratch, toolkit};
 
 /// The tiled kernel's text and entry name.
 fn tiled_text(dialect: Dialect, (schedule, parts): (Schedule, u32)) -> (String, String) {
@@ -62,36 +61,9 @@ fn hip_probe() -> String {
     )
 }
 
-/// Runs `program`, giving its output and whether it succeeded.
-fn run(program: &str, args: &[&str], dir: &Path) -> (bool, String) {
-    let out = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.success(), text)
-}
-
 /// A toolkit that is not installed is skipped.
 #[test]
 fn toolkits_agree() {
-    let here = |backend: &str| {
-        let (program, flag, want) = match backend {
-            "cuda" => ("nvcc", "--version", "nvcc"),
-            "rocm" => ("clang++", "--print-targets", "amdgcn"),
-            _ => ("xcrun", "--find", "metal-tt"),
-        };
-        let found = Command::new(program)
-            .args([flag, want])
-            .output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(want));
-        if !found {
-            println!("{backend}: no toolkit here, skipped");
-        }
-        found
-    };
     let dir = scratch("platforms");
     std::fs::create_dir_all(&dir).unwrap();
     let (cuda, _) = tiled_text(Dialect::Cuda, (SCHEDULES[0], 0));
@@ -106,7 +78,7 @@ fn toolkits_agree() {
     std::fs::write(dir.join("tiled.mtlp-json"), pipeline_script(&entry)).unwrap();
     for row in rows() {
         let backend = backend_of(&row).to_string();
-        if row.check.is_empty() || !here(&backend) {
+        if row.check.is_empty() || !toolkit(&backend) {
             continue;
         }
         for target in &row.check {

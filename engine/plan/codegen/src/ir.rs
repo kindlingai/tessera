@@ -388,9 +388,7 @@ impl Body {
                 }
             }
         }
-        for s in &self.stmts {
-            p.stmt(s);
-        }
+        p.stmts(&self.stmts);
         gather(&self.helpers, &mut helpers);
         let mut lines = p.lines;
         if p.lane {
@@ -437,9 +435,7 @@ impl Helper {
                 }
             }
         }
-        for s in &self.body.stmts {
-            p.stmt(s);
-        }
+        p.stmts(&self.body.stmts);
         let value = self.body.ret.as_ref().expect("a helper has a value");
         let value = p.expr(value);
         p.line(format!("return {value};"));

@@ -33,6 +33,7 @@ pub mod testing;
 pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
 pub use held::{Held, Holds};
 pub use loopback::Loopback;
+pub use overrides::text as kernel_text;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
 pub use rank::{Rank, Sum, sum_wire};
 pub use run::{Base, Outcome, Reload, Run};

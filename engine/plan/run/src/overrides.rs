@@ -48,8 +48,8 @@ pub(crate) fn entry(source: &Source) -> &str {
     }
 }
 
-/// A planned step's kernel text.
-pub(crate) fn text(step: &Step, backend: Backend) -> String {
+/// The text a GPU runner compiles for `step` on `backend`.
+pub fn text(step: &Step, backend: Backend) -> String {
     let source = step.kernel.source();
     match (&source, fixed_text(&source, backend)) {
         (Source::Made(body), _) => body.text().bounded(Dialect::of(backend), Some(group(step))),

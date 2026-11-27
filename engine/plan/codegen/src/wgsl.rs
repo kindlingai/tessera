@@ -119,9 +119,7 @@ impl Helper {
                 _ => return Err(format!("`{}` takes `{}`", self.name, param.name())),
             }
         }
-        for s in &self.body.stmts {
-            p.stmt(s);
-        }
+        p.stmts(&self.body.stmts);
         let value = self.body.ret.as_ref().expect("a helper has a value");
         let value = p.expr(value);
         p.line(format!("return {value};"));
@@ -157,9 +155,7 @@ impl Body {
                 _ => panic!("`{}` takes `{}` from a caller", self.entry, param.name()),
             }
         }
-        for s in &self.stmts {
-            p.stmt(s);
-        }
+        p.stmts(&self.stmts);
         checked(&p)?;
         gather(&self.helpers, &mut helpers);
         let mut used = p.used.clone();
