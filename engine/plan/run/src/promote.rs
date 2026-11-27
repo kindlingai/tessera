@@ -20,6 +20,36 @@ pub(crate) struct Swap {
     pub hot: usize,
 }
 
+/// A promoted expert whose bytes still copy to its slot.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Moving {
+    pub weight: usize,
+    pub cold: usize,
+    pub slot: usize,
+}
+
+/// Two-phase swaps: free a slot, then hand it over.
+#[derive(Default)]
+pub(crate) struct Moves(Vec<Moving>);
+
+impl Moves {
+    /// Frees `swap.hot`'s slot in its weight's `slots`.
+    pub(crate) fn begin(&mut self, slots: &mut [Option<usize>], swap: &Swap) -> Option<usize> {
+        let slot = slots[swap.hot].take()?;
+        self.0.push(Moving {
+            weight: swap.weight,
+            cold: swap.cold,
+            slot,
+        });
+        Some(slot)
+    }
+
+    /// The moves whose copies are done, once the device waited.
+    pub(crate) fn land(&mut self) -> Vec<Moving> {
+        std::mem::take(&mut self.0)
+    }
+}
+
 /// Chooses the experts that trade places after a step.
 pub(crate) trait Promote: Send {
     /// Adds a step's hit count per expert of `weight`.

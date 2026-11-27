@@ -3,10 +3,10 @@
 use crate::Error;
 use crate::held::Held;
 use crate::lanes::{Source, Staging};
-use crate::promote::{Decayed, Dense, Forecast, Paged, Promote, Unknown};
+use crate::promote::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
 use crate::run::Base;
 use std::collections::{BTreeMap, HashMap};
-use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
 use tessera_lower::kernels::{Ring, place};
 use tessera_lower::{Loaded, Plan, Slot};
 use tessera_mem::Backing;
@@ -224,6 +224,8 @@ pub(crate) struct Pager<D: Device> {
     entries: Vec<Entry<D>>,
     hits: Vec<u32>,
     policy: Box<dyn Promote>,
+    /// Swaps whose bytes copy during the next step.
+    moves: Moves,
     staging: Staging<D>,
 }
 
@@ -331,6 +333,7 @@ impl<D: Device> Pager<D> {
             entries,
             hits: Vec::new(),
             policy: Box::new(Decayed::default()),
+            moves: Moves::default(),
             staging,
         }))
     }
@@ -461,11 +464,42 @@ impl<D: Device> Pager<D> {
         Ok(true)
     }
 
-    /// Reports hits and makes the policy's swaps.
+    /// Rewrites staged deltas of experts whose slots changed.
+    fn retarget(&mut self, moved: Vec<(usize, usize)>) {
+        let mut staging = std::mem::replace(&mut self.staging, Staging::idle());
+        for (weight, expert) in moved {
+            staging.retarget(weight, expert, self.source(weight));
+        }
+        self.staging = staging;
+    }
+
+    /// Hands each copied expert its VRAM slot.
+    fn land(&mut self, ctx: &D, pool_base: u64) -> Result<(), Error> {
+        let landed = self.moves.land();
+        if landed.is_empty() {
+            return Ok(());
+        }
+        ctx.finish()?;
+        let mut moved = Vec::with_capacity(landed.len());
+        for moving in landed {
+            let entry = &mut self.entries[moving.weight];
+            let vram_at = pool_base + (entry.vram_offset + moving.slot * entry.spec.stride) as u64;
+            let hot_delta = vram_at.wrapping_sub(entry.desc_ptr);
+            let at = entry.desc_ptr + (TABLE + moving.cold * 8) as u64;
+            ctx.upload(at, &hot_delta.to_le_bytes())?;
+            entry.slot_of[moving.cold] = Some(moving.slot);
+            moved.push((moving.weight, moving.cold));
+        }
+        self.retarget(moved);
+        Ok(())
+    }
+
+    /// Reports hits and starts the policy's swaps.
     pub(crate) fn maintain(&mut self, ctx: &D) -> Result<(), Error> {
-        let Some(pool) = &self.vram_pool else {
+        let Some(pool_base) = self.vram_pool.as_ref().map(DeviceBuffer::device_ptr) else {
             return Ok(());
         };
+        self.land(ctx, pool_base)?;
         self.hits_buf.read_bytes(&mut self.raw_hits)?;
         self.hits_buf.zero()?;
         let (words, _) = self.raw_hits.as_chunks::<4>();
@@ -485,12 +519,14 @@ impl<D: Device> Pager<D> {
             });
         }
         let swaps = self.policy.swaps(&weights);
-        let pool_base = pool.device_ptr();
         let mut moved = Vec::new();
+        // The copies run beside the next step.
+        let lane = ctx.active_lane();
+        ctx.set_lane(COPY_LANE);
         for swap in swaps {
             let (cold, hot) = (swap.cold, swap.hot);
             let entry = &mut self.entries[swap.weight];
-            let Some(slot) = entry.slot_of[hot].take() else {
+            let Some(slot) = self.moves.begin(&mut entry.slot_of, &swap) else {
                 continue;
             };
             let stride = entry.spec.stride;
@@ -498,10 +534,10 @@ impl<D: Device> Pager<D> {
             let host_base = entry.host_buf.device_ptr();
             // Point evicted expert back to its pinned host copy.
             let cold_delta = (host_base + (hot * stride) as u64).wrapping_sub(desc_ptr);
-            ctx.upload(
+            let queued = ctx.upload(
                 desc_ptr + (TABLE + hot * 8) as u64,
                 &cold_delta.to_le_bytes(),
-            )?;
+            );
             // Copy promoted expert from pinned host into VRAM slot.
             let vram_at = pool_base + (entry.vram_offset + slot * stride) as u64;
             let host_mem = entry
@@ -509,22 +545,18 @@ impl<D: Device> Pager<D> {
                 .mapped()
                 .expect("pinned buffer is host-mapped");
             let off = cold * stride;
-            ctx.upload(vram_at, &host_mem[off..off + stride])?;
-            // Point promoted expert to its new VRAM slot.
-            let hot_delta = vram_at.wrapping_sub(desc_ptr);
-            ctx.upload(
-                desc_ptr + (TABLE + cold * 8) as u64,
-                &hot_delta.to_le_bytes(),
-            )?;
-            entry.slot_of[cold] = Some(slot);
-            moved.extend([(swap.weight, cold), (swap.weight, hot)]);
+            let queued =
+                queued.and_then(|_| ctx.queue_upload(vram_at, &host_mem[off..off + stride]));
+            if let Err(e) = queued {
+                // The freed slots hold stale bytes, so drop the moves.
+                self.moves.land();
+                ctx.set_lane(lane);
+                return Err(e.into());
+            }
+            moved.push((swap.weight, hot));
         }
-        // Later copy steps read the deltas of the new slots.
-        let mut staging = std::mem::replace(&mut self.staging, Staging::idle());
-        for (weight, expert) in moved {
-            staging.retarget(weight, expert, self.source(weight));
-        }
-        self.staging = staging;
+        ctx.set_lane(lane);
+        self.retarget(moved);
         Ok(())
     }
 }
