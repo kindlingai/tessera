@@ -53,8 +53,8 @@ impl Pattern for Attend {
                 }
             }
             // Slots the rows span, if the launch says. Else any.
-            let segments = tree.sizes.iter().find(|(n, _)| *n == DimName::Segments);
-            let segments = segments.map_or(queries, |(_, n)| *n as usize).min(queries);
+            let segments = tree.size(DimName::Segments);
+            let segments = segments.map_or(queries, |n| n as usize).min(queries);
             let sizes = Attn {
                 seqs,
                 queries,

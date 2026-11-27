@@ -1,11 +1,16 @@
-//! Owned-row extents, argument slicing, and sliding-ring sizing for `Tree`.
+//! Owned rows, rotated weights, kept state, ring size.
 
 use crate::extent::Extent;
+use crate::form::{F32_FORM, Load};
+use crate::plan::Share;
+use crate::select::Home;
 use crate::tree::{Node, RING_CHUNK, T, Term, Tree};
 use crate::{Error, Size};
 use std::collections::HashMap;
 use tessera_codegen::kept::{self, Layout};
-use tessera_graph::{DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, Select, View};
+use tessera_graph::{
+    DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, Select, Stage, View,
+};
 
 /// Ring capacity for sliding-window kept `index`, if smaller than context.
 pub fn sliding_ring(g: &Graph, index: u32) -> Option<usize> {
@@ -120,17 +125,8 @@ fn slice_axis0(
         };
         (Term::Op(Op::View(view)), vec![slot])
     };
-    let t = tree.add(
-        Node {
-            term,
-            args,
-            shape,
-            extents,
-            form: src.form,
-            from: src.from,
-        },
-        None,
-    );
+    let node = Node::new(term, args, (shape, extents), src.form, src.from);
+    let t = tree.add(node, None);
     sliced.insert(key, t);
     t
 }
@@ -264,6 +260,84 @@ impl<'a> Tree<'a> {
         self.kept_rings = kept_rings;
     }
 
+    /// A rotated weight's leaves: codes, `suh` and `svh`.
+    pub(super) fn turned(
+        &mut self,
+        weight: u32,
+        (shape, extents): (&[usize], &[Extent]),
+        share: Option<Share>,
+        codes: &'static dyn Load,
+        from: NodeId,
+    ) -> [T; 3] {
+        let leaf = |part: u8, axis: usize, form: &'static dyn Load| {
+            let term = Term::Leaf(Home::Part(weight, part));
+            let dims = match part {
+                0 => (shape.to_vec(), extents.to_vec()),
+                _ => (vec![shape[axis]], vec![extents[axis]]),
+            };
+            Node::new(term, Vec::new(), dims, form, from)
+        };
+        let along = |axis: u32| {
+            let cut = |s: Share| Share {
+                axis: 0,
+                inner: 1,
+                ..s
+            };
+            share.filter(|s| s.axis == axis).map(cut)
+        };
+        let f32 = crate::form::F32_FORM;
+        [
+            self.add(leaf(0, 0, codes), share),
+            self.add(leaf(1, 1, f32), along(1)),
+            self.add(leaf(2, 0, f32), along(0)),
+        ]
+    }
+
+    /// `x` through a rotated matmul: scale, turn, codes, turn, scale.
+    pub(super) fn turn(
+        &mut self,
+        x: T,
+        [codes, suh, svh]: [T; 3],
+        (shape, extents): (&[usize], &[Extent]),
+        out_form: &'static dyn Load,
+        from: NodeId,
+    ) -> T {
+        let (rows, wide) = (self.node(x).shape.clone(), self.node(x).extents.clone());
+        let turn = Stage::Hadamard { block: 128 };
+        let mut step = |term: Term, args: Vec<T>, out: bool, form: &'static dyn Load| {
+            let (shape, extents) = match out {
+                true => (shape.to_vec(), extents.to_vec()),
+                false => (rows.clone(), wide.clone()),
+            };
+            self.add(Node::new(term, args, (shape, extents), form, from), None)
+        };
+        let f32 = F32_FORM;
+        let scaled = step(Term::Stage(Stage::Mul), vec![x, suh], false, f32);
+        let turned = step(Term::Stage(turn.clone()), vec![scaled], false, f32);
+        let product = step(Term::Op(Op::Matmul), vec![turned, codes], true, f32);
+        let back = step(Term::Stage(turn), vec![product], true, f32);
+        step(Term::Stage(Stage::Mul), vec![back, svh], true, out_form)
+    }
+
+    /// Whether `t` closes a rotated matmul chain.
+    pub(super) fn closes_turn(&self, t: T) -> bool {
+        let n = self.node(t);
+        if n.term != Term::Stage(Stage::Mul) {
+            return false;
+        }
+        let Some(&back) = n.args.first() else {
+            return false;
+        };
+        let b = self.node(back);
+        if !matches!(b.term, Term::Stage(Stage::Hadamard { .. })) {
+            return false;
+        }
+        let Some(&prod) = b.args.first() else {
+            return false;
+        };
+        self.node(prod).term == Term::Op(Op::Matmul)
+    }
+
     /// The node appending to kept `index`, and rows per slot.
     pub fn kept_rows(&self, index: u32) -> Option<(T, usize)> {
         let t = (*self.kept_appends.get(index as usize)?)?;
@@ -295,5 +369,32 @@ impl<'a> Tree<'a> {
     /// True if any kept tensor is sparse-read.
     pub fn has_sparse_kept(&self) -> bool {
         self.sparse_kept.iter().any(|&s| s)
+    }
+
+    /// Fixed shape of kept state `index`, split for this rank.
+    pub fn fixed_kept(&self, index: u32) -> Option<Vec<usize>> {
+        let k = self.g.kept.get(index as usize)?;
+        let size = |name| {
+            self.size(name).or_else(|| {
+                self.g
+                    .dims
+                    .iter()
+                    .find(|d| d.name == name)
+                    .map(|d| d.size.max())
+            })
+        };
+        let mut shape: Vec<usize> = k
+            .shape
+            .0
+            .iter()
+            .map(|e| e.value(&self.g.dims, &size).map(|n| n as usize))
+            .collect::<Option<_>>()?;
+        if let Placement::Split { axis } = k.placement
+            && self.parts.ranks() > 1
+        {
+            let a = axis as usize;
+            shape[a] = self.part(shape[a])?.1;
+        }
+        Some(shape)
     }
 }
