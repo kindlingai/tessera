@@ -11,6 +11,8 @@ use tessera_lower::{
     Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Source, Step, T, Tree, knob,
 };
 
+mod sunk;
+
 knob!("flash", "bk", 16, 32);
 knob!("flash", "held", 0, 1);
 
@@ -373,6 +375,26 @@ fn take_block(
     let simd = lid() / LANES as u32;
     scores(st, simd, k0, bk);
     barrier();
+    fold_block(st, values, hd, at, k0, count, d0, cw, w, bk, held_q, v_form);
+}
+
+/// Softens the scores in `p_s`, then folds values in.
+#[kernel]
+fn fold_block(
+    st: &mut Stream,
+    #[form(v_form)] values: Buf<Dyn>,
+    hd: &Head,
+    at: u32,
+    k0: u32,
+    count: u32,
+    d0: u32,
+    #[build] cw: u32,
+    #[build] w: u32,
+    #[build] bk: u32,
+    #[build] held_q: bool,
+    #[build] v_form: &'static dyn Stored,
+) {
+    let simd = lid() / LANES as u32;
     soften(st, bk);
     barrier();
     // Held queries made room: values staged with the keys.

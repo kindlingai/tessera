@@ -451,7 +451,7 @@ impl Sizes {
     }
 
     /// One list of picks per row and head.
-    fn lists(&self) -> usize {
+    pub(crate) fn lists(&self) -> usize {
         self.len / self.width
     }
 
@@ -740,7 +740,7 @@ fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
 }
 
 /// Ragged or whole attention: listed keys, sinks, or bias.
-fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 8])> {
+pub(crate) fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 8])> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
