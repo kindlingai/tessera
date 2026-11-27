@@ -6,6 +6,9 @@ mod answer_test;
 mod decide;
 #[cfg(test)]
 mod decide_test;
+pub mod gate;
+#[cfg(test)]
+mod gate_test;
 pub mod http;
 #[cfg(test)]
 mod http_test;

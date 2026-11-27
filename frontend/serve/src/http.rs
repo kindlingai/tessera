@@ -1,9 +1,9 @@
 //! HTTP/1.1 on std threads: one thread per connection.
 
+use crate::gate::{Capped, Gate};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -62,7 +62,8 @@ impl Response {
 }
 
 pub struct Limits {
-    pub max_connections: usize,
+    /// Chooses the connections to serve.
+    pub gate: Arc<dyn Gate>,
     pub max_body: usize,
     pub max_head: usize,
     /// Time to read one request head, or to wait idle.
@@ -78,7 +79,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
-            max_connections: 64,
+            gate: Arc::new(Capped::new(64)),
             max_body: 32 << 20,
             max_head: 64 << 10,
             head_timeout: Duration::from_secs(60),
@@ -126,12 +127,12 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Lowers the count when its connection ends.
-struct Held(Arc<AtomicUsize>);
+/// Tells the gate when its connection ends.
+struct Held(Arc<dyn Gate>, Option<SocketAddr>);
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.leave(self.1);
         OPEN.sub(1);
     }
 }
@@ -143,7 +144,6 @@ where
 {
     let limits = Arc::new(limits);
     let route = Arc::new(route);
-    let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -154,9 +154,8 @@ where
                 continue;
             }
         };
-        let held = Held(open.clone());
-        OPEN.add(1);
-        if open.fetch_add(1, Ordering::Relaxed) >= limits.max_connections {
+        let peer = stream.peer_addr().ok();
+        if !limits.gate.enter(peer) {
             REFUSED.add(1);
             let _ = stream.set_write_timeout(Some(limits.write_timeout));
             let _ = head(
@@ -169,6 +168,8 @@ where
             );
             continue;
         }
+        let held = Held(limits.gate.clone(), peer);
+        OPEN.add(1);
         let (limits, route) = (limits.clone(), route.clone());
         std::thread::spawn(move || {
             let _held = held;
