@@ -1,0 +1,343 @@
+{
+  "flags": [
+    {
+      "flag": "--recipe",
+      "takes": true
+    },
+    {
+      "flag": "--model",
+      "takes": true
+    },
+    {
+      "flag": "--yes",
+      "takes": false
+    },
+    {
+      "flag": "--max-tokens",
+      "takes": true
+    },
+    {
+      "flag": "--version",
+      "takes": false
+    },
+    {
+      "flag": "--cli-json",
+      "takes": false
+    }
+  ],
+  "words": true,
+  "commands": {
+    "serve": {
+      "flags": [
+        {
+          "flag": "--host",
+          "takes": true
+        },
+        {
+          "flag": "--port",
+          "takes": true
+        },
+        {
+          "flag": "--port-file",
+          "takes": true
+        },
+        {
+          "flag": "--max-model-len",
+          "takes": true
+        },
+        {
+          "flag": "--slots",
+          "takes": true
+        },
+        {
+          "flag": "--max-batch-rows",
+          "takes": true
+        },
+        {
+          "flag": "--layers",
+          "takes": true
+        },
+        {
+          "flag": "--kv-dtype",
+          "takes": true
+        },
+        {
+          "flag": "--dtype",
+          "takes": true
+        },
+        {
+          "flag": "--shape",
+          "takes": true
+        },
+        {
+          "flag": "--kv-cache-tokens",
+          "takes": true
+        },
+        {
+          "flag": "--kv-store",
+          "takes": true
+        },
+        {
+          "flag": "--kv-keep",
+          "takes": true
+        },
+        {
+          "flag": "--kv-system-after",
+          "takes": true
+        },
+        {
+          "flag": "--served-model-name",
+          "takes": true
+        },
+        {
+          "flag": "--task",
+          "takes": true
+        },
+        {
+          "flag": "--guided",
+          "takes": false
+        },
+        {
+          "flag": "--reuse-prefix",
+          "takes": false
+        },
+        {
+          "flag": "--manifest",
+          "takes": true
+        },
+        {
+          "flag": "--draft",
+          "takes": true
+        },
+        {
+          "flag": "--spec-adaptive",
+          "takes": false
+        },
+        {
+          "flag": "--spec-len",
+          "takes": true
+        },
+        {
+          "flag": "--mtp",
+          "takes": true
+        },
+        {
+          "flag": "--image-size",
+          "takes": true
+        },
+        {
+          "flag": "--clip",
+          "takes": true
+        },
+        {
+          "flag": "--max-connections",
+          "takes": true
+        },
+        {
+          "flag": "--api-key",
+          "takes": true
+        },
+        {
+          "flag": "--cors-origin",
+          "takes": true
+        },
+        {
+          "flag": "--reject-unknown-fields",
+          "takes": false
+        },
+        {
+          "flag": "--require-favored",
+          "takes": false
+        },
+        {
+          "flag": "--explain-lowering",
+          "takes": false
+        },
+        {
+          "flag": "--allow-failed-lowering",
+          "takes": false
+        },
+        {
+          "flag": "--allow-weight-streaming",
+          "takes": false
+        },
+        {
+          "flag": "--attic",
+          "takes": false
+        },
+        {
+          "flag": "--priority",
+          "takes": true
+        },
+        {
+          "flag": "--swap-quantum",
+          "takes": true
+        },
+        {
+          "flag": "--also",
+          "takes": true
+        },
+        {
+          "flag": "--rank",
+          "takes": true
+        },
+        {
+          "flag": "--peers",
+          "takes": true
+        },
+        {
+          "flag": "--parts",
+          "takes": true
+        },
+        {
+          "flag": "--verbs",
+          "takes": true
+        },
+        {
+          "flag": "--ring",
+          "takes": true
+        },
+        {
+          "flag": "--sums",
+          "takes": true
+        },
+        {
+          "flag": "--sum-wire",
+          "takes": true
+        },
+        {
+          "flag": "--moe",
+          "takes": true
+        }
+      ],
+      "words": false,
+      "commands": {}
+    },
+    "fetch": {
+      "flags": [],
+      "words": false,
+      "commands": {}
+    },
+    "mcp": {
+      "flags": [],
+      "words": false,
+      "commands": {}
+    },
+    "size": {
+      "flags": [
+        {
+          "flag": "--ctx",
+          "takes": true
+        },
+        {
+          "flag": "--slots",
+          "takes": true
+        },
+        {
+          "flag": "--boot",
+          "takes": false
+        }
+      ],
+      "words": false,
+      "commands": {}
+    },
+    "check-kernels": {
+      "flags": [
+        {
+          "flag": "--arch",
+          "takes": true
+        },
+        {
+          "flag": "--max-spills",
+          "takes": true
+        },
+        {
+          "flag": "--file",
+          "takes": true
+        },
+        {
+          "flag": "--json",
+          "takes": false
+        }
+      ],
+      "words": false,
+      "commands": {}
+    },
+    "teleport": {
+      "flags": [
+        {
+          "flag": "--from",
+          "takes": true
+        },
+        {
+          "flag": "--root",
+          "takes": true
+        }
+      ],
+      "words": true,
+      "commands": {}
+    },
+    "task": {
+      "flags": [],
+      "words": false,
+      "commands": {
+        "ask": {
+          "flags": [
+            {
+              "flag": "--max-tokens",
+              "takes": true
+            }
+          ],
+          "words": true,
+          "commands": {}
+        },
+        "chat": {
+          "flags": [
+            {
+              "flag": "--max-tokens",
+              "takes": true
+            }
+          ],
+          "words": false,
+          "commands": {}
+        },
+        "image": {
+          "flags": [
+            {
+              "flag": "--n",
+              "takes": true
+            },
+            {
+              "flag": "--seed",
+              "takes": true
+            },
+            {
+              "flag": "--image-size",
+              "takes": true
+            },
+            {
+              "flag": "--clip",
+              "takes": true
+            },
+            {
+              "flag": "-o",
+              "takes": true
+            }
+          ],
+          "words": true,
+          "commands": {}
+        },
+        "embed": {
+          "flags": [],
+          "words": true,
+          "commands": {}
+        },
+        "tag": {
+          "flags": [],
+          "words": true,
+          "commands": {}
+        }
+      }
+    }
+  }
+}

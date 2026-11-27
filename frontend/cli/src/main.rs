@@ -13,6 +13,9 @@ mod size;
 mod source;
 #[cfg(test)]
 mod source_test;
+mod surface;
+#[cfg(test)]
+mod surface_test;
 mod task;
 mod teleport;
 #[cfg(test)]
@@ -38,11 +41,16 @@ const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>>] [--mo
                  compile planned or standalone CUDA kernels offline with NVRTC and ptxas
   teleport [--from <dir>] [--root <dir>] <user@host | local>...
                  copy this build to other machines over ssh
-  --version      print version, commit, target and GPU features";
+  --version      print version, commit, target and GPU features
+  --cli-json     print the commands, flags and words as JSON";
 
 fn run(given: &[String]) -> Result<(), Stop> {
     if given == ["--version"] {
         println!("{}", version::line());
+        return Ok(());
+    }
+    if given == ["--cli-json"] {
+        println!("{:#}", surface::json());
         return Ok(());
     }
     let (origin, args) = split(given)?;
