@@ -202,6 +202,8 @@ pub async fn serve<H: Host>(host: &H, config: &Config, req: &Request) -> Respons
     let done = match (req.method.as_str(), req.path.as_str()) {
         ("GET", path @ ("/" | "/cache" | "/limits")) => site.tab(path).await,
         ("GET", "/login") => Ok(site.login()),
+        // GitHub sends the browser here after the app is installed.
+        ("GET", "/setup") => Ok(Response::redirect("/".into())),
         ("GET", "/auth") => site.auth().await,
         ("POST", "/tier") => site.retier().await,
         ("POST", "/logout") => site.logout(),
