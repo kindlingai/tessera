@@ -240,9 +240,8 @@ impl TierMap {
             if !move_pages(Move::Promote, &pairs)? {
                 return Err(Error::TierFull.into());
             }
-            for (&(p, h), &(v, _)) in to_promote.iter().zip(&pairs) {
+            for (&(p, _), &(v, _)) in to_promote.iter().zip(&pairs) {
                 self.loc[p as usize] = Some(Loc::Vram(v));
-                self.host_free.push(h);
                 self.policy.placed(p);
             }
             moved = true;
@@ -255,6 +254,8 @@ impl TierMap {
             let picked = self.victims(short, [write_pages, &placed], priority);
             self.depart(picked, move_pages)?;
         }
+        // Slower ranks still read the promoted host pages.
+        self.host_free.extend(to_promote.iter().map(|&(_, h)| h));
         Ok(moved)
     }
 }

@@ -1,10 +1,11 @@
 //! Hot-cold VRAM cache for stacked trellis expert weights.
 
-use crate::Error;
 use crate::held::Held;
 use crate::lanes::{Source, Staging};
 use crate::run::Base;
+use crate::{Backed, Error, HostPool};
 use std::collections::{BTreeMap, HashMap};
+use tessera_engine_comm::SharedPool;
 use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
 use tessera_kv::Move;
 use tessera_lower::kernels::{Ring, place};
@@ -596,38 +597,28 @@ pub(crate) struct HostKv<D: Device> {
     by_slot: HashMap<(u32, usize), u64>,
     /// Whether copies queued on the copy lane may still run.
     busy: bool,
+    /// The pool the box's ranks share, if any.
+    shared: Option<SharedPool>,
 }
 
 impl<D: Device> Drop for HostKv<D> {
     fn drop(&mut self) {
         let _ = self.settle();
-        self.ctx.unpin(self.host);
-    }
-}
-
-fn pair_runs(pairs: &[(u32, u32)]) -> Vec<(u32, u32, usize)> {
-    let (mut out, mut i) = (Vec::new(), 0usize);
-    while i < pairs.len() {
-        let ((v0, h0), mut len) = (pairs[i], 1usize);
-        while i + len < pairs.len()
-            && pairs[i + len].0 == v0 + len as u32
-            && pairs[i + len].1 == h0 + len as u32
-        {
-            len += 1;
+        match &self.shared {
+            Some(pool) => self.ctx.unregister(pool.mapping().0),
+            None => self.ctx.unpin(self.host),
         }
-        out.push((v0, h0, len));
-        i += len;
     }
-    out
 }
 
 impl<D: Device> HostKv<D> {
-    /// Pins a host-RAM pool for sparse paged KV tensors.
+    /// Opens a host-RAM pool for sparse paged KV tensors.
     pub(crate) fn open(
         ctx: &'static D,
         plan: &Plan,
         pages: usize,
         page_rows: usize,
+        by: Backed,
     ) -> Option<Self> {
         if pages == 0 || page_rows == 0 || ctx.unified() {
             return None;
@@ -649,7 +640,11 @@ impl<D: Device> HostKv<D> {
         if by_index.is_empty() || total == 0 {
             return None;
         }
-        let (host, dev) = ctx.pin(total).ok()?;
+        let shared = SharedPool::open(by, total, |base, len| ctx.register(base, len).ok());
+        let (host, dev) = match &shared {
+            Some(pool) => pool.at(),
+            None => ctx.pin(total).ok()?,
+        };
         let mut out = Self {
             ctx,
             host,
@@ -659,6 +654,7 @@ impl<D: Device> HostKv<D> {
             by_index,
             by_slot: HashMap::new(),
             busy: false,
+            shared,
         };
         out.bind(plan);
         Some(out)
@@ -689,7 +685,7 @@ impl<D: Device> HostKv<D> {
         plan: &Plan,
         pairs: &[(u32, u32)],
     ) -> Option<Vec<(u64, *mut u8, usize)>> {
-        let runs = pair_runs(pairs);
+        let runs = tessera_kv::pair_runs(pairs);
         let mut out = Vec::new();
         for (&(index, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
             let Some(&(off, pbytes)) = self.by_index.get(&index) else {
@@ -757,8 +753,10 @@ impl<D: Device> HostKv<D> {
         // Queued steps may still write the pages that depart.
         self.busy |= kind == Move::Depart;
         self.settle()?;
+        let writes = self.shared.as_ref().is_none_or(SharedPool::writes);
         match kind {
             Move::Settle => {}
+            Move::Demote | Move::Depart if !writes => {}
             Move::Promote => {
                 let spans: Vec<(u64, &[u8])> = raw.iter().map(|s| (s.0, &*page(s))).collect();
                 self.ctx.upload_batch(&spans)?;
@@ -777,6 +775,10 @@ impl<D: Device> HostKv<D> {
                 self.ctx.set_lane(lane);
                 queued?;
             }
+        }
+        // Readers hold here until rank 0 wrote its batch.
+        if let (Move::Demote | Move::Settle, Some(pool)) = (kind, &mut self.shared) {
+            pool.pass()?;
         }
         Ok(true)
     }
@@ -810,9 +812,11 @@ impl<D: Device> KvMem<D> {
         plan: &Plan,
         pages: usize,
         page: usize,
-    ) -> bool {
-        self.host = HostKv::open(ctx, plan, pages, page);
-        self.host.is_some()
+        by: Backed,
+    ) -> HostPool {
+        self.host = HostKv::open(ctx, plan, pages, page, by);
+        let shared = |h: &HostKv<D>| HostPool::of(h.shared.as_ref());
+        self.host.as_ref().map_or(HostPool::None, shared)
     }
 
     /// Host pool device pointer for kept `slot`, or zero.

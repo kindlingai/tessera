@@ -35,6 +35,7 @@ pub use overrides::{set_flattener, text as kernel_text};
 pub use profile::{Marks, Profile, Ranks, Spent};
 pub use rank::{Rank, Sum, sum_wire};
 pub use run::{Base, Outcome, Reload, Run};
+pub(crate) use tessera_engine_comm::{Backed, HostPool};
 pub use tessera_gpukit::device::KernelAttrs;
 
 /// A failure while loading or running a plan.

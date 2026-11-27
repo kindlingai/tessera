@@ -1,7 +1,7 @@
 //! One process's rank of a plan, over a transport.
 
 use crate::open;
-use crate::{Base, Error, Run};
+use crate::{Backed, Base, Error, HostPool, Run};
 use std::ops::Range;
 use std::time::Instant;
 use tessera_codegen::Precision;
@@ -627,11 +627,11 @@ impl<T: Transport> Run for Rank<T> {
         self.runner.run_mut().upload_kept_pages(p, g, src)
     }
 
-    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+    fn open_host_kv(&mut self, pages: usize, page: usize, by: Backed) -> Result<HostPool, Error> {
         if let Some(grid) = &mut self.grid {
             let _ = grid.pause();
         }
-        self.runner.run_mut().open_host_kv(pages, page)
+        self.runner.run_mut().open_host_kv(pages, page, by)
     }
 
     fn move_kv_pages(&mut self, kind: Move, pairs: &[(u32, u32)]) -> Result<bool, Error> {

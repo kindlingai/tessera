@@ -12,7 +12,7 @@ mod tier;
 mod tiering;
 
 pub use evict::{Evict, Oldest};
-pub use flight::Move;
+pub use flight::{Move, pair_runs};
 pub use lanes::Lanes;
 pub use pool::{Error, PageCopy, Pool, RunId, Stats, Tag};
 pub use prefix::Prefixes;

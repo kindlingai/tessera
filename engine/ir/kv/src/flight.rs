@@ -13,6 +13,23 @@ pub enum Move {
     Settle,
 }
 
+/// Runs of adjacent pairs: VRAM page, host page, length.
+pub fn pair_runs(pairs: &[(u32, u32)]) -> Vec<(u32, u32, usize)> {
+    let (mut out, mut i) = (Vec::new(), 0usize);
+    while i < pairs.len() {
+        let ((v0, h0), mut len) = (pairs[i], 1usize);
+        while i + len < pairs.len()
+            && pairs[i + len].0 == v0 + len as u32
+            && pairs[i + len].1 == h0 + len as u32
+        {
+            len += 1;
+        }
+        out.push((v0, h0, len));
+        i += len;
+    }
+    out
+}
+
 /// A VRAM page whose bytes copy to a host page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Leaving {

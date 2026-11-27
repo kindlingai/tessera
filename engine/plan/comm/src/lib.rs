@@ -7,6 +7,7 @@ mod link;
 mod memory;
 mod pace;
 mod pin;
+mod shared;
 mod shm;
 #[cfg(test)]
 mod socket_link;
@@ -20,6 +21,7 @@ pub use fabric::{Fabric, Port};
 pub use link::{Blocking, Link, Put, Span, exchange_regions};
 pub use memory::Memory;
 pub use pin::{Pinned, Pinning};
+pub use shared::{Backed, HostPool, SharedPool};
 pub use shm::{Shm, ShmLink};
 pub use sockets::Sockets;
 pub use verbs::Verbs;
@@ -113,3 +115,5 @@ mod fabric_test;
 mod ibv_test;
 #[cfg(test)]
 mod pace_test;
+#[cfg(test)]
+mod shared_test;

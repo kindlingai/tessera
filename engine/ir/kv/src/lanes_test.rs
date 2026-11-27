@@ -75,6 +75,8 @@ struct Memory {
     host: Vec<u32>,
     flying: Vec<(u32, u32)>,
     departed: usize,
+    /// Host pages a promote read in this step.
+    promoted: Vec<u32>,
 }
 
 impl Memory {
@@ -82,8 +84,11 @@ impl Memory {
         match kind {
             Move::Depart => self.flying.extend_from_slice(pairs),
             Move::Settle => self.departed += self.flying.len(),
-            Move::Demote | Move::Promote => assert!(self.flying.is_empty()),
+            Move::Demote => assert!(self.flying.is_empty()),
+            Move::Promote => self.promoted.extend(pairs.iter().map(|p| p.1)),
         }
+        let reused = |p: &(u32, u32)| kind == Move::Depart && self.promoted.contains(&p.1);
+        assert!(!pairs.iter().any(reused), "a promoted host page waits");
         let copies = match kind {
             Move::Settle => std::mem::take(&mut self.flying),
             Move::Depart => Vec::new(),
@@ -114,15 +119,19 @@ fn evicting(ahead: usize) -> (Vec<u32>, usize) {
         host: vec![0; PAGES],
         ..Memory::default()
     };
-    let steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 3, 4, 10, 11];
+    let steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 5, 6, 10, 11];
     let mut lane: Vec<u32> = Vec::new();
     for (step, &page) in steps.iter().enumerate() {
-        if step == 7 {
-            // Step 6 started the copies of both pages.
-            lanes.release_freed(&[3, 4]);
-            lane.retain(|p| ![3, 4].contains(p));
+        if step == 8 {
+            // Step 7 started the copies of both pages.
+            assert_eq!(memory.flying.len(), 2 * ahead);
+            lanes.release_freed(&[5, 6]);
+            lane.retain(|p| ![5, 6].contains(p));
         }
+        memory.promoted.clear();
         let mut priority = vec![EVICT_COLD; lanes.pages()];
+        // Page 0 turns hot on the host, so it promotes.
+        priority[0] = if step < 5 { EVICT_COLD } else { EVICT_HOT };
         priority[page as usize] = EVICT_PINNED;
         let mut moves = |kind, pairs: &[(u32, u32)]| memory.act(kind, pairs);
         lanes

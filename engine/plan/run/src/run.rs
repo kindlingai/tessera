@@ -1,8 +1,8 @@
 //! Work every backend's plan runner does.
 
-use crate::Error;
 use crate::held::Held;
 use crate::profile::Profile;
+use crate::{Backed, Error, HostPool};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
@@ -264,9 +264,9 @@ pub trait Run {
         Ok(true)
     }
 
-    /// Opens a pinned device-mapped host KV pool of `pages`.
-    fn open_host_kv(&mut self, _pages: usize, _page: usize) -> Result<bool, Error> {
-        Ok(false)
+    /// Opens a device-mapped host KV pool of `pages`.
+    fn open_host_kv(&mut self, _n: usize, _page: usize, _by: Backed) -> Result<HostPool, Error> {
+        Ok(HostPool::None)
     }
 
     /// Moves `(vram_phys, host_phys)` sparse KV page pairs as `kind` says.

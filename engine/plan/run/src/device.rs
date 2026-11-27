@@ -1,6 +1,5 @@
 //! Replays a plan on any GPU over the device traits.
 
-use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
 use crate::kernels::{self, Kernels};
@@ -11,6 +10,7 @@ use crate::paged::{KvMem, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
+use crate::{Backed, Error, HostPool};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -768,9 +768,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         b.held.upload_pages(ctx, st, &b.plan, p, g, src)
     }
 
-    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+    fn open_host_kv(&mut self, pages: usize, page: usize, by: Backed) -> Result<HostPool, Error> {
         self.check_ready()?;
-        let ok = self.kv.open_host(self.ctx, &self.base.plan, pages, page);
+        let plan = &self.base.plan;
+        let ok = self.kv.open_host(self.ctx, plan, pages, page, by);
         self.clear_graphs()?;
         Ok(ok)
     }
