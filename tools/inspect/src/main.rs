@@ -4,6 +4,7 @@
 use tessera_rules as _;
 
 mod dot;
+mod html;
 mod lowering;
 mod model;
 mod pump;

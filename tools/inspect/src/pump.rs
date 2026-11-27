@@ -1,11 +1,11 @@
 //! Tokens through the ranks: a timeline of launches and sums.
 
+use crate::html::{el, json, text};
 use crate::lowering::head;
 use crate::stages::Pass;
 use serde::Serialize;
 use std::error::Error;
 use std::fmt::Write;
-use tessera_html::{el, json, text};
 
 const SCRIPT: &str = include_str!("pump.js");
 
@@ -182,6 +182,6 @@ pub fn page(model: &str, names: &[String], laps: &[Lap]) -> String {
                 .attr("type", "application/json")
                 .kid(json(&data)),
         )
-        .kid(el("script").kid(tessera_html::Part::Raw(SCRIPT.into())));
+        .kid(el("script").kid(crate::html::Part::Raw(SCRIPT.into())));
     el("html").kid(head(&title)).kid(body).page()
 }

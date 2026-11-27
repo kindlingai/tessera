@@ -1,10 +1,10 @@
 //! The lowering page: each stage and its effect per node.
 
 use crate::dot::{op_label, path};
+use crate::html::{El, Part, el, table, text};
 use crate::model::Model;
 use crate::stages::{Pass, RankView};
 use tessera_graph::{Op, Placement};
-use tessera_html::{El, Part, el, table, text};
 
 pub const STYLE: &str = include_str!("page.css");
 

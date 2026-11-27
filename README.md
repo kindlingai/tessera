@@ -114,7 +114,6 @@ for offline analysis.
 <tr><td colspan="3"><a href="tools"><b>tools/</b></a></td></tr>
 <tr><td>&emsp;<a href="tools/calibrate">calibrate/</a></td><td>tessera-calibrate</td><td>Times kernels on this machine and stores what they cost</td></tr>
 <tr><td>&emsp;<a href="tools/hessians">hessians/</a></td><td>tessera-hessians</td><td>Layer-streaming BF16 Hessian calibration generator for exlr8</td></tr>
-<tr><td>&emsp;<a href="tools/html">html/</a></td><td>tessera-html</td><td>An HTML element builder that escapes all text</td></tr>
 <tr><td>&emsp;<a href="tools/inspect">inspect/</a></td><td>tessera-inspect</td><td>Draws a model's graph, its lowering per rank, and tokens between ranks</td></tr>
 <tr><td>&emsp;<a href="tools/load">load/</a></td><td>tessera-load</td><td>Drives concurrent requests against tessera-serve and reports throughput</td></tr>
 <tr><td>&emsp;<a href="tools/parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
@@ -122,5 +121,4 @@ for offline analysis.
 <tr><td>&emsp;<a href="tools/ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
 <tr><td>&emsp;<a href="tools/rebase">rebase/</a></td><td>tessera-rebase</td><td>Rebases a branch when each conflict only adds list lines</td></tr>
 <tr><td>&emsp;<a href="tools/references">references/</a></td><td>tessera-references</td><td>Fetches the reference files the parity tests read</td></tr>
-<tr><td>&emsp;<a href="tools/tiers">tiers/</a></td><td>tessera-tiers</td><td>A board that sets pull request tiers as a GitHub App</td></tr>
 </table>

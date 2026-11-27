@@ -13,10 +13,10 @@ path = "src/main.rs"
 [dependencies]
 tessera-device = { workspace = true }
 tessera-graph = { workspace = true }
-tessera-html = { workspace = true }
 tessera-lower = { workspace = true }
 tessera-models = { workspace = true }
 tessera-platform = { workspace = true }
 tessera-rules = { workspace = true }
 tessera-sim = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
