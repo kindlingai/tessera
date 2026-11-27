@@ -159,6 +159,8 @@ pub struct Settings {
     pub memory: Memory,
     /// Weights may page from the host or load by stage.
     pub weight_streaming: bool,
+    /// Paged weights copy to VRAM ahead of their reader.
+    pub weight_staging: bool,
     pub reads: Reads,
     /// The Hugging Face hub cache.
     pub hub: Option<PathBuf>,
@@ -201,6 +203,7 @@ impl Default for Settings {
             verbs: None,
             memory: Memory::Device,
             weight_streaming: false,
+            weight_staging: false,
             reads: Reads::Cached,
             hub: None,
             temp: None,

@@ -201,6 +201,8 @@ pub struct Plan {
     /// Which of them this plan is for.
     pub rank: u32,
     pub steps: Vec<Step>,
+    /// Copy steps, each with the step it runs before.
+    pub staged: Vec<(usize, Step)>,
     /// Steps after the forward ones that replay accepted rows.
     pub commits: usize,
     /// Trailing steps that copy slot 0's spare into its state.
@@ -248,6 +250,29 @@ impl Plan {
     /// The steps every launch runs.
     pub fn forward(&self) -> std::ops::Range<usize> {
         0..self.steps.len() - self.commits - self.promotes
+    }
+
+    /// Steps of `range` in launch order, copy steps unnumbered.
+    pub fn sequence(&self, range: std::ops::Range<usize>) -> Vec<(Option<usize>, &Step)> {
+        let ends = self.forward().end;
+        let mut out = Vec::with_capacity(range.len());
+        let mut next = 0;
+        for i in range {
+            while next < self.staged.len() && self.staged[next].0 < i {
+                next += 1;
+            }
+            while next < self.staged.len() && self.staged[next].0 == i && i != ends {
+                out.push((None, &self.staged[next].1));
+                next += 1;
+            }
+            out.push((Some(i), &self.steps[i]));
+            // Copies placed at the end follow the last forward step.
+            while i + 1 == ends && next < self.staged.len() {
+                out.push((None, &self.staged[next].1));
+                next += 1;
+            }
+        }
+        out
     }
 
     /// The steps that replay a launch's leading rows.

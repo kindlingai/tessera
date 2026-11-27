@@ -31,6 +31,8 @@ pub struct Base {
     pub(crate) budget: Option<u64>,
     /// Whether weights past the budget may page from the host.
     pub(crate) streams: bool,
+    /// Cold experts copy to VRAM ahead of their reader.
+    pub(crate) stages: bool,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
     pub(crate) reads: Reads,

@@ -107,6 +107,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let files = |dir: &PathBuf| Overrides::new(dir.clone(), D::BACKEND);
         let mut base = Base::new(settings.memory, &ctx.platform());
         base.streams = settings.weight_streaming;
+        base.stages = settings.weight_staging;
         if settings.memory == Memory::Device {
             base.extend_budget(tessera_gpukit::attic::available(settings));
         }
@@ -531,8 +532,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         mut sums: Option<&mut (dyn Sum + 'static)>,
         stamped: bool,
     ) -> Result<(), Capture> {
+        let order = self.base.plan.sequence(steps.clone());
         let sync = match self.ctx.has_lanes() {
-            true => LaneSync::plan(&self.base.plan.steps[steps.clone()]),
+            true => LaneSync::plan(order.iter().map(|(_, s)| *s)),
             false => LaneSync::default(),
         };
         let stamps = stamped.then_some(self.stamps.as_ref()).flatten();
@@ -542,10 +544,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         sync.begin(self.ctx)?;
         let run = (|| -> Result<(), Capture> {
-            for i in steps {
-                let step = &self.base.plan.steps[i];
+            for (at, &(i, step)) in order.iter().enumerate() {
+                sync.before(self.ctx, at, step.lane)?;
+                let Some(i) = i else {
+                    if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
+                        pager.stage(self.ctx, batch as usize)?;
+                    }
+                    sync.after(self.ctx, at, step.lane)?;
+                    continue;
+                };
                 let rel = i - start;
-                sync.before(self.ctx, rel, step.lane)?;
                 if sync.active
                     && let Some(st) = stamps
                 {
@@ -558,8 +566,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     if !grid_cross(step, at(step.reads[0]), at(step.write), grid)? {
                         return Err(Capture::Split(i));
                     }
-                } else if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
-                    pager.stage(self.ctx, batch as usize)?;
                 } else {
                     for launch in self.base.launches(i)? {
                         self.launch(i, &launch)?;
@@ -573,7 +579,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     };
                     st.emit(self.ctx, rel, mode)?;
                 }
-                sync.after(self.ctx, rel, step.lane)?;
+                sync.after(self.ctx, at, step.lane)?;
             }
             sync.finish(self.ctx)?;
             if sync.active

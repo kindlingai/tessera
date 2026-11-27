@@ -19,6 +19,8 @@ struct Env {
     memory: Option<String>,
     /// `true` lets weights page or load by stage.
     allow_weight_streaming: Option<bool>,
+    /// `true` copies paged weights ahead of their reader.
+    stage_weights: Option<bool>,
     /// `cached` or `direct`.
     reads: Option<String>,
     /// Launches per profile report, or `dynamic`.
@@ -92,6 +94,7 @@ pub fn read() -> Settings {
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
         weight_streaming: env.allow_weight_streaming.unwrap_or(false),
+        weight_staging: env.stage_weights.unwrap_or(false),
         reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
         temp: Some(std::env::temp_dir()),

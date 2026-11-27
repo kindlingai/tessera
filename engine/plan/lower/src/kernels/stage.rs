@@ -130,6 +130,7 @@ pub fn place(
         }
     }
     let slot_of = |w: usize| weights[w].expect("an ordered weight has a slot");
+    let (mut steps, mut ends) = (plan.steps.clone(), plan.forward().end);
     let mut last = vec![None::<usize>; ring.parts];
     let mut staged = 0;
     for w in order {
@@ -154,9 +155,10 @@ pub fn place(
         let batch = id as u32;
         let step = Stage { bytes, batch }.step(slot, evicted.into_iter().collect());
         let reads = |s: &Step| s.reads.iter().any(|r| same(*r, slot));
-        let reader = plan.steps.iter().position(reads).expect("read above");
-        let at = earliest(&plan.steps, &step, reader);
-        plan.steps.insert(at, step);
+        let reader = steps.iter().position(reads).expect("read above");
+        let at = earliest(&steps, &step, reader);
+        steps.insert(at, step);
+        ends += 1;
     }
     // Each part's last weight returns to host memory.
     for evicts in last.into_iter().flatten() {
@@ -169,6 +171,16 @@ pub fn place(
         });
         let batch = id as u32;
         let step = Stage { bytes: 0, batch }.step(slot_of(weight).0, Vec::new());
-        plan.steps.insert(plan.forward().end, step);
+        steps.insert(ends, step);
+        ends += 1;
+    }
+    // Callers keep their step numbers, so copies sit apart.
+    plan.staged.clear();
+    let mut before = 0;
+    for step in steps {
+        match step.kernel.staged() {
+            Some(_) => plan.staged.push((before, step)),
+            None => before += 1,
+        }
     }
 }

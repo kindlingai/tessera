@@ -1,7 +1,6 @@
 //! Which paged experts hold a VRAM slot.
 
 use tessera_lower::Plan;
-use tessera_lower::kernels::Ring;
 
 /// The policy's view of one paged weight.
 pub(crate) struct Paged<'a> {
@@ -119,8 +118,8 @@ impl Promote for Decayed {
 
 /// Names the cold experts a plan will read.
 pub(crate) trait Forecast: Send {
-    /// The ring it needs. An empty ring stages nothing.
-    fn ring(&self) -> Ring;
+    /// Ring parts it needs. None stages nothing.
+    fn parts(&self) -> usize;
     /// Cold experts of `weight` that `plan` reads, likeliest first.
     fn cold(&mut self, plan: &Plan, weight: u32, slots: &[Option<usize>]) -> Vec<usize>;
 }
@@ -129,11 +128,66 @@ pub(crate) trait Forecast: Send {
 pub(crate) struct Unknown;
 
 impl Forecast for Unknown {
-    fn ring(&self) -> Ring {
-        Ring::default()
+    fn parts(&self) -> usize {
+        0
     }
 
     fn cold(&mut self, _: &Plan, _: u32, _: &[Option<usize>]) -> Vec<usize> {
         Vec::new()
+    }
+}
+
+/// Stages every cold expert a launch almost surely reads.
+pub(crate) struct Dense {
+    /// The least chance of a read that stages an expert.
+    pub sure: f64,
+    /// Weights staged ahead of the one in use.
+    pub parts: usize,
+}
+
+impl Default for Dense {
+    fn default() -> Self {
+        Self {
+            sure: 0.99,
+            parts: 4,
+        }
+    }
+}
+
+impl Dense {
+    /// Expert rows the plan's steps pick from `weight`.
+    fn picks(plan: &Plan, weight: u32) -> usize {
+        let loaded = |l: &&tessera_lower::Loaded| l.weight == weight && l.part.is_none();
+        let Some(slot) = plan.weights.iter().find(loaded).map(|l| l.slot) else {
+            return 0;
+        };
+        // A reader writes one output row per pick.
+        let out = slot.shape[1] as usize;
+        let mut picks = 0;
+        for step in &plan.steps[plan.forward()] {
+            let reads =
+                |r: &tessera_lower::Slot| r.buffer == slot.buffer && r.offset == slot.offset;
+            if out > 0 && step.reads.iter().any(reads) && step.write.len.is_multiple_of(out) {
+                picks = picks.max(step.write.len / out);
+            }
+        }
+        picks
+    }
+}
+
+impl Forecast for Dense {
+    fn parts(&self) -> usize {
+        self.parts
+    }
+
+    fn cold(&mut self, plan: &Plan, weight: u32, slots: &[Option<usize>]) -> Vec<usize> {
+        // Picks spread evenly until hit counts say otherwise.
+        let miss = 1.0 - 1.0 / slots.len().max(1) as f64;
+        let read = 1.0 - miss.powf(Self::picks(plan, weight) as f64);
+        if read < self.sure {
+            return Vec::new();
+        }
+        let cold = |(m, slot): (usize, &Option<usize>)| slot.is_none().then_some(m);
+        slots.iter().enumerate().filter_map(cold).collect()
     }
 }
