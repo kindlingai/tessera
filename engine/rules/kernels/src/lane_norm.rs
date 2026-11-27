@@ -125,7 +125,9 @@ fn load_sum4(
     #[build] add2: bool,
     #[build] add3: bool,
 ) -> F32x4 {
-    let mut s = a.load4(off);
+    // A packed load decodes per lane and cannot take `+=`.
+    let va = a.load4(off);
+    let mut s = F32x4::new(va.x, va.y, va.z, va.w);
     if add2 {
         let vb = b.load4(off);
         s.x += vb.x;
