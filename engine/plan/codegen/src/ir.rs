@@ -381,7 +381,7 @@ impl Body {
                 }
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
-                    scalars.push((leak(name), ty.c()));
+                    scalars.push((name.clone(), ty.c()));
                 }
                 Param::Shared { name, .. } | Param::Tiles { name } | Param::Array { name, .. } => {
                     panic!("`{}` takes `{name}` from a caller", self.entry);
@@ -442,9 +442,4 @@ impl Helper {
         assert!(!p.lane, "`{}` reads the lane: pass it in", self.name);
         dialect::function(self.ret.c(), &self.name, &params, &p.lines)
     }
-}
-
-/// Leaks a scalar name, so it outlives its source text.
-fn leak(name: &str) -> &'static str {
-    Box::leak(name.to_string().into_boxed_str())
 }

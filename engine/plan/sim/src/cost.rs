@@ -59,9 +59,12 @@ impl Sample {
         }
     }
 
-    /// The same kernel, source and work, whatever its time.
+    /// The same kernel, source, sizes and work, whatever its time.
     fn same(&self, other: &Sample) -> bool {
-        self.kernel == other.kernel && self.source == other.source && self.work == other.work
+        self.kernel == other.kernel
+            && self.source == other.source
+            && self.sizes == other.sizes
+            && self.work == other.work
     }
 }
 
@@ -126,7 +129,10 @@ impl Timings {
         let mut seen: Vec<(&'static str, Sample, Vec<f64>)> = Vec::new();
         for (name, sample) in samples {
             let seconds = sample.seconds;
-            match seen.iter_mut().find(|(_, s, _)| s.same(&sample)) {
+            match seen
+                .iter_mut()
+                .find(|(family, s, _)| *family == name && s.same(&sample))
+            {
                 Some((_, _, all)) => all.push(seconds),
                 None => seen.push((name, sample, vec![seconds])),
             }

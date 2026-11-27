@@ -410,24 +410,25 @@ impl Engine {
     /// Saves or flushes active profile data before eviction.
     pub(crate) fn park_profile(&mut self) -> Result<Option<ParkedProfile>, Error> {
         self.settle()?;
-        if self.control.is_some() {
+        let carried = if self.control.is_some() {
             let lead = self.control.as_ref().is_some_and(|c| c.rank() == 0);
             if lead && self.profile.is_some() {
                 self.switch_profile(false)?;
             }
-            return Ok(None);
-        }
-        let now = if let Some([_, done]) = self.profile.take() {
-            let taken = self.take_profile().map(|p| (done, p));
-            self.runner.profiling(false);
-            taken
+            self.carried.take()
         } else {
-            None
+            let now = if let Some([_, done]) = self.profile.take() {
+                let taken = self.take_profile().map(|p| (done, p));
+                self.runner.profiling(false);
+                taken
+            } else {
+                None
+            };
+            merge_carried(self.carried.take(), now)
         };
-        let carried = merge_carried(self.carried.take(), now);
         let asks = self.asks.clone();
         let sink = self.profiled.take();
-        if carried.is_none() && sink.is_none() {
+        if carried.is_none() && asks.is_none() && sink.is_none() {
             return Ok(None);
         }
         Ok(Some(ParkedProfile {

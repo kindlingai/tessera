@@ -244,3 +244,60 @@ fn residency_sets_waves() {
     let spilled = 8.0 * 100.0 * (200.0 - 56e3 / 512.0) * 1e-6;
     assert!((seconds(8e3, 200.0) - 8.0 * wave - spilled).abs() < 1e-9);
 }
+
+#[test]
+fn timings_separate_sizes() {
+    use crate::{Sample, Timings};
+
+    let mut timings = Timings::default();
+    let s1 = Sample::new("k".into(), 42, vec![2, 64], 128.0, 1e-3);
+    let s2 = Sample::new("k".into(), 42, vec![8, 16], 128.0, 9e-3);
+    timings.record([("op", s1.clone()), ("op", s2.clone())]);
+    assert_eq!(timings.len(), 2);
+    let e1 = timings
+        .estimate("op", Some(42), &[2, 64], 128.0, false)
+        .unwrap();
+    let e2 = timings
+        .estimate("op", Some(42), &[8, 16], 128.0, false)
+        .unwrap();
+    assert!((e1 - 1e-3).abs() < 1e-6, "e1={e1}");
+    assert!((e2 - 9e-3).abs() < 1e-6, "e2={e2}");
+    assert!(timings.known("op", &s1) && timings.known("op", &s2));
+    assert!(!timings.known("op", &Sample::new("k".into(), 42, vec![4, 32], 128.0, 0.0)));
+
+    let c1 = Sample::new("k".into(), 42, vec![2, 64], 128.0, 2e-3);
+    let c2 = Sample::new("k".into(), 42, vec![8, 16], 128.0, 18e-3);
+    timings.record_cold([("op", c1), ("op", c2)]);
+    let ec1 = timings
+        .estimate("op", Some(42), &[2, 64], 128.0, true)
+        .unwrap();
+    let ec2 = timings
+        .estimate("op", Some(42), &[8, 16], 128.0, true)
+        .unwrap();
+    assert!((ec1 - 2e-3).abs() < 1e-6, "ec1={ec1}");
+    assert!((ec2 - 18e-3).abs() < 1e-6, "ec2={ec2}");
+
+    // Identical samples in distinct family buckets stay separate.
+    let mut grouped = Timings::default();
+    grouped.record([
+        ("fam_a", Sample::new("k".into(), 7, vec![4], 4.0, 1e-3)),
+        ("fam_b", Sample::new("k".into(), 7, vec![4], 4.0, 5e-3)),
+    ]);
+    assert_eq!(grouped.len(), 2);
+    assert!(
+        (grouped
+            .estimate("fam_a", Some(7), &[4], 4.0, false)
+            .unwrap()
+            - 1e-3)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (grouped
+            .estimate("fam_b", Some(7), &[4], 4.0, false)
+            .unwrap()
+            - 5e-3)
+            .abs()
+            < 1e-6
+    );
+}

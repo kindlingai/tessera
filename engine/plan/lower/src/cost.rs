@@ -2,7 +2,7 @@
 
 use crate::abi::Source;
 use crate::form::Pins;
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{crosses, moved};
 use crate::plan::{Plan, Step};
 use crate::recipe::{Compute, Knobs, Recipe, Scoped};
@@ -125,11 +125,19 @@ pub fn kernel_identity(k: &dyn Kernel) -> (Arc<str>, u64) {
     }
 }
 
+/// Entry symbol name for `k` without hashing generated source.
+pub(crate) fn kernel_entry(k: &dyn Kernel) -> Arc<str> {
+    match k.source() {
+        Source::Fixed { entry, .. } => Arc::from(entry),
+        Source::Made(body) => Arc::from(body.entry),
+    }
+}
+
 /// A timed launch of `step`.
 fn sample(step: &Step, seconds: f64) -> Sample {
     let (sizes, work) = (step.kernel.sizes(), step.kernel.work(step.write.len));
     let kernel = format!("{:?}", step.kernel);
-    let (_, source) = kernel_identity(&*step.kernel);
+    let (_, source) = step.kernel.identity();
     Sample::new(kernel, source, sizes, work, seconds)
 }
 
@@ -451,7 +459,19 @@ impl Device {
     /// Seconds for one launch in `zone`. Cold ones stream weights.
     pub fn seconds_in(&self, zone: u32, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
         match (zone, self.cluster.kind(zone as usize)) {
-            (0, kind) | (_, kind @ ZoneKind::Cpu) => self.estimate(kind, k, len, cold),
+            (0, kind) | (_, kind @ ZoneKind::Cpu) => {
+                self.estimate_with(kind, k, || kernel_identity(k), len, cold)
+            }
+            _ => FIXED + k.guess() * k.work(len),
+        }
+    }
+
+    /// Seconds for one launch using a kernel's cached identity.
+    pub(crate) fn seconds_ref(&self, zone: u32, k: &KernelRef, len: usize, cold: bool) -> f64 {
+        match (zone, self.cluster.kind(zone as usize)) {
+            (0, kind) | (_, kind @ ZoneKind::Cpu) => {
+                self.estimate_with(kind, &**k, || k.identity(), len, cold)
+            }
             _ => FIXED + k.guess() * k.work(len),
         }
     }
@@ -474,12 +494,19 @@ impl Device {
     }
 
     /// Seconds from the samples of zones of `kind`.
-    fn estimate(&self, kind: ZoneKind, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
+    fn estimate_with(
+        &self,
+        kind: ZoneKind,
+        k: &dyn Kernel,
+        identity: impl FnOnce() -> (Arc<str>, u64),
+        len: usize,
+        cold: bool,
+    ) -> f64 {
         if self.barred.iter().any(|b| b == k.name()) {
             return f64::INFINITY;
         }
         let work = k.work(len);
-        let (entry, source) = kernel_identity(k);
+        let (entry, source) = identity();
         let key = (
             kind,
             k.name(),
@@ -525,7 +552,7 @@ impl Device {
                 "gather_rows" => self.half_ring(step.write.bytes()),
                 _ => self.all_reduce(moved(&*step.kernel, step.write.len, step.write.bytes())),
             },
-            None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len, cold)),
+            None => Some(self.seconds_ref(step.zone, &step.kernel, step.write.len, cold)),
         }
     }
 

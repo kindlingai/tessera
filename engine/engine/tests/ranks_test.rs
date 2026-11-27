@@ -322,3 +322,113 @@ fn ready_waits_for_ranks() {
     let mut lead = opened(graph, Some([s2, c2]), &recipe, 16, false);
     assert!(lead.ready().is_err());
 }
+
+fn open_ranked_pair(settings: Settings) -> (Engine, std::thread::JoinHandle<()>) {
+    let graph = || stepper::<Norm, Swiglu>(&Config::toy(1, 16));
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let f_settings = settings.clone();
+    let follower = std::thread::spawn(move || {
+        let g = graph();
+        let stored = float_weights(&g, 3);
+        let control: Box<dyn Transport> = Box::new(c1);
+        let mut eng = Engine::open_ranked(
+            g,
+            16,
+            (&Recipe::default(), &f_settings),
+            two_place(false),
+            s1,
+            control,
+        )
+        .unwrap();
+        eng.load(&stored).unwrap();
+        eng.follow().unwrap();
+    });
+    let g = graph();
+    let stored = float_weights(&g, 3);
+    let control: Box<dyn Transport> = Box::new(c0);
+    let mut lead = Engine::open_ranked(
+        g,
+        16,
+        (&Recipe::default(), &settings),
+        two_place(false),
+        s0,
+        control,
+    )
+    .unwrap();
+    lead.load(&stored).unwrap();
+    (lead, follower)
+}
+
+#[test]
+fn ranked_profile_survives_park() {
+    use tessera_engine::{Asks, Event, Sink};
+
+    let asks = Asks::default();
+    let (send, got) = std::sync::mpsc::channel();
+    let noop = || -> Sink { Box::new(|_| true) };
+    let (mut eng1, f1) = open_ranked_pair(host_settings());
+    eng1.profile_into(asks.clone(), Box::new(move |r| send.send(r).unwrap()));
+    let mut b1 = Batch::new(&mut eng1, Box::new(Fair));
+    let ask = asks.hold();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    b1.submit(
+        req(&[3, 9, 4], 4),
+        Box::new(move |ev| {
+            if matches!(ev, Event::Done(_)) {
+                let _ = done_tx.send(());
+            }
+            true
+        }),
+    );
+    assert!(b1.step().unwrap());
+    assert!(b1.busy() && got.try_recv().is_err());
+    let parked = b1.park().unwrap();
+    // Ranked park flushes pre-park segment across all ranks.
+    let seg1 = got.try_recv().unwrap();
+    assert_eq!(seg1.launches, 1);
+    assert_eq!(seg1.profiles.len(), 2);
+    assert!(seg1.profiles.iter().all(Option::is_some));
+    eng1.dismiss().unwrap();
+    f1.join().unwrap();
+    drop(eng1);
+
+    // Resuming onto default-settings ranked engine keeps asks and sink.
+    let (mut eng2, f2) = open_ranked_pair(host_settings());
+    let mut b2 = Batch::resumed(&mut eng2, Box::new(Fair), parked);
+    while b2.step().unwrap() {}
+    done_rx.try_recv().unwrap();
+    assert!(got.try_recv().is_err());
+    drop(ask);
+    assert!(!b2.step().unwrap());
+    let seg2 = got.try_recv().unwrap();
+    assert_eq!(seg2.launches, 3);
+    assert_eq!(seg2.profiles.len(), 2);
+    assert!(seg2.profiles.iter().all(Option::is_some));
+
+    // Resuming onto asks-configured ranked engine still restores original sink.
+    let ask2 = asks.hold();
+    b2.submit(req(&[3, 9, 4], 4), noop());
+    assert!(b2.step().unwrap());
+    let parked2 = b2.park().unwrap();
+    assert_eq!(got.try_recv().unwrap().launches, 1);
+    eng2.dismiss().unwrap();
+    f2.join().unwrap();
+    drop(eng2);
+
+    let with_asks = Settings {
+        asks: Some(asks.clone()),
+        ..host_settings()
+    };
+    let (mut eng3, f3) = open_ranked_pair(with_asks);
+    let mut b3 = Batch::resumed(&mut eng3, Box::new(Fair), parked2);
+    while b3.step().unwrap() {}
+    assert!(got.try_recv().is_err());
+    drop(ask2);
+    assert!(!b3.step().unwrap());
+    let seg3 = got.try_recv().unwrap();
+    assert_eq!(seg3.launches, 3);
+    assert_eq!(seg3.profiles.len(), 2);
+    assert!(seg3.profiles.iter().all(Option::is_some));
+    eng3.dismiss().unwrap();
+    f3.join().unwrap();
+}

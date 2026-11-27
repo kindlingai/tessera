@@ -744,7 +744,7 @@ mod report {
                 )
             });
             let cold = streams && reads_weight;
-            total += device.seconds_in(op.zone, &*op.kernel, out.len, cold);
+            total += device.seconds_ref(op.zone, &op.kernel, out.len, cold);
         }
         total
     }
@@ -770,7 +770,7 @@ mod report {
             }
             count += 1;
             let out = &selected.values[op.write.0 as usize];
-            let secs = device.seconds_in(op.zone, &*op.kernel, out.len, streams);
+            let secs = device.seconds_ref(op.zone, &op.kernel, out.len, streams);
             let consumer = selected.ops[idx + 1..]
                 .iter()
                 .find(|later| later.reads.contains(&op.write));

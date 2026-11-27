@@ -1,3 +1,7 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{
     Act, DType, Dim, Entry, EntryKind, Graph, Node, NodeId, Op, Output, Placement, Port, Role, Row,
@@ -6,8 +10,44 @@ use tessera_graph::{
 use tessera_lower::kernels::{Map, MapStage};
 use tessera_lower::sites::Chain;
 use tessera_lower::{
-    ByBackend, Device, Kernel, KernelRef, Launch, Slot, Source, Step, Tree, Wants, kernel_identity,
+    ByBackend, Device, Kernel, KernelRef, Launch, Plan, Slot, Source, Step, Tree, Wants,
+    kernel_identity,
 };
+
+struct CountingAlloc;
+
+thread_local! {
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+}
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() && TRACK.with(Cell::get) {
+            LIVE.with(|n| n.set(n.get() + layout.size() as isize));
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACK.with(Cell::get) {
+            LIVE.with(|n| n.set(n.get() - layout.size() as isize));
+        }
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        if !next.is_null() && TRACK.with(Cell::get) {
+            LIVE.with(|n| n.set(n.get() + new_size as isize - layout.size() as isize));
+        }
+        next
+    }
+}
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
 
 fn f32_ty(dims: Vec<tessera_graph::DimExpr>) -> TensorType {
     TensorType {
@@ -304,4 +344,74 @@ fn timings_prefer_source() {
     dev.fit_cold([(&sa, 2e-3), (&sb, 40e-3)]);
     assert!((dev.seconds_in(0, &a, 16, true) - 2e-3).abs() < 1e-9);
     assert!((dev.seconds_in(0, &b, 16, true) - 40e-3).abs() < 1e-9);
+}
+
+struct CountingMade {
+    calls: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for CountingMade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("counting_made")
+    }
+}
+
+impl Kernel for CountingMade {
+    fn name(&self) -> &'static str {
+        "counting_made"
+    }
+    fn source(&self) -> Source {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Map::plain(vec![MapStage::Add]).source()
+    }
+    fn launches(&self, _: &Step) -> Vec<Launch> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn made_identity_no_leak() {
+    let dev = Device::default();
+    let map = Map::plain(vec![MapStage::Add]);
+    let warm = dev.seconds(&map, 16);
+    assert!(warm > 0.0);
+
+    // Repeated warmed Map hits retain zero bytes.
+    for _ in 0..2 {
+        LIVE.with(|n| n.set(0));
+        TRACK.with(|t| t.set(true));
+        for _ in 0..10_000 {
+            assert_eq!(dev.seconds(&map, 16), warm);
+        }
+        TRACK.with(|t| t.set(false));
+        assert_eq!(LIVE.with(Cell::get), 0, "made identity leaked bytes");
+    }
+
+    // KernelRef caches entry and identity without re-rendering source.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let step = step_of(
+        CountingMade {
+            calls: Arc::clone(&calls),
+        },
+        16,
+    );
+    let plan = Plan::default();
+    let id = step.kernel.identity();
+    for _ in 0..100 {
+        assert_eq!(step.kernel.identity(), id);
+        assert_eq!(step.kernel.entry(), id.0);
+        assert!(dev.step_seconds(&plan, &step).unwrap() > 0.0);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    // Entry-only calls cache without computing identity hash.
+    let entry_calls = Arc::new(AtomicUsize::new(0));
+    let k = KernelRef::new(CountingMade {
+        calls: Arc::clone(&entry_calls),
+    });
+    let first = k.entry();
+    for _ in 0..100 {
+        assert_eq!(k.entry(), first);
+    }
+    assert_eq!(entry_calls.load(Ordering::Relaxed), 1);
 }

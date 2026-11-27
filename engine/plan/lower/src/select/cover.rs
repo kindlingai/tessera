@@ -449,7 +449,7 @@ impl<'a> Cover<'a> {
         }
         let weight = |r: &Read| matches!(r, Read::Node(t) if self.tree.weighed(*t));
         let cold = self.streams && d.reads.iter().any(weight);
-        Some(self.device.seconds_in(zone, &*d.kernel, d.len, cold))
+        Some(self.device.seconds_ref(zone, &d.kernel, d.len, cold))
     }
 
     /// Seconds to widen reads the drafts cannot take as stored.

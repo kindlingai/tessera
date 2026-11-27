@@ -4,7 +4,8 @@ use crate::abi::{Arg, Launch, Shape, Source};
 use crate::extent::Extent;
 use crate::plan::Step;
 use std::fmt;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 use tessera_engine_settings::Backend;
 use tessera_graph::{DType, DimName, Order};
 use tessera_platform::Platform;
@@ -264,15 +265,56 @@ impl Needs {
     }
 }
 
+struct CachedKernel {
+    kernel: Box<dyn Kernel>,
+    entry: OnceLock<Arc<str>>,
+    identity: OnceLock<(Arc<str>, u64)>,
+}
+
 /// A kernel a plan can hold, share and compare.
-#[derive(Clone, derive_more::Deref, derive_more::Debug)]
-#[deref(forward)]
-#[debug("{_0:?}")]
-pub struct KernelRef(Arc<dyn Kernel>);
+#[derive(Clone)]
+pub struct KernelRef(Arc<CachedKernel>);
 
 impl KernelRef {
     pub fn new(kernel: impl Kernel + 'static) -> Self {
-        Self(Arc::new(kernel))
+        Self(Arc::new(CachedKernel {
+            kernel: Box::new(kernel),
+            entry: OnceLock::new(),
+            identity: OnceLock::new(),
+        }))
+    }
+
+    /// Cached entry and source hash for this kernel.
+    pub fn identity(&self) -> (Arc<str>, u64) {
+        self.0
+            .identity
+            .get_or_init(|| crate::cost::kernel_identity(&*self.0.kernel))
+            .clone()
+    }
+
+    /// Cached entry symbol name without hashing generated source.
+    pub fn entry(&self) -> Arc<str> {
+        if let Some((entry, _)) = self.0.identity.get() {
+            return Arc::clone(entry);
+        }
+        self.0
+            .entry
+            .get_or_init(|| crate::cost::kernel_entry(&*self.0.kernel))
+            .clone()
+    }
+}
+
+impl Deref for KernelRef {
+    type Target = dyn Kernel;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0.kernel
+    }
+}
+
+impl fmt::Debug for KernelRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0.kernel, f)
     }
 }
 

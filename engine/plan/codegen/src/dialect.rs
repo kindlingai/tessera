@@ -34,7 +34,7 @@ pub struct Text {
     /// Name, element type, and whether the kernel writes it.
     pub buffers: Vec<(String, &'static str, bool)>,
     /// Name and type, bound after the buffers.
-    pub scalars: Vec<(&'static str, &'static str)>,
+    pub scalars: Vec<(String, &'static str)>,
     /// Functions the body calls, each once.
     pub headers: Vec<String>,
     pub body: String,

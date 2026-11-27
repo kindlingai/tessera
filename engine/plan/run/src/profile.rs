@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use tessera_engine_comm::{Reader, Writer};
 use tessera_gpukit::device::KernelAttrs;
-use tessera_lower::{Step, kernel_identity};
+use tessera_lower::Step;
 
 /// Rows past this many print as one "other" row.
 const SHOWN: usize = 40;
@@ -96,7 +96,7 @@ impl Profile {
             name.push(if i == 0 { ' ' } else { 'x' });
             name.push_str(&size.to_string());
         }
-        let (entry, _) = kernel_identity(&**kernel);
+        let entry = kernel.entry();
         let parts = [
             (!entry.is_empty()).then_some(entry.as_ref()),
             (!step.rule.is_empty()).then_some(step.rule),
