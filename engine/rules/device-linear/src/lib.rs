@@ -11,7 +11,7 @@ use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
 pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
-use tessera_graph::{DimExpr, Op, Order, View};
+use tessera_graph::{DType, DimExpr, Op, Order, Pairs, Stage, View};
 use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
@@ -280,6 +280,7 @@ fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
     source = prefill_source_entry("dtr_prep"),
     launches = prep_launches,
     load = prep_load,
+    shared,
     unproven,
 )]
 struct TrellisPrep {
@@ -470,6 +471,17 @@ pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Sto
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RopeTail {
+    width: usize,
+    rot_stride: usize,
+    rot_off: usize,
+    turned: usize,
+    adjacent: bool,
+    rope_first: bool,
+    theta: f32,
+}
+
 /// Fast CUDA stacked BF16 matmul, transposed or row-major.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
@@ -500,6 +512,7 @@ struct FastStacked {
     x_stride: [usize; 2],
     o_stride: [usize; 2],
     wide: bool,
+    rope: Option<RopeTail>,
     form: &'static dyn Stored,
 }
 
@@ -522,7 +535,11 @@ impl FastStacked {
 }
 
 fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+    match input {
+        1 => form.name() == k.form.name(),
+        3 => form.name() == "u32",
+        _ => form.name() == "f32",
+    }
 }
 
 fn stacked_needs(k: &FastStacked) -> Needs {
@@ -599,10 +616,14 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
         )
     };
     trip_ops.fresh = f64::from(u8::from(tiled || tc));
-    let reads = vec![
+    let mut reads = vec![
         (2 * k.batches * rtiles * k.n * k.k) as f64,
         (4 * k.batches * k.rows * k.k) as f64,
     ];
+    if let Some(r) = k.rope {
+        reads.push((4 * k.batches * k.rows * r.width) as f64);
+        reads.push((4 * k.rows) as f64);
+    }
     Some(Load {
         threads: groups * group,
         group,
@@ -616,16 +637,71 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
 }
 
 fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
-    let wide = k.wide || k.lanes_tc() || k.tiled_64();
+    let ([xb, xr], [ob, or]) = (k.x_stride, k.o_stride);
+    let dims = [k.rows, k.n, k.k, k.block, k.first, k.step, xb, xr, ob, or];
+    if k.wide {
+        let (across, down, threads) = if k.wide_64() {
+            (k.n / 64, k.batches * k.rows.div_ceil(64), THREADS)
+        } else {
+            (
+                k.n / WIDE_COLS,
+                k.batches * k.rows.div_ceil(16),
+                WIDE_THREADS,
+            )
+        };
+        let (rot, pos, mat_off, rope_out_off, r) = match k.rope {
+            Some(r) => {
+                let (m_off, r_off) = if r.rope_first { (r.width, 0) } else { (0, k.n) };
+                (step.read(2), step.read(3), m_off, r_off, r)
+            }
+            None => (
+                step.read(0),
+                step.read(0),
+                0,
+                0,
+                RopeTail {
+                    width: 0,
+                    rot_stride: 0,
+                    rot_off: 0,
+                    turned: 0,
+                    adjacent: false,
+                    rope_first: false,
+                    theta: 1.0,
+                },
+            ),
+        };
+        let mut args = vec![
+            step.read(0),
+            step.read(1),
+            rot,
+            pos,
+            step.out(),
+            Arg::count(k.batches),
+        ];
+        args.extend(dims.map(Arg::count));
+        args.extend([
+            Arg::count(mat_off),
+            Arg::count(r.width),
+            Arg::count(r.rot_stride),
+            Arg::count(r.rot_off),
+            Arg::count(rope_out_off),
+            Arg::count(r.turned),
+            Arg::count(usize::from(r.adjacent)),
+            Arg::value(&r.theta),
+        ]);
+        let shape = Shape::Grid {
+            across,
+            down,
+            threads,
+        };
+        return vec![Launch { args, shape }];
+    }
+    let tc = k.lanes_tc() || k.lanes_64();
     let bn = k.batches * k.n;
-    let (across, down, threads) = if k.tiled_64() {
+    let (across, down, threads) = if k.lanes_64() {
         (k.n / 64, k.batches * k.rows.div_ceil(64), THREADS)
-    } else if wide {
-        (
-            k.n / if k.wide { WIDE_COLS } else { 16 },
-            k.batches * k.rows.div_ceil(16),
-            WIDE_THREADS,
-        )
+    } else if k.lanes_tc() {
+        (k.n / 16, k.batches * k.rows.div_ceil(16), WIDE_THREADS)
     } else {
         (bn.div_ceil(WARPS), k.rows.div_ceil(8), THREADS)
     };
@@ -635,9 +711,8 @@ fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
         threads,
     };
     let mut args = vec![step.read(0), step.read(1), step.out()];
-    args.extend((!wide).then(|| Arg::count(bn)));
-    let ([xb, xr], [ob, or]) = (k.x_stride, k.o_stride);
-    args.extend([k.rows, k.n, k.k, k.block, k.first, k.step, xb, xr, ob, or].map(Arg::count));
+    args.extend((!tc).then(|| Arg::count(bn)));
+    args.extend(dims.map(Arg::count));
     vec![Launch { args, shape }]
 }
 
@@ -668,19 +743,118 @@ fn peel_input(tree: &Tree, x: T, batches: usize, rows: usize, k: usize) -> (T, [
     (inner, [k, batches * k])
 }
 
-fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
+/// Peels an optional single-reader last-axis slice from `t`.
+fn peel_rot_slice(tree: &Tree, t: T) -> Option<(T, usize, usize)> {
+    if tree.root(t) {
+        return None;
+    }
+    let n = tree.node(t);
+    let Term::Op(Op::View(View::Slice {
+        axis: 2,
+        start: off,
+        ..
+    })) = &n.term
+    else {
+        return None;
+    };
+    let parent = n.args[0];
+    if tree.node(parent).form.name() != "f32" {
+        return None;
+    }
+    let off = off.value(&tree.g.dims, &|d| tree.size(d))? as usize;
+    let stride = *tree.node(parent).shape.last()?;
+    Some((parent, off, stride))
+}
+
+/// Matches `concat(permute(matmul), rope)` or `concat(rope, permute(matmul))`.
+fn match_rope_concat(tree: &Tree, at: T) -> Option<(T, RopeTail, T, T)> {
     let outer = tree.node(at);
-    let (node, out_swap) = match &outer.term {
-        Term::Op(Op::View(View::Permute(p))) if p[..] == [1, 0, 2] => {
-            let inner = outer.args[0];
-            if tree.root(inner) || tree.node(inner).term != Term::Op(Op::Matmul) {
-                return None;
-            }
-            (tree.node(inner), true)
-        }
-        Term::Op(Op::Matmul) => (outer, false),
+    if outer.term != Term::Op(Op::View(View::Concat)) || outer.form.name() != "f32" {
+        return None;
+    }
+    let [a, b] = outer.args[..] else {
+        return None;
+    };
+    let is_rope = |t: T| matches!(tree.node(t).term, Term::Stage(Stage::Rope { .. }));
+    let (plain_t, rope_t, rope_first) = match (is_rope(a), is_rope(b)) {
+        (false, true) => (a, b, false),
+        (true, false) => (b, a, true),
         _ => return None,
     };
+    if tree.root(plain_t) || tree.root(rope_t) {
+        return None;
+    }
+    let perm = tree.node(plain_t);
+    let Term::Op(Op::View(View::Permute(order))) = &perm.term else {
+        return None;
+    };
+    if order[..] != [1, 0, 2] || perm.form.name() != "f32" {
+        return None;
+    }
+    let mat = perm.args[0];
+    if tree.root(mat) || tree.node(mat).term != Term::Op(Op::Matmul) {
+        return None;
+    }
+    let rope_node = tree.node(rope_t);
+    let Term::Stage(Stage::Rope {
+        theta,
+        pairs,
+        turned,
+    }) = rope_node.term
+    else {
+        return None;
+    };
+    let [rot_in, pos_t] = rope_node.args[..] else {
+        return None;
+    };
+    if rope_node.form.name() != "f32"
+        || tree.node(rot_in).form.name() != "f32"
+        || tree.node(pos_t).form.dtype() != DType::U32
+    {
+        return None;
+    }
+    let &[r_rows, r_heads, rope_w] = rope_node.shape.as_slice() else {
+        return None;
+    };
+    if rope_w == 0
+        || !rope_w.is_multiple_of(2)
+        || tree.elements(pos_t) != r_rows
+        || perm.shape[..2] != [r_rows, r_heads]
+    {
+        return None;
+    }
+    let (rot_src, rot_off, rot_stride) =
+        peel_rot_slice(tree, rot_in).unwrap_or((rot_in, 0, rope_w));
+    let tail = RopeTail {
+        width: rope_w,
+        rot_stride,
+        rot_off,
+        turned: turned.map_or(rope_w / 2, |t| t as usize),
+        adjacent: pairs == Pairs::Adjacent,
+        rope_first,
+        theta,
+    };
+    Some((mat, tail, rot_src, pos_t))
+}
+
+fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
+    let outer = tree.node(at);
+    let (node, out_swap, rope_match) =
+        if let Some((mat, tail, rot, pos)) = match_rope_concat(tree, at) {
+            (tree.node(mat), true, Some((tail, rot, pos)))
+        } else {
+            match &outer.term {
+                Term::Op(Op::View(View::Permute(p))) if p[..] == [1, 0, 2] => {
+                    let inner = outer.args[0];
+                    if tree.root(inner) || tree.node(inner).term != Term::Op(Op::Matmul) {
+                        return None;
+                    }
+                    (tree.node(inner), true, None)
+                }
+                Term::Op(Op::Matmul) => (outer, false, None),
+                _ => return None,
+            }
+        };
     let (x, mut w) = (node.args[0], node.args[1]);
     let (&[batches, n, k], &[xb, rows, xk]) =
         (tree.node(w).shape.as_slice(), tree.node(x).shape.as_slice())
@@ -696,14 +870,18 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     {
         return Some(Err("stacked requires f32 input and output".into()));
     }
-    let (x, x_stride) = peel_input(tree, x, batches, rows, k);
-    let o_stride = if out_swap {
-        [n, batches * n]
-    } else {
-        [rows * n, n]
-    };
     let wide =
         matches!(&tree.node(w).term, Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]);
+    if rope_match.is_some() && !wide {
+        return None;
+    }
+    let (x, x_stride) = peel_input(tree, x, batches, rows, k);
+    let out_w = n + rope_match.map_or(0, |(r, _, _)| r.width);
+    let o_stride = if out_swap {
+        [out_w, batches * out_w]
+    } else {
+        [rows * out_w, out_w]
+    };
     w = if wide { tree.node(w).args[0] } else { w };
     let mut first_row = 0usize;
     if let Term::Op(Op::View(View::Slice { axis: 1, start, .. })) = &tree.node(w).term {
@@ -735,16 +913,20 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         )));
     }
     let ok = if wide {
-        n.is_multiple_of(WIDE_COLS) && k > 0 && k.is_multiple_of(32)
+        n > 0 && n.is_multiple_of(WIDE_COLS) && k > 0 && k.is_multiple_of(32)
     } else {
-        k > 0 && k.is_multiple_of(8)
+        n > 0 && k > 0 && k.is_multiple_of(8)
     };
     if !ok {
         return Some(Err(format!(
             "stacked shape n={n} k={k} wide={wide} unsupported"
         )));
     }
-    let len = batches * rows * n;
+    let (rope, reads) = match rope_match {
+        Some((tail, rot, pos)) => (Some(tail), vec![x, leaf, rot, pos]),
+        None => (None, vec![x, leaf]),
+    };
+    let len = batches * rows * out_w;
     let k = FastStacked {
         len,
         batches,
@@ -757,9 +939,10 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         x_stride,
         o_stride,
         wide,
+        rope,
         form,
     };
-    Some(Ok(vec![Draft::new(k, [x, leaf], len)]))
+    Some(Ok(vec![Draft::new(k, reads, len)]))
 }
 
 cuda_rule!("trellis_mma", check = eval_trellis);

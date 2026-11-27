@@ -70,10 +70,38 @@ struct alignas(16) st_stacked_smem {
     u16 sw[32][34];
 };
 
+static __device__ __forceinline__ void st_rope_tail(
+    const float* rot, const u32* pos, float* ob, u32 batch, u32 batches, u32 r0, u32 tile_rows,
+    u32 rows, u32 o_rs, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
+    u32 adjacent, float theta, u32 tid, u32 nthreads) {
+    u32 nr = min(rows - r0, tile_rows);
+    u32 pairs = rope_w >> 1u;
+    u32 total = nr * pairs;
+    for (u32 i = tid; i < total; i += nthreads) {
+        u32 r = i / pairs;
+        u32 pair = i - r * pairs;
+        u32 row = r0 + r;
+        float angle = (pair < turned)
+            ? float(pos[row]) * powf(theta, -float(2u * pair) / float(rope_w))
+            : 0.0f;
+        float sn, c;
+        sincosf(angle, &sn, &c);
+        u32 a = adjacent ? (2u * pair) : pair;
+        u32 b = adjacent ? (a + 1u) : (pairs + pair);
+        const float* src = rot + (u64(row) * batches + batch) * rot_stride + rot_off;
+        float* dst = ob + u64(row) * o_rs + rope_out_off;
+        float x0 = src[a], x1 = src[b];
+        dst[a] = x0 * c - x1 * sn;
+        dst[b] = x0 * sn + x1 * c;
+    }
+}
+
 // Tensor-Core BF16 transposed stacked matmul, 16x32 per CTA.
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
-    const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
+    const float* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
+    u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
+    u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
+    u32 adjacent, float theta) {
     __shared__ st_stacked_smem sm;
     u32 tile = blockIdx.x, rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles, r0 = (blockIdx.y % rtiles) * 16u;
@@ -82,6 +110,7 @@ extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
     u32 wk = tid >> 2u, wc = (tid & 3u) << 3u;
     const float* xb = x + u64(batch) * x_bs;
     const u16* wb = w + u64(batch) * block + first + (tile << 5u) + wc;
+    float* ob = out + u64(batch) * o_bs;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     uint4 cur = st_ld_nc4(wb + u64(wk) * k_step);
     for (u32 k0 = 0u; k0 < k; k0 += 32u) {
@@ -107,21 +136,26 @@ extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
     }
     u32 col = (tile << 5u) + (wt << 3u) + (t << 1u);
     if (r0 + g < rows) {
-        *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + g) * o_rs + col) =
+        *reinterpret_cast<float2*>(ob + u64(r0 + g) * o_rs + mat_off + col) =
             make_float2(acc[0], acc[1]);
     }
     if (r0 + g + 8u < rows) {
-        *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + g + 8u) * o_rs + col) =
+        *reinterpret_cast<float2*>(ob + u64(r0 + g + 8u) * o_rs + mat_off + col) =
             make_float2(acc[2], acc[3]);
+    }
+    if (tile == 0u && rope_w > 0u) {
+        st_rope_tail(rot, pos, ob, batch, batches, r0, 16u, rows, o_rs, rope_w, rot_stride,
+                     rot_off, rope_out_off, turned, adjacent, theta, tid, 128u);
     }
 }
 
 // Widened 64x64 BF16 Tensor-Core stacked matmul (non-transposed or transposed).
 template <bool TRANSPOSED>
-static __device__ __forceinline__ void st_stacked_64(const float* x, const u16* w, float* out,
-                                                     u32 rows, u32 n, u32 k, u32 block, u32 first,
-                                                     u32 step, u32 x_bs, u32 x_rs, u32 o_bs,
-                                                     u32 o_rs) {
+static __device__ __forceinline__ void st_stacked_64(
+    const float* x, const u16* w, float* out, u32 batches, u32 rows, u32 n, u32 k, u32 block,
+    u32 first, u32 step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off, const float* rot,
+    const u32* pos, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
+    u32 adjacent, float theta) {
     __shared__ alignas(16) u32 sxh[64][18];
     __shared__ alignas(16) u32 sxl[64][18];
     __shared__ alignas(16) u16 sw_u16[64][40];
@@ -132,6 +166,7 @@ static __device__ __forceinline__ void st_stacked_64(const float* x, const u16* 
     u32 xr0 = tid >> 3u, xc = (tid & 7u) << 2u, xw = (tid & 7u) << 1u;
     const float* xb = x + u64(batch) * x_bs;
     const u16* wb = w + u64(batch) * block + first;
+    float* ob = out + u64(batch) * o_bs;
     u32 wr_r = tid >> 2u, wr_c = (tid & 3u) << 3u;
     u32 wk = tid >> 3u, wc = (tid & 7u) << 3u;
     uint4 cur = TRANSPOSED ? st_ld_nc4(wb + u64(wk) * step + n0 + wc)
@@ -173,12 +208,18 @@ static __device__ __forceinline__ void st_stacked_64(const float* x, const u16* 
     for (u32 ni = 0u; ni < 4u; ni++) {
         u32 col = n0 + n_base + (ni << 3u) + (t << 1u);
         if (r0 + m_base + g < rows) {
-            *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + m_base + g) * o_rs + col) =
+            *reinterpret_cast<float2*>(ob + u64(r0 + m_base + g) * o_rs + mat_off + col) =
                 make_float2(acc[ni][0], acc[ni][1]);
         }
         if (r0 + m_base + g + 8u < rows) {
-            *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + m_base + g + 8u) * o_rs + col) =
+            *reinterpret_cast<float2*>(ob + u64(r0 + m_base + g + 8u) * o_rs + mat_off + col) =
                 make_float2(acc[ni][2], acc[ni][3]);
+        }
+    }
+    if constexpr (TRANSPOSED) {
+        if (tile == 0u && rope_w > 0u) {
+            st_rope_tail(rot, pos, ob, batch, batches, r0, 64u, rows, o_rs, rope_w, rot_stride,
+                         rot_off, rope_out_off, turned, adjacent, theta, tid, 256u);
         }
     }
 }
@@ -186,13 +227,18 @@ static __device__ __forceinline__ void st_stacked_64(const float* x, const u16* 
 extern "C" __global__ __launch_bounds__(256, 3) void tessera_stacked_lanes_64(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
     u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
-    st_stacked_64<false>(x, w, out, rows, n, k, block, first, col_step, x_bs, x_rs, o_bs, o_rs);
+    st_stacked_64<false>(x, w, out, 1u, rows, n, k, block, first, col_step, x_bs, x_rs, o_bs, o_rs,
+                         0u, nullptr, nullptr, 0u, 0u, 0u, 0u, 0u, 0u, 0.0f);
 }
 
 extern "C" __global__ __launch_bounds__(256, 3) void tessera_stacked_wide_64(
-    const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
-    st_stacked_64<true>(x, w, out, rows, n, k, block, first, k_step, x_bs, x_rs, o_bs, o_rs);
+    const float* x, const u16* w, const float* rot, const u32* pos, float* out, u32 batches,
+    u32 rows, u32 n, u32 k, u32 block, u32 first, u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs,
+    u32 o_rs, u32 mat_off, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
+    u32 adjacent, float theta) {
+    st_stacked_64<true>(x, w, out, batches, rows, n, k, block, first, k_step, x_bs, x_rs, o_bs,
+                        o_rs, mat_off, rot, pos, rope_w, rot_stride, rot_off, rope_out_off, turned,
+                        adjacent, theta);
 }
 
 #endif

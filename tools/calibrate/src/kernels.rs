@@ -104,7 +104,13 @@ fn cases() -> Vec<Case> {
     let g3 = Pins::all(&trellis::TRELLIS_K3_PMCGX);
     all.push(case("trellis_mma", "2560x2560".into(), g, &g3, &[1, 16]));
     let g = blocks(&one, [8, 128, 128]);
-    all.push(case("fast_stacked", "8x128x128".into(), g, &bf16, &[1, 16]));
+    all.push(case(
+        "fast_stacked",
+        "8x128x128".into(),
+        g,
+        &bf16,
+        &[1, 16, 64],
+    ));
     let books = [
         &trellis::TRELLIS_K3_PMCGX as &dyn Load,
         &trellis::TRELLIS_K2,
