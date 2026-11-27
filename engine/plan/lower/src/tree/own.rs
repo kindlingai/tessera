@@ -4,7 +4,7 @@ use crate::extent::Extent;
 use crate::tree::{Node, RING_CHUNK, T, Term, Tree};
 use crate::{Error, Size};
 use std::collections::HashMap;
-use tessera_codegen::kept::{Layout, self};
+use tessera_codegen::kept::{self, Layout};
 use tessera_graph::{DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, Select, View};
 
 /// Ring capacity for sliding-window kept `index`, if smaller than context.
