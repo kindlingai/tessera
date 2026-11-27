@@ -20,7 +20,7 @@ mod admit_test;
 const BATCH_STEP_TAG: u32 = 2;
 
 /// Default maximum rows per prefill chunk.
-pub(crate) const DEFAULT_CHUNK: usize = tessera_device::FAST_MAX_ROWS;
+pub(crate) const DEFAULT_CHUNK: usize = tessera_engine_settings::FAST_MAX_ROWS;
 
 mod mode;
 #[cfg(test)]

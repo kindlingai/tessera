@@ -1911,7 +1911,6 @@ name = "tessera-engine-hooks"
 version = "0.1.0"
 dependencies = [
  "serde",
- "tessera-device",
  "tessera-engine-comm",
  "tessera-engine-settings",
  "tessera-graph",

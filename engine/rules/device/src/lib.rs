@@ -31,9 +31,6 @@ pub use tessera_gpukit::backend::Backend;
 
 pub(crate) use layout::EDITION;
 
-/// Default prefill step rows, and the end of fine buckets.
-pub const FAST_MAX_ROWS: usize = 2048;
-
 /// Non-CUDA backends skipped by CUDA-only rules.
 pub const CUDA_LACKS: &[tessera_lower::Backend] =
     &[tessera_lower::Backend::Metal, tessera_lower::Backend::Rocm];

@@ -224,7 +224,7 @@ pub struct Batch<'a> {
 impl Engine {
     /// Rows one prefill step feeds: `asked`, else the default.
     pub fn chunk(&self, asked: Option<usize>) -> usize {
-        let mut rows = asked.unwrap_or(tessera_device::FAST_MAX_ROWS);
+        let mut rows = asked.unwrap_or(tessera_engine_settings::FAST_MAX_ROWS);
         if self.ring_chunk > 0 {
             rows = rows.min(self.ring_chunk);
         }

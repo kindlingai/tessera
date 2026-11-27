@@ -354,7 +354,7 @@ pub(crate) fn run_speculate<D, S>(
         let n = prompt.len();
         let step = spec_req
             .chunk
-            .unwrap_or(tessera_device::FAST_MAX_ROWS)
+            .unwrap_or(tessera_engine_settings::FAST_MAX_ROWS)
             .min(n)
             .max(1);
         let need_taps = request.max_tokens - st.sim_emitted > 1;

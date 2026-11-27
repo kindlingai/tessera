@@ -7,7 +7,6 @@ publish.workspace = true
 description = "Engine calls and types that speculative decoders share with the engine"
 
 [dependencies]
-tessera-device = { workspace = true }
 tessera-engine-comm = { workspace = true }
 tessera-engine-settings = { workspace = true }
 tessera-graph = { workspace = true }

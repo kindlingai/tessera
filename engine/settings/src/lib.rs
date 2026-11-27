@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Default prefill step rows, and the end of fine buckets.
+pub const FAST_MAX_ROWS: usize = 2048;
+
 /// Where plans run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
