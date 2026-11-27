@@ -465,6 +465,82 @@ impl<D: Device> Pager<D> {
         Ok(true)
     }
 
+    /// Gives up hot slots until `plan` fits in `budget`.
+    fn fit(&mut self, ctx: &D, plan: &Plan, budget: u64) -> Result<(), Error> {
+        let need: u64 = plan.buffers.iter().map(|b| *b as u64).sum();
+        let Some(pool) = &self.vram_pool else {
+            return Ok(());
+        };
+        if need + self.vram_bytes <= budget {
+            return Ok(());
+        }
+        let held = pool.size();
+        let fixed = self.vram_bytes - held as u64;
+        let reserve = RESERVE.min(budget / 8);
+        let avail = budget.saturating_sub(need + fixed + reserve) as usize;
+        let (counts, used) = shares(&self.layout.specs, avail);
+        if used >= held {
+            return Ok(());
+        }
+        // Copies in flight target the old slots.
+        ctx.finish()?;
+        self.moves.land();
+        self.vram_pool = None;
+        let pool = match used > 0 {
+            true => Some(DeviceBuffer::alloc(ctx, used)?),
+            false => None,
+        };
+        let base = pool.as_ref().map_or(0, DeviceBuffer::device_ptr);
+        let mut offset = 0usize;
+        for (entry, count) in self.entries.iter_mut().zip(counts) {
+            let stride = entry.spec.stride;
+            let hot = |(m, slot): (usize, &Option<usize>)| slot.map(|s| (s, m));
+            let mut kept: Vec<(usize, usize)> =
+                entry.slot_of.iter().enumerate().filter_map(hot).collect();
+            kept.sort_unstable();
+            kept.truncate(count);
+            entry.slot_of.fill(None);
+            (entry.vram_offset, entry.resident) = (offset, count);
+            offset += count * stride;
+            for (slot, (_, m)) in kept.into_iter().enumerate() {
+                entry.slot_of[m] = Some(slot);
+            }
+            // An unloaded weight fills its slots when it loads.
+            if entry.desc_ptr == 0 {
+                continue;
+            }
+            let host = entry
+                .host_buf
+                .mapped()
+                .expect("pinned buffer is host-mapped");
+            let mut spans = Vec::with_capacity(count);
+            let mut deltas = Vec::with_capacity(entry.spec.experts * 8);
+            for (m, slot) in entry.slot_of.iter().enumerate() {
+                let at = match slot {
+                    Some(slot) => {
+                        let at = base + (entry.vram_offset + slot * stride) as u64;
+                        spans.push((at, &host[m * stride..][..stride]));
+                        at
+                    }
+                    None => entry.host_buf.device_ptr() + (m * stride) as u64,
+                };
+                deltas.extend(at.wrapping_sub(entry.desc_ptr).to_le_bytes());
+            }
+            ctx.upload_batch(&spans)?;
+            ctx.upload(entry.desc_ptr + TABLE as u64, &deltas)?;
+        }
+        self.vram_pool = pool;
+        self.vram_bytes = fixed + used as u64;
+        self.staging.reaim();
+        let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "tessera: expert VRAM cache {:.1} GiB -> {:.1} GiB for a larger plan",
+            gib(held),
+            gib(used)
+        );
+        Ok(())
+    }
+
     /// Rewrites staged deltas of experts whose slots changed.
     fn retarget(&mut self, moved: Vec<(usize, usize)>) {
         let mut staging = std::mem::replace(&mut self.staging, Staging::idle());
@@ -579,9 +655,13 @@ pub(crate) fn prepare<'a, D: Device>(
         };
         *pager = Pager::open(ctx, plan, limit, base.streams, forecast)?;
     }
-    match pager.as_mut() {
-        Some(p) => Ok((std::borrow::Cow::Owned(p.rewrite(plan)), p.vram_bytes())),
-        None => Ok((std::borrow::Cow::Borrowed(plan), 0)),
+    match (pager.as_mut(), base.budget) {
+        (Some(p), Some(limit)) => {
+            let plan = p.rewrite(plan);
+            p.fit(ctx, &plan, limit)?;
+            Ok((std::borrow::Cow::Owned(plan), p.vram_bytes()))
+        }
+        _ => Ok((std::borrow::Cow::Borrowed(plan), 0)),
     }
 }
 

@@ -262,6 +262,13 @@ impl<D: Device> Staging<D> {
         }
     }
 
+    /// Makes the next run rewrite every batch's deltas.
+    pub(crate) fn reaim(&mut self) {
+        for deltas in self.deltas.iter_mut().flatten() {
+            deltas.desc = 0;
+        }
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.pool.as_ref().map_or(0, DeviceBuffer::size)
     }
@@ -297,7 +304,11 @@ impl<D: Device> Staging<D> {
             if count == 0 || s.desc == 0 || held.as_ref().is_some_and(|d| d.desc == s.desc) {
                 continue;
             }
-            let mut pinned = DeviceBuffer::pinned(ctx, count * 16)?;
+            // Recorded copies keep reading this buffer, so reuse it.
+            let mut pinned = match held.take() {
+                Some(deltas) => deltas.pinned,
+                None => DeviceBuffer::pinned(ctx, count * 16)?,
+            };
             let words = pinned.mapped_mut().expect("pinned buffer is host-mapped");
             let ring = pool.device_ptr() + (batch.part * self.part_bytes) as u64;
             for (i, &m) in batch.experts.iter().enumerate() {
