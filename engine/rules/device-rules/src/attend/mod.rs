@@ -456,9 +456,15 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         "heads={heads} not a multiple of kv_heads={kv_heads}"
     );
     let [slots, positions] = [node.args[3], node.args[4]];
+    if a.rel_bias {
+        return None;
+    }
     let sinks = match a.sinks_arg() {
         Some(si) => {
             let s = node.args[si];
+            if tree.node(s).shape.len() > 1 {
+                return None;
+            }
             require!(f32 tree, "sinks" s);
             s
         }

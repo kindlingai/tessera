@@ -109,15 +109,23 @@ pub struct Attend {
     /// Query rows carry a slot and position: arguments four, five.
     #[serde(default)]
     pub ragged: bool,
-    /// Final argument holds per-head sink logits `[Heads]`.
+    /// Sink logits follow: `[Heads]`, or one per query head.
     #[serde(default)]
     pub sinks: bool,
+    /// Final argument biases each query's nearest `RelWin` keys.
+    #[serde(default)]
+    pub rel_bias: bool,
 }
 
 impl Attend {
     /// Expected argument count.
     pub fn arity(&self) -> usize {
-        3 + usize::from(self.picked) + 2 * usize::from(self.ragged) + usize::from(self.sinks)
+        self.listed() + usize::from(self.sinks) + usize::from(self.rel_bias)
+    }
+
+    /// Arguments before any sinks or bias.
+    fn listed(&self) -> usize {
+        3 + 2 * usize::from(self.ragged) + usize::from(self.picked)
     }
 
     /// Argument index of the listed key ids, if `picked`.
@@ -127,8 +135,13 @@ impl Attend {
 
     /// Argument index of the per-head sink logits, if `sinks`.
     pub fn sinks_arg(&self) -> Option<usize> {
-        self.sinks
-            .then_some(3 + 2 * usize::from(self.ragged) + usize::from(self.picked))
+        self.sinks.then_some(self.listed())
+    }
+
+    /// Argument index of the relative bias, if `rel_bias`.
+    pub fn rel_bias_arg(&self) -> Option<usize> {
+        self.rel_bias
+            .then_some(self.listed() + usize::from(self.sinks))
     }
 }
 

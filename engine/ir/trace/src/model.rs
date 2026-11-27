@@ -106,22 +106,52 @@ impl Model {
         self.attend_with(mask, scale, qkv, keys, Some(sinks))
     }
 
+    /// Whole-sequence attention with optional sinks and relative bias.
+    pub fn attend_biased(
+        &self,
+        mask: Mask,
+        scale: f32,
+        qkv: [&Tensor; 3],
+        keys: Option<&Tensor>,
+        [sinks, rel_bias]: [Option<&Tensor>; 2],
+    ) -> Tensor {
+        self.attend_all(mask, scale, qkv, None, [keys, sinks, rel_bias])
+    }
+
     fn attend_with(
         &self,
         mask: Mask,
         scale: f32,
-        [q, k, v]: [&Tensor; 3],
+        qkv: [&Tensor; 3],
         keys: Option<&Tensor>,
         sinks: Option<&Tensor>,
+    ) -> Tensor {
+        self.attend_all(mask, scale, qkv, None, [keys, sinks, None])
+    }
+
+    fn attend_all(
+        &self,
+        mask: Mask,
+        scale: f32,
+        qkv: [&Tensor; 3],
+        by: Option<[&Tensor; 2]>,
+        [keys, sinks, rel_bias]: [Option<&Tensor>; 3],
     ) -> Tensor {
         let op = Op::Attend(Attend {
             mask,
             scale,
             picked: keys.is_some(),
-            ragged: false,
+            ragged: by.is_some(),
             sinks: sinks.is_some(),
+            rel_bias: rel_bias.is_some(),
         });
-        let args: Vec<&Tensor> = [q, k, v].into_iter().chain(keys).chain(sinks).collect();
+        let args: Vec<&Tensor> = qkv
+            .into_iter()
+            .chain(by.into_iter().flatten())
+            .chain(keys)
+            .chain(sinks)
+            .chain(rel_bias)
+            .collect();
         push(&self.g, op, &args)
     }
 
@@ -150,28 +180,29 @@ impl Model {
         self.attend_rows_with(mask, scale, qkv, by, keys, Some(sinks))
     }
 
+    /// Ragged attention with optional sinks and relative bias.
+    pub fn attend_rows_biased(
+        &self,
+        mask: Mask,
+        scale: f32,
+        qkv: [&Tensor; 3],
+        by: [&Tensor; 2],
+        keys: Option<&Tensor>,
+        [sinks, rel_bias]: [Option<&Tensor>; 2],
+    ) -> Tensor {
+        self.attend_all(mask, scale, qkv, Some(by), [keys, sinks, rel_bias])
+    }
+
     fn attend_rows_with(
         &self,
         mask: Mask,
         scale: f32,
-        [q, k, v]: [&Tensor; 3],
-        [slots, positions]: [&Tensor; 2],
+        qkv: [&Tensor; 3],
+        by: [&Tensor; 2],
         keys: Option<&Tensor>,
         sinks: Option<&Tensor>,
     ) -> Tensor {
-        let op = Op::Attend(Attend {
-            mask,
-            scale,
-            picked: keys.is_some(),
-            ragged: true,
-            sinks: sinks.is_some(),
-        });
-        let args: Vec<&Tensor> = [q, k, v, slots, positions]
-            .into_iter()
-            .chain(keys)
-            .chain(sinks)
-            .collect();
-        push(&self.g, op, &args)
+        self.attend_all(mask, scale, qkv, Some(by), [keys, sinks, None])
     }
 
     /// The gated delta rule, with log decays and write rates.

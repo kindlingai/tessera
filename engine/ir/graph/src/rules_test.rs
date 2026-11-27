@@ -119,6 +119,7 @@ fn decode_and_constants() {
             picked: false,
             ragged: false,
             sinks: false,
+            rel_bias: false,
         })
     };
     let tys = vec![q.clone(), kv.clone(), kv.clone()];
@@ -185,6 +186,7 @@ fn picks_by_index() {
         picked: true,
         ragged: false,
         sinks: false,
+        rel_bias: false,
     });
     let tys = vec![q, kv.clone(), kv];
     assert_eq!(placed(tys.clone(), attend.clone()), Err(ErrorKind::Arity));
@@ -205,6 +207,7 @@ fn ragged_causal() {
             picked: false,
             ragged: true,
             sinks: false,
+            rel_bias: false,
         })
     };
     assert!(result(tys.clone(), attend(Mask::Causal)).is_ok());
@@ -301,6 +304,7 @@ fn attend_sinks_infer() {
         picked: false,
         ragged: true,
         sinks: true,
+        rel_bias: false,
     });
     let tys = vec![
         q.clone(),
@@ -326,4 +330,110 @@ fn attend_sinks_infer() {
     assert_eq!(placed(split.clone(), op.clone()), Err(ErrorKind::Placement));
     split[5].placement = Split { axis: 0 };
     assert_eq!(placed(split, op), Ok(Split { axis: 1 }));
+}
+
+/// Ragged attention types, sinks and bias last.
+fn biased(sinks: TensorType, win: DimName) -> (Vec<TensorType>, Op) {
+    let q = f32s([Rows, Heads, HeadDim], Replicated);
+    let kv = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let by = TensorType::new([Rows], DType::U32);
+    let rel = f32s([Rows, Heads, win], Replicated);
+    let op = Op::Attend(Attend {
+        mask: Mask::Back(2),
+        scale: 0.5,
+        picked: false,
+        ragged: true,
+        sinks: true,
+        rel_bias: true,
+    });
+    (vec![q, kv.clone(), kv, by.clone(), by, sinks, rel], op)
+}
+
+#[test]
+fn attend_bias_infer() {
+    let (tys, op) = biased(f32s([Rows, Heads], Replicated), Ffn);
+    assert_eq!(placed(tys.clone(), op.clone()), Ok(Replicated));
+    assert_eq!(placed(tys[..6].to_vec(), op.clone()), Err(ErrorKind::Arity));
+    // Static sinks still fit beside a bias.
+    let (fixed, _) = biased(f32s([Heads], Replicated), Ffn);
+    assert_eq!(placed(fixed, op.clone()), Ok(Replicated));
+    for (at, bad) in [
+        (5, f32s([Rows, HeadDim], Replicated)),
+        (5, f32s([Seqs, Context, Heads], Replicated)),
+        (6, f32s([Rows, Heads], Replicated)),
+        (6, f32s([Rows, HeadDim, Ffn], Replicated)),
+    ] {
+        let mut wrong = tys.clone();
+        wrong[at] = bad;
+        assert_eq!(placed(wrong, op.clone()), Err(ErrorKind::Shape));
+    }
+    let mut ints = tys.clone();
+    ints[6].dtype = DType::U32;
+    assert_eq!(placed(ints, op.clone()), Err(ErrorKind::DType));
+    // Head-split queries need head-split sinks and bias.
+    let mut split = tys;
+    split[0].placement = Split { axis: 1 };
+    split[1].placement = Split { axis: 2 };
+    split[2].placement = Split { axis: 2 };
+    assert_eq!(placed(split.clone(), op.clone()), Err(ErrorKind::Placement));
+    split[5].placement = Split { axis: 1 };
+    assert_eq!(placed(split.clone(), op.clone()), Err(ErrorKind::Placement));
+    split[6].placement = Split { axis: 1 };
+    assert_eq!(placed(split, op), Ok(Split { axis: 1 }));
+    // Whole sequences carry one sink per query head.
+    let q = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let whole = Op::Attend(Attend {
+        mask: Mask::Causal,
+        scale: 0.5,
+        picked: false,
+        ragged: false,
+        sinks: true,
+        rel_bias: true,
+    });
+    let sinks = f32s([Seqs, Context, Heads], Replicated);
+    let rel = f32s([Seqs, Context, Heads, Ffn], Replicated);
+    let tys = vec![q.clone(), q.clone(), q, sinks, rel];
+    assert_eq!(placed(tys, whole), Ok(Replicated));
+}
+
+/// A step graph attending with `sinks` and a bias.
+fn biased_step(sinks: TensorType) -> Graph {
+    let (tys, op) = biased(sinks, Ffn);
+    let (mut g, ids) = inputs(tys);
+    g.entries[0].kind = EntryKind::Step;
+    // Slots and positions follow the picks ungathered.
+    g.entries[0].inputs[3].role = Role::Candidates;
+    g.entries[0].inputs[4].role = Role::Candidates;
+    let node = crate::verify_test::push(&mut g, op, &ids);
+    g.entries[0].outputs.push(Output {
+        role: Role::Logits,
+        node,
+    });
+    g
+}
+
+#[test]
+fn attend_bias_trims() {
+    let g = biased_step(f32s([Rows, Heads], Replicated));
+    verify(&g).unwrap();
+    assert_eq!(Graph::from_json(&g.to_json()).unwrap(), g);
+    let Op::Attend(a) = &g.nodes.last().unwrap().op else {
+        panic!("attend is last");
+    };
+    assert_eq!(
+        (a.arity(), a.sinks_arg(), a.rel_bias_arg()),
+        (7, Some(5), Some(6))
+    );
+    // Per-token sinks and bias follow the picked rows.
+    let gathers = |g: &Graph| {
+        let trimmed = trim(g, 0).unwrap();
+        let attend = trimmed.node(trimmed.entries[0].outputs[0].node);
+        assert!(matches!(attend.op, Op::Attend(_)));
+        assert_eq!(attend.ty.shape.0[0], DimExpr::Dim(Picks));
+        let gather = |n: &&Node| n.op == Op::Select(Select::Gather);
+        trimmed.nodes.iter().filter(gather).count()
+    };
+    assert_eq!(gathers(&g), 3);
+    // Per-head sinks stay whole.
+    assert_eq!(gathers(&biased_step(f32s([Heads], Replicated))), 2);
 }

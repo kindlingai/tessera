@@ -73,6 +73,7 @@ fn rules_match(settings: &Settings) -> Vec<&'static str> {
         graphs::indexed_rows(&d, [2, 16, 2]),
         graphs::residual_norm(&d, 32),
         graphs::residual_norm(&d, 600),
+        clipped(),
     ];
     let ours = ours();
     let mut used: Vec<&str> = Vec::new();
@@ -111,6 +112,40 @@ fn rules_match_cpu() {
             let name = rule.name;
             assert!(used.contains(&name), "{name} is never exercised");
         }
+    }
+}
+
+/// Rows clipped to length 1, then scaled by position.
+fn clipped() -> Graph {
+    let m = Model::new(vec![
+        Dim::bounded(Seqs, 4),
+        Dim::bounded(Rows, 8),
+        Dim::fixed(HeadDim, 16),
+    ]);
+    let ports = [floats([Seqs, Rows, HeadDim]), ids([Seqs, Rows])];
+    let [x, at] = m.entry(EntryKind::Forward, ports);
+    let out = x.l2_clip(1.0, 1e-3).log_scale(&at, 4.0, 0.5);
+    m.finish([(Role::Logits, &out)])
+}
+
+#[test]
+fn clip_scale_match() {
+    // Row lengths 0 to 2.5. Positions straddle 4.
+    let x: Vec<f32> = (0..96)
+        .map(|i| (i / 16) as f32 * if i % 2 == 0 { 0.125 } else { -0.125 })
+        .collect();
+    let inputs = [
+        Tensor::f32(vec![2, 3, 16], x),
+        Tensor::u32(vec![2, 3], vec![0, 1, 3, 4, 9, 100]),
+    ];
+    let g = clipped();
+    let want = run(&g, &[], 0, &inputs).unwrap();
+    let tau = 1.0 + 0.5 * (101f32 / 4.0).ln();
+    let last = want[0].floats().unwrap()[95];
+    assert!((last + tau / (2.5 + 1e-3) * 0.625).abs() < 1e-6, "{last}");
+    for settings in runs() {
+        let off = gap(&g, &inputs, &Device::guess(&settings), &settings);
+        assert!(off < 1e-6, "off by {off:e}");
     }
 }
 

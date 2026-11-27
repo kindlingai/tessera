@@ -185,3 +185,140 @@ fn attend_sinks_parity() {
         check_parity(&g, &inputs, &format!("ragged picked={picked}"));
     }
 }
+
+/// Fills sink logits, with one `-inf` to skip the sink.
+fn token_sinks(shape: Vec<usize>) -> Tensor {
+    let n = shape.iter().product();
+    let mut vals = fill(n, 11, 0.4);
+    vals[n - 1] = f32::NEG_INFINITY;
+    Tensor::f32(shape, vals)
+}
+
+#[test]
+fn token_sinks_parity() {
+    let (seqs, ctx, heads, kv_heads, dim, win) = (2, 6, 4, 2, 8, 3);
+    let scale = (dim as f32).sqrt().recip();
+    let rel_win = DimName::named("RelWin");
+    let base_dims = vec![
+        fixed(Seqs, seqs),
+        fixed(Context, ctx),
+        fixed(Heads, heads),
+        fixed(KvHeads, kv_heads),
+        fixed(HeadDim, dim),
+        fixed(rel_win, win),
+    ];
+    let kv_p = port([Seqs, Context, KvHeads, HeadDim], DType::F32);
+    let kv_n = seqs * ctx * kv_heads * dim;
+    let kt = Tensor::f32(vec![seqs, ctx, kv_heads, dim], fill(kv_n, 37, 0.1));
+    let vt = Tensor::f32(vec![seqs, ctx, kv_heads, dim], fill(kv_n, 37, -0.05));
+
+    // Whole sequences: one sink and bias row per query head.
+    let q_p = port([Seqs, Context, Heads, HeadDim], DType::F32);
+    let s_p = port([Seqs, Context, Heads], DType::F32);
+    let r_p = port([Seqs, Context, Heads, rel_win], DType::F32);
+    let lists = seqs * ctx * heads;
+    let qt = Tensor::f32(vec![seqs, ctx, heads, dim], fill(lists * dim, 37, 0.0));
+    let st = token_sinks(vec![seqs, ctx, heads]);
+    let rt = Tensor::f32(vec![seqs, ctx, heads, win], fill(lists * win, 17, 0.3));
+    for mask in [Mask::Causal, Mask::Back(2)] {
+        for (with_sinks, with_rel) in [(true, true), (false, true), (true, false)] {
+            let m = Model::new(base_dims.clone());
+            let ports = [
+                q_p.clone(),
+                kv_p.clone(),
+                kv_p.clone(),
+                s_p.clone(),
+                r_p.clone(),
+            ];
+            let [q, k, v, sinks, rel] = m.entry(EntryKind::Forward, ports);
+            let extra = [with_sinks.then_some(&sinks), with_rel.then_some(&rel)];
+            let out = m.attend_biased(mask, scale, [&q, &k, &v], None, extra);
+            let g = m.finish([(Role::Tokens, &out)]);
+            let inputs = [qt.clone(), kt.clone(), vt.clone(), st.clone(), rt.clone()];
+            let tag = format!("whole {mask:?} sinks={with_sinks} rel={with_rel}");
+            check_parity(&g, &inputs, &tag);
+        }
+    }
+
+    // Uniform token sinks and a zero bias match per-head sinks.
+    let head_sinks = [-2.0, 0.5, 3.0, f32::NEG_INFINITY];
+    let m = Model::new(base_dims.clone());
+    let ports = [q_p.clone(), kv_p.clone(), kv_p.clone(), s_p, r_p];
+    let [q, k, v, sinks, rel] = m.entry(EntryKind::Forward, ports);
+    let out = m.attend_biased(
+        Mask::Causal,
+        scale,
+        [&q, &k, &v],
+        None,
+        [Some(&sinks), Some(&rel)],
+    );
+    let g = m.finish([(Role::Tokens, &out)]);
+    let spread = Tensor::f32(vec![seqs, ctx, heads], head_sinks.repeat(seqs * ctx));
+    let zeros = Tensor::f32(vec![seqs, ctx, heads, win], vec![0.0; lists * win]);
+    let inputs = [qt.clone(), kt.clone(), vt.clone(), spread, zeros];
+    let got = check_parity(&g, &inputs, "uniform");
+    let m = Model::new(base_dims.clone());
+    let h_p = port([Heads], DType::F32);
+    let [q, k, v, sinks] = m.entry(EntryKind::Forward, [q_p, kv_p.clone(), kv_p.clone(), h_p]);
+    let out = m.attend_sinks(Mask::Causal, scale, [&q, &k, &v], None, &sinks);
+    let g = m.finish([(Role::Tokens, &out)]);
+    let per_head = Tensor::f32(vec![heads], head_sinks.to_vec());
+    let inputs = [qt, kt.clone(), vt.clone(), per_head];
+    let want = tessera_interp::run(&g, &[], 0, &inputs).unwrap();
+    for (a, b) in got.iter().zip(want[0].floats().unwrap()) {
+        assert!((a - b).abs() < 1e-6, "uniform sinks: {a} vs {b}");
+    }
+
+    // Ragged rows, dense and picked.
+    let rows = 3;
+    let pick_dim = DimName::named("SinkPicks");
+    let u_p = port([Rows], DType::U32);
+    let qt = Tensor::f32(vec![rows, heads, dim], fill(rows * heads * dim, 23, 0.0));
+    let slt = Tensor::u32(vec![rows], vec![0, 1, 0]);
+    let pot = Tensor::u32(vec![rows], vec![0, 4, 5]);
+    let st = token_sinks(vec![rows, heads]);
+    let rt = Tensor::f32(vec![rows, heads, win], fill(rows * heads * win, 17, 0.3));
+    let idt = Tensor::u32(vec![rows, 3], vec![0, 9, 9, 1, 3, 4, 2, 4, 5]);
+    for (mask, picked) in [
+        (Mask::Causal, false),
+        (Mask::Back(3), false),
+        (Mask::Causal, true),
+        (Mask::Back(3), true),
+    ] {
+        let mut dims = base_dims.clone();
+        dims.push(fixed(Rows, rows));
+        dims.push(fixed(pick_dim, 3));
+        let m = Model::new(dims);
+        let ports = [
+            port([Rows, Heads, HeadDim], DType::F32),
+            kv_p.clone(),
+            kv_p.clone(),
+            u_p.clone(),
+            u_p.clone(),
+            port([Rows, pick_dim], DType::U32),
+            port([Rows, Heads], DType::F32),
+            port([Rows, Heads, rel_win], DType::F32),
+        ];
+        let [q, k, v, sl, po, ids, si, rel] = m.entry(EntryKind::Forward, ports);
+        let out = m.attend_rows_biased(
+            mask,
+            scale,
+            [&q, &k, &v],
+            [&sl, &po],
+            picked.then_some(&ids),
+            [Some(&si), Some(&rel)],
+        );
+        let g = m.finish([(Role::Tokens, &out)]);
+        let inputs = [
+            qt.clone(),
+            kt.clone(),
+            vt.clone(),
+            slt.clone(),
+            pot.clone(),
+            idt.clone(),
+            st.clone(),
+            rt.clone(),
+        ];
+        check_parity(&g, &inputs, &format!("ragged {mask:?} picked={picked}"));
+    }
+}

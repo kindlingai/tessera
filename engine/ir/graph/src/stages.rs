@@ -143,6 +143,18 @@ macro_rules! stages {
                 check: Finite(eps, "norm epsilon"),
                 pin: Norm,
             }
+            /// Shrinks a row whose length is past `threshold`.
+            L2Clip { threshold: f32 = 1.0, eps: f32 = 1e-6 } as l2_clip => "l2_clip" {
+                whole: true,
+                reduces: true,
+                check: Positive(threshold, "l2 clip threshold"),
+                pin: Norm,
+            }
+            /// Scales rows by `1 + alpha * ln(max(1, (position + 1) / floor))`.
+            LogScale { floor: f32 = 8192.0, alpha: f32 = 0.1 } as log_scale => "log_scale" {
+                operand: Positions,
+                check: Positive(floor, "log scale floor"),
+            }
             /// The scaled Walsh-Hadamard transform of each `block` of the row.
             Hadamard { block: u32 = 4 } as hadamard => "hadamard" {
                 check: PowerOfTwo(block),

@@ -118,6 +118,7 @@ fn ring_graph(heads: u64, kv_heads: u64, width: u64, mla: bool) -> Graph {
         picked: false,
         ragged: true,
         sinks: false,
+        rel_bias: false,
     });
     let out = push(&mut g, op, vec![q, k, v, slots, pos], q_ty);
     g.entries.push(Entry {

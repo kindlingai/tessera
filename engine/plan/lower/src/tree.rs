@@ -535,8 +535,8 @@ impl<'a> Tree<'a> {
                     let mut plain = a.clone();
                     plain.picked = false;
                     let mut kept = args[..5].to_vec();
-                    if let Some(si) = a.sinks_arg() {
-                        kept.push(args[si]);
+                    for i in a.sinks_arg().into_iter().chain(a.rel_bias_arg()) {
+                        kept.push(args[i]);
                     }
                     push(Term::Op(Op::Attend(plain)), kept, form)
                 }

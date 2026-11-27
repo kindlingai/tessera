@@ -874,3 +874,95 @@ fn attend_flash_knobs() {
     let sub = tessera_lower::select(&g, 0, &[(Seqs, 1), (Rows, 64), (Context, 64)], &fdev).unwrap();
     assert!(sub.ways["flash"].len() < full.ways["flash"].len());
 }
+
+/// Each row's own taps, over whole sequences and ragged rows.
+#[test]
+fn dynamic_conv_matches() {
+    let dims = || {
+        vec![
+            Dim::bounded(Seqs, 4),
+            Dim::bounded(Rows, 16),
+            Dim::bounded(Context, 16),
+            Dim::fixed(Hidden, 6),
+        ]
+    };
+    let port = |role, shape: tessera_graph::Shape, dtype| Port {
+        role,
+        ty: TensorType::new(shape, dtype),
+    };
+    let floats = |shape: Vec<tessera_graph::DimExpr>| port(Role::Tokens, shape.into(), DType::F32);
+    let (m, mut draws) = (Model::new(dims()), Noise(11));
+    let taps = vec![Seqs.into(), Context.into(), Hidden.into(), 3u64.into()];
+    let [x, w] = m.entry(
+        EntryKind::Forward,
+        [
+            floats(vec![Seqs.into(), Context.into(), Hidden.into()]),
+            floats(taps),
+        ],
+    );
+    let whole = m.finish([(Role::Logits, &x.conv_dynamic(&w, 2))]);
+    let m = Model::new(dims());
+    let ids = |role| port(role, [Rows].into(), DType::U32);
+    let ports = [
+        floats(vec![Rows.into(), Hidden.into()]),
+        floats(vec![Rows.into(), Hidden.into(), 3u64.into()]),
+        ids(Role::Slots),
+        ids(Role::Positions),
+    ];
+    let [x, w, slots, positions] = m.entry(EntryKind::Step, ports);
+    let state = TensorType::new(vec![Seqs.into(), 4u64.into(), Hidden.into()], DType::F32);
+    let out = x.conv_rows_dynamic(&w, 2, &m.kept(state), [&slots, &positions]);
+    let ragged = m.finish([(Role::Logits, &out)]);
+    let launches: [&[(u32, u32, u32)]; 2] =
+        [&[(0, 0, 7), (1, 0, 3)], &[(0, 7, 2), (1, 3, 1), (2, 0, 4)]];
+    for settings in runs() {
+        let device = Device::guess(&settings);
+        let inputs = [
+            noise(vec![2, 9, 6], &mut draws),
+            noise(vec![2, 9, 6, 3], &mut draws),
+        ];
+        let want = run(&whole, &[], 0, &inputs).unwrap();
+        let plan = lower(&whole, 0, &[(Seqs, 2), (Context, 9)], &device).unwrap();
+        assert_eq!(plan.steps[0].kernel.name(), "conv_dynamic");
+        let got = step_plan(&mut None, plan, &settings, &inputs);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-5, "whole: off by {off:e}");
+        // Slot 0 of the ragged steps is sequence 0 again.
+        let (mut store, mut runner): (Store, Option<Box<dyn Run>>) = (Store::default(), None);
+        let (xs, ws) = (inputs[0].floats().unwrap(), inputs[1].floats().unwrap());
+        for launch in launches {
+            let (slots, positions) = rows(launch);
+            let n = slots.len();
+            let (mut x, mut w) = (
+                noise(vec![n, 6], &mut draws),
+                noise(vec![n, 6, 3], &mut draws),
+            );
+            let (first, count) = (launch[0].1 as usize, launch[0].2 as usize);
+            x = Tensor::f32(vec![n, 6], splice(&x, &xs[first * 6..][..count * 6]));
+            w = Tensor::f32(vec![n, 6, 3], splice(&w, &ws[first * 18..][..count * 18]));
+            let feeds = [
+                x,
+                w,
+                Tensor::u32(vec![n], slots),
+                Tensor::u32(vec![n], positions),
+            ];
+            let want_rows = run_kept(&ragged, &[], &mut store, 0, &feeds).unwrap();
+            let want_rows = want_rows[0].floats().unwrap();
+            let same = &want[0].floats().unwrap()[first * 6..][..count * 6];
+            assert!(max_abs_diff(&want_rows[..count * 6], same) < 1e-6);
+            let sizes = [(Seqs, 4), (Rows, n as u64)];
+            let plan = lower(&ragged, 0, &sizes, &device).unwrap();
+            assert_eq!(plan.steps[0].kernel.name(), "conv_rows");
+            let got = step_plan(&mut runner, plan, &settings, &feeds);
+            let off = max_abs_diff(got.floats().unwrap(), want_rows);
+            assert!(off < 1e-5, "ragged {launch:?}: off by {off:e}");
+        }
+    }
+}
+
+/// `t`'s values with `head` over the first ones.
+fn splice(t: &Tensor, head: &[f32]) -> Vec<f32> {
+    let mut out = t.floats().unwrap().to_vec();
+    out[..head.len()].copy_from_slice(head);
+    out
+}
