@@ -18,23 +18,23 @@ use tessera_lower::{
 };
 use tessera_mem::DType;
 use tessera_run::testing::{device, host};
-use tessera_run::{Error as RunError, Grid, Item, KeptDesc, Layout, Marks, Rank, Run, Sum, sizer};
+use tessera_run::{Error as RunError, Grid, Item, KeptDesc, Layout, Rank, Run, Sum, sizer};
 
 #[derive(Default)]
 struct MockState {
+    events: Vec<String>,
+    fail_alloc: Option<usize>,
+    fail_finish: usize,
+    grid_running: bool,
+    attr_calls: Vec<(u32, u32)>,
+    recording: Option<Vec<u64>>,
+    mem: HashMap<u64, Vec<u8>>,
     next_ptr: u64,
-    live: HashMap<u64, usize>,
     allocs: usize,
     frees: usize,
     compiles: usize,
     captures: usize,
     replays: usize,
-    recording: Option<Vec<u64>>,
-    attr_calls: Vec<(u32, u32)>,
-    grid_running: bool,
-    fail_alloc: Option<usize>,
-    fail_finish: usize,
-    events: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -74,15 +74,25 @@ impl MockState {
         }
         let ptr = self.next_ptr;
         self.next_ptr += (size.max(4096) as u64).next_multiple_of(4096) + 4096;
-        self.live.insert(ptr, size.max(1));
+        self.mem.insert(ptr, vec![0u8; size.max(1)]);
         self.allocs += 1;
         self.events.push(format!("alloc:{ptr:#x}"));
         Ok(ptr)
     }
 
+    fn span_mut(&mut self, ptr: u64, len: usize) -> &mut [u8] {
+        for (&base, buf) in &mut self.mem {
+            if ptr >= base && (ptr - base) as usize + len <= buf.len() {
+                let off = (ptr - base) as usize;
+                return &mut buf[off..off + len];
+            }
+        }
+        panic!("access outside live buffer at {ptr:#x} len {len}");
+    }
+
     fn free_buf(&mut self, ptr: u64) {
         assert!(!self.grid_running, "free while grid ran");
-        assert!(self.live.remove(&ptr).is_some(), "double free {ptr:#x}");
+        assert!(self.mem.remove(&ptr).is_some(), "double free {ptr:#x}");
         self.frees += 1;
         self.events.push(format!("free:{ptr:#x}"));
     }
@@ -111,9 +121,9 @@ impl MockState {
     fn check_replay(&mut self, ptrs: &[u64]) {
         for &ptr in ptrs {
             let live = self
-                .live
+                .mem
                 .iter()
-                .any(|(&base, &len)| ptr >= base && ptr < base + len as u64);
+                .any(|(&base, buf)| ptr >= base && ptr < base + buf.len() as u64);
             assert!(live, "replayed stale pointer {ptr:#x}");
         }
         self.replays += 1;
@@ -145,7 +155,7 @@ impl TinyDevice {
     }
 
     fn is_live(&self, ptr: u64) -> bool {
-        self.0.lock().unwrap().live.contains_key(&ptr)
+        self.0.lock().unwrap().mem.contains_key(&ptr)
     }
 
     fn stats_snapshot(&self) -> (usize, usize, usize, usize, usize) {
@@ -207,15 +217,22 @@ impl Device for TinyDevice {
     fn finish(&self) -> Result<Option<f64>, GpuError> {
         self.0.lock().unwrap().finish_stream()
     }
-    fn upload(&self, _: u64, _: &[u8]) -> Result<(), GpuError> {
+    fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), GpuError> {
+        self.0
+            .lock()
+            .unwrap()
+            .span_mut(ptr, bytes.len())
+            .copy_from_slice(bytes);
         Ok(())
     }
-    fn download(&self, _: u64, bytes: &mut [u8]) -> Result<(), GpuError> {
-        bytes.fill(0);
+    fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), GpuError> {
+        bytes.copy_from_slice(self.0.lock().unwrap().span_mut(ptr, bytes.len()));
         Ok(())
     }
-    fn zero(&self, _: u64, _: usize) -> Result<(), GpuError> {
-        assert!(!self.0.lock().unwrap().grid_running, "zero while grid ran");
+    fn zero(&self, ptr: u64, len: usize) -> Result<(), GpuError> {
+        let mut s = self.0.lock().unwrap();
+        assert!(!s.grid_running, "zero while grid ran");
+        s.span_mut(ptr, len).fill(0);
         Ok(())
     }
     fn alloc(&self, size: usize) -> Result<u64, GpuError> {
@@ -336,14 +353,6 @@ impl Grid for NoopGrid {
     ) -> Result<(), RunError> {
         Ok(())
     }
-
-    fn profiling(&mut self, _: bool) {}
-
-    fn replace(&mut self, _: &str, _: Option<String>) {}
-
-    fn take_marks(&mut self) -> Vec<(String, Marks)> {
-        Vec::new()
-    }
 }
 
 struct NullTransport;
@@ -373,11 +382,6 @@ struct TinySum {
 }
 
 impl TinySum {
-    fn new(ctx: &'static TinyDevice) -> (Self, PauseLog) {
-        let (sum, log, _) = Self::with_faults(ctx);
-        (sum, log)
-    }
-
     fn with_faults(ctx: &'static TinyDevice) -> (Self, PauseLog, PauseFaults) {
         let log = Arc::new(Mutex::new((0, 0)));
         let fail_pause = Arc::new(Mutex::new(VecDeque::new()));
@@ -484,6 +488,13 @@ fn plain_kernel(name: &'static str, entry: &'static str, dim: Option<DimName>) -
         resident: None,
         dim,
     }
+}
+
+fn one_plan(bytes: usize, name: &'static str, entry: &'static str) -> Plan {
+    make_plan(
+        vec![bytes],
+        vec![make_step(plain_kernel(name, entry, None), 0, 16)],
+    )
 }
 
 fn open_runner(plan: Plan, graphs: bool) -> Box<dyn Run> {
@@ -609,38 +620,7 @@ fn unchanged_overrides_stay() {
     let (_g, ctx) = lock_ctx();
     let dir = tessera_testkit::scratch(&format!("pause-overrides-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let s0 = make_step(plain_kernel("ov", "ov_k", None), 0, 4);
-    let ar = Step {
-        kernel: KernelRef::new(AllReduce {
-            len: 4,
-            wire: DType::F32,
-        }),
-        rule: "all_reduce",
-        reads: vec![Slot::floats(0, 4)],
-        write: Slot::floats(1, 4),
-        also: Vec::new(),
-        covers: Vec::new(),
-        zone: 0,
-        lane: 1,
-        table: None,
-        index_table: None,
-    };
-    let mut plan = make_plan(vec![64, 64], vec![s0, ar]);
-    (plan.rank, plan.ranks) = (0, 2);
-    let settings = Settings {
-        memory: Memory::Off,
-        kernels: Some(dir.clone()),
-        ..host()
-    };
-    let (sum, log) = TinySum::new(ctx);
-    let mut rank = Rank::open_device::<TinyDevice>(plan, &settings, NullTransport)
-        .unwrap()
-        .with_grid(Some(Box::new(sum)))
-        .unwrap();
-    rank.launching(Launching {
-        graphs: true,
-        pdl: false,
-    });
+    let (mut rank, log, _) = open_rank(ctx, ranked_plan(vec![64, 64], "ov_k"), Some(dir.clone()));
     for _ in 0..6 {
         rank.submit(0..2).unwrap();
     }
@@ -691,17 +671,9 @@ fn marked_kernel_cached() {
 #[test]
 fn cold_plan_timers() {
     let (_g, _ctx) = lock_ctx();
-    let p1 = make_plan(
-        vec![64],
-        vec![make_step(plain_kernel("a", "a_k", None), 0, 16)],
-    );
-    let p2 = make_plan(
-        vec![65_536],
-        vec![make_step(plain_kernel("b", "b_k", None), 0, 16)],
-    );
-    let mut runner = open_runner(p1, true);
+    let mut runner = open_runner(one_plan(64, "a", "a_k"), true);
     runner.profiling(true);
-    runner.replan(&p2).unwrap();
+    runner.replan(&one_plan(65_536, "b", "b_k")).unwrap();
     runner.submit(0..1).unwrap();
     let cold = runner.take_profile().unwrap();
     assert_eq!(cold.spent["plan: alloc"].count, 1);
@@ -722,10 +694,7 @@ fn sizer_scope_isolated() {
     let isolated = std::thread::spawn(sizer::counting).join().unwrap();
     assert!(!isolated);
     let scope = sizer::current_scope().expect("active scope");
-    let plan = make_plan(
-        vec![1024],
-        vec![make_step(plain_kernel("s", "s_k", None), 0, 16)],
-    );
+    let plan = one_plan(1024, "s", "s_k");
     std::thread::spawn(move || {
         scope.run(|| {
             assert!(sizer::counting());
@@ -737,6 +706,28 @@ fn sizer_scope_isolated() {
     assert!(guard.sized().scratch >= 1024);
     drop(guard);
     assert!(!sizer::counting());
+}
+
+fn open_rank(
+    ctx: &'static TinyDevice,
+    plan: Plan,
+    kernels: Option<std::path::PathBuf>,
+) -> (Rank<NullTransport>, PauseLog, PauseFaults) {
+    let settings = Settings {
+        memory: Memory::Off,
+        kernels,
+        ..host()
+    };
+    let (sum, log, fails) = TinySum::with_faults(ctx);
+    let mut rank = Rank::open_device::<TinyDevice>(plan, &settings, NullTransport)
+        .unwrap()
+        .with_grid(Some(Box::new(sum)))
+        .unwrap();
+    rank.launching(Launching {
+        graphs: true,
+        pdl: false,
+    });
+    (rank, log, fails)
 }
 
 fn ranked_plan(buffers: Vec<usize>, entry: &'static str) -> Plan {
@@ -798,7 +789,21 @@ fn retire_partial_bind() {
     assert!(pos(&ev, "finish_ok") < pos(&ev, "drop_graph:"));
     assert!(pos(&ev, "drop_graph:") < pos(&ev, &free0));
     assert!(matches!(runner.submit(0..2), Err(RunError::Inconsistent)));
+    let data = tessera_mem::Tensor::f32(vec![16], vec![1.5; 16]);
+    for slot in [Slot::floats(0, 16), Slot::floats(1, 16)] {
+        assert_eq!(runner.address(slot), None);
+        assert!(matches!(runner.read(slot), Err(RunError::Inconsistent)));
+        assert!(matches!(
+            runner.write(slot, data.view()),
+            Err(RunError::Inconsistent)
+        ));
+    }
     runner.replan(&p1).unwrap();
+    for slot in [Slot::floats(0, 16), Slot::floats(1, 16)] {
+        assert!(runner.address(slot).is_some());
+        runner.write(slot, data.view()).unwrap();
+        assert_eq!(runner.read(slot).unwrap().floats().unwrap(), &[1.5; 16]);
+    }
     runner.submit(0..2).unwrap();
 }
 
@@ -807,19 +812,7 @@ fn retire_pause_error() {
     let (_g, ctx) = lock_ctx();
     let p1 = ranked_plan(vec![64, 64], "rp_k");
     let p2 = ranked_plan(vec![65_536, 64], "rp_k");
-    let settings = Settings {
-        memory: Memory::Off,
-        ..host()
-    };
-    let (sum, _, fails) = TinySum::with_faults(ctx);
-    let mut rank = Rank::open_device::<TinyDevice>(p1, &settings, NullTransport)
-        .unwrap()
-        .with_grid(Some(Box::new(sum)))
-        .unwrap();
-    rank.launching(Launching {
-        graphs: true,
-        pdl: false,
-    });
+    let (mut rank, _, fails) = open_rank(ctx, p1, None);
     rank.submit(0..2).unwrap();
     let old0 = rank.address(Slot::floats(0, 16)).unwrap();
     ctx.take_events();
@@ -832,6 +825,16 @@ fn retire_pause_error() {
     assert!(!ev.iter().any(|e| e.starts_with("free:")));
     assert!(ctx.is_live(old0));
     assert!(matches!(rank.submit(0..2), Err(RunError::Inconsistent)));
+    let data = tessera_mem::Tensor::f32(vec![16], vec![2.5; 16]);
+    assert_eq!(rank.address(Slot::floats(0, 16)), None);
+    assert!(matches!(
+        rank.read(Slot::floats(0, 16)),
+        Err(RunError::Inconsistent)
+    ));
+    assert!(matches!(
+        rank.write(Slot::floats(0, 16), data.view()),
+        Err(RunError::Inconsistent)
+    ));
     // Retry replan once pause recovers.
     rank.replan(&p2).unwrap();
     let ev = ctx.take_events();
@@ -840,21 +843,19 @@ fn retire_pause_error() {
     assert!(pos(&ev, "finish_ok") < pos(&ev, "drop_graph:"));
     assert!(pos(&ev, "drop_graph:") < pos(&ev, &free0));
     assert!(!ctx.is_live(old0));
+    rank.write(Slot::floats(0, 16), data.view()).unwrap();
+    assert_eq!(
+        rank.read(Slot::floats(0, 16)).unwrap().floats().unwrap(),
+        &[2.5; 16]
+    );
     rank.submit(0..2).unwrap();
 }
 
 #[test]
 fn retire_finish_error() {
     let (_g, ctx) = lock_ctx();
-    let p1 = make_plan(
-        vec![64],
-        vec![make_step(plain_kernel("f", "f_k", None), 0, 16)],
-    );
-    let p2 = make_plan(
-        vec![65_536],
-        vec![make_step(plain_kernel("f", "f_k", None), 0, 16)],
-    );
-    let mut runner = open_runner(p1, true);
+    let mut runner = open_runner(one_plan(64, "f", "f_k"), true);
+    let p2 = one_plan(65_536, "f", "f_k");
     runner.submit(0..1).unwrap();
     let old0 = runner.address(Slot::floats(0, 16)).unwrap();
     ctx.take_events();
@@ -881,21 +882,8 @@ fn override_pause_retry() {
     let (_g, ctx) = lock_ctx();
     let dir = tessera_testkit::scratch(&format!("pause-retry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let plan = ranked_plan(vec![64, 64], "pr_k");
-    let settings = Settings {
-        memory: Memory::Off,
-        kernels: Some(dir.clone()),
-        ..host()
-    };
-    let (sum, log, fails) = TinySum::with_faults(ctx);
-    let mut rank = Rank::open_device::<TinyDevice>(plan, &settings, NullTransport)
-        .unwrap()
-        .with_grid(Some(Box::new(sum)))
-        .unwrap();
-    rank.launching(Launching {
-        graphs: true,
-        pdl: false,
-    });
+    let (mut rank, log, fails) =
+        open_rank(ctx, ranked_plan(vec![64, 64], "pr_k"), Some(dir.clone()));
     rank.submit(0..2).unwrap();
     let (_, _, c0, cap0, _) = ctx.stats_snapshot();
     // Edit file, fail pause once, retry without touching disk.
@@ -934,12 +922,7 @@ fn sizer_guard_order() {
     }
     const { assert!(!Check::<sizer::SizerGuard>::IS_SEND) };
     const { assert!(Check::<sizer::Scope>::IS_SEND) };
-    let sized = |bytes| {
-        make_plan(
-            vec![bytes],
-            vec![make_step(plain_kernel("s", "s_k", None), 0, 16)],
-        )
-    };
+    let sized = |bytes| one_plan(bytes, "s", "s_k");
     // Out-of-order drop: dropping outer never clobbers or resurrects.
     let outer = sizer::sizing();
     let inner = sizer::sizing();
@@ -961,4 +944,37 @@ fn sizer_guard_order() {
     assert!(outer.sized().scratch >= 1024);
     drop(outer);
     assert!(!sizer::counting());
+}
+
+#[test]
+fn drop_retains_unquiesced() {
+    let (_g, ctx) = lock_ctx();
+    let mut runner = open_runner(one_plan(64, "d", "d_k"), true);
+    let p2 = one_plan(65_536, "d", "d_k");
+    runner.submit(0..1).unwrap();
+    let old0 = runner.address(Slot::floats(0, 16)).unwrap();
+    ctx.take_events();
+    ctx.fail_finish(2);
+    assert!(runner.replan(&p2).is_err());
+    drop(runner);
+    let ev = ctx.take_events();
+    assert_eq!(ev.iter().filter(|e| *e == "finish_err").count(), 2);
+    assert!(!ev.iter().any(|e| e.starts_with("drop_graph:")));
+    assert!(!ev.iter().any(|e| e.starts_with("free:")));
+    assert!(ctx.is_live(old0));
+    // Persistent rank drop also retains resources when pause fails.
+    let rp1 = ranked_plan(vec![64, 64], "dp_k");
+    let rp2 = ranked_plan(vec![65_536, 64], "dp_k");
+    let (mut rank, _, fails) = open_rank(ctx, rp1, None);
+    rank.submit(0..2).unwrap();
+    let r_old = rank.address(Slot::floats(0, 16)).unwrap();
+    ctx.take_events();
+    fails.lock().unwrap().extend([false, true, true]);
+    assert!(rank.replan(&rp2).is_err());
+    drop(rank);
+    let ev = ctx.take_events();
+    assert_eq!(ev.iter().filter(|e| *e == "pause_err").count(), 2);
+    assert!(!ev.iter().any(|e| e.starts_with("drop_graph:")));
+    assert!(!ev.iter().any(|e| e.starts_with("free:")));
+    assert!(ctx.is_live(r_old));
 }

@@ -2,6 +2,7 @@
 
 use super::{Runner, device_buf};
 use crate::Error;
+use crate::cache::Lru;
 use crate::kernels;
 use crate::marks;
 use crate::overrides::{self, Pending, Ready};
@@ -14,6 +15,48 @@ use std::ops::Range;
 use std::time::Instant;
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
+
+impl<D: Device> Runner<D> {
+    /// Retains owned handles when teardown cannot quiesce.
+    pub(crate) fn retain(&mut self) {
+        std::mem::forget(std::mem::replace(&mut self.graphs, Lru::new(0)));
+        std::mem::forget(std::mem::take(&mut self.evicted));
+        std::mem::forget(std::mem::take(&mut self.retired));
+        std::mem::forget(std::mem::take(&mut self.base.held));
+        std::mem::forget(self.ledger.take());
+        std::mem::forget(self.stamps.take());
+        std::mem::forget(self.pager.take());
+        std::mem::forget(std::mem::take(&mut self.kv));
+        std::mem::forget(self.grid.get_mut().take());
+    }
+}
+
+impl<D: Device> Drop for Runner<D> {
+    fn drop(&mut self) {
+        let live = !self.graphs.is_empty()
+            || !self.evicted.is_empty()
+            || !self.retired.is_empty()
+            || self.base.held.total() > 0
+            || self.ledger.is_some()
+            || self.stamps.is_some()
+            || self.pager.is_some()
+            || self.kv.stage.is_some()
+            || self.kv.host.is_some()
+            || self.grid.get_mut().is_some();
+        if !live {
+            return;
+        }
+        if self.ctx.finish().is_err() {
+            self.retain();
+            return;
+        }
+        // Drop captured graphs and grid before buffers.
+        self.graphs.clear();
+        self.evicted.clear();
+        self.retired.clear();
+        let _ = self.grid.get_mut().take();
+    }
+}
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     /// Each step's seconds by waiting, or `None` when stamped.

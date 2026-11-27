@@ -196,6 +196,7 @@ pub trait Run {
         page: usize,
         dst: &mut [u8],
     ) -> Result<bool, Error> {
+        self.check_ready()?;
         if phys.is_empty() {
             return Ok(true);
         }
@@ -215,6 +216,7 @@ pub trait Run {
 
     /// Uploads `phys` physical KV pages packed in `src`.
     fn upload_kept_pages(&mut self, phys: &[u32], page: usize, src: &[u8]) -> Result<bool, Error> {
+        self.check_ready()?;
         if phys.is_empty() {
             return Ok(true);
         }
@@ -340,11 +342,13 @@ pub trait Run {
 
     /// Uploads packed bytes for `weight` into `slot`.
     fn upload_weight(&mut self, _weight: u32, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        self.check_ready()?;
         self.held_mut().upload(slot, bytes)
     }
 
     /// Uploads a weight as stored, widened where a slot differs.
     fn load_weight(&mut self, weight: u32, w: &Weight) -> Result<(), Error> {
+        self.check_ready()?;
         let (form, bytes) = match w {
             Weight::Floats(t) => return self.load(weight, t.view()),
             Weight::Packed(form, bytes) => (form, bytes),
@@ -406,6 +410,7 @@ pub trait Run {
 
     /// Uploads one weight already in its form's bytes.
     fn load_packed(&mut self, weight: u32, bytes: &[u8]) -> Result<(), Error> {
+        self.check_ready()?;
         let slots: Vec<Slot> = (self.plan().weights.iter())
             .filter(|l| l.weight == weight)
             .map(|l| l.slot)
@@ -422,8 +427,14 @@ pub trait Run {
         Ok(())
     }
 
+    /// Fails when an incomplete replan left this runner inconsistent.
+    fn check_ready(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
+        self.check_ready()?;
         let plain = slot.form.block() == 1
             && src.dtype() == slot.form.dtype()
             && slot.form.bytes(1) == src.dtype().bytes();
@@ -436,6 +447,7 @@ pub trait Run {
 
     /// The slot's values on the host, as one row.
     fn read(&self, slot: Slot) -> Result<Tensor, Error> {
+        self.check_ready()?;
         if !slot.form.narrow() {
             return Ok(self.held().view(slot).to_tensor()?);
         }
@@ -444,6 +456,7 @@ pub trait Run {
     }
 
     fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
+        self.check_ready()?;
         Ok(self.held().view(slot).to_u32()?)
     }
 
@@ -455,6 +468,7 @@ pub trait Run {
 
     /// Uploads one graph weight, or this rank's slice.
     fn load(&mut self, weight: u32, data: View) -> Result<(), Error> {
+        self.check_ready()?;
         let split = |l: &Loaded| l.weight == weight && l.part.is_some();
         if self.plan().weights.iter().any(split) {
             let (form, why) = ("floats", "a split weight takes its file");
@@ -475,6 +489,7 @@ pub trait Run {
     }
 
     fn feed(&mut self, inputs: &[View]) -> Result<(), Error> {
+        self.check_ready()?;
         let slots = self.plan().inputs.clone();
         if inputs.len() != slots.len() {
             return Err(Error::InputCount);

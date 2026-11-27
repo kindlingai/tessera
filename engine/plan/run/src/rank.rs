@@ -124,6 +124,7 @@ pub(crate) trait RankRun: Run {
         sum: &mut (dyn Sum + 'static),
     ) -> Result<Option<usize>, Error>;
     fn finish_device(&self) -> Result<(), Error>;
+    fn retain(&mut self);
 }
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::device::Runner<D> {
@@ -152,6 +153,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::devi
 
     fn finish_device(&self) -> Result<(), Error> {
         self.finish_ctx()
+    }
+
+    fn retain(&mut self) {
+        crate::device::Runner::retain(self);
     }
 }
 
@@ -279,8 +284,13 @@ pub struct Rank<T: Transport> {
 impl<T: Transport> Drop for Rank<T> {
     fn drop(&mut self) {
         // Stop any live persistent grid before dropping device buffers.
-        if let Some(grid) = &mut self.grid {
-            let _ = grid.pause();
+        if let Some(grid) = &mut self.grid
+            && grid.pause().is_err()
+        {
+            if let Inner::Device(dev) = &mut self.runner {
+                dev.retain();
+            }
+            std::mem::forget(self.grid.take());
         }
     }
 }
@@ -624,6 +634,10 @@ impl<T: Transport> Run for Rank<T> {
     /// Queues steps without trailing sync when using a device grid.
     fn queue(&mut self, steps: Range<usize>) -> Result<(), Error> {
         self.run_steps(steps, false)
+    }
+
+    fn check_ready(&self) -> Result<(), Error> {
+        self.runner.run().check_ready()
     }
 
     fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {

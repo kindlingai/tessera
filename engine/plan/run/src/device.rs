@@ -100,18 +100,6 @@ fn device_buf<D: Device>(buf: &Buffer) -> &DeviceBuffer<D> {
         .expect("this runner allocates device buffers")
 }
 
-impl<D: Device> Drop for Runner<D> {
-    fn drop(&mut self) {
-        if !self.graphs.is_empty() || !self.evicted.is_empty() || !self.retired.is_empty() {
-            let _ = self.ctx.finish();
-        }
-        // Drop captured graphs before any retired or bound buffers.
-        self.graphs.clear();
-        self.evicted.clear();
-        self.retired.clear();
-    }
-}
-
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
@@ -875,7 +863,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.base.profile.as_mut().map(std::mem::take)
     }
 
+    fn check_ready(&self) -> Result<(), Error> {
+        Runner::check_ready(self)
+    }
+
     fn address(&self, slot: Slot) -> Option<u64> {
+        Runner::check_ready(self).ok()?;
         Some(self.buffer(slot).device_ptr() + slot.at(0) as u64)
     }
 

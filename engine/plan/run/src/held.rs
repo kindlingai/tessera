@@ -372,7 +372,7 @@ impl Held {
         for &(index, slot) in &plan.kept {
             kept[slot.buffer as usize].push((index, slot.start()));
         }
-        self.bound.clear();
+        let mut bound = Vec::with_capacity(count);
         let mut seen: HashMap<u32, usize> = HashMap::new();
         for (b, &bytes) in plan.buffers.iter().enumerate() {
             let zone = plan.zone(b as u32);
@@ -390,8 +390,9 @@ impl Held {
                 *slot += 1;
                 self.bind_scratch(zone, idx, bytes, &mut alloc, retired)?
             };
-            self.bound.push(at);
+            bound.push(at);
         }
+        self.bound = bound;
         self.compact(retired);
         self.kept_spans.clear();
         for p in self.kept.values() {
