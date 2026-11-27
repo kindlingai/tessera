@@ -26,7 +26,7 @@ impl Dense for Linear {
 }
 
 /// exlr8 rotates in blocks of this many channels.
-const ROTATION: u32 = 128;
+pub(crate) const ROTATION: u32 = 128;
 
 /// A matrix between two rotations.
 pub struct Rotated {
@@ -43,6 +43,39 @@ impl Weights for Rotated {
             svh: part(m, path, "svh", &shape[1..]),
         }
     }
+}
+
+/// Concatenates `lead` axes with `tail`.
+pub(crate) fn cat<const N: usize>(lead: &[DimExpr], tail: [DimExpr; N]) -> Vec<DimExpr> {
+    lead.iter().cloned().chain(tail).collect()
+}
+
+/// `n` items at `name` and each index under `path`.
+pub(crate) fn each_part<T>(
+    path: &mut Vec<PathSeg>,
+    name: &str,
+    n: usize,
+    mut make: impl FnMut(&mut Vec<PathSeg>) -> T,
+) -> Vec<T> {
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        path.push(PathSeg::Field(name.into()));
+        path.push(PathSeg::Index(i as u32));
+        items.push(make(path));
+        path.truncate(path.len() - 2);
+    }
+    items
+}
+
+/// `n` items of `T` under `path`, each declared with `shape`.
+pub(crate) fn declare_parts<T: Weights>(
+    m: &Model,
+    path: &mut Vec<PathSeg>,
+    name: &str,
+    n: usize,
+    shape: &[DimExpr],
+) -> Vec<T> {
+    each_part(path, name, n, |p| T::declare(m, p, shape))
 }
 
 /// Field `name` under `path`, declared with `shape`.
