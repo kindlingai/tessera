@@ -42,7 +42,6 @@ fn rates_round_trip() {
     };
     let rs = |start| {
         let k = tessera_lower::kernels::ReduceScatter {
-            len: 512,
             start,
             total: 1024,
             wire: tessera_mem::DType::Bf16,
