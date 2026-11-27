@@ -19,7 +19,7 @@ using ptr_smem = trellis::stage_smem<float[128]>;
 
 template <u32 K, u32 BOOK, bool TURNED>
 static __device__ __forceinline__ void ptr_body(
-    const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
+    const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 post, ptr_smem& sm) {
     constexpr u32 TB = 32u * K;
@@ -47,7 +47,7 @@ static __device__ __forceinline__ void ptr_body(
     trellis::blk_load<K>(gb, tid, aligned, nw);
     trellis::word_map wm = trellis::map_word<K>(lane);
     float acc[1][4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    const float* xr = x + u64(r / repeat) * k;
+    const trellis::x_t* xr = x + u64(r / repeat) * k;
     const float* sur = TURNED ? (su + u64(e) * k) : nullptr;
     for (u32 c0 = 0u; c0 < blk_per; c0 += CHUNK) {
         u32 nb = min(CHUNK, blk_per - c0);
@@ -55,7 +55,7 @@ static __device__ __forceinline__ void ptr_body(
         if (j < nb) {
             u32 col = ((c0 + j) << 7u) + (lane << 2u);
             float v[4];
-            trellis::load4(xr + col, v);
+            trellis::load_x4(xr + col, v);
             if constexpr (TURNED) {
                 float sc[4];
                 trellis::load4(sur + col, sc);
@@ -118,7 +118,7 @@ static __device__ __forceinline__ void ptr_body(
 
 template <u32 K, u32 BOOK>
 static __device__ __noinline__ void ptr_run_k(
-    const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
+    const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 turned, u32 post, ptr_smem& sm) {
     if (turned != 0u) {
@@ -132,7 +132,7 @@ static __device__ __noinline__ void ptr_run_k(
 
 template <u32 BOOK>
 static __device__ void ptr_run_book(
-    const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
+    const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 bits, u32 turned, u32 post, ptr_smem& sm) {
     if (bits == 2u) {
@@ -149,7 +149,7 @@ static __device__ void ptr_run_book(
 
 // Fast specialized PMCGX K3 rotated picked expert matmul.
 extern "C" __global__ __launch_bounds__(256, PTR_K3_MIN_BLOCKS) void ptr_k3_pmcgx_t(
-    const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
+    const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 bits, u32 book, u32 turned, u32 post) {
     (void)bits;
@@ -162,7 +162,7 @@ extern "C" __global__ __launch_bounds__(256, PTR_K3_MIN_BLOCKS) void ptr_k3_pmcg
 
 // Generic picked trellis expert matmul (K2/K3/K4, MCG/MUL1/PMCGX).
 extern "C" __global__ __launch_bounds__(256, PTR_GEN_MIN_BLOCKS) void ptr_gen(
-    const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
+    const trellis::x_t* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 bits, u32 book, u32 turned, u32 post) {
     __shared__ ptr_smem sm;

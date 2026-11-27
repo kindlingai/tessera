@@ -18,12 +18,23 @@ pub struct Dense {
     pub k: usize,
     pub bits: u32,
     pub book: u32,
+    pub x_bf16: bool,
     pub form: &'static dyn Stored,
 }
 
 impl Dense {
     /// The trellis matmul at `at`, or why it cannot lower.
     pub fn find(tree: &Tree, at: T, block: usize) -> Option<Result<Self, String>> {
+        Self::find_with(tree, at, block, false)
+    }
+
+    /// As `find`, allowing bf16 activation inputs when `allow_bf16`.
+    pub fn find_with(
+        tree: &Tree,
+        at: T,
+        block: usize,
+        allow_bf16: bool,
+    ) -> Option<Result<Self, String>> {
         let node = tree.node(at);
         let rotated = tree.site::<Rotated>(at);
         let (x, w, turn) = match rotated {
@@ -34,7 +45,7 @@ impl Dense {
         if !tree.node(w).form.name().starts_with("trellis") {
             return None;
         }
-        Some(Self::check(tree, at, [x, w], turn, block))
+        Some(Self::check(tree, at, [x, w], turn, block, allow_bf16))
     }
 
     fn check(
@@ -43,6 +54,7 @@ impl Dense {
         [x, w]: [T; 2],
         turn: Option<[T; 2]>,
         block: usize,
+        allow_bf16: bool,
     ) -> Result<Self, String> {
         let f32_form = |t: T| tree.node(t).form.name() == "f32";
         if !f32_form(at) {
@@ -66,10 +78,12 @@ impl Dense {
                 ));
             }
         }
-        if !f32_form(x) {
-            let name = tree.node(x).form.name();
-            return Err(format!("input form {name} (requires f32)"));
-        }
+        let x_name = tree.node(x).form.name();
+        let x_bf16 = match x_name {
+            "f32" => false,
+            "bf16" if allow_bf16 => true,
+            _ => return Err(format!("input form {x_name} (requires f32)")),
+        };
         let m = tree.elements(x) / k;
         if m == 0 {
             return Err("m=0".into());
@@ -91,6 +105,7 @@ impl Dense {
             k,
             bits,
             book,
+            x_bf16,
             form,
         })
     }

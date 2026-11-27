@@ -1,6 +1,8 @@
 //! Stacked BF16 matmul and optional RoPE tail fusion.
 
-use super::{THREADS, WARPS, WIDE_COLS, WIDE_THREADS, cuda_needs, cuda_source_with, trip};
+use super::{
+    THREADS, WARPS, WIDE_COLS, WIDE_THREADS, cuda_needs, cuda_source_with, trip, x_accepts, x_defs,
+};
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
 use tessera_graph::{DType, DimExpr, Op, Order, Pairs, Stage, View};
@@ -75,6 +77,7 @@ pub(crate) struct FastStacked {
     pub tiled64_min_rows: usize,
     pub min_blocks: Option<u32>,
     pub rope: Option<RopeTail>,
+    pub x_bf16: bool,
     pub form: &'static dyn Stored,
 }
 
@@ -104,6 +107,7 @@ impl FastStacked {
 
 fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
     match input {
+        0 => x_accepts(k.x_bf16, form),
         1 => form.name() == k.form.name(),
         3 => form.name() == "u32",
         _ => form.name() == "f32",
@@ -111,19 +115,20 @@ fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
 }
 
 pub(crate) fn stacked_needs(k: &FastStacked) -> Needs {
+    let xp = if k.x_bf16 { 1 } else { 2 };
     if k.tiled_64() {
         return Needs {
             bf16_tile: true,
-            ..cuda_needs(64 * 18 * 4 * 2 + 64 * 40 * 2)
+            ..cuda_needs(64 * 18 * 4 * xp + 64 * 40 * 2)
         };
     }
     if !(k.wide || k.lanes_tc()) {
         return cuda_needs(0);
     }
     let group_bytes = if k.wide {
-        16 * 18 * 8 + 32 * 34 * 2
+        16 * 18 * 4 * xp + 32 * 34 * 2
     } else {
-        4 * 24 * 36 * 4
+        (xp * 2 * 16 * 36 + 4 * 8 * 36) * 4
     };
     Needs {
         group_threads: WIDE_THREADS,
@@ -136,23 +141,29 @@ pub(crate) fn stacked_source_for(k: &FastStacked) -> Source {
     match (k.wide, k.tiled_64(), k.lanes_tc()) {
         (true, true, _) => stacked_source_with(
             "tessera_stacked_wide_64",
-            k.min_blocks.map(|v| ("ST_WIDE64_BLK", v as usize)),
+            x_defs(
+                k.min_blocks.map(|v| ("ST_WIDE64_BLK", v as usize)),
+                k.x_bf16,
+            ),
         ),
         (false, true, _) => stacked_source_with(
             "tessera_stacked_lanes_64",
-            k.min_blocks.map(|v| ("ST_LANES64_BLK", v as usize)),
+            x_defs(
+                k.min_blocks.map(|v| ("ST_LANES64_BLK", v as usize)),
+                k.x_bf16,
+            ),
         ),
         (true, false, _) => stacked_source_with(
             "tessera_stacked_wide",
-            k.min_blocks.map(|v| ("ST_WIDE_BLK", v as usize)),
+            x_defs(k.min_blocks.map(|v| ("ST_WIDE_BLK", v as usize)), k.x_bf16),
         ),
         (false, false, true) => cuda_source_with(
             "tessera_stacked_lanes_tc",
-            k.min_blocks.map(|v| ("ST_TC_BLK", v as usize)),
+            x_defs(k.min_blocks.map(|v| ("ST_TC_BLK", v as usize)), k.x_bf16),
         ),
         (false, false, false) => cuda_source_with(
             "tessera_stacked_lanes",
-            k.min_blocks.map(|v| ("ST_LANES_BLK", v as usize)),
+            x_defs(k.min_blocks.map(|v| ("ST_LANES_BLK", v as usize)), k.x_bf16),
         ),
     }
 }
@@ -199,9 +210,10 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
         )
     };
     trip_ops.fresh = f64::from(u8::from(tiled || tc));
+    let x_elem = if k.x_bf16 { 2 } else { 4 };
     let mut reads = vec![
         (2 * k.batches * rtiles * k.n * k.k) as f64,
-        (4 * k.batches * k.rows * k.k) as f64,
+        (x_elem * k.batches * k.rows * k.k) as f64,
     ];
     if let Some(r) = k.rope {
         reads.push((4 * k.batches * k.rows * r.width) as f64);
@@ -300,8 +312,9 @@ fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
 }
 
 fn peel_input(tree: &Tree, x: T, batches: usize, rows: usize, k: usize) -> (T, [usize; 2]) {
+    let want = tree.node(x).form.name();
     let is_swap = |t: T| matches!(&tree.node(t).term, Term::Op(Op::View(View::Permute(p))) if p[..] == [1, 0, 2]);
-    if !is_swap(x) || tree.root(x) || tree.node(tree.node(x).args[0]).form.name() != "f32" {
+    if !is_swap(x) || tree.root(x) || tree.node(tree.node(x).args[0]).form.name() != want {
         return (x, [rows * k, k]);
     }
     let inner = tree.node(x).args[0];
@@ -318,7 +331,7 @@ fn peel_input(tree: &Tree, x: T, batches: usize, rows: usize, k: usize) -> (T, [
         if let &[r, b, fk] = tree.node(base).shape.as_slice()
             && (r, b) == (rows, batches)
             && fk.is_multiple_of(4)
-            && tree.node(base).form.name() == "f32"
+            && tree.node(base).form.name() == want
         {
             return (base, [fk, batches * fk]);
         }
@@ -447,12 +460,19 @@ pub(crate) fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, Str
     if xb != batches || xk != k || rows == 0 {
         return None;
     }
-    if [outer.form, node.form, tree.node(x).form]
-        .iter()
-        .any(|f| f.name() != "f32")
-    {
-        return Some(Err("stacked requires f32 input and output".into()));
+    if outer.form.name() != "f32" || node.form.name() != "f32" {
+        return Some(Err("stacked requires f32 output".into()));
     }
+    let x_name = tree.node(x).form.name();
+    let x_bf16 = match x_name {
+        "f32" => false,
+        "bf16" => true,
+        _ => {
+            return Some(Err(format!(
+                "stacked input form {x_name} (requires f32 or bf16)"
+            )));
+        }
+    };
     let wide =
         matches!(&tree.node(w).term, Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]);
     if rope_match.is_some() && !wide {
@@ -531,6 +551,7 @@ pub(crate) fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, Str
         tiled64_min_rows,
         min_blocks: None,
         rope,
+        x_bf16,
         form,
     };
     let blk_knob = match (wide, k.tiled_64(), k.lanes_tc()) {

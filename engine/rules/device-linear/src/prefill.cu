@@ -78,7 +78,8 @@ static __device__ __forceinline__ void dtr_run_mma(const u32* wtiles, const u32*
 }
 
 // Rotates and quantizes dense inputs once per 64x128 block.
-extern "C" __global__ __launch_bounds__(256, DTR_PREP_BLK) void dtr_prep(const float* x, const float* suh,
+extern "C" __global__ __launch_bounds__(256, DTR_PREP_BLK) void dtr_prep(const trellis::x_t* x,
+                                                              const float* suh,
                                                               float* out, u32 m, u32 k,
                                                               u32 turned) {
     u32 c0 = blockIdx.x, rt = blockIdx.y, r0 = rt << 6u;
@@ -93,7 +94,7 @@ extern "C" __global__ __launch_bounds__(256, DTR_PREP_BLK) void dtr_prep(const f
         u32 r = (ti << 3u) + j;
         float v[4] = {};
         if (r < nr) {
-            trellis::load4(x + u64(r0 + r) * k + col, v);
+            trellis::load_x4(x + u64(r0 + r) * k + col, v);
             if (turned != 0u) {
                 v[0] *= sc[0]; v[1] *= sc[1]; v[2] *= sc[2]; v[3] *= sc[3];
                 trellis::wht128(v, trellis::INV_SQRT128);
@@ -265,14 +266,14 @@ static __device__ __forceinline__ float mx8_epilogue(float v, const float* other
 
 // Quantizes X[m, k] once to packed E4M3 and UE8M0 scales.
 extern "C" __global__ __launch_bounds__(256, MM_PREP_BLK) void tessera_mm_mxfp8_prep(
-    const float* x, float* out, u32 m, u32 k) {
+    const trellis::x_t* x, float* out, u32 m, u32 k) {
 #if DTR_MX8
     u32 blk = blockIdx.x * 32u + (threadIdx.x >> 3u);
     u32 row = blockIdx.y;
     u32 nblk = k >> 5u;
     if (row >= m || blk >= nblk) return;
     u32 sub = threadIdx.x & 7u;
-    float4 v = *reinterpret_cast<const float4*>(x + u64(row) * k + (blk << 5u) + (sub << 2u));
+    float4 v = trellis::load_x4(x + u64(row) * k + (blk << 5u) + (sub << 2u));
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4u));
     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2u));

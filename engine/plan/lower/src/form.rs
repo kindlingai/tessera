@@ -166,7 +166,7 @@ impl Pins {
     pub fn at(&self, label: &str) -> Pins {
         let mut out = Pins {
             sites: self.sites.clone(),
-            named: Vec::new(),
+            named: self.named.clone(),
             spots: Vec::new(),
             ..*self
         };
@@ -339,7 +339,7 @@ pub(crate) fn in_scope(at: &str, label: &str) -> bool {
         None => part.parse() == Ok(k),
     };
     let tails = match (at_tail, tail) {
-        (None, None) => true,
+        (None, _) => true,
         (Some(a), Some(t)) => matches(a, t),
         _ => false,
     };

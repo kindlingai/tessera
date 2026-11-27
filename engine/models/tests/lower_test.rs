@@ -437,6 +437,28 @@ fn spot_pins_stay() {
         ["bf16", "bf16", "f32", "f32", "bf16", "bf16"],
         "{forms:?}"
     );
+    // Scoped --dtype preserves per-weight named pins and covers layer sub-blocks.
+    let mut recipe = Recipe {
+        pins: Pins::all(BF16_FORM).pin("*.norm*", tessera_lower::form::F32_FORM),
+        ..Default::default()
+    };
+    recipe
+        .dtype
+        .push(tessera_lower::Dtype::parse("layer.0@norm=bf16").unwrap());
+    recipe.settle();
+    let l0 = recipe.pins.at("layer.0.attention");
+    assert_eq!(
+        l0.site_form(tessera_lower::Site::Norm).map(|f| f.name()),
+        Some("bf16")
+    );
+    assert_eq!(
+        l0.form(&[
+            tessera_graph::PathSeg::Field("layer".into()),
+            tessera_graph::PathSeg::Field("norm".into()),
+        ])
+        .name(),
+        "f32"
+    );
 }
 
 /// Spot wires pin the sums of the named layers only.

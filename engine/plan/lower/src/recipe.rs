@@ -1,8 +1,9 @@
 //! The choices lowering takes, as data a search can edit.
 
-use crate::form::{Load, Pins, Site, in_scope, matches, named};
+use crate::form::{Load, Pins, Site, Spot, in_scope, matches, named};
 use crate::rule::{Rule, gather};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use tessera_codegen::kept::{self, Layout};
@@ -286,15 +287,41 @@ enum Set {
     Operand(Compute),
 }
 
-/// One `[path][@spot][:property]=dtype` override.
+/// One `[scope][@spot][:property]=dtype` override.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "(String, String)", into = "(String, String)")]
 pub struct Dtype {
     spot: String,
     value: String,
-    /// A pattern over weight paths. Empty fits every spot.
+    /// A region scope or weight path pattern. Empty fits all.
     path: String,
     set: Set,
+}
+
+fn is_region_label(pat: &str) -> bool {
+    matches!(pat, "head" | "tail" | "layer") || pat.starts_with("layer.")
+}
+
+fn is_region_scope(pat: &str) -> bool {
+    pat == "*" || pat.starts_with("*.") || is_region_label(pat)
+}
+
+fn push_spot(pins: &mut Pins, at: &str, set: Set) {
+    let mut spot = Spot {
+        at: at.into(),
+        activations: None,
+        kept: None,
+        sites: BTreeMap::new(),
+    };
+    match set {
+        Set::Activations(form) => spot.activations = Some(form),
+        Set::Site(site, form) => {
+            spot.sites.insert(site, form);
+        }
+        Set::Kept(form) => spot.kept = Some(form),
+        _ => return,
+    }
+    pins.spots.push(spot);
 }
 
 fn store(value: &str) -> Result<&'static dyn Load, String> {
@@ -349,8 +376,17 @@ impl Dtype {
             },
             _ => return Err(format!("`{spot}` names no dtype a rule can set")),
         };
-        if !path.is_empty() && !matches!(set, Set::Wire(_)) {
-            return Err(format!("`{spot}`: only sum wires take a path"));
+        if !path.is_empty() {
+            match set {
+                Set::Outputs(_) => {
+                    return Err(format!("`{spot}`: output dtype cannot take a scope"));
+                }
+                Set::Wire(_) => {}
+                _ if !is_region_scope(path) => {
+                    return Err(format!("`{spot}`: invalid region scope `{path}`"));
+                }
+                _ => {}
+            }
         }
         Ok(Self {
             spot: spot.into(),
@@ -370,22 +406,55 @@ impl Dtype {
 
     /// Sets this rule's dtype in `recipe`.
     fn apply(&self, recipe: &mut Recipe) {
-        let pins = std::mem::take(&mut recipe.pins);
-        recipe.pins = match self.set {
-            Set::Activations(form) => pins.activations(form),
-            Set::Site(site, form) => pins.site(site, form),
-            Set::Kept(form) => pins.kept(form),
-            Set::Outputs(form) => pins.outputs(form),
-            Set::Wire(_) | Set::Operand(_) => pins,
-        };
+        if self.path.is_empty() {
+            let pins = std::mem::take(&mut recipe.pins);
+            let has_spots = !pins.spots.is_empty();
+            recipe.pins = match self.set {
+                Set::Activations(form) => pins.activations(form),
+                Set::Site(site, form) => pins.site(site, form),
+                Set::Kept(form) => pins.kept(form),
+                Set::Outputs(form) => pins.outputs(form),
+                Set::Wire(_) | Set::Operand(_) => pins,
+            };
+            if has_spots {
+                push_spot(&mut recipe.pins, "*", self.set.clone());
+            }
+            match self.set {
+                Set::Wire(wire) => {
+                    recipe.sums.all = Some(wire);
+                    recipe.sums.named.push(("*".into(), wire));
+                    if !recipe.sums.spots.is_empty() {
+                        recipe.sums.spots.push(("*".into(), wire));
+                    }
+                }
+                Set::Operand(compute) => {
+                    recipe.compute = compute;
+                    if recipe.scoped.iter().any(|s| s.compute.is_some()) {
+                        recipe.scoped.push(Scoped {
+                            at: "*".into(),
+                            compute: Some(compute),
+                            ..Default::default()
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match self.set {
-            Set::Wire(wire) if self.path.is_empty() => {
-                recipe.sums.all = Some(wire);
-                recipe.sums.named.push(("*".into(), wire));
+            Set::Activations(_) | Set::Site(_, _) | Set::Kept(_) => {
+                push_spot(&mut recipe.pins, &self.path, self.set.clone());
+            }
+            Set::Wire(wire) if is_region_label(&self.path) => {
+                recipe.sums.spots.push((self.path.clone(), wire));
             }
             Set::Wire(wire) => recipe.sums.named.push((self.path.clone(), wire)),
-            Set::Operand(compute) => recipe.compute = compute,
-            _ => {}
+            Set::Operand(compute) => recipe.scoped.push(Scoped {
+                at: self.path.clone(),
+                compute: Some(compute),
+                ..Default::default()
+            }),
+            Set::Outputs(_) => {}
         }
     }
 }

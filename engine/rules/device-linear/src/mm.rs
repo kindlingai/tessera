@@ -2,6 +2,7 @@
 
 use super::{
     CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, prefill_source_with, weight_accepts,
+    weight_x_accepts, x_accepts, x_defs,
 };
 mod mx8;
 
@@ -59,10 +60,13 @@ impl MmKind {
         }
     }
 
-    fn source(self, min_blocks: Option<u32>) -> tessera_lower::Source {
+    fn source(self, min_blocks: Option<u32>, x_bf16: bool) -> tessera_lower::Source {
         match mm_blk_def(self) {
-            None => int4_source_with(self.entry(), None::<(&str, usize)>),
-            Some(def) => cuda_source_with(self.entry(), min_blocks.map(|v| (def, v as usize))),
+            None => int4_source_with(self.entry(), x_defs(None, x_bf16)),
+            Some(def) => cuda_source_with(
+                self.entry(),
+                x_defs(min_blocks.map(|v| (def, v as usize)), x_bf16),
+            ),
         }
     }
 
@@ -76,10 +80,11 @@ impl MmKind {
         }
     }
 
-    fn smem(self) -> usize {
+    fn smem(self, x_bf16: bool) -> usize {
+        let xp = if x_bf16 { 1 } else { 2 };
         match self {
-            MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Bf16Split | MmKind::Bf16SplitK => (4 * 16 * 36 + 4 * 8 * 36) * 4,
+            MmKind::Bf16 => (xp * 16 * 36 + 4 * 8 * 36) * 4,
+            MmKind::Bf16Split | MmKind::Bf16SplitK => (xp * 2 * 16 * 36 + 4 * 8 * 36) * 4,
             MmKind::Mxfp8 | MmKind::Mxfp8Split | MmKind::Mxfp8Wide | MmKind::Mxfp8WideSplit => {
                 4 * 16 * 36 * 4
             }
@@ -270,7 +275,7 @@ fn mxfp8_tile_ks(
     emits = f32_only,
     needs = mm_needs(self),
     order = Order::PerConfig,
-    source = self.kind.source(self.min_blocks),
+    source = self.kind.source(self.min_blocks, self.x_bf16),
     launches = mm_launches,
     shape = Shape::grid(self.kind.grid(self.m, self.n, self.ks), self.kind.threads()),
     load = mm_load,
@@ -284,17 +289,18 @@ struct FastMm {
     mode: u32,
     min_blocks: Option<u32>,
     kind: MmKind,
+    x_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn mm_accepts(k: &FastMm, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+    weight_x_accepts(input, k.x_bf16, k.form, form)
 }
 
 fn mm_needs(k: &FastMm) -> Needs {
     Needs {
         lanes: 32,
-        group_bytes: k.kind.smem(),
+        group_bytes: k.kind.smem(k.x_bf16),
         group_threads: k.kind.threads(),
         compiler: true,
         lacks: CUDA_LACKS,
@@ -307,7 +313,9 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
     let (across, down) = k.kind.grid(k.m, k.n, k.ks);
     let groups = across * down;
     let threads = k.kind.threads();
-    let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (4 * k.m * k.k) as f64];
+    let x_elem = if k.x_bf16 { 2 } else { 4 };
+    let passes = if k.x_bf16 { 1 } else { 2 };
+    let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (x_elem * k.m * k.k) as f64];
     if matches!(k.mode, 1 | 3 | 4) {
         reads.push((4 * k.m * k.n) as f64);
     } else if k.mode == 2 {
@@ -325,12 +333,12 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
     load.trip.fresh = 1.0;
     match k.kind {
         MmKind::Bf16 => {
-            load.trip.bf16_flops = (2 * 2 * 16 * 32 * 64 / 128) as f64;
+            load.trip.bf16_flops = (passes * 2 * 16 * 32 * 64 / 128) as f64;
             load.trip.loads = 4.0;
             load.trip.width = 16.0;
         }
         MmKind::Bf16Split | MmKind::Bf16SplitK => {
-            load.trip.bf16_flops = (2 * 2 * 16 * 16 * 128 / 128) as f64;
+            load.trip.bf16_flops = (passes * 2 * 16 * 16 * 128 / 128) as f64;
             load.trip.loads = 6.0;
             load.trip.width = 16.0;
         }
@@ -482,6 +490,7 @@ struct MmSite {
     min_blocks: Option<u32>,
     prep_min_blocks: Option<u32>,
     reduce_min_blocks: Option<u32>,
+    x_bf16: bool,
     form: &'static dyn Stored,
 }
 
@@ -511,6 +520,7 @@ impl MmSite {
                 mode: 0,
                 min_blocks: self.min_blocks,
                 kind: self.kind,
+                x_bf16: self.x_bf16,
                 form: self.form,
             };
             return vec![
@@ -526,6 +536,7 @@ impl MmSite {
             mode,
             min_blocks: self.min_blocks,
             kind: self.kind,
+            x_bf16: self.x_bf16,
             form: self.form,
         };
         let mut reads = vec![self.x, self.w];
@@ -540,6 +551,7 @@ impl MmSite {
             m: self.m,
             k: self.k,
             min_blocks: self.prep_min_blocks,
+            x_bf16: self.x_bf16,
         };
         let pre_len = mxfp8_pre_len(self.m, self.k);
         if self.ks > 1 {
@@ -612,12 +624,12 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
     if !tree.leaf(w) {
         return Some(Err("weight is not a direct leaf".into()));
     }
-    if tree.node(x).form.name() != "f32" {
-        return Some(Err(format!(
-            "input form {} (requires f32)",
-            tree.node(x).form.name()
-        )));
-    }
+    let x_name = tree.node(x).form.name();
+    let x_bf16 = match x_name {
+        "f32" => false,
+        "bf16" => true,
+        _ => return Some(Err(format!("input form {x_name} (requires f32 or bf16)"))),
+    };
     let form = tree.node(w).form;
     let split_groups = knob(tree, "fast_mm_bf16", "split_groups", 144);
     let (kind, ks) = match form.name() {
@@ -745,6 +757,7 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         min_blocks,
         prep_min_blocks: None,
         reduce_min_blocks,
+        x_bf16,
         form,
     }))
 }

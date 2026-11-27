@@ -467,3 +467,59 @@ fn fast_mm_loads() {
     };
     assert!(text[tessera_lower::Backend::Cuda].contains("#define MM_BF16_BLK 3"));
 }
+
+#[test]
+fn bf16_inputs_skip_widen() {
+    let mut g = linear(&[Dim::bounded(Rows, 64)], 4096, 4096);
+    g.entries[0].inputs[0].ty.dtype = DType::Bf16;
+    for n in &mut g.nodes {
+        if matches!(n.op, Op::Input { .. }) {
+            n.ty.dtype = DType::Bf16;
+        }
+    }
+    let limits = Limits {
+        group_bytes: 48 * 1024,
+        dynamic_group_bytes: 99 * 1024,
+        ..Limits::assumed()
+    };
+    let mut sm121 = Platform {
+        backend: "cuda".into(),
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        units: 48,
+        bandwidth: 273e9,
+        ..Platform::host(limits)
+    };
+    sm121.row.as_mut().unwrap().mxfp8_tile = Some([16, 8, 32]);
+    let cuda = Device::default().on(sm121);
+    for (w_form, rows) in [
+        ("bf16", 1),
+        ("bf16", 16),
+        ("mxfp8", 1),
+        ("mxfp8", 16),
+        ("mxfp8", 64),
+        ("int4_g32", 1),
+        ("int4_g32", 16),
+        ("trellis_k4", 1),
+        ("trellis_k4", 64),
+    ] {
+        let pins = Pins::all(named(w_form).expect("form"));
+        let dev = cuda.clone().pinned(pins);
+        let plan = lower(&g, 0, &[(Rows, rows)], &dev).expect("lowers");
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("widen")),
+            "{w_form} rows={rows}: unexpected widen in {names:?}"
+        );
+        let has_x_bf16 = plan.steps.iter().any(|s| {
+            matches!(
+                s.kernel.source(),
+                Source::Fixed { text, .. } if text[tessera_lower::Backend::Cuda].contains("#define X_BF16 1")
+            )
+        });
+        assert!(
+            has_x_bf16,
+            "{w_form} rows={rows}: missing X_BF16 in {names:?}"
+        );
+    }
+}

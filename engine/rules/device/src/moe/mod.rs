@@ -44,6 +44,9 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     } else if let Some(mb) = k.gen_min_blocks {
         defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
+    if k.x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
     crate::cuda_source_with(cuda_source(), entry, defs)
 }
 
@@ -75,11 +78,13 @@ struct PickedTrellis {
     chunk: Option<u32>,
     min_blocks: Option<u32>,
     gen_min_blocks: Option<u32>,
+    x_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn accepts(k: &PickedTrellis, input: usize, form: &dyn Stored) -> bool {
     match input {
+        0 => form.name() == if k.x_bf16 { "bf16" } else { "f32" },
         1 => form.name() == k.form.name(),
         2 => form.name() == "u32",
         _ => form.name() == "f32",
@@ -104,9 +109,10 @@ fn needs() -> Needs {
 
 fn load(k: &PickedTrellis, _: usize) -> Option<Load> {
     let groups = (k.n / BLOCK) * k.rows;
+    let x_elem = if k.x_bf16 { 2 } else { 4 };
     let mut reads = vec![
         k.form.bytes(k.rows * k.n * k.k) as f64,
-        (4 * (k.rows / k.repeat) * k.k) as f64,
+        (x_elem * (k.rows / k.repeat) * k.k) as f64,
         (4 * k.rows) as f64,
     ];
     if k.turned {
@@ -175,10 +181,12 @@ fn gather_of(tree: &Tree, t: T) -> Option<(T, T)> {
 
 fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis, T, T)> {
     let (codes, ids) = gather_of(tree, pick)?;
-    if !tree.leaf(codes) || tree.node(x).form.name() != "f32" || tree.node(ids).form.name() != "u32"
+    let x_name = tree.node(x).form.name();
+    if !tree.leaf(codes) || !matches!(x_name, "f32" | "bf16") || tree.node(ids).form.name() != "u32"
     {
         return None;
     }
+    let x_bf16 = x_name == "bf16";
     let &[count, n, k] = tree.node(codes).shape.as_slice() else {
         return None;
     };
@@ -216,6 +224,7 @@ fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis
             .knobs
             .get("picked_trellis", "gen_min_blocks")
             .map(|v| v as u32),
+        x_bf16,
         form,
     };
     Some((kernel, codes, ids))

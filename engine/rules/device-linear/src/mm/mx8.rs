@@ -20,7 +20,7 @@ pub(super) fn mxfp8_pre_len(m: usize, k: usize) -> usize {
     order = Order::PerConfig,
     source = prefill_source_with(
         "tessera_mm_mxfp8_prep",
-        self.min_blocks.map(|v| ("MM_PREP_BLK", v as usize)),
+        x_defs(self.min_blocks.map(|v| ("MM_PREP_BLK", v as usize)), self.x_bf16),
     ),
     launches = mx8_prep_launches,
     shape = Shape::grid(((self.k / 32).div_ceil(32), self.m), 256),
@@ -32,10 +32,11 @@ pub(super) struct Mxfp8Prep {
     pub(super) m: usize,
     pub(super) k: usize,
     pub(super) min_blocks: Option<u32>,
+    pub(super) x_bf16: bool,
 }
 
-fn mx8_prep_accepts(_: &Mxfp8Prep, _: usize, form: &dyn Stored) -> bool {
-    form.name() == "f32"
+fn mx8_prep_accepts(p: &Mxfp8Prep, _: usize, form: &dyn Stored) -> bool {
+    x_accepts(p.x_bf16, form)
 }
 
 fn mx8_prep_needs() -> Needs {
@@ -52,11 +53,12 @@ fn mx8_prep_needs() -> Needs {
 
 fn mx8_prep_load(p: &Mxfp8Prep, _: usize) -> Option<Load> {
     let (across, down) = ((p.k / 32).div_ceil(32), p.m);
+    let x_elem = if p.x_bf16 { 2 } else { 4 };
     let mut load = Load {
         threads: across * down * 256,
         group: 256,
         trips: 1.0,
-        reads: vec![(4 * p.m * p.k) as f64],
+        reads: vec![(x_elem * p.m * p.k) as f64],
         written: (4 * mxfp8_pre_len(p.m, p.k)) as f64,
         flight: 512.0,
         ..Load::default()
