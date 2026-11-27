@@ -36,7 +36,8 @@ impl Response {
             ("content-type", format!("{kind}; charset=utf-8")),
             ("content-security-policy", POLICY.into()),
             ("x-content-type-options", "nosniff".into()),
-            ("referrer-policy", "no-referrer".into()),
+            // Under `no-referrer` a browser sends `Origin: null` with a form.
+            ("referrer-policy", "same-origin".into()),
             ("cache-control", "no-store".into()),
         ];
         Response {
