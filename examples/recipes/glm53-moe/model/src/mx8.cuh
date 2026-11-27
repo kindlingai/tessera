@@ -2,10 +2,41 @@
 using tessera::u8; using tessera::u16; using tessera::u32; using tessera::u64;
 namespace prim = tessera::prim;
 namespace trellis = tessera::trellis;
+#ifndef GLM53_USE_MX8
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define GLM53_USE_MX8 1
 #else
 #define GLM53_USE_MX8 0
+#endif
+#endif
+#ifndef ROUTE_MIN_BLOCKS
+#define ROUTE_MIN_BLOCKS 2
+#endif
+#ifndef FC1_MIN_BLOCKS
+#define FC1_MIN_BLOCKS 4
+#endif
+#ifndef FC2_MIN_BLOCKS
+#define FC2_MIN_BLOCKS 4
+#endif
+#ifndef FC1_TURN_MIN_BLOCKS
+#define FC1_TURN_MIN_BLOCKS 2
+#endif
+#ifndef FC1_PF_MIN_BLOCKS
+#define FC1_PF_MIN_BLOCKS 2
+#endif
+#ifndef FC2_PF_MIN_BLOCKS
+#define FC2_PF_MIN_BLOCKS 3
+#endif
+#ifdef FINISH_MIN_BLOCKS
+#define FINISH_BOUNDS __launch_bounds__(256, FINISH_MIN_BLOCKS)
+#else
+#define FINISH_BOUNDS
+#endif
+#ifndef ROUTE_PF64_MIN_ROWS
+#define ROUTE_PF64_MIN_ROWS 512u
+#endif
+#ifndef GLM53_SLOT_CAP
+#define GLM53_SLOT_CAP (rows > 32u ? 64u : 8u)
 #endif
 
 #if GLM53_USE_MX8

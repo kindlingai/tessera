@@ -259,7 +259,7 @@ fn join(
             .fabric
             .as_ref()
             .ok_or("--sums arx needs --verbs or --ring")?;
-        let sum = tessera_frontend_comm::arx_sums(&mut *met, fabric, settings)?;
+        let sum = tessera_frontend_comm::arx_sums(&mut *met, fabric, settings, &args.shape)?;
         return Ok((met, Some(sum)));
     }
     if args.sums == Sums::Grid {
@@ -269,9 +269,15 @@ fn join(
                 let regions = sums::regions(ranks);
                 let room = ShmLink::room(ranks, &regions);
                 let file = shared(&path.with_extension("grid"), rank, ranks, room)?;
-                sums::open(settings.gpu(), ShmLink::over(rank, ranks, file, &regions)?)?
+                sums::open(
+                    settings.gpu(),
+                    ShmLink::over(rank, ranks, file, &regions)?,
+                    &args.shape,
+                )?
             }
-            (None, Some(fabric)) => tessera_frontend_comm::grid(&mut *met, fabric, settings)?,
+            (None, Some(fabric)) => {
+                tessera_frontend_comm::grid(&mut *met, fabric, settings, &args.shape)?
+            }
             (None, None) => return Err("--sums grid needs --shm or --verbs".into()),
         };
         return Ok((met, Some(grid)));

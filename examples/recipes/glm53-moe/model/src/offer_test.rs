@@ -1,6 +1,9 @@
 use super::*;
 use tessera_guest::site::Input;
 
+const PLAN_WORDS: usize = 1 + MAX_SLOTS * 50 + MOST_ROWS * PICKS * 2;
+const SCORES_OFF: usize = PLAN_WORDS.next_multiple_of(4);
+
 fn input(shape: Vec<usize>, form: &str, weight: Option<&str>, parts: Option<[usize; 2]>) -> Input {
     Input {
         dims: vec![None; shape.len()],
@@ -38,6 +41,7 @@ fn site(rows: usize, experts: usize, hidden: usize, ffn: usize) -> Site {
         kept: vec![],
         sums: vec![],
         scalars: vec![],
+        knobs: vec![],
     }
 }
 
@@ -156,4 +160,33 @@ fn mixed_fc_widths() {
         got[2].counts[4],
         tessera_guest::site::Count::Fixed(3)
     ));
+}
+
+#[test]
+fn moe_split_knobs() {
+    let mut s = site(1, 256, 512, 256);
+    assert!(offer(&s).unwrap()[0].defines.is_empty());
+    let Site::Region { knobs, .. } = &mut s else {
+        panic!("region");
+    };
+    knobs.push(("glm53_moe:ks1".into(), 2));
+    knobs.push(("glm53_moe:route_min_blocks".into(), 4));
+    knobs.push(("glm53_moe:fc1_min_blocks".into(), 6));
+    let got = offer(&s).unwrap();
+    assert!(matches!(
+        got[1].counts[10],
+        tessera_guest::site::Count::Fixed(2)
+    ));
+    assert!(
+        got[0]
+            .defines
+            .iter()
+            .any(|(k, v)| k == "ROUTE_MIN_BLOCKS" && v == "4")
+    );
+    assert!(
+        got[1]
+            .defines
+            .iter()
+            .any(|(k, v)| k == "FC1_MIN_BLOCKS" && v == "6")
+    );
 }

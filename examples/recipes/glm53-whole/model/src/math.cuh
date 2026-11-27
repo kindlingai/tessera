@@ -4,9 +4,15 @@ using namespace tessera;
 using trellis::word;
 
 #define IDS 4u
+#ifndef WARPS
 #define WARPS 8u
+#endif
+#ifndef ROW_TILE
 #define ROW_TILE 4u
+#endif
+#ifndef ATTN_STAGE
 #define ATTN_STAGE 2048u
+#endif
 
 #ifndef TS_MARK
 #define TS_MARK() ((void)0)

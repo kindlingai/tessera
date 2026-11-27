@@ -7,12 +7,13 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use tessera_graph::DimName::{self, Rows};
 use tessera_graph::Size;
-use tessera_lower::{Device, Plan, Settings, Tensor, View, Weight, lower};
+use tessera_lower::{Device, Knobs, Plan, Settings, Tensor, View, Weight, lower};
 use tessera_run::Run;
 use tessera_testkit::Noise;
 
 const USAGE: &str = "usage: tessera-calibrate sweep [--over <Dim>] [--sizes <n,n,..>] \
-    [--skew <n>] [--learn] gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
+    [--skew <n>] [--shape <kernel>:<knob>=<n>] [--learn] \
+    gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
     mla <heads> <rows> <context> [--kv f32|bf16|fp8] | \
     gqa <heads> <kv heads> <rows> <context> [--kv f32|bf16|fp8] | \
     moe <experts> <top k> <hidden> <ffn> <rows> [--form <name>] [--skew <n>] [--plain] | \
@@ -125,11 +126,24 @@ fn by_kernel(plan: &Plan, seconds: &[f64], device: &Device) -> BTreeMap<&'static
 }
 
 /// Times `s` at each size of `over`. Learns if asked.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn points(
     s: &mut Subject,
     over: DimName,
     sizes: &[u64],
     settings: &Settings,
+    learn: bool,
+) -> Result<Vec<Point>, Box<dyn Error>> {
+    points_with(s, over, sizes, settings, &Knobs::default(), learn)
+}
+
+/// Times `s` across `over` with `knobs`, learning if asked.
+pub(crate) fn points_with(
+    s: &mut Subject,
+    over: DimName,
+    sizes: &[u64],
+    settings: &Settings,
+    knobs: &Knobs,
     learn: bool,
 ) -> Result<Vec<Point>, Box<dyn Error>> {
     let mut noise = Noise(7);
@@ -143,11 +157,16 @@ pub(crate) fn points(
         rest.chain([(over, n)]).collect()
     };
     let first = *sizes.first().ok_or(USAGE)?;
-    let guess = Device::guess(settings).pinned(s.pins.clone());
+    let mut guess = Device::guess(settings).pinned(s.pins.clone());
+    guess.knobs = knobs.clone();
     let mut runner = opened(lower(&s.g, 0, &at(first), &guess)?, &loads, settings)?;
     drop(loads);
     let stored = Device::stored(runner.platform(), settings);
-    let mut device = stored.map_or(guess, |d| d.pinned(s.pins.clone()));
+    let mut device = stored.map_or(guess, |d| {
+        let mut d = d.pinned(s.pins.clone());
+        d.knobs = knobs.clone();
+        d
+    });
     let mut all = Vec::new();
     for &size in sizes {
         let dims = at(size);
@@ -277,7 +296,8 @@ fn dim(name: &str) -> Option<DimName> {
 
 /// Sweeps the subject in `args` and prints the table.
 pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (mut over, mut sizes, mut learn, mut skew, mut at) = (Rows, None, false, None, 0);
+    let (mut over, mut sizes, mut learn, mut skew, mut knobs, mut at) =
+        (Rows, None, false, None, Knobs::default(), 0);
     while let Some(arg) = args.get(at) {
         match arg.as_str() {
             "--over" => over = args.get(at + 1).and_then(|d| dim(d)).ok_or(USAGE)?,
@@ -289,6 +309,10 @@ pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
             "--skew" => {
                 let val = args.get(at + 1).ok_or(USAGE)?.parse::<f64>();
                 skew = Some(val.map_err(|_| USAGE)?);
+            }
+            "--shape" => {
+                let spec = args.get(at + 1).ok_or(USAGE)?;
+                knobs.parse(spec)?;
             }
             "--learn" => learn = true,
             _ => break,
@@ -302,7 +326,7 @@ pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
         s.skew = alpha;
     }
     let sizes = sizes.unwrap_or_else(|| doubling(&s, over));
-    let points = points(&mut s, over, &sizes, settings, learn)?;
+    let points = points_with(&mut s, over, &sizes, settings, &knobs, learn)?;
     print!("{}", table(&points, over));
     Ok(())
 }

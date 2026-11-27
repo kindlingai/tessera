@@ -10,7 +10,7 @@ use tessera_lower::sites;
 use tessera_lower::sites::{After, Near, Picked};
 use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree};
 
-/// Kernel, schedule, forms for `x`, `w`, `out`, and flags.
+/// Kernel, schedule, operands, flags, and extra tag.
 pub(crate) type Variant = (
     &'static str,
     usize,
@@ -18,6 +18,7 @@ pub(crate) type Variant = (
     &'static str,
     &'static str,
     u8,
+    usize,
 );
 
 thread_local! {

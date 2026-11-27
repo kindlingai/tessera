@@ -3,8 +3,9 @@
 use crate::{AHEAD, WIDE, per_lane_row, per_row};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
-use tessera_lower::sites;
-use tessera_lower::{Kernel, Needs, stage_rule};
+use tessera_lower::{Kernel, Needs, knob, sites, stage_rule};
+
+knob!("lane_sum", "ahead", 1, 16);
 
 /// One thread per row: the sum, then each element.
 #[kernel]
@@ -29,11 +30,12 @@ fn by_sum<const DIVIDE: bool>(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, widt
 
 /// A SIMD group per row, summed by shuffles.
 #[kernel]
-fn sum_lanes<const WIDE: u32, const AHEAD: u32, const DIVIDE: bool>(
+fn sum_lanes<const WIDE: u32, const DIVIDE: bool>(
     x: Buf<F32>,
     mut out: BufMut<F32>,
     rows: u32,
     width: u32,
+    #[build] ahead: u32,
 ) {
     let row = gid() / LANES as u32;
     if row >= rows {
@@ -41,13 +43,13 @@ fn sum_lanes<const WIDE: u32, const AHEAD: u32, const DIVIDE: bool>(
     }
     let at = row as u64 * width as u64;
     let mut sum = 0.0f32;
-    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(ahead) {
         let v = x.load4(at + i as u64);
         sum += (v.x + v.y) + (v.z + v.w);
     }
     sum = sum32(sum);
     let mean = sum / width as f32;
-    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(ahead) {
         let v = x.load4(at + i as u64);
         let mut o = F32x4::zero();
         if DIVIDE {
@@ -86,7 +88,7 @@ pub(crate) struct BySum {
 /// `BySum` with a SIMD group per row.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    sum_lanes::<WIDE, AHEAD>,
+    sum_lanes::<WIDE>(self.ahead),
     variant = self.divide,
     name = match self.divide {
         true => "lane_unit_sum",
@@ -104,6 +106,7 @@ pub(crate) struct LaneSum {
     pub rows: usize,
     pub width: usize,
     pub divide: bool,
+    pub ahead: u32,
 }
 
 /// The row stage `site` names, if it sums its rows.
@@ -124,23 +127,30 @@ stage_rule!("by_sum", summed);
 
 mod lanes {
     use super::*;
+    use tessera_lower::{Draft, T, Tree};
 
-    // Wide loads need whole groups of four along a row.
-    stage_rule!(
-        "lane_sum",
-        |site| summed(site)
-            .filter(|s| s.width.is_multiple_of(WIDE as usize))
-            .map(
-                |BySum {
-                     rows,
-                     width,
-                     divide,
-                 }| LaneSum {
-                    rows,
-                    width,
-                    divide
-                }
-            ),
-        |site| site.padded()
-    );
+    fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        let site: sites::Stage = tree.site(at)?;
+        let BySum {
+            rows,
+            width,
+            divide,
+        } = summed(&site)?;
+        if !width.is_multiple_of(WIDE as usize) {
+            return None;
+        }
+        let ahead = tree
+            .knobs
+            .get("lane_sum", "ahead")
+            .map_or(AHEAD, |v| v as u32);
+        let kernel = LaneSum {
+            rows,
+            width,
+            divide,
+            ahead,
+        };
+        Some(vec![Draft::new(kernel, site.padded(), site.len)])
+    }
+
+    tessera_lower::rule!("lane_sum", propose);
 }

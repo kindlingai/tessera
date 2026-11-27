@@ -27,6 +27,7 @@ pub use crate::sums::{RELAY, regions};
 #[derive(PartialEq, Eq)]
 struct OpenKey {
     name: &'static str,
+    source_hash: u64,
     threads: u32,
     shared: u32,
     lanes: Vec<Collective>,
@@ -339,6 +340,7 @@ where
         // Counts and scratch change with sizes, not the grid.
         let key = OpenKey {
             name: kernel.name(),
+            source_hash: kernel.identity().1,
             threads: spec.threads,
             shared: spec.shared,
             lanes: spec.lanes,

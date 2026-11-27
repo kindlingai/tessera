@@ -849,3 +849,28 @@ fn sliding_ring_wraps() {
         }
     }
 }
+
+#[test]
+fn attend_flash_knobs() {
+    let g = attention(Mask::Bidirectional, 4, 64);
+    let mut dev = Device::guess(&host()).favoring("attend");
+    let base = lower(&g, 0, &[(Seqs, 1), (Rows, 2), (Context, 16)], &dev).unwrap();
+    dev.knobs.parse("attend:threads=128").unwrap();
+    let tuned = lower(&g, 0, &[(Seqs, 1), (Rows, 2), (Context, 16)], &dev).unwrap();
+    let attend_id = |p: &tessera_lower::Plan| {
+        p.steps
+            .iter()
+            .find(|s| s.kernel.name() == "attend")
+            .unwrap()
+            .kernel
+            .identity()
+    };
+    assert_ne!(attend_id(&base), attend_id(&tuned));
+
+    let mut fdev = Device::guess(&host()).favoring("flash");
+    let full =
+        tessera_lower::select(&g, 0, &[(Seqs, 1), (Rows, 64), (Context, 64)], &fdev).unwrap();
+    fdev.knobs.parse("flash:bk=16").unwrap();
+    let sub = tessera_lower::select(&g, 0, &[(Seqs, 1), (Rows, 64), (Context, 64)], &fdev).unwrap();
+    assert!(sub.ways["flash"].len() < full.ways["flash"].len());
+}

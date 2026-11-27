@@ -137,8 +137,9 @@ impl<T: Clone> Kernels<T> {
         fixed: impl FnOnce(&'static str, &'static str) -> Result<T, Error>,
         made: impl FnOnce(&str, &str) -> Result<T, Error>,
     ) -> Result<(T, bool), Error> {
-        // Printing a kernel is cheaper than writing its source.
-        let key = format!("{:?}", step.kernel);
+        // Key compiled and generated entries on source hash.
+        let (_, hash) = step.kernel.identity();
+        let key = format!("{:?}@{hash:016x}", step.kernel);
         if let Some(found) = self.known.get(&key) {
             return Ok(found.clone());
         }
@@ -150,7 +151,7 @@ impl<T: Clone> Kernels<T> {
             }
             Source::Made(body) => {
                 let group = group(step);
-                let at = format!("{}/{group}", body.entry);
+                let at = format!("{}/{group}/{hash:016x}", body.entry);
                 match self.made.get(&at) {
                     Some(compiled) => (compiled.clone(), true),
                     None => {

@@ -5,6 +5,16 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
+#ifndef PTR_CHUNK
+#define PTR_CHUNK 4u
+#endif
+#ifndef PTR_K3_MIN_BLOCKS
+#define PTR_K3_MIN_BLOCKS 4
+#endif
+#ifndef PTR_GEN_MIN_BLOCKS
+#define PTR_GEN_MIN_BLOCKS 2
+#endif
+
 using ptr_smem = trellis::stage_smem<float[128]>;
 
 template <u32 K, u32 BOOK, bool TURNED>
@@ -13,7 +23,7 @@ static __device__ __forceinline__ void ptr_body(
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 post, ptr_smem& sm) {
     constexpr u32 TB = 32u * K;
-    constexpr u32 CHUNK = 4u;
+    constexpr u32 CHUNK = PTR_CHUNK;
     u32 ob = blockIdx.x;
     u32 r = blockIdx.y;
     if (ob >= (n >> 7u) || r >= rows) return;
@@ -138,7 +148,7 @@ static __device__ void ptr_run_book(
 }
 
 // Fast specialized PMCGX K3 rotated picked expert matmul.
-extern "C" __global__ __launch_bounds__(256, 4) void ptr_k3_pmcgx_t(
+extern "C" __global__ __launch_bounds__(256, PTR_K3_MIN_BLOCKS) void ptr_k3_pmcgx_t(
     const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 bits, u32 book, u32 turned, u32 post) {
@@ -151,7 +161,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void ptr_k3_pmcgx_t(
 }
 
 // Generic picked trellis expert matmul (K2/K3/K4, MCG/MUL1/PMCGX).
-extern "C" __global__ __launch_bounds__(256, 2) void ptr_gen(
+extern "C" __global__ __launch_bounds__(256, PTR_GEN_MIN_BLOCKS) void ptr_gen(
     const float* x, const u8* w, const u32* ids, const float* su, const float* sv,
     const float* extra, float* out, u32 rows, u32 n, u32 k, u32 count, u32 repeat, u32 first,
     u32 bits, u32 book, u32 turned, u32 post) {

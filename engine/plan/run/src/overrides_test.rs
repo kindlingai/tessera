@@ -291,6 +291,7 @@ impl Launch for DispatchDev {
 #[derive(Debug)]
 struct TestKernel {
     entry: &'static str,
+    body: &'static str,
     resident: Option<Resident>,
 }
 
@@ -300,7 +301,7 @@ impl Kernel for TestKernel {
     }
     fn source(&self) -> Source {
         Source::Fixed {
-            text: ByBackend::from_fn(|_| "__global__ void k() {}"),
+            text: ByBackend::from_fn(|_| self.body),
             entry: self.entry,
         }
     }
@@ -351,7 +352,7 @@ impl Grid for MockGrid {
     }
 }
 
-fn single_step_plan(entry: &'static str, resident: Option<Resident>) -> Plan {
+fn single_step_with(entry: &'static str, body: &'static str, resident: Option<Resident>) -> Plan {
     let slot_in = Slot::floats(0, 16);
     let slot_out = Slot::floats(1, 16);
     Plan {
@@ -365,7 +366,11 @@ fn single_step_plan(entry: &'static str, resident: Option<Resident>) -> Plan {
             write: slot_out,
             also: Vec::new(),
             covers: Vec::new(),
-            kernel: KernelRef::new(TestKernel { entry, resident }),
+            kernel: KernelRef::new(TestKernel {
+                entry,
+                body,
+                resident,
+            }),
             rule: "test",
             site: None,
             lane: 0,
@@ -374,6 +379,10 @@ fn single_step_plan(entry: &'static str, resident: Option<Resident>) -> Plan {
         }],
         ..Plan::default()
     }
+}
+
+fn single_step_plan(entry: &'static str, resident: Option<Resident>) -> Plan {
+    single_step_with(entry, "__global__ void k() {}", resident)
 }
 
 #[test]
@@ -472,4 +481,26 @@ fn launch_override_dispatch_resident() {
             .any(|(e, s)| e == "res_k" && s.as_deref().is_some_and(|t| t.contains("v2")))
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_key_hash() {
+    let mut cache = crate::kernels::Kernels::<usize>::default();
+    let mut count = 0usize;
+    let step = |body| single_step_with("same", body, None).steps.pop().unwrap();
+    let mut compile = |body| {
+        cache
+            .get(
+                &step(body),
+                Backend::Cuda,
+                |_, _| {
+                    count += 1;
+                    Ok(count)
+                },
+                |_, _| unreachable!(),
+            )
+            .unwrap()
+            .0
+    };
+    assert_eq!((compile("a"), compile("b"), compile("a")), (1, 2, 1));
 }

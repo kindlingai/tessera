@@ -3,7 +3,8 @@
 use crate::slots::slot_scan;
 use tessera_codegen::prelude::*;
 use tessera_lower::{
-    Arg, Draft, Keeping, Kernel, KernelRef, Launch, Read, Shape, Step, T, Tree, ZoneKind, sites,
+    Arg, Draft, Keeping, Kernel, KernelRef, Launch, Read, Shape, Step, T, Tree, ZoneKind, knob,
+    sites,
 };
 use tessera_lower::{GUESS, small, source};
 
@@ -12,6 +13,8 @@ const WIDEST: usize = 128;
 
 /// Threads in a GPU group.
 const THREADS: usize = 128;
+
+knob!("delta", "threads", 32, 1024);
 
 /// Per row: decay, write the value, answer the query.
 #[kernel]
@@ -152,6 +155,7 @@ pub(crate) struct Delta {
     site: sites::Delta,
     zone: ZoneKind,
     keeping: Keeping,
+    threads: usize,
 }
 
 impl Delta {
@@ -185,9 +189,9 @@ fn launches(k: &Delta, step: &Step) -> Vec<Launch> {
     let shape = match k.zone {
         ZoneKind::Cpu => small(jobs),
         _ => Shape::Grid {
-            across: jobs.div_ceil(THREADS),
+            across: jobs.div_ceil(k.threads),
             down: 1,
-            threads: THREADS,
+            threads: k.threads,
         },
     };
     let mut launch = Launch::plain(step, &[jobs], shape);
@@ -219,10 +223,12 @@ fn propose(zone: ZoneKind, tree: &Tree, at: T) -> Option<Vec<Draft>> {
         Some(_) => Keeping::of(tree),
         None => Keeping::Stores,
     };
+    let threads = tree.knobs.get("delta", "threads").unwrap_or(THREADS);
     let kernel = Delta {
         site,
         zone,
         keeping,
+        threads,
     };
     Some(vec![Draft::new(kernel, reads, len)])
 }

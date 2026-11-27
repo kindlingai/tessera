@@ -4,6 +4,7 @@ use crate::form::{Load, Pins, Site, in_scope, matches, named};
 use crate::rule::{Rule, gather};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use tessera_codegen::kept::{self, Layout};
 use tessera_graph::{DType, Graph, NodeId, Op, PathSeg, Region, layers, sums_ranks};
 
@@ -404,6 +405,7 @@ impl From<Dtype> for (String, String) {
 }
 
 /// One shape number a kernel reads, with its legal range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Knob {
     pub kernel: &'static str,
     pub name: &'static str,
@@ -414,6 +416,43 @@ pub struct Knob {
 gather! {
     #[gather]
     pub static KNOBS: scattered_collect::ScatteredSlice<Knob>;
+}
+
+static GUEST_KNOBS: OnceLock<Mutex<Vec<Knob>>> = OnceLock::new();
+
+/// Registers a runtime knob for validation and lookup.
+pub fn register_knob(knob: Knob) {
+    let mut guard = GUEST_KNOBS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("knobs");
+    let same = |k: &Knob| k.kernel == knob.kernel && k.name == knob.name;
+    if KNOBS.iter().any(same) {
+        return;
+    }
+    if let Some(slot) = guard
+        .iter_mut()
+        .find(|k| k.kernel == knob.kernel && k.name == knob.name)
+    {
+        *slot = knob;
+    } else {
+        guard.push(knob);
+    }
+}
+
+/// Finds a registered static or guest knob.
+pub fn find_knob(kernel: &str, name: &str) -> Option<Knob> {
+    if let Some(k) = KNOBS.iter().find(|k| k.kernel == kernel && k.name == name) {
+        return Some(*k);
+    }
+    let guard = GUEST_KNOBS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("knobs");
+    guard
+        .iter()
+        .find(|k| k.kernel == kernel && k.name == name)
+        .copied()
 }
 
 /// Declares a knob that shape rules may set.
@@ -440,10 +479,24 @@ macro_rules! knob {
 pub struct Knobs(Vec<(String, u64)>);
 
 impl Knobs {
+    /// Splits `kernel:knob=value` without validating against known knobs.
+    pub fn split_flag(text: &str) -> Result<(&str, &str, u64), String> {
+        let Some((spot, raw)) = text.rsplit_once('=') else {
+            return Err(format!("`{text}` is not kernel:knob=value"));
+        };
+        let Some((kernel, name)) = spot.split_once(':') else {
+            return Err(format!("`{text}` is not kernel:knob=value"));
+        };
+        let value = raw
+            .parse::<u64>()
+            .map_err(|_| format!("`{text}` is not kernel:knob=value"))?;
+        Ok((kernel, name, value))
+    }
+
     /// Sets `spot`, a `kernel:knob`, to `value`.
     pub fn set(&mut self, spot: &str, value: u64) -> Result<(), String> {
-        let named = |k: &&Knob| spot.split_once(':') == Some((k.kernel, k.name));
-        match KNOBS.iter().find(named) {
+        let found = spot.split_once(':').and_then(|(k, n)| find_knob(k, n));
+        match found {
             Some(k) if (k.least..=k.most).contains(&value) => {
                 self.0.push((spot.into(), value));
                 Ok(())
@@ -466,6 +519,11 @@ impl Knobs {
     pub fn get(&self, kernel: &str, knob: &str) -> Option<usize> {
         let named = |(spot, _): &&(String, u64)| spot.split_once(':') == Some((kernel, knob));
         self.0.iter().rev().find(named).map(|(_, v)| *v as usize)
+    }
+
+    /// Raw `(kernel:knob, value)` pairs in order.
+    pub fn entries(&self) -> &[(String, u64)] {
+        &self.0
     }
 
     /// These values, then `later`'s.

@@ -36,6 +36,7 @@ fn tiled_text(dialect: Dialect, (schedule, parts): (Schedule, u32)) -> (String, 
         },
         schedule,
         parts,
+        band: 8,
     };
     let Source::Made(body) = tiled.source() else {
         panic!("tiled is generated");

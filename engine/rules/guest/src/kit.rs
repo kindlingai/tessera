@@ -13,6 +13,7 @@ pub struct Region<'a> {
     pub kept: &'a [Kept],
     pub sums: &'a [usize],
     pub scalars: &'a [Scalar],
+    pub knobs: &'a [(String, u64)],
 }
 
 /// A model region's step: one output, kept rows by slot.
@@ -23,6 +24,7 @@ pub struct Step<'a> {
     pub kept: &'a [Kept],
     pub sums: &'a [usize],
     pub scalars: &'a [Scalar],
+    pub knobs: &'a [(String, u64)],
     /// Input places of tokens, positions, slots and picks.
     pub ids: [usize; 4],
 }
@@ -37,6 +39,7 @@ impl Site {
             kept,
             sums,
             scalars,
+            knobs,
         } = self
         else {
             return None;
@@ -47,6 +50,7 @@ impl Site {
             kept,
             sums,
             scalars,
+            knobs,
         })
     }
 
@@ -71,6 +75,7 @@ impl Site {
             kept: r.kept,
             sums: r.sums,
             scalars: r.scalars,
+            knobs: r.knobs,
             ids: [tokens, positions, slots, picks],
         })
     }
@@ -81,12 +86,22 @@ impl Region<'_> {
     pub fn scalar(&self, op: &str) -> Option<f32> {
         crate::site::scalar(self.scalars, op)
     }
+
+    /// The value set for `kernel:name`, if any.
+    pub fn knob(&self, kernel: &str, name: &str) -> Option<usize> {
+        crate::site::find_knob(self.knobs, kernel, name)
+    }
 }
 
 impl Step<'_> {
     /// The value of `op`, if present and unique.
     pub fn scalar(&self, op: &str) -> Option<f32> {
         crate::site::scalar(self.scalars, op)
+    }
+
+    /// The value set for `kernel:name`, if any.
+    pub fn knob(&self, kernel: &str, name: &str) -> Option<usize> {
+        crate::site::find_knob(self.knobs, kernel, name)
     }
 
     /// Rows the step reads.
@@ -137,6 +152,7 @@ impl Default for Offer {
             guess: 1e-12,
             writes: None,
             resident: None,
+            defines: Vec::new(),
         }
     }
 }

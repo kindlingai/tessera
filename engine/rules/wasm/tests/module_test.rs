@@ -618,6 +618,7 @@ fn guest(
         }],
         graph: false,
         files,
+        knobs: vec![],
     };
     let rows = Count::Dim {
         dim: "Rows".into(),
@@ -633,6 +634,7 @@ fn guest(
         guess: 1e-15,
         writes: None,
         resident: None,
+        defines: vec![],
     };
     let bytes = module(&json!(manifest), &json!([offer]), "");
     Ok(tessera_wasm::load(&bytes)?[0])
@@ -851,4 +853,24 @@ fn bad_offers_pinpoint_reason() {
     let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     let err = first["error"].as_str().unwrap();
     assert!(err.contains("all_reduce #0 length 128"), "{err}");
+}
+
+#[test]
+fn module_knob_defines() {
+    let mut man = manifest(ABI, "matmul");
+    man["knobs"] = json!([{"kernel": "wasm_matmul", "name": "tile", "least": 8, "most": 64}]);
+    let (off0, mut off1) = (matmul(), matmul());
+    off1["defines"] = json!([["TILE", "16"]]);
+    let m0 = tessera_wasm::load(&module(&man, &json!([off0]), "")).unwrap()[0];
+    let m1 = tessera_wasm::load(&module(&man, &json!([off1]), "")).unwrap()[0];
+    assert!(tessera_lower::find_knob("wasm_matmul", "tile").is_some());
+    let (d0, mut d1) = (compiling().adding(m0), compiling().adding(m1));
+    d1.knobs.parse("wasm_matmul:tile=16").unwrap();
+    let p0 = lower(&graph(false), 0, &[(Rows, 4)], &d0).unwrap();
+    let p1 = lower(&graph(false), 0, &[(Rows, 4)], &d1).unwrap();
+    assert_ne!(p0.steps[0].kernel.identity(), p1.steps[0].kernel.identity());
+    let Source::Fixed { text, .. } = p1.steps[0].kernel.source() else {
+        panic!("expected fixed source");
+    };
+    assert!(text[Backend::Cuda].contains("#define TILE 16"));
 }

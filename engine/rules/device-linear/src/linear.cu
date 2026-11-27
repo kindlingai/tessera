@@ -3,7 +3,72 @@
 
 using namespace tessera;
 
+#ifndef TM_WARPS
 #define TM_WARPS 8u
+#endif
+#ifndef GEMV_BF16_WARPS
+#define GEMV_BF16_WARPS TM_WARPS
+#endif
+#ifndef DTR_T1_BLK
+#define DTR_T1_BLK 4
+#endif
+#ifndef DTR_T2_BLK
+#define DTR_T2_BLK 2
+#endif
+#ifndef DTR_T4_BLK
+#define DTR_T4_BLK 2
+#endif
+#ifndef DTR_GEN_BLK
+#define DTR_GEN_BLK 2
+#endif
+#ifndef DTR_RED_BLK
+#define DTR_RED_BLK 4
+#endif
+#ifndef MM_BF16_BLK
+#define MM_BF16_BLK 6
+#endif
+#ifndef MM_BF16_KS2_BLK
+#define MM_BF16_KS2_BLK 4
+#endif
+#ifndef MM_BF16_SK_BLK
+#define MM_BF16_SK_BLK 4
+#endif
+#ifndef MM_MX_R8_BLK
+#define MM_MX_R8_BLK 6
+#endif
+#ifndef MM_MX_R8_SK_BLK
+#define MM_MX_R8_SK_BLK 6
+#endif
+#ifndef MM_MX_R16_BLK
+#define MM_MX_R16_BLK 4
+#endif
+#ifndef MM_MX_R16_SK_BLK
+#define MM_MX_R16_SK_BLK 4
+#endif
+#ifndef MM_MX_R64_BLK
+#define MM_MX_R64_BLK 2
+#endif
+#ifndef MM_MX_R64_SK_BLK
+#define MM_MX_R64_SK_BLK 2
+#endif
+#ifndef MM_RED_BLK
+#define MM_RED_BLK 4
+#endif
+#ifndef GEMV_BF16_BLK
+#define GEMV_BF16_BLK 2
+#endif
+#ifndef GEMV_MXFP8_BLK
+#define GEMV_MXFP8_BLK 2
+#endif
+#ifndef GEMV_INT4_BLK
+#define GEMV_INT4_BLK 2
+#endif
+#ifndef ST_TC_BLK
+#define ST_TC_BLK 4
+#endif
+#ifndef ST_LANES_BLK
+#define ST_LANES_BLK 2
+#endif
 
 #if defined(TESSERA_CUDA)
 
@@ -142,16 +207,16 @@ static __device__ void dtr_gen(const float* x, const u8* w, const float* suh, co
         dtr_body<K, BOOK, NT, TURNED, SPLIT>(x, w, suh, svh, out, m, n, k, ks, sm);           \
     }
 
-DTR_DEF(dtr_k4_t1s, 4u, trellis::BOOK_MCG, 1u, true, true, 4)
-DTR_DEF(dtr_k4_t1, 4u, trellis::BOOK_MCG, 1u, true, false, 4)
-DTR_DEF(dtr_k4_p1s, 4u, trellis::BOOK_MCG, 1u, false, true, 4)
-DTR_DEF(dtr_k4_p1, 4u, trellis::BOOK_MCG, 1u, false, false, 4)
-DTR_DEF(dtr_k4_t2s, 4u, trellis::BOOK_MCG, 2u, true, true, 2)
-DTR_DEF(dtr_k4_t2, 4u, trellis::BOOK_MCG, 2u, true, false, 2)
-DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, 2)
+DTR_DEF(dtr_k4_t1s, 4u, trellis::BOOK_MCG, 1u, true, true, DTR_T1_BLK)
+DTR_DEF(dtr_k4_t1, 4u, trellis::BOOK_MCG, 1u, true, false, DTR_T1_BLK)
+DTR_DEF(dtr_k4_p1s, 4u, trellis::BOOK_MCG, 1u, false, true, DTR_T1_BLK)
+DTR_DEF(dtr_k4_p1, 4u, trellis::BOOK_MCG, 1u, false, false, DTR_T1_BLK)
+DTR_DEF(dtr_k4_t2s, 4u, trellis::BOOK_MCG, 2u, true, true, DTR_T2_BLK)
+DTR_DEF(dtr_k4_t2, 4u, trellis::BOOK_MCG, 2u, true, false, DTR_T2_BLK)
+DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, DTR_T4_BLK)
 
 // Generic dense trellis matmul for up to 8 rows.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen1(
+extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen1(
     const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
     u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
@@ -159,7 +224,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen1(
 }
 
 // Generic dense trellis matmul for 16-row tiles.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen2(
+extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen2(
     const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
     u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
@@ -167,7 +232,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen2(
 }
 
 // Generic dense trellis matmul for 32-row tiles.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen4(
+extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen4(
     const float* x, const u8* w, const float* suh, const float* svh, float* out, u32 m, u32 n,
     u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
     __shared__ dtr_smem sm;
@@ -175,7 +240,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void dtr_gen4(
 }
 
 // Sums split-K partials in order and applies output rotation.
-extern "C" __global__ __launch_bounds__(256, 4) void dtr_reduce(
+extern "C" __global__ __launch_bounds__(256, DTR_RED_BLK) void dtr_reduce(
     const float* part, const float* svh, float* out, u32 m, u32 n, u32 ks, u32 turned) {
     u32 ob = blockIdx.x;
     if (ob >= (n >> 7u)) return;
@@ -413,21 +478,21 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
 }
 
 // Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
-extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
+extern "C" __global__ __launch_bounds__(128, MM_BF16_BLK) void tessera_mm_bf16(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
     fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_ks2(
+extern "C" __global__ __launch_bounds__(128, MM_BF16_KS2_BLK) void tessera_mm_bf16_ks2(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
     fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_sk(
+extern "C" __global__ __launch_bounds__(128, MM_BF16_SK_BLK) void tessera_mm_bf16_sk(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_bf16_smem<2u> sm;
@@ -652,14 +717,14 @@ static __device__ __forceinline__ void fg_mxfp8_r64(const float* x, const u8* w,
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 8 rows per block.
-extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8(
+extern "C" __global__ __launch_bounds__(128, MM_MX_R8_BLK) void tessera_mm_mxfp8_r8(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K MXFP8 Tensor-Core matmul, up to 8 rows per block.
-extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8_sk(
+extern "C" __global__ __launch_bounds__(128, MM_MX_R8_SK_BLK) void tessera_mm_mxfp8_r8_sk(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx_smem sm;
@@ -667,7 +732,7 @@ extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8_sk(
 }
 
 // Split-K MXFP8 Tensor-Core matmul, up to 16 rows per block.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16_sk(
+extern "C" __global__ __launch_bounds__(128, MM_MX_R16_SK_BLK) void tessera_mm_mxfp8_r16_sk(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx_smem sm;
@@ -675,7 +740,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16_sk(
 }
 
 // Sums split-K partials in order and applies matmul epilogue.
-extern "C" __global__ __launch_bounds__(256, 4) void tessera_mm_reduce(
+extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
     const float* part, const float* other, float* out, u32 m, u32 n, u32 ks, u32 mode) {
     u64 idx = u64(blockIdx.x) * 256u + threadIdx.x;
     u64 mn = u64(m) * n;
@@ -688,7 +753,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void tessera_mm_reduce(
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16(
+extern "C" __global__ __launch_bounds__(128, MM_MX_R16_BLK) void tessera_mm_mxfp8_r16(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
@@ -701,14 +766,14 @@ static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, 
 }
 
 // Staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_mm_mxfp8_r64(
+extern "C" __global__ __launch_bounds__(256, MM_MX_R64_BLK) void tessera_mm_mxfp8_r64(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx64_smem sm;
     fg_mxfp8_r64<false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_mm_mxfp8_r64_sk(
+extern "C" __global__ __launch_bounds__(256, MM_MX_R64_SK_BLK) void tessera_mm_mxfp8_r64_sk(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_mx64_smem sm;
@@ -716,9 +781,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_mm_mxfp8_r64_sk(
 }
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16(
+extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16(
     const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
-    u32 row = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
+    u32 row = blockIdx.x * GEMV_BF16_WARPS + (threadIdx.x >> 5);
     if (row >= n) return;
     u32 lane = threadIdx.x & 31u;
     float s = fg_dot8_bf16(x, w + u64(row) * k, k, lane);
@@ -726,26 +791,28 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16(
 }
 
 // Streaming 8-BF16 narrow decode GEMV, one block per output row.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16_narrow(
+extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16_narrow(
     const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
-    __shared__ float part[TM_WARPS];
+    __shared__ float part[GEMV_BF16_WARPS];
     u32 row = blockIdx.x;
     if (row >= n) return;
     u32 tid = threadIdx.x;
     const u16* wr = w + u64(row) * k;
     float acc = 0.0f;
-    for (u32 i = tid << 3; i < k; i += 2048u) acc = fg_dot8_step(acc, x, wr, i);
+    for (u32 i = tid << 3; i < k; i += (GEMV_BF16_WARPS << 8)) acc = fg_dot8_step(acc, x, wr, i);
     float ws = fg_warp_sum(acc);
     if ((tid & 31u) == 0u) part[tid >> 5] = ws;
     prim::block_sync();
     if (tid == 0u) {
-        float s = part[0] + part[1] + part[2] + part[3] + part[4] + part[5] + part[6] + part[7];
+        float s = 0.0f;
+#pragma unroll
+        for (u32 wi = 0u; wi < GEMV_BF16_WARPS; wi++) s += part[wi];
         out[row] = fg_gemv_act(s, mode, a, b);
     }
 }
 
 // Tensor-Core BF16 stacked matmul, 16x16 per block.
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_stacked_lanes_tc(
+extern "C" __global__ __launch_bounds__(128, ST_TC_BLK) void tessera_stacked_lanes_tc(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
     u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     __shared__ fg_bf16_smem<2u> sm;
@@ -760,7 +827,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_stacked_lanes_tc(
 }
 
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
+extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_lanes(
     const float* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
     u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     u32 idx = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
@@ -798,7 +865,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
 }
 
 // Streaming chunk-tiled MXFP8 decode GEMV, one warp per output.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_mxfp8(
+extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_mxfp8(
     const float* x, const u8* w, float* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][268];
@@ -855,7 +922,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_mxfp8(
 }
 
 // Streaming chunk-tiled 2-row INT4_G32 decode GEMV.
-extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_int4(
+extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_int4(
     const float* x, const u8* w, float* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][296];

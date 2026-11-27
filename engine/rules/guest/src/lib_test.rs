@@ -48,6 +48,7 @@ fn ask_parses() {
             guess: 1.0,
             writes: None,
             resident: None,
+            defines: vec![],
         }])
     });
     let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();

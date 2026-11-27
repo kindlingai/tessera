@@ -5,7 +5,7 @@ use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
+    Arg, ByBackend, Draft, Kernel, Knobs, Launch, Load, Needs, Shape, Source, Step, T, Tree, knob,
 };
 
 const BLOCK: usize = 128;
@@ -17,12 +17,27 @@ const PF16_SMEM: usize = (16 * 132 + 8 * 16 * 20) * 4;
 const PF32_SMEM: usize = (32 * 132 + 8 * 16 * 20) * 4;
 const GUESS: f64 = 2.0e-11;
 
-fn split_k(m: usize, n: usize, k: usize) -> usize {
+knob!("trellis_metal", "splits", 1, 16);
+knob!("trellis_metal", "split_max_rows", 1, 4);
+knob!("trellis_metal", "split_goal", 1, 128);
+knob!("trellis_metal", "mid_rows", 4, 16);
+
+fn split_k(knobs: &Knobs, m: usize, n: usize, k: usize) -> usize {
     let ibs = k / BLOCK;
-    if m > 4 || ibs <= 1 {
+    let max_rows = knobs.get("trellis_metal", "split_max_rows").unwrap_or(4);
+    if m > max_rows || ibs <= 1 {
         return 1;
     }
-    let goal: usize = if m <= 2 { 40 } else { 20 };
+    if let Some(s) = knobs.get("trellis_metal", "splits") {
+        let s = s.min(ibs);
+        if ibs.is_multiple_of(s) {
+            return s;
+        }
+    }
+    let default_goal = if m <= 2 { 40 } else { 20 };
+    let goal = knobs
+        .get("trellis_metal", "split_goal")
+        .unwrap_or(default_goal);
     let want = goal.div_ceil(n / BLOCK).clamp(1, 8).min(ibs);
     (1..=ibs.min(8))
         .filter(|d| ibs.is_multiple_of(*d))
@@ -37,10 +52,10 @@ fn fixed(entry: &'static str) -> Source {
     }
 }
 
-fn tile_rows(m: usize) -> usize {
+fn tile_rows(m: usize, mid_rows: usize) -> usize {
     if m <= 4 {
         m
-    } else if m <= 16 {
+    } else if m <= mid_rows {
         16
     } else {
         32
@@ -49,27 +64,37 @@ fn tile_rows(m: usize) -> usize {
 
 fn entry(t: &TrellisMetal) -> &'static str {
     let m = t.shape[0];
-    match (m, t.book, t.bits) {
-        (1, 0, 2) => "tm_k2_d1",
-        (1, 0, 3) => "tm_k3_d1",
-        (1, 0, 4) => "tm_k4_d1",
-        (1, _, _) => "tm_gen_d1",
-        (2..=4, _, _) => "tm_dec4",
-        (5..=16, 0, 2) => "tm_k2_pf16",
-        (5..=16, 0, 3) => "tm_k3_pf16",
-        (5..=16, 0, 4) => "tm_k4_pf16",
-        (5..=16, _, _) => "tm_gen_pf16",
-        (_, 0, 2) => "tm_k2_pf32",
-        (_, 0, 3) => "tm_k3_pf32",
-        (_, 0, 4) => "tm_k4_pf32",
+    if m == 1 {
+        return match (t.book, t.bits) {
+            (0, 2) => "tm_k2_d1",
+            (0, 3) => "tm_k3_d1",
+            (0, 4) => "tm_k4_d1",
+            _ => "tm_gen_d1",
+        };
+    }
+    if m <= 4 {
+        return "tm_dec4";
+    }
+    if m <= t.mid_rows {
+        return match (t.book, t.bits) {
+            (0, 2) => "tm_k2_pf16",
+            (0, 3) => "tm_k3_pf16",
+            (0, 4) => "tm_k4_pf16",
+            _ => "tm_gen_pf16",
+        };
+    }
+    match (t.book, t.bits) {
+        (0, 2) => "tm_k2_pf32",
+        (0, 3) => "tm_k3_pf32",
+        (0, 4) => "tm_k4_pf32",
         _ => "tm_gen_pf32",
     }
 }
 
-fn smem_bytes(m: usize) -> usize {
+fn smem_bytes(m: usize, mid_rows: usize) -> usize {
     if m <= 4 {
         DEC_SMEM
-    } else if m <= 16 {
+    } else if m <= mid_rows {
         PF16_SMEM
     } else {
         PF32_SMEM
@@ -80,7 +105,7 @@ fn metal_needs(t: &TrellisMetal) -> Needs {
     let m = t.shape[0];
     Needs {
         lanes: 32,
-        group_bytes: smem_bytes(m),
+        group_bytes: smem_bytes(m, t.mid_rows),
         group_threads: THREADS,
         tile: m > 4,
         compiler: true,
@@ -107,6 +132,7 @@ fn metal_needs(t: &TrellisMetal) -> Needs {
 struct TrellisMetal {
     shape: [usize; 3],
     splits: usize,
+    mid_rows: usize,
     bits: u32,
     book: u32,
     turned: bool,
@@ -126,7 +152,7 @@ fn accepts(k: &TrellisMetal, input: usize, form: &dyn Stored) -> bool {
 
 fn load(t: &TrellisMetal, _: usize) -> Option<Load> {
     let [m, n, k] = t.shape;
-    let down = m.div_ceil(tile_rows(m));
+    let down = m.div_ceil(tile_rows(m, t.mid_rows));
     let groups = (n / BLOCK) * t.splits * down;
     let mut reads = vec![t.form.bytes(n * k) as f64, (4 * m * k) as f64];
     if t.turned {
@@ -142,7 +168,7 @@ fn load(t: &TrellisMetal, _: usize) -> Option<Load> {
         reads,
         written: (4 * t.splits * m * n) as f64,
         flight: 1024.0,
-        group_bytes: smem_bytes(m) as f64,
+        group_bytes: smem_bytes(m, t.mid_rows) as f64,
         ..Load::default()
     })
 }
@@ -151,7 +177,7 @@ fn launches(t: &TrellisMetal, step: &Step) -> Vec<Launch> {
     let [m, n, k] = t.shape;
     let shape = Shape::Grid {
         across: (n / BLOCK) * t.splits,
-        down: m.div_ceil(tile_rows(m)),
+        down: m.div_ceil(tile_rows(m, t.mid_rows)),
         threads: THREADS,
     };
     let args = launch_args(step, [m, n, k, t.splits], t.bits, t.book, t.turned);
@@ -230,12 +256,14 @@ fn reduce_launches(r: &MetalReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn drafts(d: &Dense) -> Vec<Draft> {
+fn drafts(d: &Dense, knobs: &Knobs) -> Vec<Draft> {
     let [m, n, k] = [d.m, d.n, d.k];
-    let (splits, turned) = (split_k(m, n, k), d.turned());
+    let (splits, turned) = (split_k(knobs, m, n, k), d.turned());
+    let mid_rows = knobs.get("trellis_metal", "mid_rows").unwrap_or(16);
     let kernel = TrellisMetal {
         shape: [m, n, k],
         splits,
+        mid_rows,
         bits: d.bits,
         book: d.book,
         turned,
@@ -250,7 +278,7 @@ fn drafts(d: &Dense) -> Vec<Draft> {
 }
 
 fn eval_metal(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    Some(Dense::find(tree, at, BLOCK)?.map(|d| drafts(&d)))
+    Some(Dense::find(tree, at, BLOCK)?.map(|d| drafts(&d, &tree.knobs)))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

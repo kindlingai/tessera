@@ -144,9 +144,11 @@ impl Ranks {
             }
             (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
             (false, Sums::P2p, _) => p2p(&mut *met, settings, knobs).map(Grids::Sums),
-            (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
+            (false, Sums::Grid, Some(fabric)) => {
+                grid(&mut *met, fabric, settings, knobs).map(Grids::Sums)
+            }
             (false, Sums::Arx, Some(fabric)) => {
-                arx_sums(&mut *met, fabric, settings).map(Grids::Sums)
+                arx_sums(&mut *met, fabric, settings, knobs).map(Grids::Sums)
             }
             (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());

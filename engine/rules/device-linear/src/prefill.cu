@@ -8,11 +8,37 @@ using namespace tessera;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define DTR_MX8 1
 constexpr u32 DTR_TILE = trellis::MX8_TILE;
+#ifndef DTR_T8_BLK
 #define DTR_T8_BLK 3
+#endif
 #else
 #define DTR_MX8 0
 constexpr u32 DTR_TILE = 512u;
+#ifndef DTR_T8_BLK
 #define DTR_T8_BLK 2
+#endif
+#endif
+
+#ifndef DTR_PREP_BLK
+#define DTR_PREP_BLK 3
+#endif
+#ifndef DTR_T16_BLK
+#define DTR_T16_BLK 2
+#endif
+#ifndef DTR_GEN8_BLK
+#define DTR_GEN8_BLK 2
+#endif
+#ifndef DTR_GEN16_BLK
+#define DTR_GEN16_BLK 2
+#endif
+#ifndef MM_PREP_BLK
+#define MM_PREP_BLK 4
+#endif
+#ifndef MM_MX8_BLK
+#define MM_MX8_BLK 1
+#endif
+#ifndef MM_MX8_SK_BLK
+#define MM_MX8_SK_BLK 1
 #endif
 
 constexpr u32 DTR_STRIDE = 8u * DTR_TILE;
@@ -52,7 +78,7 @@ static __device__ __forceinline__ void dtr_run_mma(const u32* wtiles, const u32*
 }
 
 // Rotates and quantizes dense inputs once per 64x128 block.
-extern "C" __global__ __launch_bounds__(256, 3) void dtr_prep(const float* x, const float* suh,
+extern "C" __global__ __launch_bounds__(256, DTR_PREP_BLK) void dtr_prep(const float* x, const float* suh,
                                                               float* out, u32 m, u32 k,
                                                               u32 turned) {
     u32 c0 = blockIdx.x, rt = blockIdx.y, r0 = rt << 6u;
@@ -199,7 +225,7 @@ extern "C" __global__ __launch_bounds__(256, DTR_T8_BLK) void dtr_pre_k4_t8(
 }
 
 // Rotated 4-bit dense trellis prefill, 128 rows per block.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_pre_k4_t16(
+extern "C" __global__ __launch_bounds__(256, DTR_T16_BLK) void dtr_pre_k4_t16(
     const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
     u32 book, u32 turned) {
     (void)bits; (void)book; (void)turned;
@@ -208,7 +234,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void dtr_pre_k4_t16(
 }
 
 // Generic dense trellis prefill, 64 rows per block.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_pre_gen8(
+extern "C" __global__ __launch_bounds__(256, DTR_GEN8_BLK) void dtr_pre_gen8(
     const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
     u32 book, u32 turned) {
     __shared__ dtr_pre_smem<8u> sm;
@@ -216,7 +242,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void dtr_pre_gen8(
 }
 
 // Generic dense trellis prefill, 128 rows per block.
-extern "C" __global__ __launch_bounds__(256, 2) void dtr_pre_gen16(
+extern "C" __global__ __launch_bounds__(256, DTR_GEN16_BLK) void dtr_pre_gen16(
     const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
     u32 book, u32 turned) {
     __shared__ dtr_pre_smem<16u> sm;
@@ -238,7 +264,7 @@ static __device__ __forceinline__ float mx8_epilogue(float v, const float* other
 }
 
 // Quantizes X[m, k] once to packed E4M3 and UE8M0 scales.
-extern "C" __global__ __launch_bounds__(256, 4) void tessera_mm_mxfp8_prep(
+extern "C" __global__ __launch_bounds__(256, MM_PREP_BLK) void tessera_mm_mxfp8_prep(
     const float* x, float* out, u32 m, u32 k) {
 #if DTR_MX8
     u32 blk = blockIdx.x * 32u + (threadIdx.x >> 3u);
@@ -472,7 +498,7 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
 #endif
 
 // Blackwell native MXFP8 MMA matmul, 128x128 per block.
-extern "C" __global__ __launch_bounds__(256, 1) void tessera_mm_mxfp8_mx8(
+extern "C" __global__ __launch_bounds__(256, MM_MX8_BLK) void tessera_mm_mxfp8_mx8(
     const float* xpre, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
 #if DTR_MX8
     fg_mxfp8_mx8<false>(xpre, w, other, out, m, n, k, mode, 1u);
@@ -482,7 +508,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void tessera_mm_mxfp8_mx8(
 }
 
 // Split-K Blackwell native MXFP8 MMA matmul, 128x128 per block.
-extern "C" __global__ __launch_bounds__(256, 1) void tessera_mm_mxfp8_mx8_sk(
+extern "C" __global__ __launch_bounds__(256, MM_MX8_SK_BLK) void tessera_mm_mxfp8_mx8_sk(
     const float* xpre, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
 #if DTR_MX8

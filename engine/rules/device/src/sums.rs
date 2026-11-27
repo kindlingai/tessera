@@ -8,6 +8,7 @@ use tessera_engine_comm::Link;
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_lower::Knobs;
 use tessera_mem::DType;
 
 pub use tessera_run::Sum;
@@ -32,6 +33,10 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// The most bytes in one relayed put.
 pub const RELAY: usize = ROOM as usize * 4;
 
+tessera_lower::knob!("grid_sum", "threads", 32, 1024);
+tessera_lower::knob!("grid_sum", "share", 1, 256);
+tessera_lower::knob!("grid_sum", "min_blocks", 1, 16);
+
 /// One two-way pool of every rank, slots of `RELAY` bytes.
 pub(crate) fn pool(ranks: u32) -> PoolPlan {
     PoolPlan {
@@ -44,6 +49,10 @@ pub(crate) fn pool(ranks: u32) -> PoolPlan {
 }
 
 pub(crate) fn plan(ranks: u32) -> Plan {
+    plan_with(ranks, THREADS, SHARE)
+}
+
+fn plan_with(ranks: u32, threads: u32, share: u32) -> Plan {
     let lane = |op, elem| LanePlan {
         op,
         elem,
@@ -62,9 +71,9 @@ pub(crate) fn plan(ranks: u32) -> Plan {
         kept: Vec::new(),
         pages: Vec::new(),
         arenas: Vec::new(),
-        threads: THREADS,
+        threads,
         shared: 0,
-        share: SHARE,
+        share,
     }
 }
 
@@ -269,14 +278,33 @@ where
 }
 
 /// Sums over `link` in a grid on `ctx`.
-pub fn on<D, L>(ctx: &D, link: L) -> Result<Box<dyn Sum>, Error>
+pub fn on<D, L>(ctx: &D, link: L, knobs: &Knobs) -> Result<Box<dyn Sum>, Error>
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
     let options = Options::plain(crate::resident::backend::<D>()?);
-    let text = flatten("sum.cu", KERNEL, &|_| None, &options)?.text;
-    let plan = plan(link.ranks());
+    let most = knobs
+        .get("grid_sum", "threads")
+        .map_or(THREADS, |t| t as u32);
+    let limit = ctx.platform().limits.group_threads as u32;
+    let threads = (limit.min(most) & !31).max(32);
+    let share = knobs.get("grid_sum", "share").map_or(SHARE, |s| s as u32);
+    let min_blocks = knobs.get("grid_sum", "min_blocks");
+    let mut text = flatten("sum.cu", KERNEL, &|_| None, &options)?.text;
+    let mut defs = Vec::new();
+    if threads != THREADS {
+        defs.push(("SUM_THREADS", threads.to_string()));
+    }
+    if let Some(mb) = min_blocks {
+        defs.push(("SUM_MIN_BLOCKS", mb.to_string()));
+    }
+    if !defs.is_empty() {
+        let prefix = tessera_lower::define_prefix(defs.iter().map(|(k, v)| (*k, v.as_str())))
+            .expect("valid cuda define");
+        text = format!("{prefix}{text}");
+    }
+    let plan = plan_with(link.ranks(), threads, share);
     let hand = ctx.compile(&text, HAND)?;
     let job = DeviceBuffer::alloc(ctx, JOB)?;
     ctx.zero(job.device_ptr(), JOB)?;
@@ -292,17 +320,21 @@ where
     }))
 }
 
-struct Start<L>(L);
+struct Start<'a, L>(L, &'a Knobs);
 
-impl<L: Link + 'static> OnGpu for Start<L> {
+impl<L: Link + 'static> OnGpu for Start<'_, L> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        on(cached_context::<D>()?, self.0)
+        on(cached_context::<D>()?, self.0, self.1)
     }
 }
 
 /// Sums over `link` on the GPU `gpu` names.
-pub fn open<L: Link + 'static>(gpu: Option<Gpu>, link: L) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(link))
+pub fn open<L: Link + 'static>(
+    gpu: Option<Gpu>,
+    link: L,
+    knobs: &Knobs,
+) -> Result<Box<dyn Sum>, Error> {
+    persistent(gpu, Start(link, knobs))
 }

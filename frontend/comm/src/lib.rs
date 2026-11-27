@@ -122,9 +122,10 @@ pub fn grid(
     met: &mut dyn Transport,
     fabric: &Fabric,
     settings: &Settings,
+    knobs: &Knobs,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let link = link(met, fabric, settings, (sums::regions, sums::RELAY), "sums")?;
-    Ok(sums::open(settings.gpu(), link)?)
+    Ok(sums::open(settings.gpu(), link, knobs)?)
 }
 
 /// Dual-root RoCE sums over `fabric`, met through `met`.
@@ -132,6 +133,7 @@ pub fn arx_sums(
     met: &mut dyn Transport,
     fabric: &Fabric,
     settings: &Settings,
+    knobs: &Knobs,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let (rank, ranks) = (met.rank(), met.ranks());
     let pinning = tessera_engine::pinning(settings);
@@ -141,7 +143,7 @@ pub fn arx_sums(
         fabric.lanes(),
         roce::describe(fabric)
     );
-    Ok(arx::open(settings.gpu(), link)?)
+    Ok(arx::open(settings.gpu(), link, knobs)?)
 }
 
 /// A recipe's resident grid, its sums over `fabric`.

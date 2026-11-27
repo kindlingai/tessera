@@ -4,6 +4,13 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
+#ifndef PBF16_MIN_BLOCKS
+#define PBF16_MIN_BLOCKS 2
+#endif
+#ifndef PBF16_GM
+#define PBF16_GM 8u
+#endif
+
 constexpr u32 CALIB_MAX_EXPERTS = 1024u;
 constexpr u32 CALIB_TILE = 128u;
 constexpr u32 CALIB_BK = 32u;
@@ -461,7 +468,7 @@ static __device__ __forceinline__ void pbf16_grouped_body(
     if (blockIdx.y >= total_m) return;
     u32 n_tiles = gridDim.x;
     u32 linear = blockIdx.y * n_tiles + blockIdx.x;
-    u32 gm = 8u;
+    u32 gm = PBF16_GM;
     u32 mg = linear / (gm * n_tiles);
     u32 rem = linear - mg * (gm * n_tiles);
     u32 gm_size = total_m - mg * gm;
@@ -596,7 +603,7 @@ static __device__ __forceinline__ void pbf16_grouped_body(
 }
 
 #define PBF16_GEMM_DEF(NAME, OF)                                                                   \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                     \
+    extern "C" __global__ __launch_bounds__(256, PBF16_MIN_BLOCKS) void NAME(                      \
         const u16* x, const u16* w, const u32* offsets, const u32* perm, const u32* tile_meta,     \
         void* out, u32 n, u32 k, u32 stride, u32 w_off, u32 repeat) {                              \
         __shared__ gemm_smem sm;                                                                   \
@@ -608,7 +615,7 @@ PBF16_GEMM_DEF(pbf16_gemm_bf16_bf16, false)
 PBF16_GEMM_DEF(pbf16_gemm_bf16_f32, true)
 
 #define PBF16_GU_DEF(NAME, OF)                                                                     \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                     \
+    extern "C" __global__ __launch_bounds__(256, PBF16_MIN_BLOCKS) void NAME(                      \
         const u16* x, const u16* wg, const u16* wu, const u32* offsets, const u32* perm,           \
         const u32* tile_meta, void* out, u32 n, u32 k, u32 stride, u32 repeat) {                   \
         __shared__ gemm_smem sm;                                                                   \

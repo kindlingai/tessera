@@ -77,7 +77,15 @@ impl Picked {
             out_form,
             ..
         } = self.product;
-        let key: Variant = ("picked", 0, x_form.name(), form.name(), out_form.name(), 0);
+        let key: Variant = (
+            "picked",
+            0,
+            x_form.name(),
+            form.name(),
+            out_form.name(),
+            0,
+            0,
+        );
         let mut body = self.product.tree(key, || picked_ir(x_form, form, out_form));
         let gid = Expr::Call(Intrinsic::Gid, Vec::new());
         let at = Expr::cast(Ty::U64, gid);

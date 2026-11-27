@@ -7,7 +7,13 @@ use tessera_graph::Order;
 use tessera_lower::form::{BF16_FORM, Load as Stored, plain};
 use tessera_lower::kernels::finish;
 use tessera_lower::sites::Near;
-use tessera_lower::{Compute, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree};
+use tessera_lower::{
+    Compute, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree, knob,
+};
+
+knob!("tiled", "band", 1, 64);
+knob!("tiled", "block_m", 32, 128);
+knob!("tiled", "block_n", 32, 128);
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +323,7 @@ macro_rules! tiled_kernel {
             #[build] $threads: u32,
             #[build] $wide: bool,
             #[build] wbits: u32,
+            #[build] band_cfg: u32,
             $($builds)*
             #[build] $x_form: &'static dyn Stored,
             #[build] $form: &'static dyn Stored,
@@ -326,7 +333,7 @@ macro_rules! tiled_kernel {
             let group = gid() / $threads;
             // Down a band, then across: groups share a weight block.
             let tiles_m = ($m + $bm - 1) / $bm;
-            let mut band = BAND;
+            let mut band = band_cfg;
             if $n * wbits >= 32 * $m {
                 band = tiles_m;
             }
@@ -479,6 +486,7 @@ pub struct Tiled {
     pub schedule: Schedule,
     /// Slabs of `x` in bf16, or zero for f32.
     pub parts: u32,
+    pub band: u32,
 }
 
 impl Tiled {
@@ -525,17 +533,17 @@ impl Tiled {
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
-            let (wbits, parts) = (weight_bits(form), self.parts);
+            let (wbits, parts, band) = (weight_bits(form), self.parts, self.band);
             match (near, parts) {
                 (true, _) => tiled_near_ir(
-                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, x_form, form, out_form,
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, band, x_form, form, out_form,
                 ),
                 (false, 0) => tiled_ir(
-                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, x_form, form, out_form,
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, band, x_form, form, out_form,
                 ),
                 _ => tiled_parts_ir(
-                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, parts, direct_x, direct_w,
-                    x_form, form, out_form,
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, band, parts, direct_x,
+                    direct_w, x_form, form, out_form,
                 ),
             }
         };
@@ -556,6 +564,7 @@ impl Tiled {
             form.name(),
             out_form.name(),
             flags,
+            self.band as usize,
         );
         let mut body = self.product.tree(key, build);
         body.stmts.push(self.stores());
@@ -607,11 +616,11 @@ fn weight_bits(form: &dyn Stored) -> u32 {
 }
 
 /// Row blocks per band. The kernel computes the same count.
-fn band(m: usize, n: usize, bm: usize, form: &dyn Stored) -> usize {
+fn band(m: usize, n: usize, bm: usize, form: &dyn Stored, cfg: u32) -> usize {
     let tiles_m = m.div_ceil(bm);
     match n * weight_bits(form) as usize >= 32 * m {
         true => tiles_m,
-        false => (BAND as usize).min(tiles_m),
+        false => (cfg as usize).min(tiles_m),
     }
 }
 
@@ -633,7 +642,7 @@ fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
         None => x_form.bytes(m * k) as f64,
     };
     let mut reads = vec![rows];
-    let bands = gm.div_ceil(band(m, n, bm, form));
+    let bands = gm.div_ceil(band(m, n, bm, form, t.band));
     reads.extend((0..bands).map(|_| form.bytes(n * k) as f64));
     reads.extend(
         t.product
@@ -698,16 +707,24 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if product.picked.is_some() {
         return None;
     }
+    let band = tree.knobs.get("tiled", "band").map_or(BAND, |v| v as u32);
+    let block_m = tree.knobs.get("tiled", "block_m");
+    let block_n = tree.knobs.get("tiled", "block_n");
+    let matches_block = |s: &Schedule| {
+        block_m.is_none_or(|m| s.block.0 == m) && block_n.is_none_or(|n| s.block.1 == n)
+    };
     // Each schedule is one way, so the cheapest wins.
     let draft = |product: &Product, reads: &[Read], (choice, schedule): (usize, &Schedule)| {
         let tiled = Tiled {
             product: product.clone(),
             schedule: *schedule,
             parts: 0,
+            band,
         };
         Draft::new(tiled, reads.to_vec(), product.outputs()).choice(choice)
     };
     let mut drafts: Vec<Draft> = (SCHEDULES.iter().enumerate())
+        .filter(|(_, s)| matches_block(s))
         .map(|c| draft(&product, &reads, c))
         .collect();
     let direct_x = bf16_fits(product.x_form, product.m * product.k);
@@ -715,10 +732,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     // bf16 weights multiply as stored, against `x` split exactly.
     if direct_w && product.k.is_multiple_of(WIDE as usize) {
         for (i, schedule) in PARTS.iter().enumerate() {
+            if !matches_block(schedule) {
+                continue;
+            }
             let tiled = Tiled {
                 product: product.clone(),
                 schedule: *schedule,
                 parts: SLABS,
+                band,
             };
             let choice = 2 * SCHEDULES.len() + i;
             drafts.push(Draft::new(tiled, reads.to_vec(), product.outputs()).choice(choice));
@@ -733,10 +754,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if aligned && (tree.compute_at(at) == Compute::Bf16 || (direct_x && direct_w)) {
         let base = 2 * SCHEDULES.len() + PARTS.len();
         for (i, schedule) in BF16.iter().enumerate() {
+            if !matches_block(schedule) {
+                continue;
+            }
             let tiled = Tiled {
                 product: product.clone(),
                 schedule: *schedule,
                 parts: 1,
+                band,
             };
             drafts.push(Draft::new(tiled, reads.to_vec(), product.outputs()).choice(base + i));
         }
@@ -748,13 +773,12 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             near: Some(near),
             ..product.clone()
         };
-        let ways = SCHEDULES
-            .iter()
-            .enumerate()
+        let ways = (SCHEDULES.iter().enumerate())
+            .filter(|(_, s)| matches_block(s))
             .map(|(i, s)| (SCHEDULES.len() + i, s));
         drafts.extend(ways.map(|c| draft(&product, &reads, c)));
     }
-    Some(drafts)
+    (!drafts.is_empty()).then_some(drafts)
 }
 
 /// The input's neighbours, and reads that skip the gather.

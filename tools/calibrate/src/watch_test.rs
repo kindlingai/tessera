@@ -337,3 +337,21 @@ fn serve_dims_change_plan() {
     assert!(sizes_pos.contains(&(DimName::Context, 48)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn watch_shape_knobs() {
+    let parsed = parse_watch(&args(&[
+        "out",
+        "gemm",
+        "4",
+        "8",
+        "8",
+        "--shape",
+        "tiled:band=16",
+    ]))
+    .unwrap();
+    let settings = tessera_run::testing::host();
+    let (opts, _, _) = build_options(&parsed, &settings, true).unwrap();
+    assert_eq!(opts.knobs().get("tiled", "band"), Some(16));
+    assert!(parse_watch(&args(&["out", "gemm", "4", "8", "8", "--shape", "bad"])).is_err());
+}

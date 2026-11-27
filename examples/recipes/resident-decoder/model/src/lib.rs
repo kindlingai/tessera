@@ -56,15 +56,32 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     ];
     let ops = ["rms_norm", "rope_halves", "attend"];
     let reads = found.iter().map(Found::read);
+    let threads = site.knob(NAME, "threads").unwrap_or(THREADS as usize);
+    if !threads.is_multiple_of(32) {
+        return None;
+    }
+    let warps = site.knob(NAME, "warps").unwrap_or(32);
+    if warps < threads / 32 {
+        return None;
+    }
+    let mut defines = Vec::new();
+    if warps != 32 {
+        defines.push(("WARPS".into(), warps.to_string()));
+    }
     let floats = rows * (3 * hidden + 2 * heads + 2 * kv + ffn);
     let work = (rows * layers * hidden * (heads + 2 * kv + 3 * ffn)) as f64;
-    let resident = Resident::grid(THREADS, floats * 4, Lane::Sum);
-    let whole = step.resident(NAME, reads, &sizes, &ops, work, resident)?;
+    let resident = Resident::grid(threads as u32, floats * 4, Lane::Sum);
+    let mut whole = step.resident(NAME, reads, &sizes, &ops, work, resident)?;
+    whole.defines = defines;
     Some(vec![whole])
 }
 
 tessera_guest::exports! {
     rules: { NAME => Kind::Model },
     kernels: { "whole.kernel": [NAME] },
+    knobs: [
+        (NAME, "threads", 32, 1024),
+        (NAME, "warps", 1, 32),
+    ],
     propose: offer,
 }

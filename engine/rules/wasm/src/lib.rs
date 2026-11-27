@@ -306,6 +306,14 @@ impl Module {
         if manifest.abi != ABI {
             return Err(Error::Abi(manifest.abi));
         }
+        for k in manifest.knobs {
+            tessera_lower::register_knob(tessera_lower::Knob {
+                kernel: leak(k.kernel),
+                name: leak(k.name),
+                least: k.least,
+                most: k.most,
+            });
+        }
         let mut kernels = Vec::with_capacity(manifest.kernels.len());
         for k in manifest.kernels {
             kernels.push(Fixed::open(k, &manifest.files)?);

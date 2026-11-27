@@ -16,6 +16,7 @@ fn distinct_row_entries() {
         m: 1,
         n: 128,
         k: 512,
+        rows_cap: 4,
         form,
     };
     let three = Turned { m: 3, ..one };

@@ -2,6 +2,8 @@
 
 use crate::extent::Extent;
 use crate::plan::{Slot, Step};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use tessera_codegen::ir::{Body, Param};
 use tessera_codegen::{Dialect, hash};
 use tessera_engine_settings::ByBackend;
@@ -221,4 +223,47 @@ impl Source {
             Source::Made(body) => hash(&body.text().render(Dialect::Cuda)),
         }
     }
+}
+
+type PrefixedCache = Mutex<HashMap<(usize, usize, String), &'static str>>;
+
+/// Returns `base` prefixed with `prefix`, cached once per pair.
+pub fn prefixed(prefix: &str, base: &'static str) -> &'static str {
+    if prefix.is_empty() {
+        return base;
+    }
+    static CACHE: OnceLock<PrefixedCache> = OnceLock::new();
+    let map = CACHE.get_or_init(Mutex::default);
+    let key = (base.as_ptr() as usize, base.len(), prefix.to_owned());
+    let mut guard = map.lock().expect("prefixed sources");
+    if let Some(&cached) = guard.get(&key) {
+        return cached;
+    }
+    let leaked: &'static str = Box::leak(format!("{prefix}{base}").into_boxed_str());
+    guard.insert(key, leaked);
+    leaked
+}
+
+/// Formats `#define` lines terminated by `#line 1`.
+pub fn define_prefix<'a>(
+    defs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String, String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (name, value) in defs {
+        let valid_name = !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !name.as_bytes()[0].is_ascii_digit();
+        if !valid_name {
+            return Err(format!("invalid define name `{name}`"));
+        }
+        if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+            return Err(format!("invalid define value for `{name}`"));
+        }
+        let _ = writeln!(out, "#define {name} {value}");
+    }
+    if !out.is_empty() {
+        out.push_str("#line 1\n");
+    }
+    Ok(out)
 }

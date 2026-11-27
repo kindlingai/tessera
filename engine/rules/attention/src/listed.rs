@@ -5,7 +5,7 @@ use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::{
-    Arg, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree, knob,
 };
 
 /// Elements one wide load brings per lane.
@@ -14,8 +14,7 @@ const WIDE: u32 = 4;
 /// SIMD groups sharing one query row and head.
 const WARPS: u32 = 8;
 
-/// Threads in one fused attention group.
-const THREADS: u32 = WARPS * LANES as u32;
+knob!("listed_fused", "warps", 1, 32);
 
 /// Widest head handled by the fused warp kernel.
 const MAX_WIDTH: usize = 640;
@@ -28,6 +27,7 @@ const MAX_QUADS: u32 = (MAX_SLOTS / WIDE as usize) as u32;
 
 /// Fused split-K attention: one group per query and head.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn listed_attend(
     #[form(q_form)] q: Buf<Dyn>,
     #[form(k_form)] k: Buf<Dyn>,
@@ -50,12 +50,14 @@ fn listed_attend(
     after: u32,
     has_sinks: u32,
     #[build] width: u32,
+    #[build] warps: u32,
+    #[build] threads: u32,
     #[build] q_form: &'static dyn Stored,
     #[build] k_form: &'static dyn Stored,
     #[build] v_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
 ) {
-    let list = gid() / THREADS;
+    let list = gid() / threads;
     if list >= lists {
         return;
     }
@@ -125,7 +127,7 @@ fn listed_attend(
             stop = lo;
         }
     }
-    for p in (start + warp..stop).by(WARPS) {
+    for p in (start + warp..stop).by(warps) {
         let mut j = p;
         if from_list == 1 {
             j = ids[row as u64 * picks as u64 + p as u64];
@@ -161,9 +163,9 @@ fn listed_attend(
             }
         }
     }
-    let mut m_s = shared::<f32>(WARPS);
-    let mut l_s = shared::<f32>(WARPS);
-    let mut o_s = shared::<f32>(WARPS * width);
+    let mut m_s = shared::<f32>(warps);
+    let mut l_s = shared::<f32>(warps);
+    let mut o_s = shared::<f32>(warps * width);
     if l == 0 {
         m_s[warp] = peak;
         l_s[warp] = total;
@@ -185,7 +187,7 @@ fn listed_attend(
         sink = sinks[head as u64];
     }
     let mut best = sink;
-    for w in 0..WARPS {
+    for w in 0..warps {
         if l_s[w] > 0.0 {
             best = max(best, m_s[w]);
         }
@@ -194,15 +196,15 @@ fn listed_attend(
     if has_sinks == 1 && sink > f32::NEG_INFINITY {
         denom = exp(sink - best);
     }
-    for w in 0..WARPS {
+    for w in 0..warps {
         if l_s[w] > 0.0 {
             denom += l_s[w] * exp(m_s[w] - best);
         }
     }
     let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
-    for d in (lid()..width).by(THREADS) {
+    for d in (lid()..width).by(threads) {
         let mut sum = 0.0f32;
-        for w in 0..WARPS {
+        for w in 0..warps {
             if l_s[w] > 0.0 {
                 sum += o_s[w * width + d] * exp(m_s[w] - best);
             }
@@ -512,9 +514,9 @@ impl Sizes {
     }
 
     /// Single-launch split-K attention when width fits.
-    fn fused(self, reads: [T; 7]) -> Option<Vec<Draft>> {
+    fn fused(self, reads: [T; 7], warps: u32) -> Option<Vec<Draft>> {
         self.check_fused().ok()?;
-        Some(vec![Draft::new(ListedAttend(self), reads, self.len)])
+        Some(vec![Draft::new(ListedAttend(self, warps), reads, self.len)])
     }
 }
 
@@ -530,9 +532,9 @@ impl Sizes {
     emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
-    shape = Shape::grid((self.0.lists(), 1), THREADS as usize),
+    shape = Shape::grid((self.0.lists(), 1), (self.1 * LANES as u32) as usize),
 )]
-pub(crate) struct ListedAttend(pub Sizes);
+pub(crate) struct ListedAttend(pub Sizes, pub u32);
 
 fn attend_accepts(k: &ListedAttend, input: usize, form: &dyn Stored) -> bool {
     match input {
@@ -551,23 +553,41 @@ fn attend_emits(k: &ListedAttend, form: &dyn Stored) -> bool {
 }
 
 fn attend_source(k: &ListedAttend) -> Source {
-    let s = &k.0;
+    let (s, warps) = (&k.0, k.1);
     let body = kept::attach(
-        listed_attend_ir(s.width as u32, s.q_form, s.k_form, s.v_form, s.out_form),
+        listed_attend_ir(
+            s.width as u32,
+            warps,
+            warps * LANES as u32,
+            s.q_form,
+            s.k_form,
+            s.v_form,
+            s.out_form,
+        ),
         s.kept,
     );
+    let tag = if warps == WARPS {
+        String::new()
+    } else {
+        format!("_w{warps}")
+    };
     let suffix = Sizes::form_suffix(&[s.q_form, s.k_form, s.v_form, s.out_form]);
     Source::named(
         body,
-        format!("plan_listed_attend_{}_{}{suffix}", s.kept.name(), s.width),
+        format!(
+            "plan_listed_attend_{}_{}{suffix}{tag}",
+            s.kept.name(),
+            s.width
+        ),
     )
 }
 
 fn attend_needs(k: &ListedAttend) -> Needs {
+    let warps = k.1 as usize;
     Needs {
         lanes: LANES,
-        group_bytes: 4 * (WARPS as usize * (k.0.width + 2)),
-        group_threads: THREADS as usize,
+        group_bytes: 4 * (warps * (k.0.width + 2)),
+        group_threads: warps * LANES,
         ..Needs::default()
     }
 }
@@ -805,7 +825,11 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 
 fn propose_fused(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (sizes, reads) = site(tree, at)?;
-    sizes.fused(reads)
+    let warps = tree
+        .knobs
+        .get("listed_fused", "warps")
+        .map_or(WARPS, |w| w as u32);
+    sizes.fused(reads, warps)
 }
 
 fn why_fused(tree: &Tree, at: T) -> Option<String> {

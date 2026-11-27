@@ -27,6 +27,7 @@ pub use rope::Rope;
 pub use softmax::Softmax;
 
 use tessera_codegen::prelude::LANES;
+pub(crate) use tessera_lower::knob as __knob;
 use tessera_work::{Load, Ops};
 
 /// Elements one wide load brings a lane.

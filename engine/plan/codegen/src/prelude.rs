@@ -227,6 +227,11 @@ pub fn shared<T>(_: u32) -> Shared<T> {
     device()
 }
 
+/// `len` elements of register-local memory. `len` is fixed when built.
+pub fn local<T>(_: usize) -> Vec<T> {
+    device()
+}
+
 impl<T> Index<u32> for Shared<T> {
     type Output = T;
 

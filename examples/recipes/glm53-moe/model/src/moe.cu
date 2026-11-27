@@ -8,8 +8,12 @@ namespace prim = tessera::prim; namespace trellis = tessera::trellis;
 using trellis::word; typedef const u8* bytes;
 
 #define PICKS 8
+#ifndef MAX_ROWS
 #define MAX_ROWS 2048
+#endif
+#ifndef MAX_SLOTS
 #define MAX_SLOTS 640
+#endif
 #define ROW_WORDS (MAX_ROWS / 32u)
 #define ROUTE_SCALE 2.5f
 #define PLAN_WORDS (1u + MAX_SLOTS * 50u + MAX_ROWS * PICKS * 2u)
@@ -427,7 +431,7 @@ static __device__ __noinline__ void route_plan(
 }
 
 // Scores via sigmoid(x router), then last CTA builds plan.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
+extern "C" __global__ __launch_bounds__(256, ROUTE_MIN_BLOCKS) void glm53_route(
     const float* x, const void* router, const float* bias, float* plan_out,
     u32 rows, u32 hidden, u32 experts, u32 bf16, u32 picks, u32 first, u32 count) {
   __shared__ RouteSmem sm;
@@ -442,7 +446,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
   u32 rks = (use_tc || use_pf) ? (gridDim.x / nb) : 1u;
   if (use_gemv) route_gemv(x, reinterpret_cast<const u16*>(router), scores, sm.wsum, hidden, experts);
   else if (use_pf_bf) route_pf_bf16(x, reinterpret_cast<const u16*>(router), bias, plan_out, sm.bf, rows, hidden, picks, first, count);
-  else if (use_pf && rows >= 512u) route_pf<64u>(x, router, scores, sm.pf, rows, hidden, experts, bf16, nb, rks);
+  else if (use_pf && rows >= ROUTE_PF64_MIN_ROWS) route_pf<64u>(x, router, scores, sm.pf, rows, hidden, experts, bf16, nb, rks);
   else if (use_pf) route_pf<32u>(x, router, scores, sm.pf, rows, hidden, experts, bf16, nb, rks);
   else if (use_tc) route_tc(x, router, scores, sm.tc, rows, hidden, experts, bf16, nb, rks);
   else if (blockIdx.x * 2u < experts) {
@@ -506,7 +510,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
     prim::block_sync();
   }
   route_plan(scores, bias, plan_out, sm.plan, rows, experts, picks, first, count, rks, fused,
-             use_pf_bf, rows > 32u ? 64u : 8u);
+             use_pf_bf, GLM53_SLOT_CAP);
 }
 
 struct alignas(16) Fc1Smem { u32 btab[2048], wtiles[2048]; };
@@ -600,7 +604,7 @@ static __device__ __noinline__ void fc1_cold(
 }
 
 // Split-K gate and up projections for routed and shared slots.
-extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
+extern "C" __global__ __launch_bounds__(256, FC1_MIN_BLOCKS) void glm53_fc1(
     const float* x, const float* plan_in, const float* signs_in, const float* gate_su, bytes gate,
     const float* up_su, bytes up, bytes shared_gate, const float* shared_gate_su, bytes shared_up,
     const float* shared_up_su, float* gpart, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k,
@@ -688,7 +692,7 @@ static __device__ __noinline__ void fc2_cold(
 }
 
 // SwiGLU and down projection into fp16 partials.
-extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
+extern "C" __global__ __launch_bounds__(256, FC2_MIN_BLOCKS) void glm53_fc2(
     const float* plan_in, const float* gpart, const float* gate_sv, const float* up_sv,
     const float* down_su, bytes down, const float* shared_gate_sv, const float* shared_up_sv,
     bytes shared_down, const float* shared_down_su, float* z_out, u32 rows, u32 hidden, u32 ffn,
@@ -719,7 +723,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
 }
 
 // Pre-turns routed and shared activations once per slot block.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_turn(
+extern "C" __global__ __launch_bounds__(256, FC1_TURN_MIN_BLOCKS) void glm53_fc1_turn(
     const float* x, const float* plan_in, const float* signs_in, const float* gate_su,
     const float* up_su, const float* sh_gate_su, const float* sh_up_su, float* x_out,
     u32 rows, u32 hidden, u32 first) {
@@ -849,7 +853,7 @@ static __device__ __noinline__ void fc1_pf_cold(const float* x, const Plan* plan
   fc1_pf_body<K, BOOK, 8u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
 // Prefill fused gate, up and SwiGLU for 64-token slots.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(
+extern "C" __global__ __launch_bounds__(256, FC1_PF_MIN_BLOCKS) void glm53_fc1_pf(
     const float* x, const float* plan_in, const float* x_turned, const float* signs_in, const float* gate_su, bytes gate, const float* gate_sv, const float* up_su, bytes up, const float* up_sv, const float* down_su, bytes sh_gate, const float* sh_gate_su, const float* sh_gate_sv, bytes sh_up, const float* sh_up_su, const float* sh_up_sv, const float* sh_down_su, float* act_out, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book, u32 first, u32 shared_ffn) {
   (void)picks;
   const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
@@ -910,7 +914,7 @@ static __device__ __noinline__ void fc2_pf_cold(const Plan* plan, const u32* act
 }
 
 // Prefill down projection writing coalesced weighted fp16 partials.
-extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2_pf(
+extern "C" __global__ __launch_bounds__(256, FC2_PF_MIN_BLOCKS) void glm53_fc2_pf(
     const float* plan_in, const float* act_in, bytes down, bytes shared_down,
     const float* down_sv, const float* signs_out, const float* shared_down_sv, float* z_out,
     u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book,
@@ -934,7 +938,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2_pf(
 }
 
 // Each row's fixed-order sum over picks, after output turn.
-extern "C" __global__ void glm53_finish(
+extern "C" __global__ FINISH_BOUNDS void glm53_finish(
     const float* plan_in, const float* down_sv, const float* signs_out,
     const float* shared_down_sv, const float* z_in, float* y,
     u32 rows, u32 hidden, u32 ffn, u32 picks, u32 shared_ffn, u32 z_chunks) {

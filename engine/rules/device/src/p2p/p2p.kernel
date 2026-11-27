@@ -833,8 +833,14 @@ TESSERA_FN void rs_body(const u64* areas, u32* counters, u32* fault, u64* seq_pt
 
 }  // namespace p2p
 
+#ifdef P2P_MIN_BLOCKS
+#define P2P_BOUNDS __launch_bounds__(P2P_THREADS, P2P_MIN_BLOCKS)
+#else
+#define P2P_BOUNDS __launch_bounds__(P2P_THREADS)
+#endif
+
 #define P2P_SUM_DEF(NAME, BODY, WIRE)                                                             \
-    extern "C" __global__ __launch_bounds__(P2P_THREADS) void NAME(                               \
+    extern "C" __global__ P2P_BOUNDS void NAME(                                                   \
         const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr,      \
         u32 total, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {                                \
         p2p::BODY<p2p::Wire::WIRE>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr,  \
@@ -851,7 +857,7 @@ P2P_SUM_DEF(tessera_p2p_rs_fp16, rs_body, Fp16)
 P2P_SUM_DEF(tessera_p2p_rs_fp8, rs_body, Fp8)
 
 // Direct P2P all-gather: fan-out (0) or pairwise rounds (1+).
-extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
+extern "C" __global__ P2P_BOUNDS void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
                                               u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 part,
                                               u32 total, u32 rows, u32 nr, u32 me, u32 sched,
                                               u64 timeout_ticks) {
@@ -932,7 +938,7 @@ extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather(con
 }
 
 // Direct P2P contiguous row gather (even chunked or uneven single-round).
-extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather_rows(
+extern "C" __global__ P2P_BOUNDS void tessera_p2p_gather_rows(
     const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 start,
     u32 part, u32 limit, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     __shared__ int stop;

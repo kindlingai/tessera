@@ -69,14 +69,34 @@ impl AttendKind {
     }
 }
 
-fn attend_entry(entry: &'static str) -> Source {
+fn attend_entry(
+    entry: &'static str,
+    defs: impl IntoIterator<Item = (&'static str, usize)>,
+) -> Source {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
-    let text = *CUDA.get_or_init(|| flatten_cuda("mla.kernel", KERNEL));
+    let base = *CUDA.get_or_init(|| flatten_cuda("mla.kernel", KERNEL));
+    let text = crate::cuda_prefixed(base, defs);
     Source::Fixed {
         text: ByBackend::from_fn(|_| text),
         entry,
     }
 }
+
+tessera_lower::knob!("fast_mla_attend", "splits", 1, 32);
+tessera_lower::knob!("fast_mla_attend", "min_blocks", 1, 16);
+tessera_lower::knob!("fast_mla_attend", "reduce_min_blocks", 1, 16);
+tessera_lower::knob!("fast_mla_attend", "reduce_threads", 32, 1024);
+tessera_lower::knob!("fast_gqa_attend", "splits", 1, 32);
+tessera_lower::knob!("fast_gqa_attend", "min_blocks", 1, 16);
+tessera_lower::knob!("fast_gqa_attend", "reduce_min_blocks", 1, 16);
+tessera_lower::knob!("fast_indexer", "min_blocks", 1, 16);
+tessera_lower::knob!("fast_indexer", "qt_min_rows", 1, 4096);
+tessera_lower::knob!("fast_indexer", "qt_min_blocks", 1, 16);
+tessera_lower::knob!("fast_indexer", "tile_keys", 16, 4096);
+tessera_lower::knob!("fast_indexer", "small_rows", 1, 4096);
+tessera_lower::knob!("fast_indexer", "small_tile_keys", 16, 4096);
+tessera_lower::knob!("fast_indexer", "large_tile_keys", 16, 4096);
+tessera_lower::knob!("fast_indexer", "qt_tile_keys", 32, 4096);
 
 fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     let groups = rows * hgroups;
@@ -104,7 +124,16 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     emits = f32_only,
     needs = attend_needs(self),
     order = Order::PerConfig,
-    source = attend_entry(self.entry),
+    source = attend_entry(
+        self.entry,
+        self.min_blocks.map(|v| {
+            let def = match self.kind {
+                AttendKind::Mla => "MLA_MIN_BLOCKS",
+                AttendKind::Gqa => "GQA_MIN_BLOCKS",
+            };
+            (def, v as usize)
+        }),
+    ),
     launches = attend_launches,
     load = attend_load,
     unproven,
@@ -124,6 +153,7 @@ struct SplitAttend {
     scale: f32,
     window: (usize, usize),
     splits: usize,
+    min_blocks: Option<u32>,
     kv_form: &'static dyn Stored,
     entry: &'static str,
 }
@@ -243,7 +273,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
     emits = f32_only,
     needs = red_needs(self),
     order = Order::PerConfig,
-    source = attend_entry(self.kind.names().2),
+    source = reduce_source(self),
     launches = red_launches,
     load = red_load,
     unproven,
@@ -253,6 +283,24 @@ struct SplitReduce {
     lists: usize,
     splits: usize,
     out_width: usize,
+    threads: usize,
+    custom_threads: bool,
+    min_blocks: Option<u32>,
+}
+
+fn reduce_source(r: &SplitReduce) -> Source {
+    let mut defs = Vec::new();
+    if let Some(mb) = r.min_blocks {
+        let def = match r.kind {
+            AttendKind::Mla => "MLA_REDUCE_MIN_BLOCKS",
+            AttendKind::Gqa => "GQA_REDUCE_MIN_BLOCKS",
+        };
+        defs.push((def, mb as usize));
+    }
+    if r.kind == AttendKind::Mla && r.custom_threads {
+        defs.push(("MLA_REDUCE_THREADS", r.threads));
+    }
+    attend_entry(r.kind.names().2, defs)
 }
 
 fn red_accepts(_: &SplitReduce, _: usize, form: &dyn Stored) -> bool {
@@ -260,14 +308,14 @@ fn red_accepts(_: &SplitReduce, _: usize, form: &dyn Stored) -> bool {
 }
 
 fn red_needs(r: &SplitReduce) -> Needs {
-    let (group_bytes, group_threads) = match r.kind {
-        AttendKind::Mla => (4 * 32 * 3 + 4, 160),
-        AttendKind::Gqa => (0, 128),
+    let group_bytes = match r.kind {
+        AttendKind::Mla => 4 * 32 * 3 + 4,
+        AttendKind::Gqa => 0,
     };
     Needs {
         lanes: 32,
         group_bytes,
-        group_threads,
+        group_threads: r.threads,
         compiler: true,
         lacks: CUDA_LACKS,
         ..Needs::default()
@@ -275,13 +323,13 @@ fn red_needs(r: &SplitReduce) -> Needs {
 }
 
 fn red_load(r: &SplitReduce, _: usize) -> Option<Load> {
-    let (blocks, group) = match r.kind {
-        AttendKind::Mla => (r.lists, 160),
-        AttendKind::Gqa => (r.lists.div_ceil(4), 128),
+    let blocks = match r.kind {
+        AttendKind::Mla => r.lists,
+        AttendKind::Gqa => r.lists.div_ceil(4),
     };
     Some(Load {
-        threads: blocks * group,
-        group,
+        threads: blocks * r.threads,
+        group: r.threads,
         trips: r.splits as f64,
         reads: vec![(4 * r.lists * r.splits * (r.out_width + 4)) as f64],
         written: (4 * r.lists * r.out_width) as f64,
@@ -291,14 +339,14 @@ fn red_load(r: &SplitReduce, _: usize) -> Option<Load> {
 }
 
 fn red_launches(r: &SplitReduce, step: &Step) -> Vec<Launch> {
-    let (across, threads) = match r.kind {
-        AttendKind::Mla => (r.lists, 160),
-        AttendKind::Gqa => (r.lists.div_ceil(4), 128),
+    let across = match r.kind {
+        AttendKind::Mla => r.lists,
+        AttendKind::Gqa => r.lists.div_ceil(4),
     };
     let shape = Shape::Grid {
         across,
         down: 1,
-        threads,
+        threads: r.threads,
     };
     let mut args = vec![
         step.read(0),
@@ -445,7 +493,24 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     );
     let (context, kept) = cache?;
     let entry = entry?;
-    let splits = split_count(kind, rows, hgroups);
+    let rule = kind.names().0;
+    let splits = tree
+        .knobs
+        .get(rule, "splits")
+        .unwrap_or_else(|| split_count(kind, rows, hgroups));
+    let min_blocks = tree.knobs.get(rule, "min_blocks").map(|v| v as u32);
+    let reduce_min_blocks = tree.knobs.get(rule, "reduce_min_blocks").map(|v| v as u32);
+    let (red_threads, custom_threads) = match (kind, tree.knobs.get(rule, "reduce_threads")) {
+        (AttendKind::Mla, Some(t)) => {
+            require!(
+                t.is_multiple_of(32),
+                "reduce_threads={t} (requires a multiple of 32)"
+            );
+            (t, true)
+        }
+        (AttendKind::Mla, None) => (160, false),
+        (AttendKind::Gqa, _) => (128, false),
+    };
     let attend = SplitAttend {
         kind,
         rows,
@@ -461,6 +526,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         scale: a.scale,
         window: a.mask.window(most),
         splits,
+        min_blocks,
         kv_form,
         entry,
     };
@@ -474,6 +540,9 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         lists,
         splits,
         out_width,
+        threads: red_threads,
+        custom_threads,
+        min_blocks: reduce_min_blocks,
     };
     Some(Ok(vec![
         Draft::new(attend, reads, lists * splits * stride),
@@ -509,16 +578,6 @@ fn idx_kv_entry(kv: &str, qt: bool) -> Option<&'static str> {
     }
 }
 
-fn idx_tile_keys(rows: usize, qt: bool) -> usize {
-    if qt {
-        1024
-    } else if rows <= 4 {
-        64
-    } else {
-        256
-    }
-}
-
 /// Tensor-Core Lightning Indexer over dense, ring, or paged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
@@ -529,7 +588,13 @@ fn idx_tile_keys(rows: usize, qt: bool) -> usize {
     emits = f32_only,
     needs = idx_needs(self),
     order = Order::PerConfig,
-    source = attend_entry(self.entry),
+    source = attend_entry(
+        self.entry,
+        match self.qt {
+            true => self.qt_min_blocks.map(|v| ("IDX_QT_MIN_BLOCKS", v as usize)),
+            false => self.min_blocks.map(|v| ("IDX_MIN_BLOCKS", v as usize)),
+        },
+    ),
     launches = idx_launches,
     load = idx_load,
     unproven,
@@ -544,6 +609,9 @@ struct FastIndexer {
     dim: usize,
     masked: bool,
     qt: bool,
+    tile_keys: usize,
+    min_blocks: Option<u32>,
+    qt_min_blocks: Option<u32>,
     k_form: &'static dyn Stored,
     entry: &'static str,
 }
@@ -569,7 +637,7 @@ fn idx_needs(k: &FastIndexer) -> Needs {
 }
 
 fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
-    let tk = idx_tile_keys(k.rows, k.qt);
+    let tk = k.tile_keys;
     let blocks_x = k.out_keys.div_ceil(tk);
     let blocks_y = if k.qt { k.rows.div_ceil(8) } else { k.rows };
     let group = if k.qt { 256 } else { 128 };
@@ -588,7 +656,7 @@ fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
 }
 
 fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
-    let tk = idx_tile_keys(k.rows, k.qt);
+    let tk = k.tile_keys;
     let shape = Shape::Grid {
         across: k.out_keys.div_ceil(tk),
         down: if k.qt { k.rows.div_ceil(8) } else { k.rows },
@@ -687,7 +755,31 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let fits = heads.max(64) * (dim / 2 + 2) <= IDX_SM_WORDS;
     require!(fits, "heads={heads}, dim={dim} exceed shared memory");
     let kf = k_node.form.name();
-    let qt = rows >= 8 && heads == 32 && dim == 128;
+    let qt_min_rows = tree.knobs.get("fast_indexer", "qt_min_rows").unwrap_or(8);
+    let qt = rows >= qt_min_rows && heads == 32 && dim == 128;
+    let tile_keys = if let Some(v) = tree.knobs.get("fast_indexer", "tile_keys") {
+        v
+    } else if qt {
+        tree.knobs
+            .get("fast_indexer", "qt_tile_keys")
+            .unwrap_or(1024)
+    } else {
+        let small = tree.knobs.get("fast_indexer", "small_rows").unwrap_or(4);
+        if rows <= small {
+            tree.knobs
+                .get("fast_indexer", "small_tile_keys")
+                .unwrap_or(64)
+        } else {
+            tree.knobs
+                .get("fast_indexer", "large_tile_keys")
+                .unwrap_or(256)
+        }
+    };
+    let align = if qt { 32 } else { 16 };
+    require!(
+        tile_keys >= align && tile_keys.is_multiple_of(align),
+        "tile_keys={tile_keys} (requires a multiple of {align})"
+    );
     let entry = idx_kv_entry(kf, qt);
     require!(entry.is_some(), "key form {kf} (supports fp8, bf16, f32)");
     let paged = kept_stride(tree.kept, raw_ctx);
@@ -715,6 +807,15 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         dim,
         masked,
         qt,
+        tile_keys,
+        min_blocks: tree
+            .knobs
+            .get("fast_indexer", "min_blocks")
+            .map(|v| v as u32),
+        qt_min_blocks: tree
+            .knobs
+            .get("fast_indexer", "qt_min_blocks")
+            .map(|v| v as u32),
         k_form: k_node.form,
         entry,
     };

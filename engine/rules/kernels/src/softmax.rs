@@ -3,7 +3,9 @@
 use crate::per_row;
 use tessera_codegen::prelude::*;
 use tessera_graph::Stage;
-use tessera_lower::{Arg, Kernel, Launch, Shape, Step, stage_rule};
+use tessera_lower::{Arg, Kernel, Launch, Shape, Step, knob};
+
+knob!("softmax", "threads", 1, 1024);
 
 /// One thread per row: peak, sum, then the probabilities.
 #[kernel]
@@ -38,13 +40,27 @@ pub(crate) fn softmax(
     }
 }
 
-/// One thread per row of `keys` scores.
-pub(crate) fn launch(x: Arg, out: Arg, [rows, queries, keys]: [usize; 3], scale: f32) -> Launch {
+/// Scores one row per thread, or custom `threads` grid.
+pub(crate) fn launch_grouped(
+    x: Arg,
+    out: Arg,
+    [rows, queries, keys]: [usize; 3],
+    scale: f32,
+    threads: usize,
+) -> Launch {
     let sizes = [rows, queries, keys].map(Arg::count);
     let args = [x, out].into_iter().chain(sizes);
+    let shape = match threads {
+        0 => Shape::Line(rows),
+        t => Shape::Grid {
+            across: rows.div_ceil(t),
+            down: 1,
+            threads: t,
+        },
+    };
     Launch {
         args: args.chain([Arg::value(&scale)]).collect(),
-        shape: Shape::Line(rows),
+        shape,
     }
 }
 
@@ -58,16 +74,24 @@ pub(crate) fn launch(x: Arg, out: Arg, [rows, queries, keys]: [usize; 3], scale:
 pub struct Softmax {
     pub rows: usize,
     pub width: usize,
+    pub threads: usize,
 }
 
 /// Each row is one query that sees every key, unscaled.
 fn softmax_launches(k: &Softmax, step: &Step) -> Vec<Launch> {
-    vec![launch(step.read(0), step.out(), [k.rows, 1, k.width], 1.0)]
+    vec![launch_grouped(
+        step.read(0),
+        step.out(),
+        [k.rows, 1, k.width],
+        1.0,
+        k.threads,
+    )]
 }
 
-stage_rule!("softmax", |site| {
+tessera_lower::stage_rule!("softmax", knobs: |site, knobs| {
     (site.stage == Stage::Softmax).then(|| Softmax {
         rows: site.len / site.width,
         width: site.width,
+        threads: knobs.get("softmax", "threads").unwrap_or(0),
     })
 });

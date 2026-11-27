@@ -373,3 +373,31 @@ fn near_matches_cpu() {
         );
     }
 }
+
+#[test]
+fn linear_selection_knobs() {
+    let g = linear(64, 64);
+    let mut dev = Device::guess(&host()).favoring("tiled");
+    let base = lower(&g, 0, &[(Rows, 8)], &dev).unwrap();
+    dev.knobs.parse("tiled:band=16").unwrap();
+    let tuned = lower(&g, 0, &[(Rows, 8)], &dev).unwrap();
+    assert_ne!(
+        base.steps[0].kernel.identity(),
+        tuned.steps[0].kernel.identity()
+    );
+
+    let g_thin = linear(8, 32);
+    let mut dev_lanes = Device::guess(&host()).favoring("lanes");
+    let mut dev_low = dev_lanes.clone();
+    dev_low.knobs.parse("lanes:max_rows=2").unwrap();
+    let l_base = lower(&g_thin, 0, &[(Rows, 4)], &dev_lanes).unwrap();
+    let l_low = lower(&g_thin, 0, &[(Rows, 4)], &dev_low).unwrap();
+    assert!(l_base.steps.iter().any(|s| s.kernel.name() == "lanes"));
+    assert!(l_low.steps.iter().all(|s| s.kernel.name() != "lanes"));
+    dev_lanes.knobs.parse("lanes:ahead=2").unwrap();
+    let l_ahead = lower(&g_thin, 0, &[(Rows, 4)], &dev_lanes).unwrap();
+    assert_ne!(
+        l_base.steps[0].kernel.identity(),
+        l_ahead.steps[0].kernel.identity()
+    );
+}

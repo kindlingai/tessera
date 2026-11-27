@@ -13,7 +13,9 @@ using namespace tessera;
 #define NORM 5
 #define LAYER 6
 #define FIELDS 11
+#ifndef WARPS
 #define WARPS 32
+#endif
 
 // Layer fields, in item order.
 enum field { LN1, Q, Q_NORM, K, K_NORM, V, O, LN2, GATE, UP, DOWN };

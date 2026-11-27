@@ -1,11 +1,18 @@
 //! Streaming decode GEMV for BF16, MXFP8 and INT4 weights.
 
-use super::{THREADS, WARPS, cuda_needs, cuda_source_entry, f32_only, trip, weight_accepts};
+use super::{WARPS, cuda_needs, cuda_source_with, f32_only, trip, weight_accepts};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Term, Tree,
 };
+
+tessera_lower::knob!("fast_gemv_bf16", "narrow_max_n", 1, 1024);
+tessera_lower::knob!("fast_gemv_bf16", "narrow_min_k", 256, 131072);
+tessera_lower::knob!("fast_gemv_bf16", "warps", 1, 32);
+tessera_lower::knob!("fast_gemv_bf16", "min_blocks", 1, 16);
+tessera_lower::knob!("fast_gemv_mxfp8", "min_blocks", 1, 16);
+tessera_lower::knob!("fast_gemv_int4_g32", "min_blocks", 1, 16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GemvKind {
@@ -33,12 +40,20 @@ impl GemvKind {
         }
     }
 
-    fn smem(self) -> usize {
+    fn blk_def(self) -> &'static str {
+        match self {
+            GemvKind::Bf16 | GemvKind::Bf16Narrow => "GEMV_BF16_BLK",
+            GemvKind::Mxfp8 => "GEMV_MXFP8_BLK",
+            GemvKind::Int4 => "GEMV_INT4_BLK",
+        }
+    }
+
+    fn smem(self, warps: usize) -> usize {
         match self {
             GemvKind::Bf16 => 0,
-            GemvKind::Bf16Narrow => WARPS * 4,
-            GemvKind::Mxfp8 => 512 * 4 + WARPS * 268 * 4,
-            GemvKind::Int4 => 512 * 4 + WARPS * 296 * 4,
+            GemvKind::Bf16Narrow => warps * 4,
+            GemvKind::Mxfp8 => 512 * 4 + warps * 268 * 4,
+            GemvKind::Int4 => 512 * 4 + warps * 296 * 4,
         }
     }
 
@@ -58,11 +73,11 @@ impl GemvKind {
         }
     }
 
-    fn groups(self, n: usize) -> usize {
+    fn groups(self, n: usize, warps: usize) -> usize {
         match self {
-            GemvKind::Int4 => (n / 2).div_ceil(WARPS),
+            GemvKind::Int4 => (n / 2).div_ceil(warps),
             GemvKind::Bf16Narrow => n,
-            GemvKind::Bf16 | GemvKind::Mxfp8 => n.div_ceil(WARPS),
+            GemvKind::Bf16 | GemvKind::Mxfp8 => n.div_ceil(warps),
         }
     }
 }
@@ -79,7 +94,11 @@ impl GemvKind {
     order = Order::PerConfig,
     source = gemv_source(self),
     launches = gemv_launches,
-    shape = Shape::Grid { across: self.kind.groups(self.n), down: 1, threads: THREADS },
+    shape = Shape::Grid {
+        across: self.kind.groups(self.n, self.warps),
+        down: 1,
+        threads: self.warps * 32,
+    },
     load = gemv_load,
     unproven,
 )]
@@ -89,6 +108,9 @@ struct FastGemv {
     mode: u32,
     a: f32,
     b: f32,
+    warps: usize,
+    custom_warps: bool,
+    min_blocks: Option<u32>,
     kind: GemvKind,
     form: &'static dyn Stored,
 }
@@ -98,23 +120,34 @@ fn gemv_accepts(k: &FastGemv, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn gemv_needs(k: &FastGemv) -> Needs {
-    cuda_needs(k.kind.smem())
+    Needs {
+        group_threads: k.warps * 32,
+        ..cuda_needs(k.kind.smem(k.warps))
+    }
 }
 
 fn gemv_source(k: &FastGemv) -> Source {
-    cuda_source_entry(k.kind.entry())
+    let mut defs = Vec::new();
+    if k.custom_warps {
+        defs.push(("GEMV_BF16_WARPS", k.warps));
+    }
+    if let Some(mb) = k.min_blocks {
+        defs.push((k.kind.blk_def(), mb as usize));
+    }
+    cuda_source_with(k.kind.entry(), defs)
 }
 
 fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
-    let groups = k.kind.groups(k.n);
+    let groups = k.kind.groups(k.n, k.warps);
+    let threads = k.warps * 32;
     let step = match k.kind {
         GemvKind::Bf16 => 256.0,
-        GemvKind::Bf16Narrow => 2048.0,
+        GemvKind::Bf16Narrow => (k.warps * 256) as f64,
         GemvKind::Mxfp8 | GemvKind::Int4 => 1024.0,
     };
     Some(Load {
-        threads: groups * THREADS,
-        group: THREADS,
+        threads: groups * threads,
+        group: threads,
         trips: k.k as f64 / step,
         trip: k.kind.trip(),
         reads: vec![k.form.bytes(k.n * k.k) as f64, (4 * k.k) as f64],
@@ -197,8 +230,18 @@ fn check_gemv(
         )));
     }
     let form = tree.node(w).form;
+    let narrow_max_n = tree
+        .knobs
+        .get("fast_gemv_bf16", "narrow_max_n")
+        .unwrap_or(64);
+    let narrow_min_k = tree
+        .knobs
+        .get("fast_gemv_bf16", "narrow_min_k")
+        .unwrap_or(1024);
     let kind = match form.name() {
-        "bf16" if k.is_multiple_of(8) && n <= 64 && k >= 1024 => GemvKind::Bf16Narrow,
+        "bf16" if k.is_multiple_of(8) && n <= narrow_max_n && k >= narrow_min_k => {
+            GemvKind::Bf16Narrow
+        }
         "bf16" if k.is_multiple_of(256) => GemvKind::Bf16,
         // A part trip leaves warp lanes idle: lanes is faster.
         "bf16" if k.is_multiple_of(8) => return None,
@@ -218,12 +261,20 @@ fn check_gemv(
             )));
         }
     };
+    let (warps, custom_warps) = match (kind, tree.knobs.get("fast_gemv_bf16", "warps")) {
+        (GemvKind::Bf16 | GemvKind::Bf16Narrow, Some(w)) => (w, true),
+        _ => (WARPS, false),
+    };
+    let min_blocks = tree.knobs.get(kind.name(), "min_blocks").map(|v| v as u32);
     let kernel = FastGemv {
         n,
         k,
         mode,
         a,
         b,
+        warps,
+        custom_warps,
+        min_blocks,
         kind,
         form,
     };

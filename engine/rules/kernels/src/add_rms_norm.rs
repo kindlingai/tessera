@@ -1,23 +1,26 @@
 //! Fused residual add and RMS norm, per warp or block.
 
+use crate::WIDE;
+use crate::lane_norm::norm_knobs;
 use crate::lane_norm::{
-    RowSpec, block_threads, cache_trips, row_body, row_launches, row_needs, row_shape, row_tag,
-    use_block,
+    RowCfg, RowSpec, block_threads, cache_trips, row_body, row_launches, row_needs, row_shape,
+    row_tag,
 };
-use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, Tree, sites};
+
+norm_knobs!("add_rms_norm");
 
 /// Fused add + RMS norm over `rows` of `width`, one launch.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = add_norm_name(self),
     launches = add_norm_launches,
-    shape = row_shape(self.rows, self.width, self.block),
+    shape = row_shape(self.rows, self.block, self.warps),
     work = self.rows * self.width,
-    needs = row_needs(self.width, self.block),
+    needs = row_needs(self.block, self.warps),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
     accepts = add_norm_accepts,
@@ -35,6 +38,9 @@ pub(crate) struct AddLaneNorm {
     pub weighted: bool,
     pub save_sum: bool,
     pub block: bool,
+    pub warps: u32,
+    pub cache_trips: u32,
+    pub ahead: u32,
     pub a_form: &'static dyn Stored,
     pub b_form: &'static dyn Stored,
     pub c_form: &'static dyn Stored,
@@ -99,6 +105,9 @@ fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
     row_body(RowSpec {
         width: k.width,
         block: k.block,
+        warps: k.warps,
+        cache_trips: k.cache_trips,
+        ahead: k.ahead,
         a_form: k.a_form,
         b_form: k.b_form,
         c_form: k.c_form,
@@ -116,13 +125,13 @@ fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
 
 fn add_norm_launches(k: &AddLaneNorm, step: &Step) -> Vec<Launch> {
     let body = add_norm_body(k);
-    row_launches(&body, step, k.rows, k.width, k.eps, k.block)
+    row_launches(&body, step, k.rows, k.width, k.eps, k.block, k.warps)
 }
 
 fn add_norm_source(k: &AddLaneNorm) -> Source {
     let body = add_norm_body(k);
     let base = k.name();
-    let tag = row_tag(k.width, k.block);
+    let tag = row_tag(k.width, k.block, k.warps, k.cache_trips, k.ahead);
     let mut forms = vec![k.a_form.name(), k.b_form.name()];
     if k.add3 {
         forms.push(k.c_form.name());
@@ -155,14 +164,14 @@ fn add_norm_load(k: &AddLaneNorm, _: usize) -> Option<Load> {
     if k.save_sum {
         written += k.sum_form.bytes(elems) as f64;
     }
-    let mut flight = k.a_form.bytes((WIDE * AHEAD) as usize) as f64
-        + k.b_form.bytes((WIDE * AHEAD) as usize) as f64;
+    let span = (WIDE * k.ahead) as usize;
+    let mut flight = k.a_form.bytes(span) as f64 + k.b_form.bytes(span) as f64;
     if k.add3 {
-        flight += k.c_form.bytes((WIDE * AHEAD) as usize) as f64;
+        flight += k.c_form.bytes(span) as f64;
     }
-    let threads = block_threads(k.width) as usize;
+    let threads = block_threads(k.warps) as usize;
     let per_row = if k.block { threads } else { LANES };
-    let trips = if cache_trips(k.width, k.block) > 0 {
+    let trips = if cache_trips(k.width, k.block, k.warps, k.cache_trips) > 0 {
         1.0
     } else {
         (k.width as f64 / (per_row * WIDE as usize) as f64).ceil()
@@ -210,7 +219,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         .operand
         .map_or(F32_FORM, |(o, _)| plain(tree.node(o).form));
     let rows = site.len / site.width;
-    let block = use_block(rows, site.width);
+    let cfg = RowCfg::of(&tree.knobs, "add_rms_norm");
+    let block = cfg.use_block(rows, site.width);
+    let warps = cfg.warps(site.width);
     let make = |reads: Vec<T>, forms: [&'static dyn Stored; 3], add3: bool, choice: usize| {
         let kernel = AddLaneNorm {
             rows,
@@ -220,6 +231,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             weighted,
             save_sum,
             block,
+            warps,
+            cache_trips: cfg.cache_trips,
+            ahead: cfg.ahead,
             a_form: forms[0],
             b_form: forms[1],
             c_form: forms[2],
