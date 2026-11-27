@@ -7,12 +7,14 @@ use crate::batch_spec::{
 use crate::dual::{DualSelector, DualState, DualStep, split_taps};
 use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, flush_mtp, take_cols};
+use crate::sample::Sampler;
 use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
 use crate::spec_loop::{TapsBuf, TapsIn, span};
 use crate::speculate::Drafter;
-use crate::{Engine, Error, Request, Row};
+use crate::{Engine, Error, Head, Request, Row};
 use std::collections::VecDeque;
+use tessera_lower::Wants;
 
 /// Context rows retained per slot for DFlash tail promotion.
 pub(crate) const DFLASH_TAIL_WIN: usize = 128;
@@ -290,6 +292,24 @@ impl<'a> BatchMtp<'a> {
 
 /// Headroom rows reserved before admitting another paged request.
 pub(crate) const PAGE_HEADROOM: usize = 2048;
+/// Suffix length that bypasses decode interleaving cooldown.
+const QUICK_PREFILL_ROWS: usize = 512;
+/// Maximum extra decode rounds run after a large prefill chunk.
+const MAX_DECODE_INTERLEAVE: usize = 4;
+
+fn taps_slice(buf: &TapsBuf, row_off: usize, rows: usize, width: usize) -> TapsIn<'_> {
+    match buf {
+        TapsBuf::Device { addr, .. } => TapsIn::Device {
+            addr: *addr + (row_off * width * 4) as u64,
+            rows,
+            stride: 0,
+        },
+        TapsBuf::Host(v) => {
+            let lo = row_off * width;
+            TapsIn::Host(&v[lo..lo + rows * width])
+        }
+    }
+}
 
 struct DFlashPrefill {
     slot: u32,
@@ -297,6 +317,23 @@ struct DFlashPrefill {
     sink: Option<Sink>,
     pos: usize,
     d_base: usize,
+}
+
+impl DFlashPrefill {
+    fn rem(&self) -> usize {
+        self.request.tokens.len() - self.pos
+    }
+
+    fn is_sampled_final(&self) -> bool {
+        !self.request.sampling.greedy() && self.rem() == 1
+    }
+}
+
+struct PrefillSlice {
+    seq: DFlashPrefill,
+    pos0: usize,
+    off: usize,
+    len: usize,
 }
 
 struct DFlashSeq {
@@ -328,6 +365,7 @@ pub struct BatchDFlash<'a> {
     reuse: bool,
     admitted_skips: VecDeque<usize>,
     prefilling: VecDeque<DFlashPrefill>,
+    prefill_cooldown: usize,
     active: Vec<DFlashSeq>,
 }
 
@@ -353,6 +391,7 @@ impl<'a> BatchDFlash<'a> {
             reuse: false,
             admitted_skips: VecDeque::new(),
             prefilling: VecDeque::new(),
+            prefill_cooldown: 0,
             active: Vec::new(),
         })
     }
@@ -424,8 +463,22 @@ impl<'a> BatchDFlash<'a> {
                 d_base,
             });
         }
-        if !self.prefilling.is_empty() {
-            self.prefill_step()?;
+        let run_prefill = if self.prefilling.is_empty() {
+            self.prefill_cooldown = 0;
+            false
+        } else if self.active.is_empty() || self.prefill_cooldown == 0 || self.has_quick_prefill() {
+            true
+        } else {
+            self.prefill_cooldown -= 1;
+            false
+        };
+        if run_prefill {
+            let rows = self.prefill_step()?;
+            self.prefill_cooldown = if !self.prefilling.is_empty() && !self.active.is_empty() {
+                (rows / 1024).min(MAX_DECODE_INTERLEAVE)
+            } else {
+                0
+            };
         }
         self.active.sort_by_key(|s| s.seq.slot);
         if !self.active.is_empty() {
@@ -437,49 +490,29 @@ impl<'a> BatchDFlash<'a> {
         Ok(())
     }
 
-    fn prefill_step(&mut self) -> Result<(), Error> {
-        let mut seq = self.prefilling.pop_front().expect("prefill seq");
-        let n = seq.request.tokens.len();
-        let pos0 = seq.pos;
-        let len = prefill_len(
-            n,
-            pos0,
-            self.core.prefill_chunk,
-            seq.request.sampling.greedy(),
-        );
-        let end = pos0 + len;
-        let mut rows = Vec::with_capacity(len);
-        span(
-            &mut rows,
-            seq.slot,
-            pos0,
-            seq.request.tokens[pos0..end].iter().copied(),
-        );
-        self.ensure_pages(&rows)?;
-        let wants = self.drafter.draft_wants();
-        if end < n {
-            let (_, taps) = self.core.target.step_taps_local(&rows)?;
-            if pos0 >= seq.d_base && end - seq.d_base + self.block <= self.draft_ctx {
-                self.drafter.run_taps(
-                    seq.slot,
-                    seq.request.tokens[end],
-                    end - seq.d_base,
-                    pos0 - seq.d_base,
-                    taps.as_in(),
-                    wants,
-                )?;
-            }
-            seq.pos = end;
-            self.prefilling.push_front(seq);
-            return Ok(());
-        }
-        let (mut act, taps, ended) =
+    fn has_quick_prefill(&self) -> bool {
+        self.prefilling
+            .iter()
+            .any(|s| s.rem() <= QUICK_PREFILL_ROWS)
+    }
+
+    fn finish_dflash_prefill(
+        &mut self,
+        seq: DFlashPrefill,
+        pos0: usize,
+        sampler: Sampler,
+        anchor: u32,
+        taps_in: TapsIn<'_>,
+        wants: Wants,
+    ) -> Result<(), Error> {
+        let (mut act, ended) =
             self.core
-                .finish_prefill(seq.slot, seq.request, seq.sink, &rows, 0, false)?;
+                .accept_prefill(seq.slot, seq.request, seq.sink, sampler, anchor);
         if ended {
             self.free_slot(act.slot, act.history);
             return Ok(());
         }
+        let n = act.start;
         let spec = self.spec_len.fresh();
         let mut last_lp = None;
         let room = act.room(self.core.max_ctx);
@@ -493,7 +526,7 @@ impl<'a> BatchDFlash<'a> {
                 act.anchor,
                 n - d_base,
                 pos0 - d_base,
-                taps.as_in(),
+                taps_in,
                 wants,
             )?;
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
@@ -510,6 +543,119 @@ impl<'a> BatchDFlash<'a> {
             d_base,
         });
         Ok(())
+    }
+
+    fn prefill_sampled_finals(&mut self) -> Result<usize, Error> {
+        let mut ready = Vec::new();
+        let mut rest = VecDeque::with_capacity(self.prefilling.len());
+        while let Some(seq) = self.prefilling.pop_front() {
+            if seq.is_sampled_final() {
+                ready.push(seq);
+            } else {
+                rest.push_back(seq);
+            }
+        }
+        self.prefilling = rest;
+        ready.sort_by_key(|s| s.slot);
+        let mut rows = Vec::with_capacity(ready.len());
+        for seq in &ready {
+            span(&mut rows, seq.slot, seq.pos, [seq.request.tokens[seq.pos]]);
+        }
+        let picks: Vec<u32> = (0..rows.len() as u32).collect();
+        self.ensure_pages(&rows)?;
+        let (mut logits, vocab, raw_taps) =
+            self.core.target.logits_local(&rows, &picks, true, false)?;
+        let raw_taps = raw_taps.expect("taps were asked for");
+        let wants = self.drafter.draft_wants();
+        for (i, seq) in ready.into_iter().enumerate() {
+            let pos0 = seq.pos;
+            let mut sampler = Sampler::new(seq.request.sampling);
+            let anchor = sampler.draw_row(&mut logits[i * vocab..(i + 1) * vocab], None, &[]);
+            let taps_in = taps_slice(&raw_taps, i, 1, self.tap_width);
+            self.finish_dflash_prefill(seq, pos0, sampler, anchor, taps_in, wants)?;
+        }
+        Ok(rows.len())
+    }
+
+    fn prefill_step(&mut self) -> Result<usize, Error> {
+        if self.prefilling.iter().any(DFlashPrefill::is_sampled_final) {
+            return self.prefill_sampled_finals();
+        }
+        let mut ordered: Vec<DFlashPrefill> = self.prefilling.drain(..).collect();
+        ordered.sort_by_key(|s| (s.rem(), s.slot));
+        let mut queue: VecDeque<DFlashPrefill> = ordered.into();
+        let mut budget = self.core.prefill_chunk;
+        let mut rows = Vec::new();
+        let mut packed = Vec::new();
+        while budget > 0 {
+            let Some(seq) = queue.pop_front() else {
+                break;
+            };
+            let n = seq.request.tokens.len();
+            let pos0 = seq.pos;
+            let len = prefill_len(n, pos0, budget, seq.request.sampling.greedy());
+            let off = rows.len();
+            span(
+                &mut rows,
+                seq.slot,
+                pos0,
+                seq.request.tokens[pos0..pos0 + len].iter().copied(),
+            );
+            budget -= len;
+            packed.push(PrefillSlice {
+                seq,
+                pos0,
+                off,
+                len,
+            });
+        }
+        self.prefilling = queue;
+        self.ensure_pages(&rows)?;
+        let need_taps = packed.iter().any(|s| {
+            let end = s.pos0 + s.len;
+            end == s.seq.request.tokens.len()
+                || (end > s.seq.d_base && end - s.seq.d_base + self.block <= self.draft_ctx)
+        });
+        if !need_taps {
+            let last = [rows.len() as u32 - 1];
+            self.core
+                .target
+                .launch_local(&rows, &last, Head::Full(None), false, false)?;
+            for mut s in packed {
+                s.seq.pos = s.pos0 + s.len;
+                self.prefilling.push_back(s.seq);
+            }
+            return Ok(rows.len());
+        }
+        let (ids, raw_taps) = self.core.target.step_taps_local(&rows)?;
+        let wants = self.drafter.draft_wants();
+        for mut s in packed {
+            let n = s.seq.request.tokens.len();
+            let end = s.pos0 + s.len;
+            if end < n {
+                if end > s.seq.d_base && end - s.seq.d_base + self.block <= self.draft_ctx {
+                    let start = s.pos0.max(s.seq.d_base);
+                    let skip = start - s.pos0;
+                    let taps_in = taps_slice(&raw_taps, s.off + skip, end - start, self.tap_width);
+                    self.drafter.run_taps(
+                        s.seq.slot,
+                        s.seq.request.tokens[end],
+                        end - s.seq.d_base,
+                        start - s.seq.d_base,
+                        taps_in,
+                        wants,
+                    )?;
+                }
+                s.seq.pos = end;
+                self.prefilling.push_back(s.seq);
+            } else {
+                let anchor = ids[s.off + s.len - 1];
+                let sampler = Sampler::new(s.seq.request.sampling);
+                let taps_in = taps_slice(&raw_taps, s.off, s.len, self.tap_width);
+                self.finish_dflash_prefill(s.seq, s.pos0, sampler, anchor, taps_in, wants)?;
+            }
+        }
+        Ok(rows.len())
     }
 
     fn verify_and_draft(&mut self) -> Result<(), Error> {
@@ -561,18 +707,7 @@ impl<'a> BatchDFlash<'a> {
         }
         let wants = self.drafter.draft_wants();
         for job in jobs {
-            let taps_in = match &raw_taps {
-                TapsBuf::Device { addr, .. } => TapsIn::Device {
-                    addr: *addr + (job.tap_row_off * self.tap_width * 4) as u64,
-                    rows: job.commit,
-                    stride: 0,
-                },
-                TapsBuf::Host(v) => {
-                    let lo = job.tap_row_off * self.tap_width;
-                    let hi = lo + job.commit * self.tap_width;
-                    TapsIn::Host(&v[lo..hi])
-                }
-            };
+            let taps_in = taps_slice(&raw_taps, job.tap_row_off, job.commit, self.tap_width);
             let outs = self
                 .drafter
                 .run_taps(job.slot, job.anchor, job.d_new, job.d_old, taps_in, wants)?;

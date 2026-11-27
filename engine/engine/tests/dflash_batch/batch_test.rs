@@ -158,3 +158,93 @@ fn batch_dflash_rolls_window() {
     let mut dr = open_drafter(&d_graph, &dw, 16, 4, 0, &settings);
     assert_eq!(run_batch_reqs(&mut te, &mut dr, prompts), want);
 }
+
+#[test]
+fn batch_dflash_packs_prefill() {
+    let (t_graph, d_graph) = toy_pair(32);
+    let tw = weights(&t_graph, &mut Noise(131));
+    let dw = weights(&d_graph, &mut Noise(137));
+    let settings = host_settings();
+    let p_long: Vec<u32> = (0..18).map(|i| (i % 7) + 1).collect();
+    let p_short: Vec<u32> = vec![3, 5, 2];
+    let p_mid: Vec<u32> = vec![4, 1, 6, 2, 7];
+
+    let step_once = |items: &[(&[u32], usize)]| -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let mut te = open_target(&t_graph, &tw, 32, &settings);
+        let mut dr = open_drafter(&d_graph, &dw, 32, 4, 0, &settings);
+        let mut batch = BatchDFlash::new(&mut te, &mut dr)
+            .unwrap()
+            .with_prefill_chunk(10);
+        let mut rxs = Vec::new();
+        for &(p, max) in items {
+            let (tx, rx) = std::sync::mpsc::channel();
+            batch.submit(req(p, max), Box::new(move |e| tx.send(e).is_ok()));
+            rxs.push(rx);
+        }
+        assert!(batch.step().unwrap());
+        let first: Vec<Vec<u32>> = rxs
+            .iter()
+            .map(|r| collect_ids(&r.try_iter().collect::<Vec<_>>()))
+            .collect();
+        let mut full = first.clone();
+        while batch.step().unwrap() {}
+        for (i, rx) in rxs.into_iter().enumerate() {
+            full[i].extend(collect_ids(&rx.try_iter().collect::<Vec<_>>()));
+        }
+        (first, full)
+    };
+
+    // Two short prompts pack into one prefill step.
+    let pair: &[(&[u32], usize)] = &[(&p_mid, 4), (&p_short, 4)];
+    let want_pair = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 32, &settings, pair);
+    let (first, got) = step_once(pair);
+    assert!(!first[0].is_empty() && !first[1].is_empty());
+    assert_eq!(got, want_pair);
+
+    // Short prompt finishes prefill ahead of a queued long prompt.
+    let mixed: &[(&[u32], usize)] = &[(&p_long, 4), (&p_short, 4)];
+    let want_mixed = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 32, &settings, mixed);
+    let (first, got) = step_once(mixed);
+    assert!(first[0].is_empty() && !first[1].is_empty());
+    assert_eq!(got, want_mixed);
+
+    // Sampled multi-lane prefill packs cleanly and matches 2-rank TP.
+    let sampled = tessera_engine::Sampling {
+        temperature: 1.2,
+        top_p: 0.9,
+        seed: Some(99),
+        ..Default::default()
+    };
+    let run_sampled = |batch: &mut BatchDFlash<'_>| {
+        let mut chans = Vec::new();
+        for &(p, max) in pair {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let r = Request {
+                sampling: sampled,
+                ..req(p, max)
+            };
+            batch.submit(r, Box::new(move |e| tx.send(e).is_ok()));
+            chans.push(rx);
+        }
+        while batch.step().unwrap() {}
+        chans
+            .into_iter()
+            .map(|r| collect_ids(&r.try_iter().collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+    };
+    let mut te = open_target(&t_graph, &tw, 32, &settings);
+    let mut dr = open_drafter(&d_graph, &dw, 32, 4, 0, &settings);
+    let mut solo_batch = BatchDFlash::new(&mut te, &mut dr)
+        .unwrap()
+        .with_prefill_chunk(10);
+    let want_sampled = run_sampled(&mut solo_batch);
+    let got_tp = with_tp_batch(
+        (&t_graph, &d_graph),
+        32,
+        (131, 137),
+        Some(10),
+        false,
+        run_sampled,
+    );
+    assert_eq!(got_tp, want_sampled);
+}

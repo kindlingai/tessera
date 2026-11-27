@@ -152,25 +152,18 @@ impl<'a> BatchCore<'a> {
         }
     }
 
-    /// Runs the final prefill chunk and builds `ActiveSeq`.
-    pub(crate) fn finish_prefill(
+    /// Builds `ActiveSeq` after picking `anchor` for a finished prompt.
+    pub(crate) fn accept_prefill(
         &mut self,
         slot: u32,
         request: Request,
         sink: Option<Sink>,
-        rows: &[Row],
-        mtp_valid: usize,
-        push_anchor: bool,
-    ) -> Result<(ActiveSeq, TapsBuf, bool), Error> {
+        sampler: Sampler,
+        anchor: u32,
+    ) -> (ActiveSeq, bool) {
         let n = request.tokens.len();
-        let mut sampler = Sampler::new(request.sampling);
-        let (anchor, taps) = self.target.prefill_pick(rows, &mut sampler)?;
         fnv_u32(&mut self.hash, anchor);
-        let mut history = Vec::with_capacity(n + usize::from(push_anchor));
-        history.extend_from_slice(&request.tokens);
-        if push_anchor {
-            history.push(anchor);
-        }
+        let history = request.tokens.clone();
         let mut act = ActiveSeq {
             slot,
             request,
@@ -183,11 +176,31 @@ impl<'a> BatchCore<'a> {
             solo: None,
             d_tail: Vec::new(),
             history,
-            mtp_valid,
+            mtp_valid: 0,
             sampler,
         };
         let done = act.commit(&[anchor], self.max_ctx);
         let ended = done.is_some() || (self.target.control.is_none() && act.cancelled);
+        (act, ended)
+    }
+
+    /// Runs the final prefill chunk and builds `ActiveSeq`.
+    pub(crate) fn finish_prefill(
+        &mut self,
+        slot: u32,
+        request: Request,
+        sink: Option<Sink>,
+        rows: &[Row],
+        mtp_valid: usize,
+        push_anchor: bool,
+    ) -> Result<(ActiveSeq, TapsBuf, bool), Error> {
+        let mut sampler = Sampler::new(request.sampling);
+        let (anchor, taps) = self.target.prefill_pick(rows, &mut sampler)?;
+        let (mut act, ended) = self.accept_prefill(slot, request, sink, sampler, anchor);
+        act.mtp_valid = mtp_valid;
+        if push_anchor {
+            act.history.push(anchor);
+        }
         Ok((act, taps, ended))
     }
 }
