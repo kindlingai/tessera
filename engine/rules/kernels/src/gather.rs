@@ -1,8 +1,9 @@
 //! Rows of a table at given indices.
 
+use crate::io_name;
 use tessera_codegen::kept::{self, Layout};
 use tessera_codegen::prelude::*;
-use tessera_lower::form::Load as Stored;
+use tessera_lower::form::{Load as Stored, writable};
 use tessera_lower::sites;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
 
@@ -11,11 +12,12 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
 fn gather(
     #[form(form)] table: Buf<Dyn>,
     ids: Buf<U32>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     rows: u32,
     width: u32,
     table_rows: u32,
     #[build] form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     if gid() >= rows * width {
         return;
@@ -57,7 +59,14 @@ fn kept_gather(
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(gather(self.form), name = self.form.suffixed("gather"), threads = self.rows * self.width, accepts = gather_accepts)]
+#[launch(
+    gather(self.form, self.out_form),
+    name = self.form.suffixed("gather"),
+    threads = self.rows * self.width,
+    accepts = gather_accepts,
+    emits = gather_emits,
+    source = gather_source,
+)]
 pub struct Gather {
     pub rows: usize,
     pub width: usize,
@@ -65,10 +74,22 @@ pub struct Gather {
     pub table_rows: usize,
     /// How the table is stored.
     pub form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
 }
 
 fn gather_accepts(k: &Gather, input: usize, form: &dyn Stored) -> bool {
     k.form.taken(input, 0, form)
+}
+
+fn gather_emits(k: &Gather, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn gather_source(k: &Gather) -> Source {
+    Source::named(
+        gather_ir(k.form, k.out_form),
+        io_name("gather", k.form, k.out_form),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -149,6 +170,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         width,
         table_rows,
         form,
+        out_form: writable(tree.node(at).form),
     };
     Some(vec![Draft::new(gather, [table, ids], rows * width)])
 }

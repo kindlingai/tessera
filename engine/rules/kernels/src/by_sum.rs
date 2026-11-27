@@ -1,15 +1,23 @@
 //! Rows less their mean, or over their sum, generated.
 
-use crate::{AHEAD, WIDE, per_lane_row, per_row};
+use crate::{AHEAD, WIDE, io_name, io_pair, per_lane_row, per_row};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
-use tessera_lower::{Kernel, Needs, knob, sites, stage_rule};
+use tessera_lower::form::Load as Stored;
+use tessera_lower::{Draft, Kernel, Needs, Source, T, Tree, knob, sites};
 
 knob!("lane_sum", "ahead", 1, 16);
 
 /// One thread per row: the sum, then each element.
 #[kernel]
-fn by_sum<const DIVIDE: bool>(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
+fn by_sum<const DIVIDE: bool>(
+    #[form(in_form)] x: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    rows: u32,
+    width: u32,
+    #[build] in_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) {
     if gid() >= rows {
         return;
     }
@@ -31,11 +39,13 @@ fn by_sum<const DIVIDE: bool>(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, widt
 /// A SIMD group per row, summed by shuffles.
 #[kernel]
 fn sum_lanes<const WIDE: u32, const DIVIDE: bool>(
-    x: Buf<F32>,
-    mut out: BufMut<F32>,
+    #[form(in_form)] x: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     rows: u32,
     width: u32,
     #[build] ahead: u32,
+    #[build] in_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let row = gid() / LANES as u32;
     if row >= rows {
@@ -70,25 +80,48 @@ fn sum_lanes<const WIDE: u32, const DIVIDE: bool>(
 /// One thread per row: centered, or scaled to unit sum.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    by_sum,
+    by_sum(self.in_form, self.out_form),
     variant = self.divide,
     name = match self.divide {
         true => "unit_sum",
         false => "center",
     },
     threads = self.rows,
+    accepts = by_sum_accepts,
+    emits = by_sum_emits,
+    source = by_sum_source,
     load = Some(per_row(self.rows, self.width, body.trip(), 0.0)),
 )]
 pub(crate) struct BySum {
     pub rows: usize,
     pub width: usize,
     pub divide: bool,
+    pub in_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
+}
+
+fn by_sum_accepts(k: &BySum, _: usize, form: &dyn Stored) -> bool {
+    form.name() == k.in_form.name()
+}
+
+fn by_sum_emits(k: &BySum, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn by_sum_source(k: &BySum) -> Source {
+    let base = if k.divide { "unit_sum" } else { "center" };
+    let body = if k.divide {
+        by_sum_ir::<true>(k.in_form, k.out_form)
+    } else {
+        by_sum_ir::<false>(k.in_form, k.out_form)
+    };
+    Source::named(body, io_name(base, k.in_form, k.out_form))
 }
 
 /// `BySum` with a SIMD group per row.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    sum_lanes::<WIDE>(self.ahead),
+    sum_lanes::<WIDE>(self.ahead, self.in_form, self.out_form),
     variant = self.divide,
     name = match self.divide {
         true => "lane_unit_sum",
@@ -99,6 +132,9 @@ pub(crate) struct BySum {
     needs = Needs::lanes(),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
+    accepts = lane_sum_accepts,
+    emits = lane_sum_emits,
+    source = lane_sum_source,
     load = Some(per_lane_row(self.rows, self.width, body.trip(), 0.0)),
     unproven,
 )]
@@ -107,27 +143,59 @@ pub(crate) struct LaneSum {
     pub width: usize,
     pub divide: bool,
     pub ahead: u32,
+    pub in_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
+}
+
+fn lane_sum_accepts(k: &LaneSum, _: usize, form: &dyn Stored) -> bool {
+    form.name() == k.in_form.name()
+}
+
+fn lane_sum_emits(k: &LaneSum, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn lane_sum_source(k: &LaneSum) -> Source {
+    let base = if k.divide {
+        "lane_unit_sum"
+    } else {
+        "lane_center"
+    };
+    let body = if k.divide {
+        sum_lanes_ir::<WIDE, true>(k.ahead, k.in_form, k.out_form)
+    } else {
+        sum_lanes_ir::<WIDE, false>(k.ahead, k.in_form, k.out_form)
+    };
+    Source::named(body, io_name(base, k.in_form, k.out_form))
 }
 
 /// The row stage `site` names, if it sums its rows.
-fn summed(site: &sites::Stage) -> Option<BySum> {
+fn summed(tree: &Tree, at: T, site: &sites::Stage) -> Option<BySum> {
     let divide = match site.stage {
         Stage::Center => false,
         Stage::UnitSum => true,
         _ => return None,
     };
+    let (in_form, out_form) = io_pair(tree.node(site.x).form, tree.node(at).form);
     Some(BySum {
         rows: site.len / site.width,
         width: site.width,
         divide,
+        in_form,
+        out_form,
     })
 }
 
-stage_rule!("by_sum", summed);
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let site: sites::Stage = tree.site(at)?;
+    let kernel = summed(tree, at, &site)?;
+    Some(vec![Draft::new(kernel, site.padded(), site.len)])
+}
+
+tessera_lower::rule!("by_sum", propose);
 
 mod lanes {
     use super::*;
-    use tessera_lower::{Draft, T, Tree};
 
     fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         let site: sites::Stage = tree.site(at)?;
@@ -135,7 +203,9 @@ mod lanes {
             rows,
             width,
             divide,
-        } = summed(&site)?;
+            in_form,
+            out_form,
+        } = summed(tree, at, &site)?;
         if !width.is_multiple_of(WIDE as usize) {
             return None;
         }
@@ -148,6 +218,8 @@ mod lanes {
             width,
             divide,
             ahead,
+            in_form,
+            out_form,
         };
         Some(vec![Draft::new(kernel, site.padded(), site.len)])
     }

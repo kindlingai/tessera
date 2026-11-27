@@ -1,8 +1,10 @@
 //! The Walsh-Hadamard transform of 128-wide blocks, a SIMD group each.
 
+use crate::{io_name, io_pair};
 use tessera_codegen::prelude::*;
 use tessera_graph::Stage;
-use tessera_lower::{Kernel, Needs, stage_rule};
+use tessera_lower::form::Load as Stored;
+use tessera_lower::{Draft, Kernel, Needs, Source, T, Tree, sites};
 
 /// Each lane holds four values of the block.
 const PER_LANE: u32 = 4;
@@ -58,7 +60,13 @@ pub fn spin(x: f32, y: f32, z: f32, w: f32) -> Four {
 
 /// One SIMD group per block.
 #[kernel]
-fn hadamard(x: Buf<F32>, mut out: BufMut<F32>, blocks: u32) {
+fn hadamard(
+    #[form(in_form)] x: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    blocks: u32,
+    #[build] in_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) {
     let block = gid() / LANES as u32;
     if block >= blocks {
         return;
@@ -76,16 +84,50 @@ fn hadamard(x: Buf<F32>, mut out: BufMut<F32>, blocks: u32) {
 
 /// `blocks` transforms of `BLOCK` values, one SIMD group each.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(hadamard, threads = self.blocks * LANES, needs = Needs::lanes())]
+#[launch(
+    hadamard(self.in_form, self.out_form),
+    threads = self.blocks * LANES,
+    needs = Needs::lanes(),
+    accepts = hadamard_accepts,
+    emits = hadamard_emits,
+    source = hadamard_source,
+)]
 pub struct Hadamard {
     pub blocks: usize,
+    pub in_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
 }
 
-stage_rule!("hadamard", |site| {
+fn hadamard_accepts(k: &Hadamard, _: usize, form: &dyn Stored) -> bool {
+    form.name() == k.in_form.name()
+}
+
+fn hadamard_emits(k: &Hadamard, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn hadamard_source(k: &Hadamard) -> Source {
+    Source::named(
+        hadamard_ir(k.in_form, k.out_form),
+        io_name("hadamard", k.in_form, k.out_form),
+    )
+}
+
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let site: sites::Stage = tree.site(at)?;
     let Stage::Hadamard { block } = site.stage else {
         return None;
     };
-    (block == BLOCK).then(|| Hadamard {
+    if block != BLOCK {
+        return None;
+    }
+    let (in_form, out_form) = io_pair(tree.node(site.x).form, tree.node(at).form);
+    let kernel = Hadamard {
         blocks: site.len / BLOCK as usize,
-    })
-});
+        in_form,
+        out_form,
+    };
+    Some(vec![Draft::new(kernel, site.padded(), site.len)])
+}
+
+tessera_lower::rule!("hadamard", propose);

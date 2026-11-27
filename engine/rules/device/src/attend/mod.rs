@@ -4,7 +4,7 @@
 mod attend_test;
 
 use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule, f32_only};
+use crate::{CUDA_LACKS, cuda_rule, io_defs};
 use std::sync::OnceLock;
 use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;
@@ -82,6 +82,14 @@ fn attend_entry(
     }
 }
 
+fn plain_io(form: &dyn Stored) -> bool {
+    matches!(form.name(), "f32" | "bf16")
+}
+
+fn io_match(bf16: bool, form: &dyn Stored) -> bool {
+    form.name() == if bf16 { "bf16" } else { "f32" }
+}
+
 tessera_lower::knob!("fast_mla_attend", "splits", 1, 32);
 tessera_lower::knob!("fast_mla_attend", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_mla_attend", "reduce_min_blocks", 1, 16);
@@ -121,18 +129,23 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     sizes = [self.rows, self.heads, self.kv_heads, self.keys.most(), self.picks, self.splits],
     work = self.rows * self.heads * self.picks * self.kind.width(),
     accepts = attend_accepts,
-    emits = f32_only,
+    emits = attend_emits,
     needs = attend_needs(self),
     order = Order::PerConfig,
     source = attend_entry(
         self.entry,
-        self.min_blocks.map(|v| {
-            let def = match self.kind {
-                AttendKind::Mla => "MLA_MIN_BLOCKS",
-                AttendKind::Gqa => "GQA_MIN_BLOCKS",
-            };
-            (def, v as usize)
-        }),
+        io_defs(
+            self.min_blocks.map(|v| {
+                let def = match self.kind {
+                    AttendKind::Mla => "MLA_MIN_BLOCKS",
+                    AttendKind::Gqa => "GQA_MIN_BLOCKS",
+                };
+                (def, v as usize)
+            }),
+            self.x_bf16,
+            self.y_bf16,
+            false,
+        ),
     ),
     launches = attend_launches,
     load = attend_load,
@@ -154,6 +167,8 @@ struct SplitAttend {
     window: (usize, usize),
     splits: usize,
     min_blocks: Option<u32>,
+    x_bf16: bool,
+    y_bf16: bool,
     kv_form: &'static dyn Stored,
     entry: &'static str,
 }
@@ -173,10 +188,15 @@ impl SplitAttend {
 
 fn attend_accepts(k: &SplitAttend, input: usize, form: &dyn Stored) -> bool {
     match (k.kind, input) {
-        (_, 0) | (_, 5) => form.name() == "f32",
+        (_, 0) => io_match(k.x_bf16, form),
+        (_, 5) => io_match(!k.has_sinks && k.x_bf16, form),
         (AttendKind::Mla, 1) | (AttendKind::Gqa, 1 | 2) => form.name() == k.kv_form.name(),
         _ => form.name() == "u32",
     }
+}
+
+fn attend_emits(k: &SplitAttend, form: &dyn Stored) -> bool {
+    io_match(k.y_bf16, form)
 }
 
 fn attend_needs(k: &SplitAttend) -> Needs {
@@ -196,7 +216,9 @@ fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
     let threads = k.kind.threads();
     let groups = k.rows * k.hgroups() * k.splits;
     let seen = k.picks.min(k.keys.most()).max(1);
-    let q_bytes = (4 * k.rows * k.heads * w) as f64;
+    let q_elem = if k.x_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
+    let q_bytes = (q_elem * k.rows * k.heads * w) as f64;
     let kv_mul = match k.kind {
         AttendKind::Mla => 1,
         AttendKind::Gqa => 2,
@@ -206,7 +228,7 @@ fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
         1 => k.out_width,
         s => s * k.stride(),
     };
-    let out_bytes = (4 * k.rows * k.heads * out_stride) as f64;
+    let out_bytes = (y_elem * k.rows * k.heads * out_stride) as f64;
     Some(Load {
         threads: groups * threads,
         group: threads,
@@ -270,7 +292,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
     sizes = [self.lists, self.splits, self.out_width],
     work = self.lists * self.splits * self.out_width,
     accepts = red_accepts,
-    emits = f32_only,
+    emits = red_emits,
     needs = red_needs(self),
     order = Order::PerConfig,
     source = reduce_source(self),
@@ -286,6 +308,7 @@ struct SplitReduce {
     threads: usize,
     custom_threads: bool,
     min_blocks: Option<u32>,
+    y_bf16: bool,
 }
 
 fn reduce_source(r: &SplitReduce) -> Source {
@@ -300,11 +323,15 @@ fn reduce_source(r: &SplitReduce) -> Source {
     if r.kind == AttendKind::Mla && r.custom_threads {
         defs.push(("MLA_REDUCE_THREADS", r.threads));
     }
-    attend_entry(r.kind.names().2, defs)
+    attend_entry(r.kind.names().2, io_defs(defs, false, r.y_bf16, false))
 }
 
 fn red_accepts(_: &SplitReduce, _: usize, form: &dyn Stored) -> bool {
     form.name() == "f32"
+}
+
+fn red_emits(r: &SplitReduce, form: &dyn Stored) -> bool {
+    io_match(r.y_bf16, form)
 }
 
 fn red_needs(r: &SplitReduce) -> Needs {
@@ -327,12 +354,13 @@ fn red_load(r: &SplitReduce, _: usize) -> Option<Load> {
         AttendKind::Mla => r.lists,
         AttendKind::Gqa => r.lists.div_ceil(4),
     };
+    let y_elem = if r.y_bf16 { 2 } else { 4 };
     Some(Load {
         threads: blocks * r.threads,
         group: r.threads,
         trips: r.splits as f64,
         reads: vec![(4 * r.lists * r.splits * (r.out_width + 4)) as f64],
-        written: (4 * r.lists * r.out_width) as f64,
+        written: (y_elem * r.lists * r.out_width) as f64,
         flight: 512.0,
         ..Load::default()
     })
@@ -399,6 +427,12 @@ macro_rules! require {
             require!(form == "f32", "{} form {} (requires f32)", $what, form);
         )+
     };
+    (io $tree:expr, $($what:literal $t:expr),+) => {
+        $(
+            let form = $tree.node($t).form;
+            require!(plain_io(form), "{} form {} (requires f32 or bf16)", $what, form.name());
+        )+
+    };
     ($cond:expr, $($why:tt)+) => {
         if !$cond {
             return Some(Err(format!($($why)+)));
@@ -437,7 +471,9 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     if !a.ragged || !own {
         return None;
     }
-    require!(f32 tree, "output" at, "attend" attend_t, "query" q);
+    require!(io tree, "output" at, "attend" attend_t, "query" q);
+    let x_bf16 = tree.node(q).form.name() == "bf16";
+    let y_bf16 = tree.node(at).form.name() == "bf16";
     let (kv_form, vf) = (tree.node(k).form, tree.node(v).form.name());
     let kv = kv_form.name();
     require!(vf == kv, "key form {kv} and value form {vf} differ");
@@ -527,6 +563,8 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         window: a.mask.window(most),
         splits,
         min_blocks,
+        x_bf16,
+        y_bf16: splits == 1 && y_bf16,
         kv_form,
         entry,
     };
@@ -543,6 +581,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         threads: red_threads,
         custom_threads,
         min_blocks: reduce_min_blocks,
+        y_bf16,
     };
     Some(Ok(vec![
         Draft::new(attend, reads, lists * splits * stride),
@@ -585,15 +624,20 @@ fn idx_kv_entry(kv: &str, qt: bool) -> Option<&'static str> {
     sizes = [self.rows, self.out_keys, self.heads, self.dim],
     work = self.rows * self.out_keys * self.heads * self.dim,
     accepts = idx_accepts,
-    emits = f32_only,
+    emits = idx_emits,
     needs = idx_needs(self),
     order = Order::PerConfig,
     source = attend_entry(
         self.entry,
-        match self.qt {
-            true => self.qt_min_blocks.map(|v| ("IDX_QT_MIN_BLOCKS", v as usize)),
-            false => self.min_blocks.map(|v| ("IDX_MIN_BLOCKS", v as usize)),
-        },
+        io_defs(
+            match self.qt {
+                true => self.qt_min_blocks.map(|v| ("IDX_QT_MIN_BLOCKS", v as usize)),
+                false => self.min_blocks.map(|v| ("IDX_MIN_BLOCKS", v as usize)),
+            },
+            self.x_bf16,
+            self.y_bf16,
+            self.o_bf16,
+        ),
     ),
     launches = idx_launches,
     load = idx_load,
@@ -612,16 +656,24 @@ struct FastIndexer {
     tile_keys: usize,
     min_blocks: Option<u32>,
     qt_min_blocks: Option<u32>,
+    x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
     k_form: &'static dyn Stored,
     entry: &'static str,
 }
 
 fn idx_accepts(k: &FastIndexer, input: usize, form: &dyn Stored) -> bool {
     match input {
-        0 | 2 => form.name() == "f32",
+        0 => io_match(k.x_bf16, form),
         1 => form.name() == k.k_form.name(),
+        2 => io_match(k.o_bf16, form),
         _ => form.name() == "u32",
     }
+}
+
+fn idx_emits(k: &FastIndexer, form: &dyn Stored) -> bool {
+    io_match(k.y_bf16, form)
 }
 
 fn idx_needs(k: &FastIndexer) -> Needs {
@@ -641,9 +693,11 @@ fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
     let blocks_x = k.out_keys.div_ceil(tk);
     let blocks_y = if k.qt { k.rows.div_ceil(8) } else { k.rows };
     let group = if k.qt { 256 } else { 128 };
-    let q_bytes = (4 * k.rows * k.heads * k.dim) as f64;
+    let q_elem = if k.x_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
+    let q_bytes = (q_elem * k.rows * k.heads * k.dim) as f64;
     let k_bytes = k.k_form.bytes(blocks_y * k.out_keys * k.dim) as f64;
-    let out_bytes = (4 * k.rows * k.out_keys) as f64;
+    let out_bytes = (y_elem * k.rows * k.out_keys) as f64;
     Some(Load {
         threads: blocks_x * blocks_y * group,
         group,
@@ -746,7 +800,10 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         return None;
     }
     let (_, raw_ctx) = tree.kept_rows(ki)?;
-    require!(f32 tree, "output" at, "query" q, "head weight" by_head);
+    require!(io tree, "output" at, "query" q, "head weight" by_head);
+    let x_bf16 = tree.node(q).form.name() == "bf16";
+    let y_bf16 = tree.node(at).form.name() == "bf16";
+    let o_bf16 = tree.node(by_head).form.name() == "bf16";
     require!(!q_node.extents[0].runtime(), "query rows are runtime-sized");
     let fits = (16..=IDX_MAX_HEADS).contains(&heads) && heads.is_multiple_of(16);
     require!(fits, "heads={heads} (requires n*16, max {IDX_MAX_HEADS})");
@@ -816,6 +873,9 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
             .knobs
             .get("fast_indexer", "qt_min_blocks")
             .map(|v| v as u32),
+        x_bf16,
+        y_bf16,
+        o_bf16,
         k_form: k_node.form,
         entry,
     };

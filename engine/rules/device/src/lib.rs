@@ -97,6 +97,26 @@ pub fn f32_only<K>(_: &K, form: &dyn tessera_lower::form::Load) -> bool {
     form.name() == "f32"
 }
 
+/// Appends optional BF16 input, output, and epilogue `#define` flags.
+pub fn io_defs<'a>(
+    base: impl IntoIterator<Item = (&'a str, usize)>,
+    x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
+) -> Vec<(&'a str, usize)> {
+    let mut defs: Vec<_> = base.into_iter().collect();
+    if x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
+    if y_bf16 {
+        defs.push(("Y_BF16", 1));
+    }
+    if o_bf16 {
+        defs.push(("O_BF16", 1));
+    }
+    defs
+}
+
 /// Flattens one built-in kernel source into a static string.
 pub fn flatten_for(backend: Backend, name: &str, kernel: &str) -> &'static str {
     let flat = flatten(name, kernel, &|_| None, &Options::plain(backend));

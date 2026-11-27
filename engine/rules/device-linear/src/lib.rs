@@ -11,7 +11,7 @@ mod stacked_test;
 
 use gemv::{propose_gemv, why_gemv};
 use stacked::check_stacked;
-pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
+pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only, io_defs};
 use tessera_graph::Order;
 use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
@@ -623,25 +623,6 @@ fn cuda_needs(group_bytes: usize) -> Needs {
         lacks: CUDA_LACKS,
         ..Needs::default()
     }
-}
-
-pub(crate) fn io_defs<'a>(
-    base: impl IntoIterator<Item = (&'a str, usize)>,
-    x_bf16: bool,
-    y_bf16: bool,
-    o_bf16: bool,
-) -> Vec<(&'a str, usize)> {
-    let mut defs: Vec<_> = base.into_iter().collect();
-    if x_bf16 {
-        defs.push(("X_BF16", 1));
-    }
-    if y_bf16 {
-        defs.push(("Y_BF16", 1));
-    }
-    if o_bf16 {
-        defs.push(("O_BF16", 1));
-    }
-    defs
 }
 
 pub(crate) fn x_defs<'a>(
