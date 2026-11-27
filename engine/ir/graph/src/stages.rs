@@ -13,6 +13,8 @@ pub enum Takes {
     RowWeight,
     /// Integer positions that lead the rows.
     Positions,
+    /// Integer coordinates per position, with a trailing axis count.
+    Axes,
     /// A `u32` mask word per 32 entries, then edits.
     Bits,
 }
@@ -175,6 +177,18 @@ macro_rules! stages {
             } => "rope" {
                 operand: Positions,
                 check: Positive(theta, "rope base"),
+                blocks: 2,
+            }
+            /// Multi-axis rotary positions. Operand holds coordinates per position.
+            Mrope {
+                theta: f32 = 10000.0,
+                /// Pairs per axis, zero-padded to three axes.
+                sections: [u32; 3] = [2, 2, 0],
+                /// Interleaved uses global frequencies. Contiguous resets per axis.
+                interleaved: bool = false,
+            } => "rope" {
+                operand: Axes,
+                check: Positive(theta, "mrope base"),
                 blocks: 2,
             }
             Act(a: Act = Act::Silu) as act => Map { place: Nonlinear(a.keeps_zero()) }

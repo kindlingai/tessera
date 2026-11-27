@@ -25,7 +25,7 @@ mod select;
 pub mod sites;
 mod tree;
 
-pub use abi::{Arg, Launch, Shape, Source, ToArg, define_prefix, prefixed};
+pub use abi::{Arg, Launch, Shape, Source, ToArg, define_prefix, made_hash, prefixed};
 pub use assign::assign;
 pub use body::{GUESS, small, source};
 pub use cache::Cache;

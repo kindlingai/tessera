@@ -51,6 +51,7 @@ macro_rules! hf_keys {
     ($each:ident) => {
         $each! {
             (TEXT_CONFIG, "text_config", Object),
+            (VISION_CONFIG, "vision_config", Object),
             (ROPE_PARAMETERS, "rope_parameters", Object),
             (SLIDING_ATTENTION, "sliding_attention", Object),
             (FULL_ATTENTION, "full_attention", Object),

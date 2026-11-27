@@ -93,6 +93,7 @@ helpers! {
     half(P, P, P) -> I32;
     exp(F32) -> F32;
     tanh(F32) -> F32;
+    erf(F32) -> F32;
     log(F32) -> F32;
     cos(F32) -> F32;
     sin(F32) -> F32;

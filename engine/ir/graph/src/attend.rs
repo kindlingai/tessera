@@ -12,16 +12,21 @@ pub(crate) fn heads_fit(
     dims: &[Dim],
     [q, k, v]: [&TensorType; 3],
     q_heads: usize,
+    kv_axis: usize,
     ragged: bool,
 ) -> Result<(), TypeError> {
     // Values may be narrower than keys, as in MLA.
     need(
-        same_shape(dims, &front(&k.shape, 3), &front(&v.shape, 3))?,
+        same_shape(
+            dims,
+            &front(&k.shape, kv_axis + 1),
+            &front(&v.shape, kv_axis + 1),
+        )?,
         ErrorKind::Shape,
         || format!("keys {} and values {} differ", k.shape, v.shape),
     )?;
     let heads = poly(dims, &q.shape.0[q_heads])?.as_const();
-    let kv_heads = poly(dims, &k.shape.0[2])?.as_const();
+    let kv_heads = poly(dims, &k.shape.0[kv_axis])?.as_const();
     if let (Some(h), Some(kv)) = (heads, kv_heads) {
         need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
             format!("{h} query heads do not group over {kv} key heads")
@@ -33,7 +38,8 @@ pub(crate) fn heads_fit(
         || "attention needs one float dtype".into(),
     )?;
     let p = [q.placement, k.placement, v.placement];
-    let split = [q_heads as u32, 2, 2].map(|axis| Placement::Split { axis });
+    let split =
+        [q_heads as u32, kv_axis as u32, kv_axis as u32].map(|axis| Placement::Split { axis });
     // One key head serves query heads split any way.
     let shared = kv_heads == Some(1) && p[1..] == [Placement::Replicated; 2] && p[0] == split[0];
     // Replicated caches serve owned query rows directly.
@@ -56,7 +62,41 @@ pub(crate) fn attend(
     a: &[&TensorType],
 ) -> Result<TensorType, TypeError> {
     let (q, k, v) = (a[0], a[1], a[2]);
-    let q_heads = if op.ragged {
+    let (q_heads, kv_axis) = if op.packed() {
+        need(
+            a[..3].iter().all(|t| t.rank() == 3),
+            ErrorKind::Shape,
+            || "packed attention takes [Rows, Heads, HeadDim] tensors".into(),
+        )?;
+        for axis in [0, 2] {
+            need(
+                same(dims, &q.shape.0[axis], &k.shape.0[axis])?,
+                ErrorKind::Shape,
+                || {
+                    format!(
+                        "queries {} and keys {} differ on axis {axis}",
+                        q.shape, k.shape
+                    )
+                },
+            )?;
+        }
+        let b = a[3];
+        let b_fit = b.rank() == 2
+            && same(dims, &b.shape.0[0], &q.shape.0[0])?
+            && poly(dims, &b.shape.0[1])?.as_const() == Some(2);
+        need(b_fit, ErrorKind::Shape, || {
+            format!("bounds {} must be [Rows, 2] for {}", b.shape, q.shape)
+        })?;
+        need(b.dtype.is_int(), ErrorKind::DType, || {
+            format!("bounds must be integers, got {:?}", b.dtype)
+        })?;
+        need(
+            b.placement == Placement::Replicated,
+            ErrorKind::Placement,
+            || "bounds must be replicated".into(),
+        )?;
+        (1, 1)
+    } else if op.ragged {
         need(
             q.rank() == 3 && k.rank() == 4 && v.rank() == 4,
             ErrorKind::Shape,
@@ -73,7 +113,7 @@ pub(crate) fn attend(
             },
         )?;
         row_ids(dims, &q.shape, a[3], a[4])?;
-        1
+        (1, 2)
     } else {
         need(
             a[..3].iter().all(|t| t.rank() == 4),
@@ -92,9 +132,9 @@ pub(crate) fn attend(
                 },
             )?;
         }
-        2
+        (2, 2)
     };
-    heads_fit(dims, [q, k, v], q_heads, op.ragged)?;
+    heads_fit(dims, [q, k, v], q_heads, kv_axis, op.ragged)?;
     if let Some(i) = op.ids_arg() {
         key_lists(dims, a[i], q, q_heads)?;
     }

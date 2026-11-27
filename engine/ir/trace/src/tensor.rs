@@ -118,6 +118,24 @@ impl Tensor {
         )
     }
 
+    /// Multi-axis rotary positions using `[.., Axes]` coordinates.
+    pub fn mrope(
+        &self,
+        coords: &Tensor,
+        theta: f32,
+        sections: [u32; 3],
+        interleaved: bool,
+    ) -> Tensor {
+        self.stage(
+            Stage::Mrope {
+                theta,
+                sections,
+                interleaved,
+            },
+            &[coords],
+        )
+    }
+
     pub fn reshape(&self, shape: impl Into<Shape>) -> Tensor {
         self.op(Op::View(View::Reshape(shape.into())), &[])
     }

@@ -121,6 +121,11 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             need(!a.ragged || a.mask.causal(), ErrorKind::Value, || {
                 format!("ragged attention is causal only, got {:?}", a.mask)
             })?;
+            need(
+                !a.packed() || (!a.ragged && !a.picked && !a.sinks && !a.rel_bias),
+                ErrorKind::Value,
+                || "packed attention cannot combine with ragged, picked, sinks or rel_bias".into(),
+            )?;
             attend(&g.dims, a, args)
         }
         Op::Delta(d) => {
@@ -338,7 +343,7 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             q.shape, k.shape, v.shape
         )
     })?;
-    heads_fit(dims, [v, q, k], 2, false)?;
+    heads_fit(dims, [v, q, k], 2, 2, false)?;
     delta_gates(dims, v, &a[3..5], 3)?;
     Ok(v.clone())
 }
@@ -443,7 +448,6 @@ pub(crate) fn valued(q: &TensorType, v: &TensorType) -> TensorType {
     *out.shape.0.last_mut().expect("rank checked") = width;
     out
 }
-
 /// Integer positions lead the rows of `x`, on every rank.
 fn positions(
     dims: &[Dim],
@@ -468,6 +472,55 @@ fn positions(
         };
     need(placed, ErrorKind::Placement, || {
         format!("{p:?} rows cannot follow {:?} positions", pos.placement)
+    })
+}
+
+/// Multi-axis integer coordinates lead `x` with trailing axis count.
+fn mrope_axes(
+    dims: &[Dim],
+    s: &Stage,
+    x: &TensorType,
+    pos: &TensorType,
+    p: Placement,
+) -> Result<(), TypeError> {
+    let Stage::Mrope { sections, .. } = *s else {
+        unreachable!("mrope stage expected");
+    };
+    let lead = pos.rank().saturating_sub(1);
+    let need_axes = if sections[2] > 0 {
+        3
+    } else if sections[1] > 0 {
+        2
+    } else {
+        1
+    };
+    let axes = pos
+        .shape
+        .0
+        .last()
+        .map(|e| poly(dims, e))
+        .transpose()?
+        .and_then(|n| n.as_const());
+    let fits = pos.rank() >= 2
+        && lead < x.rank()
+        && same_shape(dims, &front(&x.shape, lead), &front(&pos.shape, lead))?
+        && axes.is_some_and(|n| n >= need_axes);
+    need(fits, ErrorKind::Shape, || {
+        format!("axes {} do not fit {}", pos.shape, x.shape)
+    })?;
+    let sum: u64 = sections.iter().map(|&n| u64::from(n)).sum();
+    if let Some(width) = poly(dims, x.shape.0.last().expect("rank checked"))?.as_const() {
+        need(sum * 2 == width, ErrorKind::Shape, || {
+            format!("mrope sections {sections:?} do not cover width {width}")
+        })?;
+    }
+    need(pos.dtype.is_int(), ErrorKind::DType, || {
+        format!("axes must be integers, got {:?}", pos.dtype)
+    })?;
+    let last = x.rank() as u32 - 1;
+    let placed = pos.placement == Placement::Replicated && p != Placement::Split { axis: last };
+    need(placed, ErrorKind::Placement, || {
+        format!("{p:?} rows cannot follow {:?} axes", pos.placement)
     })
 }
 
@@ -594,6 +647,7 @@ fn takes(
             )
         }
         Takes::Positions => positions(dims, x, o, p),
+        Takes::Axes => mrope_axes(dims, s, x, o, p),
         Takes::Bits => allowed(dims, x, o),
     }
 }
@@ -802,7 +856,6 @@ pub(crate) fn row_ids(
     }
     Ok(())
 }
-
 /// Rows go to kept `[Seqs, Context, ..]` by slot and position.
 fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (rows, slots, positions) = (a[0], a[1], a[2]);
