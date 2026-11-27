@@ -58,7 +58,16 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     order = Order::PerConfig,
     source = trellis_source(self),
     launches = launches,
-    load = load, load_key = tessera_lower::load_key(((self.rows, self.n, self.k, self.count, self.repeat, self.first, self.bits), (self.book, self.turned, self.post, self.chunk, self.min_blocks, self.gen_min_blocks), self.form.name())),
+    load = load,
+    load_key = tessera_lower::load_key((
+        self.site.rows,
+        self.site.n,
+        self.site.k,
+        self.site.repeat,
+        self.site.turned,
+        self.site.post,
+        self.site.form.name(),
+    )),
     unproven,
 )]
 struct PickedTrellis {

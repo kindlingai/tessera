@@ -316,6 +316,15 @@ tessera_lower::rule!("trellis_metal", propose, why = why, lacks = LACKS);
     source = fixed(picked_entry(self)),
     launches = picked_launches,
     load = Some(self.site.load(BLOCK, THREADS)),
+    load_key = tessera_lower::load_key((
+        self.site.rows,
+        self.site.n,
+        self.site.k,
+        self.site.repeat,
+        self.site.turned,
+        self.site.post,
+        self.site.form.name(),
+    )),
 )]
 struct PickedTrellisMetal {
     site: Coded,
