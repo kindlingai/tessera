@@ -14,7 +14,6 @@ mod forms_test;
 pub mod layout;
 #[cfg(test)]
 mod layout_test;
-mod moe;
 pub mod p2p;
 pub mod proxy;
 #[cfg(test)]

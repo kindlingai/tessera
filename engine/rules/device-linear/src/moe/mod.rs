@@ -1,13 +1,13 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
-use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule};
+use super::{CUDA_LACKS, cuda_rule, x_defs};
 use std::sync::OnceLock;
+use tessera_device::{Backend, flatten_for};
 use tessera_graph::{Act, Op, Order, Select, Stage};
+use tessera_linear::parse_form;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Rotated;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
-use tessera_mem::trellis::parse_form;
 
 const KERNEL: &str = include_str!("trellis.cu");
 const BLOCK: usize = 128;
@@ -20,7 +20,7 @@ tessera_lower::knob!("picked_trellis", "gen_min_blocks", 1, 16);
 
 fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_cuda("moe_trellis.kernel", KERNEL))
+    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "moe_trellis.kernel", KERNEL))
 }
 
 fn entry_name(k: &PickedTrellis) -> &'static str {
@@ -33,21 +33,18 @@ fn entry_name(k: &PickedTrellis) -> &'static str {
 
 fn trellis_source(k: &PickedTrellis) -> Source {
     let entry = entry_name(k);
-    let mut defs = Vec::new();
+    let mut base = Vec::new();
     if let Some(c) = k.chunk {
-        defs.push(("PTR_CHUNK", c as usize));
+        base.push(("PTR_CHUNK", c as usize));
     }
     if entry == "ptr_k3_pmcgx_t" {
         if let Some(mb) = k.min_blocks {
-            defs.push(("PTR_K3_MIN_BLOCKS", mb as usize));
+            base.push(("PTR_K3_MIN_BLOCKS", mb as usize));
         }
     } else if let Some(mb) = k.gen_min_blocks {
-        defs.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
+        base.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
-    if k.x_bf16 {
-        defs.push(("X_BF16", 1));
-    }
-    crate::cuda_source_with(cuda_source(), entry, defs)
+    tessera_device::cuda_source_with(cuda_source(), entry, x_defs(base, k.x_bf16))
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
