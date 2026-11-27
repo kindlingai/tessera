@@ -485,7 +485,7 @@ pub(crate) fn routed_calib<E: ExpertSet>(
 }
 
 /// Joins an expert's gate and up branches.
-pub type Join<'a> = dyn Fn(Tensor, Tensor) -> Tensor + 'a;
+pub(crate) type Join<'a> = dyn Fn(Tensor, Tensor) -> Tensor + 'a;
 
 /// SwiGLU's join.
 fn swish(gate: Tensor, up: Tensor) -> Tensor {

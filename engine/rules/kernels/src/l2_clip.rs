@@ -37,11 +37,11 @@ fn l2_clip(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32, threshold: 
     threads = self.rows,
     load = Some(per_row(self.rows, self.width, body.trip(), 0.0)),
 )]
-pub struct L2Clip {
-    pub rows: usize,
-    pub width: usize,
-    pub threshold: f32,
-    pub eps: f32,
+struct L2Clip {
+    rows: usize,
+    width: usize,
+    threshold: f32,
+    eps: f32,
 }
 
 stage_rule!("l2_clip", |site| {

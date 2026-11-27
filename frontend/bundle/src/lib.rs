@@ -14,7 +14,7 @@ mod gguf;
 #[cfg(test)]
 mod gguf_test;
 pub mod hy4;
-pub mod inkling2;
+mod inkling2;
 pub mod mla;
 pub mod mtp;
 #[cfg(test)]

@@ -170,7 +170,7 @@ impl Config {
         }
     }
 
-    pub fn dims(&self) -> Vec<Dim> {
+    fn dims(&self) -> Vec<Dim> {
         let s = &self.stack;
         let kv = self.kv_heads * s.head_dim;
         let mut own = vec![

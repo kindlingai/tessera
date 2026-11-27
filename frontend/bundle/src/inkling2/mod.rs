@@ -60,7 +60,7 @@ pub(crate) fn parse_config(json: &str, [seqs, context]: [u64; 2]) -> Result<Conf
 }
 
 /// Maps traced Inkling-2 weights to checkpoint tensor names.
-pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
+pub(crate) fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
     let top = "model.llm";
     let mut rules: Vec<Rule> = [
         ("embed", "embed"),

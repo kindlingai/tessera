@@ -30,12 +30,12 @@ fn log_scale(
 /// Rows scaled by position, `per` rows to a position.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(log_scale, threads = self.rows)]
-pub struct LogScale {
-    pub floor: f32,
-    pub alpha: f32,
-    pub rows: usize,
-    pub per: usize,
-    pub width: usize,
+struct LogScale {
+    floor: f32,
+    alpha: f32,
+    rows: usize,
+    per: usize,
+    width: usize,
 }
 
 stage_rule!("log_scale", |site| {
