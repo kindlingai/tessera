@@ -1,10 +1,12 @@
 //! `#[kernel]` keeps the function and adds one building its tree.
 
 mod derive;
+mod stmt;
 
 use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as Tokens, TokenTree};
 use quote::{format_ident, quote};
+use stmt::{block, build_group, named};
 use syn::spanned::Spanned;
 use syn::{
     BinOp, Error, Expr, ExprCall, ExprLit, FnArg, GenericArgument, GenericParam, Generics, Ident,
@@ -286,8 +288,7 @@ fn tree_generics(f: &ItemFn) -> Generics {
         }
         if let Type::Path(path) = &*p.ty
             && let Some(last) = path.path.segments.last()
-            && let PathArguments::AngleBracketed(a) = &last.arguments
-            && let Some(GenericArgument::Type(t)) = a.args.first()
+            && let Some(t) = first_ty(&last.arguments)
         {
             used.push(quote!(#t).to_string());
         }
@@ -306,10 +307,7 @@ fn tree_generics(f: &ItemFn) -> Generics {
 
 /// The struct a `Group` parameter names, through any borrow.
 fn group_ty(ty: &Type) -> Option<&Type> {
-    let ty = match ty {
-        Type::Reference(r) => &*r.elem,
-        other => other,
-    };
+    let ty = deref_ty(ty);
     let Type::Path(path) = ty else {
         return None;
     };
@@ -321,10 +319,7 @@ fn group_ty(ty: &Type) -> Option<&Type> {
 /// `#[form(f)]` on a `Buf<Dyn>` reads build parameter `f`.
 fn param(name: &Tokens, ty: &Type, picked: Option<Ident>) -> Res {
     // A reference passes group memory or tiles by name.
-    let ty = match ty {
-        Type::Reference(r) => &*r.elem,
-        other => other,
-    };
+    let ty = deref_ty(ty);
     if let Type::Array(a) = ty {
         let ty = scalar(&a.elem)?;
         return Ok(quote!(Param::Array { name: #name.into(), ty: #ty }));
@@ -336,29 +331,21 @@ fn param(name: &Tokens, ty: &Type, picked: Option<Ident>) -> Res {
     let head = last.ident.to_string();
     let form = |args: &PathArguments| match (&picked, args) {
         (Some(f), _) => Ok(quote!(#f)),
-        (None, PathArguments::AngleBracketed(a)) => match a.args.first() {
-            Some(GenericArgument::Type(t)) => {
-                Ok(quote!(<#t as tessera_codegen::prelude::Form>::FORM))
-            }
-            _ => Err(Error::new(a.span(), "a form, like `F32` or `F`")),
+        (None, PathArguments::AngleBracketed(a)) => match first_ty(args) {
+            Some(t) => Ok(quote!(<#t as tessera_codegen::prelude::Form>::FORM)),
+            None => Err(Error::new(a.span(), "a form, like `F32` or `F`")),
         },
         _ => Err(Error::new(last.span(), "`Buf<F>` names its form")),
     };
     Ok(match head.as_str() {
-        "Buf" => {
+        "Buf" | "BufMut" => {
             let form = form(&last.arguments)?;
-            quote!(Param::Buffer { name: #name.into(), form: #form, writes: false })
-        }
-        "BufMut" => {
-            let form = form(&last.arguments)?;
-            quote!(Param::Buffer { name: #name.into(), form: #form, writes: true })
+            let writes = head == "BufMut";
+            quote!(Param::Buffer { name: #name.into(), form: #form, writes: #writes })
         }
         "Shared" => {
-            let PathArguments::AngleBracketed(a) = &last.arguments else {
+            let Some(t) = first_ty(&last.arguments) else {
                 return Err(Error::new(last.span(), "`Shared<T>` names its element"));
-            };
-            let Some(GenericArgument::Type(t)) = a.args.first() else {
-                return Err(Error::new(a.span(), "`Shared<T>` names its element"));
             };
             let ty = scalar(t)?;
             quote!(Param::Shared { name: #name.into(), ty: #ty })
@@ -371,6 +358,25 @@ fn param(name: &Tokens, ty: &Type, picked: Option<Ident>) -> Res {
     })
 }
 
+/// The first type inside `<..>`.
+pub(crate) fn first_ty(args: &PathArguments) -> Option<&Type> {
+    let PathArguments::AngleBracketed(a) = args else {
+        return None;
+    };
+    match a.args.first() {
+        Some(GenericArgument::Type(t)) => Some(t),
+        _ => None,
+    }
+}
+
+/// The type under any borrow.
+fn deref_ty(ty: &Type) -> &Type {
+    match ty {
+        Type::Reference(r) => &r.elem,
+        other => other,
+    }
+}
+
 /// A scalar type's `Ty`. `usize` indexes locals as `u32`.
 fn scalar(ty: &Type) -> Res {
     let text = quote!(#ty).to_string();
@@ -381,373 +387,6 @@ fn scalar(ty: &Type) -> Res {
         "bool" => quote!(Ty::Bool),
         _ => return Err(Error::new(ty.span(), "f32, u32, u64 or bool")),
     })
-}
-
-fn block(stmts: &[Stmt], ctx: &Ctx) -> Res {
-    let stmts: Vec<Tokens> = stmts
-        .iter()
-        .map(|s| stmt(s, ctx))
-        .collect::<Result<_, _>>()?;
-    Ok(quote!({
-        let mut b: Vec<Stmt> = Vec::new();
-        #(b.extend(#stmts);)*
-        b
-    }))
-}
-
-/// A statement's list: any inlined calls, then itself.
-fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
-    if let Stmt::Expr(Expr::Call(c), _) = s
-        && let Some(call) = kernel_call(c, ctx)?
-    {
-        return Ok(quote!({
-            let mut pre: Vec<Stmt> = Vec::new();
-            let call = #call;
-            inl.stmt(&mut pre, call);
-            pre
-        }));
-    }
-    if let Stmt::Local(local) = s
-        && let Some(init) = &local.init
-        && let Expr::Struct(lit) = &*init.expr
-    {
-        let name = binding(&local.pat)?;
-        return build_group(&quote!(#name), lit, ctx);
-    }
-    // A bound call gives a value, or a group's fields.
-    if let Stmt::Local(local) = s
-        && let Some(init) = &local.init
-        && let Expr::Call(c) = &*init.expr
-        && let Some(call) = kernel_call(c, ctx)?
-    {
-        let name = binding(&local.pat)?;
-        return Ok(quote!({
-            let mut pre: Vec<Stmt> = Vec::new();
-            let call = #call;
-            if let Some(init) = inl.bind(&mut pre, call, #name) {
-                pre.push(Stmt::Let { name: #name.into(), init });
-            }
-            pre
-        }));
-    }
-    let one = one(s, ctx)?;
-    Ok(quote!({
-        let mut pre: Vec<Stmt> = Vec::new();
-        let s = #one;
-        pre.push(s);
-        pre
-    }))
-}
-
-/// Evaluates all method call arguments in kernel expression context.
-fn call_args(m: &syn::ExprMethodCall, ctx: &Ctx) -> Result<Vec<Tokens>, Error> {
-    m.args.iter().map(|a| expr(a, ctx)).collect()
-}
-
-/// A name, or `g.field` of group `g` as `g__field`.
-fn named(e: &Expr) -> Result<String, Error> {
-    match e {
-        Expr::Path(p) => match p.path.get_ident() {
-            Some(i) => Ok(i.to_string()),
-            None => Err(Error::new(p.span(), "a plain name")),
-        },
-        Expr::Field(f) => {
-            let member = &f.member;
-            Ok(format!("{}__{}", named(&f.base)?, quote!(#member)))
-        }
-        Expr::Reference(r) => named(&r.expr),
-        Expr::Paren(p) => named(&p.expr),
-        other => Err(Error::new(other.span(), "a name")),
-    }
-}
-
-fn binding(pat: &Pat) -> Result<String, Error> {
-    match pat {
-        Pat::Ident(i) => Ok(i.ident.to_string()),
-        Pat::Type(t) => binding(&t.pat),
-        other => Err(Error::new(other.span(), "name the binding")),
-    }
-}
-
-/// A group built in place: a `let` for each field.
-fn build_group(name: &Tokens, lit: &syn::ExprStruct, ctx: &Ctx) -> Res {
-    if let Some(rest) = &lit.rest {
-        return Err(Error::new(rest.span(), "give every field"));
-    }
-    let mut lets = Vec::new();
-    for f in &lit.fields {
-        let member = &f.member;
-        let field = quote!(#member).to_string();
-        let named = quote!(tessera_codegen::inline::member(#name, #field));
-        lets.push(declare(&named, &f.expr, ctx)?);
-    }
-    Ok(quote!(vec![#(#lets),*]))
-}
-
-fn one(s: &Stmt, ctx: &Ctx) -> Res {
-    match s {
-        Stmt::Local(local) => {
-            let name = binding(&local.pat)?;
-            let Some(init) = &local.init else {
-                return Err(Error::new(local.span(), "give the binding a value"));
-            };
-            declare(&quote!(#name), &init.expr, ctx)
-        }
-        Stmt::Expr(e, _) => statement(e, ctx),
-        other => Err(Error::new(other.span(), "not part of a kernel body")),
-    }
-}
-
-/// A `let`: group memory, tiles, an array, or a value.
-fn declare(name: &Tokens, init: &Expr, ctx: &Ctx) -> Res {
-    if let Expr::Call(call) = init
-        && let Expr::Path(p) = &*call.func
-        && let Some(last) = p.path.segments.last()
-        && matches!(last.ident.to_string().as_str(), "shared" | "local")
-    {
-        let kind = last.ident.to_string();
-        let PathArguments::AngleBracketed(a) = &last.arguments else {
-            return Err(Error::new(p.span(), format!("`{kind}::<T>(len)`")));
-        };
-        let Some(GenericArgument::Type(t)) = a.args.first() else {
-            return Err(Error::new(a.span(), format!("`{kind}::<T>(len)`")));
-        };
-        let (ty, len) = (scalar(t)?, &call.args[0]);
-        let kind_id = if kind == "local" {
-            quote!(Stmt::Array)
-        } else {
-            quote!(Stmt::Shared)
-        };
-        return Ok(quote!(#kind_id { name: #name.into(), ty: #ty, len: (#len) as usize }));
-    }
-    if let Expr::Call(c) = init
-        && is_path(&c.func, "atomic_shared")
-    {
-        let len = &c.args[0];
-        return Ok(quote!(Stmt::AtomicShared { name: #name.into(), len: (#len) as usize }));
-    }
-    if let Expr::Call(call) = init
-        && is_path(&call.func, "tiles")
-    {
-        let (rows, cols) = (&call.args[0], &call.args[1]);
-        return Ok(quote!(Stmt::TileAcc {
-            name: #name.into(),
-            rows: (#rows) as usize,
-            cols: (#cols) as usize,
-        }));
-    }
-    if let Expr::Call(call) = init
-        && is_path(&call.func, "held")
-    {
-        let (rows, depth) = (&call.args[0], &call.args[1]);
-        return Ok(quote!(Stmt::TileHeld {
-            name: #name.into(),
-            rows: (#rows) as usize,
-            depth: (#depth) as usize,
-        }));
-    }
-    if let Expr::Repeat(r) = init {
-        let ty = match &*r.expr {
-            Expr::Lit(ExprLit {
-                lit: Lit::Float(_), ..
-            }) => quote!(Ty::F32),
-            _ => quote!(Ty::U32),
-        };
-        let n = &r.len;
-        return Ok(quote!(Stmt::Array { name: #name.into(), ty: #ty, len: (#n) as usize }));
-    }
-    let init = expr(init, ctx)?;
-    Ok(quote!(Stmt::Let { name: #name.into(), init: #init }))
-}
-
-fn statement(e: &Expr, ctx: &Ctx) -> Res {
-    match e {
-        Expr::Assign(a) => {
-            let (target, value) = (expr(&a.left, ctx)?, expr(&a.right, ctx)?);
-            Ok(quote!(Stmt::Assign { target: #target, op: None, value: #value }))
-        }
-        Expr::Binary(b) if assign_op(&b.op).is_some() => {
-            let op = assign_op(&b.op).expect("checked");
-            let (target, value) = (expr(&b.left, ctx)?, expr(&b.right, ctx)?);
-            Ok(quote!(Stmt::Assign { target: #target, op: Some(#op), value: #value }))
-        }
-        Expr::ForLoop(f) => {
-            let Pat::Ident(var) = &*f.pat else {
-                return Err(Error::new(f.pat.span(), "name the loop variable"));
-            };
-            let var = var.ident.to_string();
-            let (from, to, step, unroll) = range(&f.expr, ctx)?;
-            let body = block(&f.body.stmts, ctx)?;
-            Ok(quote!(Stmt::For {
-                var: #var.into(),
-                from: #from,
-                to: #to,
-                step: #step,
-                unroll: #unroll,
-                body: #body,
-            }))
-        }
-        Expr::MethodCall(m) if m.method == "block" => {
-            let (acc, args) = (named(&m.receiver)?, call_args(m, ctx)?);
-            let [a, a_at, b, b_at, stride, _] = args.as_slice() else {
-                return Err(Error::new(
-                    m.span(),
-                    "`acc.block(a, a_at, b, b_at, stride, depth)`",
-                ));
-            };
-            let depth_expr = &m.args[5];
-            Ok(quote!(Stmt::TileBlock {
-                acc: #acc.into(),
-                a: #a,
-                a_at: #a_at,
-                b: #b,
-                b_at: #b_at,
-                stride: #stride,
-                depth: (#depth_expr) as usize,
-                parts: 0,
-                apart: Expr::Int(0),
-            }))
-        }
-        Expr::MethodCall(m) if m.method == "parts" => {
-            let (acc, args) = (named(&m.receiver)?, call_args(m, ctx)?);
-            let [a, a_at, apart, _, b, b_at, stride, _] = args.as_slice() else {
-                return Err(Error::new(
-                    m.span(),
-                    "`acc.parts(a, a_at, apart, parts, b, b_at, stride, depth)`",
-                ));
-            };
-            let (parts, depth) = (&m.args[3], &m.args[7]);
-            Ok(quote!(Stmt::TileBlock {
-                acc: #acc.into(),
-                a: #a,
-                a_at: #a_at,
-                b: #b,
-                b_at: #b_at,
-                stride: #stride,
-                depth: (#depth) as usize,
-                parts: (#parts) as usize,
-                apart: #apart,
-            }))
-        }
-        Expr::MethodCall(m) if m.method == "hold" => {
-            let (held, args) = (named(&m.receiver)?, call_args(m, ctx)?);
-            let [a, a_at, stride] = args.as_slice() else {
-                return Err(Error::new(m.span(), "`held.hold(a, a_at, stride)`"));
-            };
-            Ok(quote!(Stmt::TileHold {
-                held: #held.into(),
-                a: #a,
-                a_at: #a_at,
-                stride: #stride,
-            }))
-        }
-        Expr::MethodCall(m) if m.method == "zero" => {
-            let acc = named(&m.receiver)?;
-            Ok(quote!(Stmt::TileZero { acc: #acc.into() }))
-        }
-        Expr::MethodCall(m) if m.method == "add" => {
-            let (name, at, val) = (
-                named(&m.receiver)?,
-                expr(&m.args[0], ctx)?,
-                expr(&m.args[1], ctx)?,
-            );
-            Ok(quote!(Stmt::AtomicAdd { name: #name.into(), at: #at, value: #val }))
-        }
-        Expr::MethodCall(m) if m.method == "scale" => {
-            let acc = named(&m.receiver)?;
-            let Some(Expr::Closure(f)) = m.args.first() else {
-                return Err(Error::new(m.span(), "`acc.scale(|r| ..)`"));
-            };
-            let by = expr(&f.body, ctx)?;
-            Ok(quote!(Stmt::TileScale { acc: #acc.into(), by: #by }))
-        }
-        Expr::MethodCall(m) if m.method == "each" => {
-            let acc = named(&m.receiver)?;
-            let Some(Expr::Closure(f)) = m.args.first() else {
-                return Err(Error::new(m.span(), "`acc.each(|r, c, v| { .. })`"));
-            };
-            let names: Vec<String> = f
-                .inputs
-                .iter()
-                .map(|p| match p {
-                    Pat::Ident(i) => Ok(i.ident.to_string()),
-                    other => Err(Error::new(other.span(), "`|r, c, v|`")),
-                })
-                .collect::<Result<_, _>>()?;
-            if names != ["r", "c", "v"] {
-                return Err(Error::new(f.span(), "the closure takes `|r, c, v|`"));
-            }
-            let body = match &*f.body {
-                Expr::Block(b) => block(&b.block.stmts, ctx)?,
-                other => return Err(Error::new(other.span(), "a block body")),
-            };
-            Ok(quote!(Stmt::TileEach { acc: #acc.into(), body: #body }))
-        }
-        Expr::If(i) if is_const(&i.cond, ctx) => {
-            // Settled at build time: the printer keeps one branch.
-            let cond = &i.cond;
-            let then = block(&i.then_branch.stmts, ctx)?;
-            let els = match &i.else_branch {
-                None => quote!(vec![]),
-                Some((_, e)) => match &**e {
-                    Expr::Block(b) => block(&b.block.stmts, ctx)?,
-                    other => return Err(Error::new(other.span(), "a block")),
-                },
-            };
-            Ok(quote!(Stmt::If { cond: Expr::Bool(#cond), then: #then, els: #els }))
-        }
-        Expr::If(i) => {
-            let cond = expr(&i.cond, ctx)?;
-            let then = block(&i.then_branch.stmts, ctx)?;
-            let els = match &i.else_branch {
-                None => quote!(vec![]),
-                Some((_, e)) => match &**e {
-                    Expr::Block(b) => block(&b.block.stmts, ctx)?,
-                    nested @ Expr::If(_) => stmt(&Stmt::Expr(nested.clone(), None), ctx)?,
-                    other => return Err(Error::new(other.span(), "a block or `else if`")),
-                },
-            };
-            Ok(quote!(Stmt::If { cond: #cond, then: #then, els: #els }))
-        }
-        Expr::Return(r) if r.expr.is_none() => Ok(quote!(Stmt::Return)),
-        Expr::Call(c) if is_path(&c.func, "barrier") => Ok(quote!(Stmt::Barrier)),
-        Expr::Block(b) => {
-            // A bare block scopes nothing the tree needs.
-            let stmts = block(&b.block.stmts, ctx)?;
-            Ok(quote!(Stmt::If { cond: Expr::Bool(true), then: #stmts, els: vec![] }))
-        }
-        other => {
-            let e = expr(other, ctx)?;
-            Ok(quote!(Stmt::Expr(#e)))
-        }
-    }
-}
-
-/// `a..b` under any `.by(s)` and `.unroll(n)`.
-fn range(e: &Expr, ctx: &Ctx) -> Result<(Tokens, Tokens, Tokens, Tokens), Error> {
-    let (mut step, mut unroll) = (quote!(Expr::Int(1)), quote!(0usize));
-    let mut e = e;
-    loop {
-        match e {
-            Expr::Paren(p) => e = &p.expr,
-            Expr::MethodCall(m) if m.method == "by" => {
-                step = expr(&m.args[0], ctx)?;
-                e = &m.receiver;
-            }
-            Expr::MethodCall(m) if m.method == "unroll" => {
-                let n = &m.args[0];
-                unroll = quote!((#n) as usize);
-                e = &m.receiver;
-            }
-            Expr::Range(r) => {
-                let (Some(from), Some(to)) = (&r.start, &r.end) else {
-                    return Err(Error::new(r.span(), "a range with both ends"));
-                };
-                return Ok((expr(from, ctx)?, expr(to, ctx)?, step, unroll));
-            }
-            other => return Err(Error::new(other.span(), "`for v in (a..b).by(s)`")),
-        }
-    }
 }
 
 fn assign_op(op: &BinOp) -> Option<Tokens> {
