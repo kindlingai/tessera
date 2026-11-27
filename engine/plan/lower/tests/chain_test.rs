@@ -442,3 +442,25 @@ fn knobs_and_prefixes() {
     assert!(std::ptr::eq(prefixed("", base), base));
     assert_ne!(prefixed(&def, base), base);
 }
+
+#[test]
+fn unmeasured_skips_source() {
+    let mut dev = Device::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let k = CountingMade {
+        calls: Arc::clone(&calls),
+    };
+    let step = step_of(
+        CountingMade {
+            calls: Arc::clone(&calls),
+        },
+        16,
+    );
+    let plan = Plan::default();
+    assert!(dev.seconds(&k, 16) > 0.0);
+    assert!(dev.step_seconds(&plan, &step).unwrap() > 0.0);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    dev.fit([(&step, 2e-3)]);
+    assert!((dev.seconds(&k, 16) - 2e-3).abs() < 1e-9);
+    assert!(calls.load(Ordering::Relaxed) > 0);
+}

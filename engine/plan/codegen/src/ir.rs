@@ -5,9 +5,10 @@ use crate::dialect::{self, Text};
 use crate::form::Load;
 use crate::print::{Kind, Printer};
 use crate::wgsl::store4;
+use std::hash::{Hash, Hasher};
 
 /// A value's type, for the printer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     F32,
     U32,
@@ -32,7 +33,7 @@ impl Ty {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -106,7 +107,7 @@ macro_rules! intrinsics {
     ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:ident),*)
         $(-> $ret:ident)? { device: $dev:expr, text: $text:expr, wgsl: $wgsl:expr, host: $host:expr,
         count: $count:expr $(,)? })*) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum Intrinsic {
             $($(#[$doc])* $var,)*
         }
@@ -366,6 +367,13 @@ pub struct Helper {
 }
 
 impl Body {
+    /// Deterministic structural hash, without rendering dialect text.
+    pub fn hash(&self) -> u64 {
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        Hash::hash(self, &mut h);
+        h.finish()
+    }
+
     /// The text of this body, with buffers and scalars declared.
     pub fn text(&self) -> Text {
         assert!(self.ret.is_none(), "`{}` has a value: call it", self.entry);
@@ -441,5 +449,121 @@ impl Helper {
         p.line(format!("return {value};"));
         assert!(!p.lane, "`{}` reads the lane: pass it in", self.name);
         dialect::function(self.ret.c(), &self.name, &params, &p.lines)
+    }
+}
+
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+impl Hash for Expr {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(self).hash(h);
+        match self {
+            Expr::Int(v) => v.hash(h),
+            Expr::Float(v) => v.to_bits().hash(h),
+            Expr::Bool(v) => v.hash(h),
+            Expr::Var(s) => s.hash(h),
+            Expr::Neg(a) | Expr::Not(a) => a.hash(h),
+            Expr::Bin(op, a, b) => (op, a, b).hash(h),
+            Expr::Cast(ty, a) => (ty, a).hash(h),
+            Expr::Index(a, b) => (a, b).hash(h),
+            Expr::Field(a, c) => (a, c).hash(h),
+            Expr::Call(i, args) => (i, args).hash(h),
+            Expr::Select(c, a, b) => (c, a, b).hash(h),
+            Expr::Fn(name, ty, args) => (name, ty, args).hash(h),
+        }
+    }
+}
+
+impl Hash for Stmt {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(self).hash(h);
+        match self {
+            Stmt::Let { name, init } => (name, init).hash(h),
+            Stmt::Array { name, ty, len } | Stmt::Shared { name, ty, len } => {
+                (name, ty, len).hash(h)
+            }
+            Stmt::AtomicShared { name, len } => (name, len).hash(h),
+            Stmt::AtomicAdd { name, at, value } => (name, at, value).hash(h),
+            Stmt::Assign { target, op, value } => (target, op, value).hash(h),
+            Stmt::For {
+                var,
+                from,
+                to,
+                step,
+                unroll,
+                body,
+            } => (var, from, to, step, unroll, body).hash(h),
+            Stmt::If { cond, then, els } => (cond, then, els).hash(h),
+            Stmt::Return | Stmt::Barrier => {}
+            Stmt::Expr(e) => e.hash(h),
+            Stmt::TileAcc { name, rows, cols } => (name, rows, cols).hash(h),
+            Stmt::TileHeld { name, rows, depth } => (name, rows, depth).hash(h),
+            Stmt::TileHold {
+                held,
+                a,
+                a_at,
+                stride,
+            } => (held, a, a_at, stride).hash(h),
+            Stmt::TileBlock {
+                acc,
+                a,
+                a_at,
+                b,
+                b_at,
+                stride,
+                depth,
+                parts,
+                apart,
+            } => (acc, a, a_at, b, b_at, stride, depth, parts, apart).hash(h),
+            Stmt::TileEach { acc, body } => (acc, body).hash(h),
+            Stmt::TileZero { acc } => acc.hash(h),
+            Stmt::TileScale { acc, by } => (acc, by).hash(h),
+        }
+    }
+}
+
+impl Hash for Param {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(self).hash(h);
+        match self {
+            Param::Buffer { name, form, writes } => {
+                (name, form.name(), form.ty(), form.header(), writes).hash(h);
+            }
+            Param::Scalar { name, ty } | Param::Shared { name, ty } | Param::Array { name, ty } => {
+                (name, ty).hash(h);
+            }
+            Param::Tiles { name } => name.hash(h),
+        }
+    }
+}
+
+impl Hash for Helper {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        (&self.name, self.ret, &self.body).hash(h);
+    }
+}
+
+impl Hash for Body {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        (
+            &self.entry,
+            &self.params,
+            &self.stmts,
+            &self.ret,
+            &self.helpers,
+        )
+            .hash(h);
     }
 }

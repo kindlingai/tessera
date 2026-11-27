@@ -78,6 +78,11 @@ impl Timings {
         self.0.values().map(Vec::len).sum()
     }
 
+    /// Whether any timed samples exist for `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.0.get(name).is_some_and(|t| !t.is_empty())
+    }
+
     /// Whether `now` was timed with its current source.
     pub fn known(&self, name: &str, now: &Sample) -> bool {
         self.fresh(name, now, false)

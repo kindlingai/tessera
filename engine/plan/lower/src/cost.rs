@@ -506,6 +506,15 @@ impl Device {
             return f64::INFINITY;
         }
         let work = k.work(len);
+        // A host zone beside a GPU has its own samples.
+        let own = kind == self.cluster.kind(0);
+        let timed = if own { &self.timed } else { &self.host };
+        let chip = self.model.as_ref().filter(|_| own);
+        let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
+        // Without samples, skip source hashing and memoization.
+        if !timed.has(k.name()) {
+            return modelled().unwrap_or(FIXED + k.guess() * work);
+        }
         let (entry, source) = identity();
         let key = (
             kind,
@@ -519,13 +528,8 @@ impl Device {
         if let Some(seconds) = self.memo.borrow().get(&key) {
             return *seconds;
         }
-        // A host zone beside a GPU has its own samples.
-        let own = kind == self.cluster.kind(0);
-        let timed = if own { &self.timed } else { &self.host };
         let near = timed.estimate(k.name(), Some(source), &key.4, work, cold);
-        // With no sample of this kernel, the chip model speaks.
-        let chip = self.model.as_ref().filter(|_| own);
-        let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
+        // With no matching sample, the chip model speaks.
         let seconds = near.or_else(modelled).unwrap_or(FIXED + k.guess() * work);
         self.memo.borrow_mut().insert(key, seconds);
         seconds

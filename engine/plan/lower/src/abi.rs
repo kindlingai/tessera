@@ -4,8 +4,8 @@ use crate::extent::Extent;
 use crate::plan::{Slot, Step};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use tessera_codegen::hash;
 use tessera_codegen::ir::{Body, Param};
-use tessera_codegen::{Dialect, hash};
 use tessera_engine_settings::ByBackend;
 use tessera_graph::DimName;
 
@@ -220,7 +220,7 @@ impl Source {
             Source::Fixed { text, entry } => {
                 (text.0.iter().chain([entry])).fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text))
             }
-            Source::Made(body) => hash(&body.text().render(Dialect::Cuda)),
+            Source::Made(body) => body.hash(),
         }
     }
 }
