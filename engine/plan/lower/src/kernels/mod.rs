@@ -13,6 +13,6 @@ pub use join::Join;
 pub use map::{Map, MapStage, add_operand_forms, add_operands, finish, operands};
 pub(crate) use moves::Move;
 pub(crate) use scatter::Scatter;
-pub use stage::{Batch, Batches, Ring, Stage, place};
+pub use stage::{Batches, Ring, Stage, place};
 pub(crate) use widen::Narrow;
 pub use widen::Widen;
