@@ -102,15 +102,17 @@ fn form_kinds_hold() {
 
 #[test]
 fn p2p_kernel_flattens() {
-    let source = include_str!("p2p/p2p.kernel");
+    let source = crate::p2p::source();
     for backend in [Backend::Cuda, Backend::Rocm] {
         let options = Options::plain(backend);
-        let flat = flatten("p2p.kernel", source, &|_| None, &options).unwrap();
+        let flat = flatten("p2p.kernel", &source, &|_| None, &options).unwrap();
         assert!(flat.text.contains("tessera_p2p_sum"));
         assert!(flat.text.contains("tessera_p2p_sum_bf16"));
         assert!(flat.text.contains("tessera_p2p_sum_fp16"));
         assert!(flat.text.contains("tessera_p2p_sum_fp8"));
+        assert!(flat.text.contains("tessera_p2p_rs_fp8"));
         assert!(flat.text.contains("tessera_p2p_gather"));
+        assert!(flat.text.contains("sum_range"));
         assert!(flat.text.contains("add_pair"));
         assert!(flat.text.contains("seq_ptr"));
         assert!(flat.text.contains("timeout_ticks"));

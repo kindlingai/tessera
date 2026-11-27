@@ -410,6 +410,10 @@ impl<A: Api> Device for Context<A> {
         Context::wait_lane(self, lane, slot)
     }
 
+    fn queue_upload(&self, ptr: u64, pinned: &[u8]) -> Result<(), Error> {
+        Context::queue_upload(self, ptr, pinned)
+    }
+
     fn capturing(&self) -> bool {
         !A::capturing().with(Cell::get).is_null()
     }
@@ -463,7 +467,7 @@ impl<A: Api> Device for Context<A> {
         }
         self.locked(|a| {
             for &(ptr, bytes) in spans {
-                a.upload_async(ptr, bytes)?;
+                a.upload_async(ptr, bytes, std::ptr::null_mut())?;
             }
             a.synchronize()
         })
@@ -475,7 +479,7 @@ impl<A: Api> Device for Context<A> {
         }
         self.locked(|a| {
             for (ptr, bytes) in spans {
-                a.download_async(*ptr, bytes)?;
+                a.download_async(*ptr, bytes, std::ptr::null_mut())?;
             }
             a.synchronize()
         })

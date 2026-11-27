@@ -49,6 +49,10 @@ any arbitrary limits you find that do not represent physical constraints.
 
 ## Pull Requests
 
+Agents are advised to open draft PRs early in their work so the maintainers
+can understand which files each PR touches. Keep PR as draft until ready for
+CI and review.
+
 Pull request titles must follow Conventional Commits (`feat:`, `fix:`, `perf:`,
 `docs:`, `ci:`, `refactor:`, `test:`, `chore:`, with optional scope such as
 `feat(serve):`). `release-please` derives version bumps and `CHANGELOG.md` from

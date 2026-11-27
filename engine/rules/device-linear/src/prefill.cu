@@ -291,23 +291,11 @@ extern "C" __global__ __launch_bounds__(256, MM_PREP_BLK) void tessera_mm_mxfp8_
 #endif
 }
 
-#if DTR_MX8
-struct alignas(16) mx8_128_smem {
-    u32 sw[2][128][36];
-    u32 sx[2][128][32];
-    u32 sxs[2][128];
-};
-
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 static __device__ __forceinline__ void mx8_cp16(void* smem, const void* gmem, bool pred) {
     u32 dst = static_cast<u32>(__cvta_generic_to_shared(smem));
     if (pred) asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(gmem));
     else *reinterpret_cast<uint4*>(smem) = make_uint4(0u, 0u, 0u, 0u);
-}
-
-static __device__ __forceinline__ void mx8_cp4(void* smem, const void* gmem, bool pred) {
-    u32 dst = static_cast<u32>(__cvta_generic_to_shared(smem));
-    if (pred) asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(gmem));
-    else *reinterpret_cast<u32*>(smem) = 0u;
 }
 
 static __device__ __forceinline__ void mx8_ldm4(u32 (&r)[4], const void* smem_ptr) {
@@ -315,6 +303,81 @@ static __device__ __forceinline__ void mx8_ldm4(u32 (&r)[4], const void* smem_pt
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(addr));
+}
+
+template <bool SPLIT>
+static __device__ __forceinline__ void mx8_store_vec4(
+    float4 v, const float* other, float* out, u64 off, u32 col, u32 n, u32 mode, bool vec4) {
+    if (vec4 && col + 3u < n) {
+        if (!SPLIT && mode != 0u) {
+            v.x = mx8_epilogue(v.x, other, off, col, mode);
+            v.y = mx8_epilogue(v.y, other, off + 1u, col + 1u, mode);
+            v.z = mx8_epilogue(v.z, other, off + 2u, col + 2u, mode);
+            v.w = mx8_epilogue(v.w, other, off + 3u, col + 3u, mode);
+        }
+        *reinterpret_cast<float4*>(out + off) = v;
+    } else {
+        float vals[4] = {v.x, v.y, v.z, v.w};
+        for (u32 j = 0u; j < 4u && col + j < n; j++) {
+            out[off + j] = SPLIT ? vals[j] : mx8_epilogue(vals[j], other, off + j, col + j, mode);
+        }
+    }
+}
+
+template <u32 MI, bool SPLIT>
+static __device__ __forceinline__ void mx8_epilogue_smem(
+    float (*out_sm)[132], const float (&acc)[2][MI][4], const float* other, float* out,
+    u32 m, u32 n, u32 r0, u32 n0, u32 p, u32 mode, u32 tid, u32 wm, u32 n_base, u32 g, u32 t) {
+    constexpr u32 Q_ROWS = MI << 3u;
+    constexpr u32 Q_SHIFT = (MI == 8u) ? 6u : 5u;
+    u32 sr = tid >> 5u, sc4 = (tid & 31u) << 2u;
+    bool vec4 = (n & 3u) == 0u;
+#pragma unroll
+    for (u32 q = 0u; q < 2u; q++) {
+        if (wm == q) {
+#pragma unroll
+            for (u32 ni = 0u; ni < 2u; ni++) {
+                u32 lc0 = n_base + (ni << 4u) + g, lc1 = lc0 + 8u;
+#pragma unroll
+                for (u32 mi = 0u; mi < MI; mi++) {
+                    u32 lr = (mi << 3u) + (t << 1u);
+                    out_sm[lr][lc0] = acc[ni][mi][0];
+                    out_sm[lr][lc1] = acc[ni][mi][2];
+                    out_sm[lr + 1u][lc0] = acc[ni][mi][1];
+                    out_sm[lr + 1u][lc1] = acc[ni][mi][3];
+                }
+            }
+        }
+        prim::block_sync();
+        u32 col = n0 + sc4;
+#pragma unroll
+        for (u32 dr = 0u; dr < Q_ROWS; dr += 8u) {
+            u32 row = r0 + (q << Q_SHIFT) + sr + dr;
+            if (row < m && col < n) {
+                float4 v = *reinterpret_cast<const float4*>(&out_sm[sr + dr][sc4]);
+                u64 off = u64(SPLIT ? (p * m + row) : row) * n + col;
+                mx8_store_vec4<SPLIT>(v, other, out, off, col, n, mode, vec4);
+            }
+        }
+        if (q == 0u) prim::block_sync();
+    }
+}
+#endif
+
+#if DTR_MX8
+union alignas(16) mx8_128_smem {
+    struct {
+        u32 sw[2][128][36];
+        u32 sx[2][128][32];
+        u32 sxs[2][128];
+    } k;
+    float out[64][132];
+};
+
+static __device__ __forceinline__ void mx8_cp4(void* smem, const void* gmem, bool pred) {
+    u32 dst = static_cast<u32>(__cvta_generic_to_shared(smem));
+    if (pred) asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(gmem));
+    else *reinterpret_cast<u32*>(smem) = 0u;
 }
 
 template <u32 SH>
@@ -341,73 +404,62 @@ static __device__ __forceinline__ void mx8_load_stage(
 #pragma unroll
     for (u32 dr = 0u; dr < 128u; dr += 32u) {
         u32 nr = r0_t + dr;
-        mx8_cp16(&sm.sw[st][nr][col16 << 2u],
+        mx8_cp16(&sm.k.sw[st][nr][col16 << 2u],
                  w + u64(n0 + nr) * row_bytes + aligned_off + (col16 << 4u), n0 + nr < n);
     }
     if (tid < 128u) {
-        mx8_cp16(&sm.sw[st][tid][32u], w + u64(n0 + tid) * row_bytes + aligned_off + 128u, n0 + tid < n);
+        mx8_cp16(&sm.k.sw[st][tid][32u], w + u64(n0 + tid) * row_bytes + aligned_off + 128u, n0 + tid < n);
     }
     u32 k_off = ch128 << 7u;
 #pragma unroll
     for (u32 dr = 0u; dr < 128u; dr += 32u) {
         u32 mr = r0_t + dr;
-        mx8_cp16(&sm.sx[st][mr][(col16 ^ (mr & 7u)) << 2u],
+        mx8_cp16(&sm.k.sx[st][mr][(col16 ^ (mr & 7u)) << 2u],
                  xq + u64(r0 + mr) * k + k_off + (col16 << 4u), r0 + mr < m);
     }
     if (tid < 128u) {
-        mx8_cp4(&sm.sxs[st][tid], xs + u64(r0 + tid) * nblk + (ch128 << 2u), r0 + tid < m);
+        mx8_cp4(&sm.k.sxs[st][tid], xs + u64(r0 + tid) * nblk + (ch128 << 2u), r0 + tid < m);
     }
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
 template <u32 PH, u32 BLK>
 static __device__ __forceinline__ void mx8_run_blk(
-    const u32 (*sw_st)[36], const u32 (*sx_st)[32], const u32* sxs_st,
-    u32 n_base, u32 m_base, u32 g, u32 t, u32 lb_row, u32 lb_half, float acc[4][4][4]) {
+    const u32 (*sw_st)[36], const u32 (*sx_st)[32], const u32 sb4[8],
+    u32 n_base, u32 m_base, u32 g, u32 t, u32 lb_row, u32 lb_half, float acc[2][8][4]) {
     constexpr u32 B_OFF = PH * 4u + BLK * 33u;
     constexpr u32 Q_BASE = B_OFF + 1u;
     constexpr u32 SH = (Q_BASE & 3u) << 3u;
     constexpr u32 W_BASE = Q_BASE >> 2u;
     constexpr u32 S_SH = BLK << 3u;
-    u32 fb[4][2], sb[4];
-    {
-        u32 mr0 = m_base + lb_row, tmp[4];
-        mx8_ldm4(tmp, &sx_st[mr0][(((BLK << 1u) | lb_half) ^ (mr0 & 7u)) << 2u]);
-        fb[0][0] = tmp[0]; fb[0][1] = tmp[1]; fb[1][0] = tmp[2]; fb[1][1] = tmp[3];
-    }
-    {
-        u32 mr2 = m_base + 16u + lb_row, tmp[4];
-        mx8_ldm4(tmp, &sx_st[mr2][(((BLK << 1u) | lb_half) ^ (mr2 & 7u)) << 2u]);
-        fb[2][0] = tmp[0]; fb[2][1] = tmp[1]; fb[3][0] = tmp[2]; fb[3][1] = tmp[3];
+    u32 fb[8][2], sb[8];
+#pragma unroll
+    for (u32 q = 0u; q < 4u; q++) {
+        u32 mr = m_base + (q << 4u) + lb_row, tmp[4];
+        mx8_ldm4(tmp, &sx_st[mr][(((BLK << 1u) | lb_half) ^ (mr & 7u)) << 2u]);
+        fb[q << 1u][0] = tmp[0]; fb[q << 1u][1] = tmp[1];
+        fb[(q << 1u) + 1u][0] = tmp[2]; fb[(q << 1u) + 1u][1] = tmp[3];
     }
 #pragma unroll
-    for (u32 mi = 0u; mi < 4u; mi++) sb[mi] = (sxs_st[m_base + (mi << 3u) + g] >> S_SH) & 0xFFu;
+    for (u32 mi = 0u; mi < 8u; mi++) sb[mi] = (sb4[mi] >> S_SH) & 0xFFu;
 
-    u32 fa_cur[4], fa_nxt[4], sa_cur, sa_nxt;
+    u32 fa0[4], fa1[4], sa0, sa1;
     {
         u32 nr0 = n_base + g, nr1 = nr0 + 8u;
         const u32 *sw0 = sw_st[nr0], *sw1 = sw_st[nr1];
-        sa_cur = u32(reinterpret_cast<const u8*>((t & 1u) ? sw1 : sw0)[B_OFF]);
-        mx8_load_fa<SH>(sw0, sw1, W_BASE, t, fa_cur);
+        sa0 = u32(reinterpret_cast<const u8*>((t & 1u) ? sw1 : sw0)[B_OFF]);
+        mx8_load_fa<SH>(sw0, sw1, W_BASE, t, fa0);
+    }
+    {
+        u32 nr0 = n_base + 16u + g, nr1 = nr0 + 8u;
+        const u32 *sw0 = sw_st[nr0], *sw1 = sw_st[nr1];
+        sa1 = u32(reinterpret_cast<const u8*>((t & 1u) ? sw1 : sw0)[B_OFF]);
+        mx8_load_fa<SH>(sw0, sw1, W_BASE, t, fa1);
     }
 #pragma unroll
-    for (u32 ni = 0u; ni < 4u; ni++) {
-        if (ni + 1u < 4u) {
-            u32 nr0 = n_base + ((ni + 1u) << 4u) + g, nr1 = nr0 + 8u;
-            const u32 *sw0 = sw_st[nr0], *sw1 = sw_st[nr1];
-            sa_nxt = u32(reinterpret_cast<const u8*>((t & 1u) ? sw1 : sw0)[B_OFF]);
-            mx8_load_fa<SH>(sw0, sw1, W_BASE, t, fa_nxt);
-        }
+    for (u32 mi = 0u; mi < 8u; mi++) trellis::mma_mx8(acc[0][mi], fa0, fb[mi], sa0, sb[mi]);
 #pragma unroll
-        for (u32 mi = 0u; mi < 4u; mi++) {
-            trellis::mma_mx8(acc[ni][mi], fa_cur, fb[mi], sa_cur, sb[mi]);
-        }
-        if (ni + 1u < 4u) {
-            fa_cur[0] = fa_nxt[0]; fa_cur[1] = fa_nxt[1];
-            fa_cur[2] = fa_nxt[2]; fa_cur[3] = fa_nxt[3];
-            sa_cur = sa_nxt;
-        }
-    }
+    for (u32 mi = 0u; mi < 8u; mi++) trellis::mma_mx8(acc[1][mi], fa1, fb[mi], sa1, sb[mi]);
 }
 
 template <u32 PH>
@@ -415,7 +467,7 @@ static __device__ __forceinline__ void mx8_phase_step(
     mx8_128_smem& sm, u32 st, u32 nxt_ch, bool has_nxt,
     const u8* xq, const u8* xs, const u8* w, u32 m, u32 n, u32 k, u32 nblk, u64 row_bytes,
     u32 n0, u32 r0, u32 tid, u32 r0_t, u32 col16,
-    u32 n_base, u32 m_base, u32 g, u32 t, u32 lb_row, u32 lb_half, float acc[4][4][4]) {
+    u32 n_base, u32 m_base, u32 g, u32 t, u32 lb_row, u32 lb_half, float acc[2][8][4]) {
     if (has_nxt) {
         mx8_load_stage(sm, st ^ 1u, nxt_ch, xq, xs, w, m, n, k, nblk, row_bytes, n0, r0, tid, r0_t, col16);
         asm volatile("cp.async.wait_group 1;\n" ::);
@@ -423,10 +475,13 @@ static __device__ __forceinline__ void mx8_phase_step(
         asm volatile("cp.async.wait_group 0;\n" ::);
     }
     prim::block_sync();
-    mx8_run_blk<PH, 0u>(sm.sw[st], sm.sx[st], sm.sxs[st], n_base, m_base, g, t, lb_row, lb_half, acc);
-    mx8_run_blk<PH, 1u>(sm.sw[st], sm.sx[st], sm.sxs[st], n_base, m_base, g, t, lb_row, lb_half, acc);
-    mx8_run_blk<PH, 2u>(sm.sw[st], sm.sx[st], sm.sxs[st], n_base, m_base, g, t, lb_row, lb_half, acc);
-    mx8_run_blk<PH, 3u>(sm.sw[st], sm.sx[st], sm.sxs[st], n_base, m_base, g, t, lb_row, lb_half, acc);
+    u32 sb4[8];
+#pragma unroll
+    for (u32 mi = 0u; mi < 8u; mi++) sb4[mi] = sm.k.sxs[st][m_base + (mi << 3u) + g];
+    mx8_run_blk<PH, 0u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 1u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 2u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
+    mx8_run_blk<PH, 3u>(sm.k.sw[st], sm.k.sx[st], sb4, n_base, m_base, g, t, lb_row, lb_half, acc);
     if (has_nxt) prim::block_sync();
 }
 
@@ -437,7 +492,7 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
     extern __shared__ u8 raw_smem[];
     mx8_128_smem& sm = *reinterpret_cast<mx8_128_smem*>(raw_smem);
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
-    u32 g = lane >> 2u, t = lane & 3u, wn = warp & 1u, wm = warp >> 1u;
+    u32 g = lane >> 2u, t = lane & 3u, wn = warp & 3u, wm = warp >> 2u;
     u32 nb = (n + 127u) >> 7u, mb = (m + 127u) >> 7u;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x;
     u32 p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -454,14 +509,14 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
     const u8* xq = reinterpret_cast<const u8*>(xpre);
     const u8* xs = xq + u64(m) * k;
     u32 r0_t = tid >> 3u, col16 = tid & 7u;
-    u32 n_base = wn << 6u, m_base = wm << 5u;
+    u32 n_base = wn << 5u, m_base = wm << 6u;
     u32 lb_row = ((lane >> 4u) << 3u) | (lane & 7u), lb_half = (lane >> 3u) & 1u;
 
-    float acc[4][4][4];
+    float acc[2][8][4];
 #pragma unroll
-    for (u32 ni = 0u; ni < 4u; ni++)
+    for (u32 ni = 0u; ni < 2u; ni++)
 #pragma unroll
-        for (u32 mi = 0u; mi < 4u; mi++)
+        for (u32 mi = 0u; mi < 8u; mi++)
             acc[ni][mi][0] = acc[ni][mi][1] = acc[ni][mi][2] = acc[ni][mi][3] = 0.0f;
 
     mx8_load_stage(sm, 0u, c5_0 << 2u, xq, xs, w, m, n, k, nblk, row_bytes, n0, r0, tid, r0_t, col16);
@@ -476,24 +531,8 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
         mx8_phase_step<3u>(sm, 1u, base + 4u, c5 + 1u < c5_1, xq, xs, w, m, n, k, nblk, row_bytes,
                            n0, r0, tid, r0_t, col16, n_base, m_base, g, t, lb_row, lb_half, acc);
     }
-#pragma unroll
-    for (u32 ni = 0u; ni < 4u; ni++) {
-        u32 col0 = n0 + n_base + (ni << 4u) + g, col1 = col0 + 8u;
-#pragma unroll
-        for (u32 mi = 0u; mi < 4u; mi++) {
-            u32 row0 = r0 + m_base + (mi << 3u) + (t << 1u);
-            if (row0 < m) {
-                u64 off0 = u64(SPLIT ? (p * m + row0) : row0) * n;
-                if (col0 < n) out[off0 + col0] = SPLIT ? acc[ni][mi][0] : mx8_epilogue(acc[ni][mi][0], other, off0 + col0, col0, mode);
-                if (col1 < n) out[off0 + col1] = SPLIT ? acc[ni][mi][2] : mx8_epilogue(acc[ni][mi][2], other, off0 + col1, col1, mode);
-            }
-            if (row0 + 1u < m) {
-                u64 off1 = u64(SPLIT ? (p * m + row0 + 1u) : (row0 + 1u)) * n;
-                if (col0 < n) out[off1 + col0] = SPLIT ? acc[ni][mi][1] : mx8_epilogue(acc[ni][mi][1], other, off1 + col0, col0, mode);
-                if (col1 < n) out[off1 + col1] = SPLIT ? acc[ni][mi][3] : mx8_epilogue(acc[ni][mi][3], other, off1 + col1, col1, mode);
-            }
-        }
-    }
+    prim::block_sync();
+    mx8_epilogue_smem<8u, SPLIT>(sm.out, acc, other, out, m, n, r0, n0, p, mode, tid, wm, n_base, g, t);
 }
 #endif
 

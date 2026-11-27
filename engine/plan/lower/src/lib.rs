@@ -14,6 +14,7 @@ mod cut;
 mod error;
 mod extent;
 pub mod form;
+pub mod hazard;
 mod kernel;
 pub mod kernels;
 mod plan;

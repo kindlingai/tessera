@@ -85,13 +85,17 @@ fn cases() -> Vec<Case> {
     }
     let g = linear(&one, 2560, 2560);
     let mxfp8 = Pins::all(&block::MXFP8);
+    let int4 = Pins::all(&block::INT4_G32);
     all.push(case("fast_mm", "2560x2560".into(), g.clone(), &bf16, TALL));
     let what = "2560x2560 mxfp8".into();
     all.push(case("fast_mm", what, g.clone(), &mxfp8, TALL));
+    let what = "2560x2560 int4_g32".into();
+    all.push(case("fast_mm", what, g.clone(), &int4, TALL));
     // Forced splits. bf16 splits need n%32 > 0.
     for (spot, [k, n], pins) in [
         ("fast_mm_bf16_sk", [2560, 2544], &bf16),
         ("fast_mm_mxfp8_sk", [4096, 2560], &mxfp8),
+        ("fast_mm_int4_sk", [4096, 2560], &int4),
     ] {
         let (g, what) = (linear(&one, k, n), format!("{k}x{n} {spot}=4"));
         let mut split = case("fast_mm", what, g, pins, TALL);

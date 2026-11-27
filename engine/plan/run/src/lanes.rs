@@ -1,8 +1,11 @@
 //! Cross-lane hazard analysis and event synchronization for multi-stream plans.
 
 use tessera_gpukit::device::Device;
-use tessera_lower::kernels::crosses;
-use tessera_lower::{Slot, Step};
+use tessera_lower::Step;
+use tessera_lower::hazard::hazards;
+
+// The plan's copy lane is the device's copy stream.
+const _: () = assert!(tessera_lower::hazard::COPY_LANE == tessera_gpukit::device::COPY_LANE);
 
 /// Maximum distinct execution lanes tracked per plan.
 const MAX_LANES: usize = 4;
@@ -19,32 +22,6 @@ pub(crate) struct LaneSync {
     pub(crate) records: Vec<Option<usize>>,
     /// Event slots lane `0` waits on after the final step.
     pub(crate) joins: Vec<usize>,
-}
-
-fn overlaps(a: Slot, b: Slot) -> bool {
-    if a.buffer != b.buffer {
-        return false;
-    }
-    let a_end = a.offset + a.bytes().max(1);
-    let b_end = b.offset + b.bytes().max(1);
-    a.offset < b_end && b.offset < a_end
-}
-
-fn writes(step: &Step) -> impl Iterator<Item = Slot> + '_ {
-    std::iter::once(step.write).chain(step.also.iter().copied())
-}
-
-fn hazards(earlier: &Step, later: &Step) -> bool {
-    if crosses(earlier.kernel.name()) && crosses(later.kernel.name()) {
-        return true;
-    }
-    let raw = writes(earlier).any(|w| later.reads.iter().any(|&r| overlaps(w, r)));
-    let war = earlier
-        .reads
-        .iter()
-        .any(|&r| writes(later).any(|w| overlaps(r, w)));
-    let waw = writes(earlier).any(|w1| writes(later).any(|w2| overlaps(w1, w2)));
-    raw || war || waw
 }
 
 impl LaneSync {

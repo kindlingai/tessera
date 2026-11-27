@@ -18,6 +18,12 @@ filter = 'binary_id(tessera-tasks) & test(=flow_test::matches_torch)'
 test-group = 'checkpoint'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Every planned kernel through each toolkit's compiler, for each target.
+# The kernel count grows with each new kernel.
+[[profile.default.overrides]]
+filter = 'binary_id(tessera-models::kernels_test) & test(/_kernels_compile$/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 2 }

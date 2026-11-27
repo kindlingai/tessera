@@ -8,10 +8,10 @@ using namespace tessera;
 #define ST_WIDE_BLK 6
 #endif
 #ifndef ST_LANES64_BLK
-#define ST_LANES64_BLK 3
+#define ST_LANES64_BLK 4
 #endif
 #ifndef ST_WIDE64_BLK
-#define ST_WIDE64_BLK 3
+#define ST_WIDE64_BLK 4
 #endif
 
 static __device__ __forceinline__ uint4 st_ld_nc4(const void* p) {
@@ -87,15 +87,16 @@ static __device__ __forceinline__ void st_rope_tail(
     u32 nr = min(rows - r0, tile_rows);
     u32 pairs = rope_w >> 1u;
     u32 total = nr * pairs;
+    float log_theta = __logf(theta);
+    float inv_rw = -2.0f / float(rope_w);
     for (u32 i = tid; i < total; i += nthreads) {
         u32 r = i / pairs;
         u32 pair = i - r * pairs;
         u32 row = r0 + r;
         float angle = (pair < turned)
-            ? float(pos[row]) * powf(theta, -float(2u * pair) / float(rope_w))
+            ? float(pos[row]) * __expf(float(pair) * inv_rw * log_theta)
             : 0.0f;
-        float sn, c;
-        sincosf(angle, &sn, &c);
+        float sn = __sinf(angle), c = __cosf(angle);
         u32 a = adjacent ? (2u * pair) : pair;
         u32 b = adjacent ? (a + 1u) : (pairs + pair);
         const float* src = rot + (u64(row) * batches + batch) * rot_stride + rot_off;
@@ -166,9 +167,16 @@ static __device__ __forceinline__ void st_stacked_64(
     u32 first, u32 step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs, u32 mat_off, const float* rot,
     const u32* pos, u32 rope_w, u32 rot_stride, u32 rot_off, u32 rope_out_off, u32 turned,
     u32 adjacent, float theta) {
-    __shared__ alignas(16) u32 sxh[64][18];
-    __shared__ alignas(16) u32 sxl[64][18];
-    __shared__ alignas(16) u16 sw_u16[64][40];
+    constexpr u32 SW_STRIDE = TRANSPOSED ? 34u : 40u;
+    union alignas(16) st64_smem {
+        struct {
+            u32 sxh[64][18];
+            u32 sxl[64][18];
+            u16 sw[64][SW_STRIDE];
+        } k;
+        float out[32][68];
+    };
+    __shared__ st64_smem sm;
     u32 tile = blockIdx.x, rtiles = (rows + 63u) >> 6u;
     u32 batch = blockIdx.y / rtiles, r0 = (blockIdx.y % rtiles) << 6u, n0 = tile << 6u;
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
@@ -185,12 +193,12 @@ static __device__ __forceinline__ void st_stacked_64(
     for (u32 k0 = 0u; k0 < k; k0 += 32u) {
 #pragma unroll
         for (u32 dr = 0u; dr < 64u; dr += 32u) {
-            st_stacked_x_bf16(xb, r0, rows, x_rs, k0, xr0 + dr, xc, xw, sxh, sxl);
+            st_stacked_x_bf16(xb, r0, rows, x_rs, k0, xr0 + dr, xc, xw, sm.k.sxh, sm.k.sxl);
         }
         if constexpr (TRANSPOSED) {
-            st_stacked_w_t(sw_u16, wc, wk, cur);
+            st_stacked_w_t(sm.k.sw, wc, wk, cur);
         } else {
-            *reinterpret_cast<uint4*>(&sw_u16[wr_r][wr_c]) = cur;
+            *reinterpret_cast<uint4*>(&sm.k.sw[wr_r][wr_c]) = cur;
         }
         prim::block_sync();
         if (k0 + 32u < k) {
@@ -201,30 +209,46 @@ static __device__ __forceinline__ void st_stacked_64(
         for (u32 ks = 0u; ks < 2u; ks++) {
             u32 off = (ks << 3u) + t;
             u32 ah[4], al[4];
-            st_stacked_a(sxh, sxl, m_base + g, off, ah, al);
+            st_stacked_a(sm.k.sxh, sm.k.sxl, m_base + g, off, ah, al);
             u32 wk0 = (ks << 4u) + (t << 1u);
 #pragma unroll
             for (u32 ni = 0u; ni < 4u; ni++) {
                 u32 nc = n_base + (ni << 3u) + g;
-                u32 b[2] = {*reinterpret_cast<const u32*>(&sw_u16[nc][wk0]),
-                            *reinterpret_cast<const u32*>(&sw_u16[nc][wk0 + 8u])};
+                u32 b[2] = {*reinterpret_cast<const u32*>(&sm.k.sw[nc][wk0]),
+                            *reinterpret_cast<const u32*>(&sm.k.sw[nc][wk0 + 8u])};
                 st_mma_bf16(acc[ni], ah, b);
                 st_mma_bf16(acc[ni], al, b);
             }
         }
         prim::block_sync();
     }
+    u32 sr = tid >> 4u, sc4 = (tid & 15u) << 2u;
 #pragma unroll
-    for (u32 ni = 0u; ni < 4u; ni++) {
-        u32 col = n0 + n_base + (ni << 3u) + (t << 1u);
-        if (r0 + m_base + g < rows) {
-            *reinterpret_cast<float2*>(ob + u64(r0 + m_base + g) * o_rs + mat_off + col) =
-                make_float2(acc[ni][0], acc[ni][1]);
+    for (u32 half = 0u; half < 2u; half++) {
+        if ((wm >> 1u) == half) {
+            u32 lr = ((wm & 1u) << 4u) + g;
+#pragma unroll
+            for (u32 ni = 0u; ni < 4u; ni++) {
+                u32 lc = n_base + (ni << 3u) + (t << 1u);
+                *reinterpret_cast<float2*>(&sm.out[lr][lc]) = make_float2(acc[ni][0], acc[ni][1]);
+                *reinterpret_cast<float2*>(&sm.out[lr + 8u][lc]) = make_float2(acc[ni][2], acc[ni][3]);
+            }
         }
-        if (r0 + m_base + g + 8u < rows) {
-            *reinterpret_cast<float2*>(ob + u64(r0 + m_base + g + 8u) * o_rs + mat_off + col) =
-                make_float2(acc[ni][2], acc[ni][3]);
+        prim::block_sync();
+#pragma unroll
+        for (u32 dr = 0u; dr < 32u; dr += 16u) {
+            u32 r = r0 + (half << 5u) + sr + dr;
+            if (r < rows) {
+                float4 v = *reinterpret_cast<const float4*>(&sm.out[sr + dr][sc4]);
+                float* d = ob + u64(r) * o_rs + mat_off + n0 + sc4;
+                if (((o_rs | o_bs | mat_off) & 3u) == 0u) {
+                    *reinterpret_cast<float4*>(d) = v;
+                } else {
+                    d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+                }
+            }
         }
+        if (half == 0u) prim::block_sync();
     }
     if constexpr (TRANSPOSED) {
         if (tile == 0u && rope_w > 0u) {

@@ -91,11 +91,15 @@ fn compile_all(
     }
     let width = std::thread::available_parallelism().map_or(4, |n| n.get());
     let failed = std::sync::Mutex::new(Vec::new());
+    // Threads take the next job, so slow ones spread out.
+    let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
-        for chunk in jobs.chunks(jobs.len().div_ceil(width).max(1)) {
-            let (dir, failed, command) = (&dir, &failed, &command);
+        for _ in 0..width {
+            let (dir, failed, command, jobs, next) = (&dir, &failed, &command, &jobs, &next);
             s.spawn(move || {
-                for (file, target) in chunk {
+                while let Some((file, target)) =
+                    jobs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
                     let args = command(file, target);
                     let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
                     let (ok, log) = run(&args[0], &rest, dir);

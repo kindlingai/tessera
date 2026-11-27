@@ -1,11 +1,14 @@
 //! Streaming BF16 and MXFP8 Tensor-Core small-batch matmul rule.
 
-use super::{CUDA_LACKS, cuda_source_with, f32_only, prefill_source_with, weight_accepts};
+use super::{
+    CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, prefill_source_with, weight_accepts,
+};
+mod mx8;
+
+use mx8::{Mxfp8Mx8, Mxfp8Prep, mxfp8_pre_len};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
-
-const MX8_SMEM: usize = 2 * (128 * 36 + 128 * 32 + 128) * 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MmKind {
@@ -18,6 +21,10 @@ enum MmKind {
     Mxfp8WideSplit,
     Mxfp8Tall,
     Mxfp8TallSplit,
+    Int4,
+    Int4Split,
+    Int4Tall,
+    Int4TallSplit,
 }
 
 impl MmKind {
@@ -29,6 +36,8 @@ impl MmKind {
             MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit | MmKind::Mxfp8TallSplit => {
                 "fast_mm_mxfp8_sk"
             }
+            MmKind::Int4 | MmKind::Int4Tall => "fast_mm_int4",
+            MmKind::Int4Split | MmKind::Int4TallSplit => "fast_mm_int4_sk",
         }
     }
 
@@ -43,12 +52,26 @@ impl MmKind {
             MmKind::Mxfp8WideSplit => "tessera_mm_mxfp8_r16_sk",
             MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r64",
             MmKind::Mxfp8TallSplit => "tessera_mm_mxfp8_r64_sk",
+            MmKind::Int4 => "tessera_mm_int4_r16",
+            MmKind::Int4Split => "tessera_mm_int4_r16_sk",
+            MmKind::Int4Tall => "tessera_mm_int4_r64",
+            MmKind::Int4TallSplit => "tessera_mm_int4_r64_sk",
+        }
+    }
+
+    fn source(self, min_blocks: Option<u32>) -> tessera_lower::Source {
+        match mm_blk_def(self) {
+            None => int4_source_with(self.entry(), None::<(&str, usize)>),
+            Some(def) => cuda_source_with(self.entry(), min_blocks.map(|v| (def, v as usize))),
         }
     }
 
     fn threads(self) -> usize {
         match self {
-            MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit => 256,
+            MmKind::Mxfp8Tall
+            | MmKind::Mxfp8TallSplit
+            | MmKind::Int4Tall
+            | MmKind::Int4TallSplit => 256,
             _ => 128,
         }
     }
@@ -61,18 +84,22 @@ impl MmKind {
                 4 * 16 * 36 * 4
             }
             MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit => (64 * 136 + 64 * 36) * 4,
+            MmKind::Int4 | MmKind::Int4Split => 2 * 16 * 36 * 4,
+            MmKind::Int4Tall | MmKind::Int4TallSplit => (128 * 36 + 2 * 64 * 32) * 4,
         }
     }
 
     fn grid(self, m: usize, n: usize, ks: usize) -> (usize, usize) {
         match self {
             MmKind::Bf16 => (n / 32, m.div_ceil(16)),
-            MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
-            MmKind::Bf16SplitK => ((n / 16) * ks, m.div_ceil(16)),
+            MmKind::Bf16Split | MmKind::Mxfp8Wide | MmKind::Int4 => (n / 16, m.div_ceil(16)),
+            MmKind::Bf16SplitK | MmKind::Int4Split => ((n / 16) * ks, m.div_ceil(16)),
             MmKind::Mxfp8 => (n / 16, 1),
             MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => ((n / 16) * ks, 1),
             MmKind::Mxfp8Tall => (n.div_ceil(64), m.div_ceil(64)),
             MmKind::Mxfp8TallSplit => (n.div_ceil(64) * ks, m.div_ceil(64)),
+            MmKind::Int4Tall => (n.div_ceil(128), m.div_ceil(64)),
+            MmKind::Int4TallSplit => (n.div_ceil(128) * ks, m.div_ceil(64)),
         }
     }
 
@@ -80,6 +107,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 => 64.0,
             MmKind::Bf16Split | MmKind::Bf16SplitK => 128.0,
+            MmKind::Int4 | MmKind::Int4Split | MmKind::Int4Tall | MmKind::Int4TallSplit => 256.0,
             MmKind::Mxfp8
             | MmKind::Mxfp8Split
             | MmKind::Mxfp8Wide
@@ -89,8 +117,8 @@ impl MmKind {
         }
     }
 
-    fn min_knob(self) -> (&'static str, &'static str) {
-        match self {
+    fn min_knob(self) -> Option<(&'static str, &'static str)> {
+        Some(match self {
             MmKind::Bf16 => ("fast_mm_bf16", "min_blocks"),
             MmKind::Bf16Split => ("fast_mm_bf16", "ks2_min_blocks"),
             MmKind::Bf16SplitK => ("fast_mm_bf16_sk", "min_blocks"),
@@ -100,7 +128,10 @@ impl MmKind {
             MmKind::Mxfp8WideSplit => ("fast_mm_mxfp8_sk", "wide_min_blocks"),
             MmKind::Mxfp8Tall => ("fast_mm_mxfp8", "tall_min_blocks"),
             MmKind::Mxfp8TallSplit => ("fast_mm_mxfp8_sk", "tall_min_blocks"),
-        }
+            MmKind::Int4 | MmKind::Int4Split | MmKind::Int4Tall | MmKind::Int4TallSplit => {
+                return None;
+            }
+        })
     }
 
     fn is_split(self) -> bool {
@@ -110,6 +141,8 @@ impl MmKind {
                 | MmKind::Mxfp8Split
                 | MmKind::Mxfp8WideSplit
                 | MmKind::Mxfp8TallSplit
+                | MmKind::Int4Split
+                | MmKind::Int4TallSplit
         )
     }
 }
@@ -148,6 +181,7 @@ tessera_lower::knob!("fast_mm_mxfp8_sk", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_sk", "wide_min_blocks", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_sk", "tall_min_blocks", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_sk", "reduce_min_blocks", 1, 16);
+tessera_lower::knob!("fast_mm_int4_sk", "splits", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_mx8", "min_rows", 16, 512);
 tessera_lower::knob!("fast_mm_mxfp8_mx8", "min_groups", 1, 2048);
 tessera_lower::knob!("fast_mm_mxfp8_mx8", "target_groups", 1, 2048);
@@ -157,8 +191,8 @@ tessera_lower::knob!("fast_mm_mxfp8_mx8_sk", "splits", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_mx8_sk", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_mx8_sk", "reduce_min_blocks", 1, 16);
 
-fn mm_blk_def(kind: MmKind) -> &'static str {
-    match kind {
+fn mm_blk_def(kind: MmKind) -> Option<&'static str> {
+    Some(match kind {
         MmKind::Bf16 => "MM_BF16_BLK",
         MmKind::Bf16Split => "MM_BF16_KS2_BLK",
         MmKind::Bf16SplitK => "MM_BF16_SK_BLK",
@@ -168,7 +202,10 @@ fn mm_blk_def(kind: MmKind) -> &'static str {
         MmKind::Mxfp8WideSplit => "MM_MX_R16_SK_BLK",
         MmKind::Mxfp8Tall => "MM_MX_R64_BLK",
         MmKind::Mxfp8TallSplit => "MM_MX_R64_SK_BLK",
-    }
+        MmKind::Int4 | MmKind::Int4Split | MmKind::Int4Tall | MmKind::Int4TallSplit => {
+            return None;
+        }
+    })
 }
 
 /// The split count a rule set, fitted to `chunks`.
@@ -233,10 +270,7 @@ fn mxfp8_tile_ks(
     emits = f32_only,
     needs = mm_needs(self),
     order = Order::PerConfig,
-    source = cuda_source_with(
-        self.kind.entry(),
-        self.min_blocks.map(|v| (mm_blk_def(self.kind), v as usize)),
-    ),
+    source = self.kind.source(self.min_blocks),
     launches = mm_launches,
     shape = Shape::grid(self.kind.grid(self.m, self.n, self.ks), self.kind.threads()),
     load = mm_load,
@@ -318,182 +352,18 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
             load.trip.width = 16.0;
             load.trip.e4m3 = 256.0;
         }
+        MmKind::Int4 | MmKind::Int4Split => {
+            load.trip.bf16_flops = (2 * 2 * 16 * 16 * 256 / 128) as f64;
+            load.trip.loads = 17.125;
+            load.trip.width = 144.0 / 17.125;
+        }
+        MmKind::Int4Tall | MmKind::Int4TallSplit => {
+            load.trip.bf16_flops = (2 * 128 * 64 * 256 / 256) as f64;
+            load.trip.loads = 20.5;
+            load.trip.width = 16.0;
+        }
     }
     Some(load)
-}
-
-fn mxfp8_pre_len(m: usize, k: usize) -> usize {
-    (m * k / 128) * 33
-}
-
-/// Quantizes activations once into packed E4M3 and UE8M0 scales.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    name = "fast_mm_mxfp8_prep",
-    sizes = [self.m, self.k],
-    work = self.m * self.k,
-    accepts = mx8_prep_accepts,
-    emits = f32_only,
-    needs = mx8_prep_needs(),
-    order = Order::PerConfig,
-    source = prefill_source_with(
-        "tessera_mm_mxfp8_prep",
-        self.min_blocks.map(|v| ("MM_PREP_BLK", v as usize)),
-    ),
-    launches = mx8_prep_launches,
-    shape = Shape::grid(((self.k / 32).div_ceil(32), self.m), 256),
-    load = mx8_prep_load,
-    shared,
-    unproven,
-)]
-struct Mxfp8Prep {
-    m: usize,
-    k: usize,
-    min_blocks: Option<u32>,
-}
-
-fn mx8_prep_accepts(_: &Mxfp8Prep, _: usize, form: &dyn Stored) -> bool {
-    form.name() == "f32"
-}
-
-fn mx8_prep_needs() -> Needs {
-    Needs {
-        lanes: 32,
-        group_bytes: 0,
-        group_threads: 256,
-        compiler: true,
-        lacks: CUDA_LACKS,
-        mxfp8_tile: true,
-        ..Needs::default()
-    }
-}
-
-fn mx8_prep_load(p: &Mxfp8Prep, _: usize) -> Option<Load> {
-    let (across, down) = ((p.k / 32).div_ceil(32), p.m);
-    let mut load = Load {
-        threads: across * down * 256,
-        group: 256,
-        trips: 1.0,
-        reads: vec![(4 * p.m * p.k) as f64],
-        written: (4 * mxfp8_pre_len(p.m, p.k)) as f64,
-        flight: 512.0,
-        ..Load::default()
-    };
-    load.trip.fresh = 1.0;
-    Some(load)
-}
-
-fn mx8_prep_launches(p: &Mxfp8Prep, step: &Step) -> Vec<Launch> {
-    let shape = p.shape().expect("a grid");
-    let args = vec![step.read(0), step.out(), Arg::count(p.m), Arg::count(p.k)];
-    vec![Launch { args, shape }]
-}
-
-/// Blackwell native 128x128 block-scaled MXFP8 Tensor-Core matmul.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    name = if self.ks > 1 { "fast_mm_mxfp8_mx8_sk" } else { "fast_mm_mxfp8_mx8" },
-    sizes = [self.m, self.n, self.k],
-    work = self.m * self.n * self.k,
-    accepts = mx8_mm_accepts,
-    emits = f32_only,
-    needs = mx8_mm_needs(),
-    order = Order::PerConfig,
-    source = prefill_source_with(
-        if self.ks > 1 {
-            "tessera_mm_mxfp8_mx8_sk"
-        } else {
-            "tessera_mm_mxfp8_mx8"
-        },
-        self.min_blocks.map(|v| {
-            let def = if self.ks > 1 {
-                "MM_MX8_SK_BLK"
-            } else {
-                "MM_MX8_BLK"
-            };
-            (def, v as usize)
-        }),
-    ),
-    launches = mx8_mm_launches,
-    shape = Shape::grid((self.n.div_ceil(128) * self.ks, self.m.div_ceil(128)), 256),
-    load = mx8_mm_load,
-    unproven,
-)]
-struct Mxfp8Mx8 {
-    m: usize,
-    n: usize,
-    k: usize,
-    ks: usize,
-    mode: u32,
-    min_blocks: Option<u32>,
-    form: &'static dyn Stored,
-}
-
-fn mx8_mm_accepts(k: &Mxfp8Mx8, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
-}
-
-fn mx8_mm_needs() -> Needs {
-    Needs {
-        lanes: 32,
-        group_bytes: 0,
-        dynamic_shared: MX8_SMEM,
-        group_threads: 256,
-        compiler: true,
-        lacks: CUDA_LACKS,
-        mxfp8_tile: true,
-        ..Needs::default()
-    }
-}
-
-fn mx8_mm_load(k: &Mxfp8Mx8, _: usize) -> Option<Load> {
-    let groups = k.n.div_ceil(128) * k.ks * k.m.div_ceil(128);
-    let mut reads = vec![
-        k.form.bytes(k.n * k.k) as f64,
-        (4 * mxfp8_pre_len(k.m, k.k)) as f64,
-    ];
-    if matches!(k.mode, 1 | 3 | 4) {
-        reads.push((4 * k.m * k.n) as f64);
-    } else if k.mode == 2 {
-        reads.push((4 * k.n) as f64);
-    }
-    let mut load = Load {
-        threads: groups * 256,
-        group: 256,
-        trips: k.k as f64 / (128.0 * k.ks as f64),
-        reads,
-        written: (4 * k.ks * k.m * k.n) as f64,
-        flight: 1024.0,
-        ..Load::default()
-    };
-    load.trip.fresh = 1.0;
-    load.trip.loads = 8.5;
-    load.trip.width = 16.0;
-    load.trip.fp8_flops = (2 * 128 * 128 * 128 / 256) as f64;
-    Some(load)
-}
-
-fn mx8_mm_launches(k: &Mxfp8Mx8, step: &Step) -> Vec<Launch> {
-    let shape = k.shape().expect("a grid");
-    let other = if matches!(k.mode, 1..=4) {
-        step.read(2)
-    } else {
-        step.read(0)
-    };
-    let mut args = vec![
-        step.read(0),
-        step.read(1),
-        other,
-        step.out(),
-        Arg::count(k.m),
-        Arg::count(k.n),
-        Arg::count(k.k),
-        Arg::value(&k.mode),
-    ];
-    if k.ks > 1 {
-        args.push(Arg::count(k.ks));
-    }
-    vec![Launch { args, shape }]
 }
 
 fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
@@ -809,12 +679,57 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         "mxfp8" => {
             return Some(Err(format!("k={k} is not a multiple of 512 for mxfp8")));
         }
+        "int4_g32" if n.is_multiple_of(16) && k.is_multiple_of(256) => {
+            let chunks = k / 256;
+            let set = set_ks(tree, "fast_mm_int4_sk", chunks);
+            if m <= 16 {
+                let nb = n / 16;
+                let ks = set.unwrap_or_else(|| {
+                    if chunks <= 1 || nb >= 112 {
+                        1
+                    } else {
+                        let cap = if nb >= 32 { 6 } else { 12 }.min(chunks);
+                        pick_divisor(chunks, 320usize.div_ceil(nb).clamp(1, cap), cap)
+                    }
+                });
+                if ks > 1 {
+                    (MmKind::Int4Split, ks)
+                } else {
+                    (MmKind::Int4, 1)
+                }
+            } else {
+                let base = n.div_ceil(128) * m.div_ceil(64);
+                let ks = set.unwrap_or_else(|| {
+                    if chunks <= 1 || base >= 96 {
+                        1
+                    } else {
+                        let cap = if base >= 48 { 4 } else { 12 }.min(chunks);
+                        pick_divisor(chunks, 144usize.div_ceil(base).clamp(1, cap), cap)
+                    }
+                });
+                if ks > 1 {
+                    (MmKind::Int4TallSplit, ks)
+                } else {
+                    (MmKind::Int4Tall, 1)
+                }
+            }
+        }
+        "int4_g32" if !n.is_multiple_of(16) => {
+            return Some(Err(format!("n={n} is not a multiple of 16 for int4_g32")));
+        }
+        "int4_g32" => {
+            return Some(Err(format!("k={k} is not a multiple of 256 for int4_g32")));
+        }
         other => {
-            return Some(Err(format!("weight form {other} (supports bf16, mxfp8)")));
+            return Some(Err(format!(
+                "weight form {other} (supports bf16, mxfp8, int4_g32)"
+            )));
         }
     };
-    let (blk_rule, blk_knob) = kind.min_knob();
-    let min_blocks = tree.knobs.get(blk_rule, blk_knob).map(|v| v as u32);
+    let min_blocks = kind
+        .min_knob()
+        .and_then(|(rule, name)| tree.knobs.get(rule, name))
+        .map(|v| v as u32);
     let reduce_min_blocks = tree
         .knobs
         .get(kind.name(), "reduce_min_blocks")
