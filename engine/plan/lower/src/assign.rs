@@ -1,5 +1,6 @@
 //! Packs values into contiguous arenas, for one op order.
 
+use crate::hazard::COMM_LANE;
 use crate::kernel::KernelRef;
 use crate::kernels::{Map, crosses};
 use crate::plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step, pack_shape};
@@ -138,7 +139,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
         {
             continue;
         }
-        lanes[at] = 1;
+        lanes[at] = COMM_LANE;
         for v in &op.reads {
             if join > last[v.0 as usize] {
                 last[v.0 as usize] = join;

@@ -86,6 +86,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn resident(&self) -> Option<Resident> {
         None
     }
+    /// The runner's copy list, when the step copies host bytes.
+    fn staged(&self) -> Option<u32> {
+        None
+    }
     /// The twin that stores state this kernel leaves unchanged.
     fn commit(&self) -> Option<KernelRef> {
         None

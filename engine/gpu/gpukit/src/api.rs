@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::LocalKey;
 
 use crate::backend::Backend;
-use crate::device::{Caches, IpcHandle, KernelStats};
+use crate::device::{COPY_LANE, Caches, IpcHandle, KernelStats};
 use crate::dl::image_hash;
 use crate::gate::Gate;
 use crate::launch::{self, KernelArgs, Launch};
@@ -196,12 +196,12 @@ pub trait Api: Sync + Sized + 'static {
     }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
-    /// Queues an async H2D copy on the default stream.
-    fn upload_async(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+    /// Queues an async H2D copy on `stream`.
+    fn upload_async(&self, ptr: u64, bytes: &[u8], _stream: Handle) -> Result<(), Error> {
         self.upload(ptr, bytes)
     }
-    /// Queues an async D2H copy on the default stream.
-    fn download_async(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+    /// Queues an async D2H copy on `stream`.
+    fn download_async(&self, ptr: u64, bytes: &mut [u8], _stream: Handle) -> Result<(), Error> {
         self.download(ptr, bytes)
     }
     fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error>;
@@ -422,7 +422,12 @@ impl<A: Api> Context<A> {
         let idx = (lane - 1) as usize;
         let mut lanes = self.0.lanes.lock().unwrap_or_else(|e| e.into_inner());
         while lanes.len() <= idx {
-            lanes.push(api.stream_high()? as usize);
+            // Copies yield to compute and comm kernels.
+            let stream = match lanes.len() + 1 == COPY_LANE as usize {
+                true => api.stream()?,
+                false => api.stream_high()?,
+            };
+            lanes.push(stream as usize);
         }
         Ok(lanes[idx] as Handle)
     }
@@ -460,6 +465,14 @@ impl<A: Api> Context<A> {
             let stream = self.stream_of(a, lane)?;
             let ev = self.event_of(a, slot)?;
             a.wait_event(stream, ev)
+        })
+    }
+
+    /// Copies pinned `bytes` to the device on the active lane.
+    pub fn queue_upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.locked(|a| {
+            let stream = self.stream_of(a, A::active_lane().with(Cell::get))?;
+            a.upload_async(ptr, bytes, stream)
         })
     }
 

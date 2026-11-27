@@ -30,6 +30,9 @@ pub struct KernelAttrs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcHandle(pub [u8; 64]);
 
+/// The lane host copies queue on, below compute priority.
+pub const COPY_LANE: u8 = 2;
+
 static ORDINAL: AtomicUsize = AtomicUsize::new(0);
 
 /// Sets the GPU ordinal opened on first context use.
@@ -233,6 +236,11 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// Makes `lane` wait on sync event `slot`.
     fn wait_lane(&self, _lane: u8, _slot: usize) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Queues `pinned` on the active lane. It must outlive that.
+    fn queue_upload(&self, ptr: u64, pinned: &[u8]) -> Result<(), Error> {
+        self.upload(ptr, pinned)
     }
 
     /// Whether this thread is recording a device graph now.

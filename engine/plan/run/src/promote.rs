@@ -1,5 +1,8 @@
 //! Which paged experts hold a VRAM slot.
 
+use tessera_lower::Plan;
+use tessera_lower::kernels::Ring;
+
 /// The policy's view of one paged weight.
 pub(crate) struct Paged<'a> {
     /// Each expert's VRAM slot. `None`: host memory.
@@ -111,5 +114,26 @@ impl Promote for Decayed {
             out.push(swap);
         }
         out
+    }
+}
+
+/// Names the cold experts a plan will read.
+pub(crate) trait Forecast: Send {
+    /// The ring it needs. An empty ring stages nothing.
+    fn ring(&self) -> Ring;
+    /// Cold experts of `weight` that `plan` reads, likeliest first.
+    fn cold(&mut self, plan: &Plan, weight: u32, slots: &[Option<usize>]) -> Vec<usize>;
+}
+
+/// Predicts nothing, so every cold read streams from host.
+pub(crate) struct Unknown;
+
+impl Forecast for Unknown {
+    fn ring(&self) -> Ring {
+        Ring::default()
+    }
+
+    fn cold(&mut self, _: &Plan, _: u32, _: &[Option<usize>]) -> Vec<usize> {
+        Vec::new()
     }
 }

@@ -344,6 +344,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.check_ready()?;
         self.reread_with(sums.as_deref_mut())?;
         let (end, profiled) = (steps.end, self.base.profile.is_some());
+        if let Some(pager) = &mut self.pager {
+            let ends = end >= self.base.plan.forward().end;
+            pager.enter(self.ctx, steps.start, ends)?;
+        }
         if steps.is_empty() {
             self.maintain_pager(wait, end)?;
             return Ok((None, None));
@@ -554,6 +558,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     if !grid_cross(step, at(step.reads[0]), at(step.write), grid)? {
                         return Err(Capture::Split(i));
                     }
+                } else if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
+                    pager.stage(self.ctx, batch as usize)?;
                 } else {
                     for launch in self.base.launches(i)? {
                         self.launch(i, &launch)?;
