@@ -112,8 +112,15 @@ impl tessera_lower::form::Filed for MemFile {
     }
 }
 
-fn mix_plan(form: &'static dyn tessera_lower::form::Load, elems: usize, slots: usize) -> Plan {
+fn mix_plan(
+    form: &'static dyn tessera_lower::form::Load,
+    shape: [usize; 3],
+    slots: usize,
+    share: Option<tessera_lower::Share>,
+) -> Plan {
+    let elems = shape[0] * shape[1] * shape[2];
     let bytes = form.bytes(elems);
+    let packed = [shape[0] as u32, shape[1] as u32, shape[2] as u32, 0];
     let weights = (0..slots)
         .map(|i| tessera_lower::Loaded {
             weight: 0,
@@ -122,10 +129,10 @@ fn mix_plan(form: &'static dyn tessera_lower::form::Load, elems: usize, slots: u
                 offset: i * bytes,
                 len: elems,
                 form,
-                dims: 1,
-                shape: [elems as u32, 0, 0, 0],
+                dims: 3,
+                shape: packed,
             },
-            share: None,
+            share,
             part: None,
         })
         .collect();
@@ -146,8 +153,10 @@ fn filed_validates_mixed_trellis() {
     use tessera_run::{Error, open};
 
     let form = named("trellis_mix_pmcgx").expect("mixed form");
-    let elems = 2 * 128 * 128;
-    let (valid, offsets) = alloc_mixed(128, 128, 1, &[2, 4]);
+    let shape = [2, 128, 128];
+    let elems = shape[0] * shape[1] * shape[2];
+    let (mut valid, offsets) = alloc_mixed(128, 128, 1, &[2, 4]);
+    valid[offsets[0]..offsets[0] + 16].fill(0x5A);
 
     let mut trunc = valid.clone();
     trunc.truncate(valid.len() - 64);
@@ -164,8 +173,13 @@ fn filed_validates_mixed_trellis() {
     let near_end = (past_end.len() - 64) as u64;
     past_end[MIX_TABLE + MIX_ROW..MIX_TABLE + MIX_ROW + 8].copy_from_slice(&near_end.to_le_bytes());
 
+    // Same-total mixed buffers with different axes.
+    let (wrong_count, _) = alloc_mixed(128, 256, 1, &[3]);
+    let (wrong_axes, _) = alloc_mixed(256, 128, 1, &[2, 4]);
+    let shape_256 = [2, 128, 256];
+
     for slots in [1, 2] {
-        let plan = mix_plan(form, elems, slots);
+        let plan = mix_plan(form, shape, slots, None);
         let s0 = plan.weights[0].slot;
         let s1 = (slots == 2).then(|| plan.weights[1].slot);
         let mut runner = open(plan, &host()).unwrap();
@@ -176,9 +190,10 @@ fn filed_validates_mixed_trellis() {
             .load_weight(0, &Weight::Packed(form, valid.clone()))
             .unwrap();
         runner.load_weight(0, &Weight::Filed(form, file)).unwrap();
-        let before = s1.map(|s| runner.held().bytes(s).unwrap());
+        let prev0 = runner.held().bytes(s0).unwrap();
+        let prev1 = s1.map(|s| runner.held().bytes(s).unwrap());
 
-        for bad in [&trunc, &bad_width, &bad_offset, &past_end] {
+        for bad in [&trunc, &bad_width, &bad_offset, &past_end, &wrong_count] {
             let err_p = runner
                 .load_weight(0, &Weight::Packed(form, bad.clone()))
                 .unwrap_err();
@@ -188,9 +203,104 @@ fn filed_validates_mixed_trellis() {
                 .unwrap_err();
             assert!(matches!(err_p, Error::WeightSize { weight: 0, .. }));
             assert!(matches!(err_f, Error::WeightSize { weight: 0, .. }));
-            if let (Some(slot), Some(prev)) = (s1, before.as_ref()) {
+            // Rejected reloads preserve slot 0 and every later slot.
+            assert_eq!(runner.held().bytes(s0).unwrap(), prev0);
+            if let (Some(slot), Some(prev)) = (s1, prev1.as_ref()) {
                 assert_eq!(&runner.held().bytes(slot).unwrap(), prev);
             }
         }
     }
+
+    // Swapped [out, inp] with same element total is rejected.
+    let mut r2 = open(mix_plan(form, shape_256, 1, None), &host()).unwrap();
+    let (ok_256, _) = alloc_mixed(256, 128, 1, &[2, 4]);
+    let (swapped, _) = alloc_mixed(128, 256, 1, &[2, 4]);
+    assert_eq!(wrong_axes.len(), ok_256.len());
+    r2.load_weight(0, &Weight::Packed(form, ok_256)).unwrap();
+    assert!(matches!(
+        r2.load_weight(0, &Weight::Packed(form, swapped.clone())),
+        Err(Error::WeightSize { weight: 0, .. })
+    ));
+    assert!(matches!(
+        r2.load_packed(0, &swapped),
+        Err(Error::WeightSize { weight: 0, .. })
+    ));
+    let f_swap: Arc<dyn Filed> = Arc::new(MemFile(swapped));
+    assert!(matches!(
+        r2.load_weight(0, &Weight::Filed(form, f_swap)),
+        Err(Error::WeightSize { weight: 0, .. })
+    ));
+}
+
+#[test]
+fn sharded_validates_mixed_trellis() {
+    use std::sync::Arc;
+    use tessera_lower::Share;
+    use tessera_lower::form::{F32_FORM, Filed, Weight, named};
+    use tessera_mem::trellis::alloc_mixed;
+    use tessera_run::{Error, open};
+
+    let form = named("trellis_mix_pmcgx").expect("mixed form");
+    let share = Share {
+        axis: 0,
+        first: 2,
+        count: 2,
+        whole: 4,
+        inner: 128 * 128,
+    };
+    let (mut whole, offsets) = alloc_mixed(128, 128, 1, &[3, 2, 4, 2]);
+    for (m, &off) in offsets.iter().enumerate() {
+        whole[off..off + 32].fill(0x11 * (m as u8 + 1));
+    }
+    let expect = form
+        .share(&whole, [1, 4, 128 * 128], [2, 2])
+        .expect("direct slice");
+    assert_eq!(share.of(form, &whole).as_deref(), Some(expect.as_slice()));
+
+    // Valid 4x128x128 set shards through packed and filed loads.
+    let plan = mix_plan(form, [2, 128, 128], 1, Some(share));
+    let s0 = plan.weights[0].slot;
+    let mut runner = open(plan, &host()).unwrap();
+    runner
+        .load_weight(0, &Weight::Packed(form, whole.clone()))
+        .unwrap();
+    let loaded = runner.held().bytes(s0).unwrap();
+    assert_eq!(&loaded[..expect.len()], expect.as_slice());
+
+    // Pre-cut rank-local mixed buffer also loads directly.
+    runner
+        .load_weight(0, &Weight::Packed(form, expect.clone()))
+        .unwrap();
+    let whole_file: Arc<dyn Filed> = Arc::new(MemFile(whole.clone()));
+    runner
+        .load_weight(0, &Weight::Filed(form, whole_file))
+        .unwrap();
+    let prev = runner.held().bytes(s0).unwrap();
+    assert_eq!(&prev[..expect.len()], expect.as_slice());
+
+    // Invalid and wrong-shape mixed sets return WeightSize.
+    let mut trunc_whole = whole.clone();
+    trunc_whole.truncate(whole.len() - 64);
+    let (wrong_whole, _) = alloc_mixed(128, 256, 1, &[3, 2]);
+    let (wrong_local, _) = alloc_mixed(128, 256, 1, &[3]);
+    for bad in [&trunc_whole, &wrong_whole, &wrong_local] {
+        assert!(matches!(
+            runner.load_weight(0, &Weight::Packed(form, bad.clone())),
+            Err(Error::WeightSize { weight: 0, .. })
+        ));
+        let bad_file: Arc<dyn Filed> = Arc::new(MemFile(bad.clone()));
+        assert!(matches!(
+            runner.load_weight(0, &Weight::Filed(form, bad_file)),
+            Err(Error::WeightSize { weight: 0, .. })
+        ));
+        assert_eq!(runner.held().bytes(s0).unwrap(), prev);
+    }
+
+    // Widening sharded path rejects invalid input before unpack_all.
+    let wide = mix_plan(F32_FORM, [2, 128, 128], 1, Some(share));
+    let mut r_wide = open(wide, &host()).unwrap();
+    assert!(matches!(
+        r_wide.load_weight(0, &Weight::Packed(form, trunc_whole)),
+        Err(Error::WeightSize { weight: 0, .. })
+    ));
 }

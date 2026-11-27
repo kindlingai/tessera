@@ -201,6 +201,14 @@ impl Shape {
         }
     }
 
+    fn read_checked(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            inp: read_u32(bytes, 0)? as usize,
+            out: read_u32(bytes, 4)? as usize,
+            side: read_u32(bytes, 8)?,
+        })
+    }
+
     fn write(&self) -> [u8; HEAD] {
         let mut head = [0u8; HEAD];
         let inverse = (1.0 / self.inp as f32).to_bits();
@@ -628,9 +636,35 @@ impl Form for TrellisMix {
     fn bytes(&self, elements: usize) -> usize {
         (MIX_TABLE + MIX_ROW * (elements / 256)).next_multiple_of(16) + elements / 2
     }
+    fn checks_bytes(&self) -> bool {
+        true
+    }
+    fn count(&self, bytes: &[u8]) -> Option<usize> {
+        let shape = Shape::read_checked(bytes)?;
+        let n = read_u32(bytes, HEAD)? as usize;
+        let elements = n.checked_mul(shape.inp)?.checked_mul(shape.out)?;
+        self.fits(elements, bytes).then_some(elements)
+    }
     fn fits_size(&self, elements: usize, bytes: usize) -> bool {
         let min = MIX_TABLE.next_multiple_of(16) + elements / 4;
         bytes >= min && bytes <= self.bytes(elements)
+    }
+    fn fits_shape(&self, shape: &[usize], bytes: &[u8]) -> bool {
+        let (count, out, inp) = match *shape {
+            [count, out, inp] => (count, out, inp),
+            [out, inp] => (1, out, inp),
+            _ => return false,
+        };
+        let Some(elements) = count.checked_mul(out).and_then(|n| n.checked_mul(inp)) else {
+            return false;
+        };
+        if !self.fits(elements, bytes) {
+            return false;
+        }
+        let hdr = Shape::read(bytes);
+        read_u32(bytes, HEAD).is_some_and(|n| n as usize == count)
+            && hdr.out == out
+            && hdr.inp == inp
     }
     fn fits(&self, elements: usize, bytes: &[u8]) -> bool {
         if !self.fits_size(elements, bytes.len()) {
@@ -719,10 +753,11 @@ impl Form for TrellisMix {
         [outer, _, inner]: [usize; 3],
         [first, count]: [usize; 2],
     ) -> Option<Vec<u8>> {
+        self.count(bytes)?;
         let (shape, table) = (Shape::read(bytes), table(bytes));
         let widths = |t: &[(usize, usize)]| t.iter().map(|e| e.1 as u32).collect::<Vec<u32>>();
         if (outer, inner) == (1, shape.inp * shape.out) {
-            let kept = table.get(first..first + count)?;
+            let kept = table.get(first..first.checked_add(count)?)?;
             let (mut out, at) = alloc_mixed(shape.inp, shape.out, shape.side, &widths(kept));
             for (to, (from, k)) in at.iter().zip(kept) {
                 let len = shape.inp * shape.out * k / 8;
@@ -738,6 +773,10 @@ impl Form for TrellisMix {
             (o, 1) if o == table.len() * shape.out => false,
             _ => return None,
         };
+        let limit = if outputs { shape.out } else { shape.inp };
+        if count == 0 || first.checked_add(count)? > limit {
+            return None;
+        }
         let tiles = cut(&shape, outputs, [first, count]);
         let part = narrowed(shape, outputs, count);
         let (mut out, _) = alloc_mixed(part.inp, part.out, part.side, &widths(&table));

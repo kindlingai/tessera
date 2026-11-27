@@ -242,4 +242,14 @@ fn mixed_fits_validation() {
         buf[HEAD..HEAD + 4].copy_from_slice(&bad_count.to_le_bytes());
         assert!(!mix.fits(elems, &buf), "accepted count {bad_count}");
     }
+
+    // Shape-level checks reject same-total different-axes headers.
+    assert!(mix.fits_shape(&[2, 128, 128], &valid));
+    assert!(!mix.fits_shape(&[1, 256, 128], &valid));
+    assert!(!mix.fits_shape(&[4, 128, 64], &valid));
+    assert!(!mix.fits_shape(&[elems], &valid));
+    assert!(mix.fits_shape(&[3, 256, 128], &valid_in));
+    assert!(!mix.fits_shape(&[3, 128, 256], &valid_in));
+    assert_eq!(mix.count(&valid), Some(elems));
+    assert_eq!(mix.count(&trunc), None);
 }
