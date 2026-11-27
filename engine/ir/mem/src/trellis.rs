@@ -803,6 +803,16 @@ pub fn parse_form(name: &str) -> Option<(u32, u32)> {
     (2..=4).contains(&bits).then_some((bits, book))
 }
 
+/// Parses `trellis_mix[_{mul1,pmcgx}]` into its book.
+pub fn parse_mix_form(name: &str) -> Option<u32> {
+    match name.strip_prefix("trellis_mix")? {
+        "" => Some(0),
+        "_mul1" => Some(1),
+        "_pmcgx" => Some(2),
+        _ => None,
+    }
+}
+
 macro_rules! define_trellis {
     ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {$(
         #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]

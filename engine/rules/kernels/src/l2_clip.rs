@@ -16,10 +16,14 @@ fn l2_clip(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32, threshold: 
     for i in 0..width {
         sum += x[at + i as u64] * x[at + i as u64];
     }
-    // The epsilon is added to the root, not under it.
-    let mut by = threshold / (1.0 / rsqrt(sum) + eps);
-    if by > 1.0 {
-        by = 1.0;
+    // A zero row is kept, its root never taken.
+    let mut by = 1.0f32;
+    if sum > 0.0 {
+        // The epsilon is added to the root, not under it.
+        by = threshold / (1.0 / rsqrt(sum) + eps);
+        if by > 1.0 {
+            by = 1.0;
+        }
     }
     for i in 0..width {
         out[at + i as u64] = x[at + i as u64] * by;

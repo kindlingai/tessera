@@ -8,6 +8,8 @@ constant uint TM_INPUT_SIDE = 2u;
 constant uint TM_SIDE_MASK = 0xFFFFu;
 constant uint TM_PAGED = 0x80000000u;
 constant uint TM_TABLE = 24u;
+constant uint TM_MIX_TABLE = 24u;
+constant uint TM_MIX_ROW = 16u;
 constant uint TM_MCG = 0xCBAC1FEDu;
 constant uint TM_MUL1 = 0x83DCD12Du;
 constant uint TM_PMCG2 = 0xBCA14C51u;
@@ -262,6 +264,53 @@ static inline void tm_dec_finish(
     }
 }
 
+// Stages four input blocks per barrier, then streams their tiles.
+template <uint K, uint BOOK>
+static inline void tm_dec1_run(
+    device const float *x,
+    device const float *scale,
+    bool turned,
+    TmWalk walk,
+    TmWordMap wm,
+    uint simd,
+    uint lane,
+    threadgroup float xs[4][128],
+    thread float &acc0,
+    thread float &acc1) {
+    constexpr uint tw = 8u * K;
+    uint rr = lane & 3u;
+    device const uchar *gb = walk.at;
+    for (uint c0 = 0u; c0 < walk.blocks; c0 += 4u) {
+        uint nb = min(4u, walk.blocks - c0);
+        if (c0 > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd < nb) {
+            uint col = ((c0 + simd) << 7u) + (lane << 2u);
+            float4 v = *(device const float4 *)(x + col);
+            if (turned) v = tm_turn_in(v, *(device const float4 *)(scale + col), lane);
+            tm_put4(&xs[simd][lane << 2u], v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint b = 0u; b < nb; b++) {
+            device const uint *tiles = (device const uint *)gb;
+            uint raw = (K == 4u || lane < tw) ? tiles[simd * tw + lane] : 0u;
+            for (uint u = 0u; u < 8u; u++) {
+                uint next = (u + 1u < 8u && (K == 4u || lane < tw))
+                                ? tiles[((u + 1u) * 8u + simd) * tw + lane]
+                                : 0u;
+                half4 wa, wb;
+                tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
+                raw = next;
+                uint xb = u * 16u + (rr << 1u);
+                float4 xv = float4(xs[b][xb], xs[b][xb + 1u], xs[b][xb + 8u], xs[b][xb + 9u]);
+                acc0 += dot(xv, float4(wa));
+                acc1 += dot(xv, float4(wb));
+            }
+            gb += walk.stride;
+        }
+    }
+}
+
 // Single-row tile-streaming decode, staging four input blocks per barrier.
 template <uint K, uint BOOK>
 static inline void tm_dec1_body(
@@ -279,36 +328,10 @@ static inline void tm_dec1_body(
     threadgroup float xs[4][128]) {
     TM_DEC_START
 
+    (void)gb; (void)tw;
     float acc0[1] = {0.0f}, acc1[1] = {0.0f};
-    for (uint c0 = 0u; c0 < walk.blocks; c0 += 4u) {
-        uint nb = min(4u, walk.blocks - c0);
-        if (c0 > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd < nb) {
-            uint col = ((walk.first + c0 + simd) << 7u) + (lane << 2u);
-            float4 v = *(device const float4 *)(x + col);
-            if (turned) v = tm_turn_in(v, *(device const float4 *)(suh + col), lane);
-            tm_put4(&xs[simd][lane << 2u], v);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint b = 0u; b < nb; b++) {
-            device const uint *tiles = (device const uint *)gb;
-            uint raw = (K == 4u || lane < tw) ? tiles[simd * tw + lane] : 0u;
-            for (uint u = 0u; u < 8u; u++) {
-                uint next = (u + 1u < 8u && (K == 4u || lane < tw))
-                                ? tiles[((u + 1u) * 8u + simd) * tw + lane]
-                                : 0u;
-                half4 wa, wb;
-                tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
-                raw = next;
-                uint xb = u * 16u + (rr << 1u);
-                float4 xv = float4(xs[b][xb], xs[b][xb + 1u], xs[b][xb + 8u], xs[b][xb + 9u]);
-                acc0[0] += dot(xv, float4(wa));
-                acc1[0] += dot(xv, float4(wb));
-            }
-            gb += walk.stride;
-        }
-    }
+    uint at = walk.first << 7u;
+    tm_dec1_run<K, BOOK>(x + at, suh + at, turned != 0u, walk, wm, simd, lane, xs, acc0[0], acc1[0]);
 
     tm_dec_finish(acc0, acc1, 1u, n, ks, p, ob, simd, lane, cc, rr, turned, svh, out, xs);
 }
@@ -582,5 +605,163 @@ kernel void tm_reduce(
         }
         if (turned) sum = tm_turn_out(sum, sc, lane);
         *(device float4 *)(out + ulong(r) * n + base) = sum;
+    }
+}
+
+// Weight blocks of one picked matrix for output `ob`.
+template <uint K>
+static inline TmWalk tm_picked_walk(
+    device const uchar *w, device const uchar *mat, uint n, uint k, uint ob) {
+    uint side = *(device const uint *)(w + 8u);
+    bool input_side = (side & TM_SIDE_MASK) == TM_INPUT_SIDE;
+    ulong local = input_side ? (ulong(ob) * 64u) : (ulong(ob) * (k >> 1u));
+    ulong stride = (input_side ? ulong(n >> 1u) : 64ull) * ulong(32u * K);
+    return {k >> 7u, 0u, stride, mat + local * (32u * K)};
+}
+
+// Matrix `e` of a set, and its code width.
+static inline device const uchar *tm_picked_mat(
+    device const uchar *w, uint n, uint k, uint bits, uint e, thread uint &ek) {
+    if (bits == 0u) {
+        device const uchar *meta = w + TM_MIX_TABLE + ulong(e) * TM_MIX_ROW;
+        ek = *(device const uint *)(meta + 8u);
+        return w + *(device const ulong *)meta;
+    }
+    ek = bits;
+    uint side = *(device const uint *)(w + 8u);
+    if (side & TM_PAGED) return w + *(device const ulong *)(w + TM_TABLE + ulong(e) * 8u);
+    return w + TM_HEAD + ulong(e) * ulong(k >> 4u) * ulong(n >> 4u) * ulong(32u * bits);
+}
+
+// One output row and block on its picked matrix.
+template <uint K, uint BOOK, bool TURNED>
+static inline void tm_picked_body(
+    device const float *x,
+    device const uchar *w,
+    device const uchar *mat,
+    device const float *su,
+    device const float *sv,
+    device const float *extra,
+    device float *out,
+    uint n,
+    uint k,
+    uint repeat,
+    uint post,
+    uint e,
+    uint ob,
+    uint r,
+    uint tid,
+    threadgroup float xs[4][128]) {
+    uint simd = tid >> 5u;
+    uint lane = tid & 31u;
+    uint cc = lane >> 2u;
+    uint rr = lane & 3u;
+    TmWalk walk = tm_picked_walk<K>(w, mat, n, k, ob);
+    TmWordMap wm = tm_word_map<K, BOOK>(lane);
+    device const float *xr = x + ulong(r / repeat) * k;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    tm_dec1_run<K, BOOK>(xr, su + ulong(e) * k, TURNED, walk, wm, simd, lane, xs, acc0, acc1);
+
+    acc0 += simd_shuffle_xor(acc0, ushort(1u));
+    acc0 += simd_shuffle_xor(acc0, ushort(2u));
+    acc1 += simd_shuffle_xor(acc1, ushort(1u));
+    acc1 += simd_shuffle_xor(acc1, ushort(2u));
+    uint lcol = (simd << 4u) + cc;
+    if constexpr (!TURNED) {
+        if (rr == 0u) {
+            device float *row = out + ulong(r) * n + (ob << 7u);
+            row[lcol] = acc0;
+            row[lcol + 8u] = acc1;
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rr == 0u) {
+            xs[0][lcol] = acc0;
+            xs[0][lcol + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            uint base = (ob << 7u) + (lane << 2u);
+            float4 sc = *(device const float4 *)(sv + ulong(e) * n + base);
+            float4 y = tm_turn_out(tm_get4(&xs[0][lane << 2u]), sc, lane);
+            if (post == 1u) {
+                y *= *(device const float4 *)(extra + base);
+            } else if (post == 2u) {
+                float4 ex = *(device const float4 *)(extra + ulong(r) * n + base);
+                y = (y / (1.0f + exp(-y))) * ex;
+            }
+            *(device float4 *)(out + ulong(r) * n + base) = y;
+        }
+    }
+}
+
+#define TM_PICKED_ARGS                                                                       \
+    device const float *x [[buffer(0)]],                                                     \
+    device const uchar *w [[buffer(1)]],                                                     \
+    device const uint *ids [[buffer(2)]],                                                    \
+    device const float *su [[buffer(3)]],                                                    \
+    device const float *sv [[buffer(4)]],                                                    \
+    device const float *extra [[buffer(5)]],                                                 \
+    device float *out [[buffer(6)]],                                                         \
+    constant uint &rows [[buffer(7)]],                                                       \
+    constant uint &n [[buffer(8)]],                                                          \
+    constant uint &k [[buffer(9)]],                                                          \
+    constant uint &count [[buffer(10)]],                                                     \
+    constant uint &repeat [[buffer(11)]],                                                    \
+    constant uint &first [[buffer(12)]],                                                     \
+    constant uint &bits [[buffer(13)]],                                                      \
+    constant uint &book [[buffer(14)]],                                                      \
+    constant uint &turned [[buffer(15)]],                                                    \
+    constant uint &post [[buffer(16)]],                                                      \
+    uint3 tg [[threadgroup_position_in_grid]],                                               \
+    uint tid [[thread_index_in_threadgroup]]
+
+// Finds the group's matrix. Rows off this rank store zeros.
+#define TM_PICKED_START                                                                      \
+    threadgroup float xs[4][128];                                                            \
+    uint ob = tg.x;                                                                          \
+    uint r = tg.y;                                                                           \
+    if (ob >= (n >> 7u) || r >= rows) return;                                                \
+    uint raw_id = ids[r];                                                                    \
+    if (raw_id < first || raw_id - first >= count) {                                         \
+        if (tid < 128u) out[ulong(r) * n + (ob << 7u) + tid] = 0.0f;                         \
+        return;                                                                              \
+    }                                                                                        \
+    uint e = raw_id - first;                                                                 \
+    uint ek;                                                                                 \
+    device const uchar *mat = tm_picked_mat(w, n, k, bits, e, ek);
+
+#define TM_PICKED_K(BOOK, TURNED, POST)                                                      \
+    if (ek == 2u)                                                                            \
+        tm_picked_body<2u, BOOK, TURNED>(x, w, mat, su, sv, extra, out, n, k, repeat, POST, e, ob, r, tid, xs); \
+    else if (ek == 3u)                                                                       \
+        tm_picked_body<3u, BOOK, TURNED>(x, w, mat, su, sv, extra, out, n, k, repeat, POST, e, ob, r, tid, xs); \
+    else                                                                                     \
+        tm_picked_body<4u, BOOK, TURNED>(x, w, mat, su, sv, extra, out, n, k, repeat, POST, e, ob, r, tid, xs);
+
+#define TM_PICKED_BOOK(BOOK)                                                                 \
+    if (turned) {                                                                            \
+        TM_PICKED_K(BOOK, true, post)                                                        \
+    } else {                                                                                 \
+        TM_PICKED_K(BOOK, false, 0u)                                                         \
+    }
+
+// Rotated PMCGX experts, each at its own width.
+kernel void tm_pickmix_pmcgx_t(TM_PICKED_ARGS) {
+    (void)book; (void)turned;
+    TM_PICKED_START
+    TM_PICKED_K(TM_BOOK_PMCGX, true, post)
+}
+
+// Picked experts of any width, book and rotation.
+kernel void tm_picked_gen(TM_PICKED_ARGS) {
+    TM_PICKED_START
+    if (book == TM_BOOK_PMCGX) {
+        TM_PICKED_BOOK(TM_BOOK_PMCGX)
+    } else if (book == TM_BOOK_MUL1) {
+        TM_PICKED_BOOK(TM_BOOK_MUL1)
+    } else {
+        TM_PICKED_BOOK(TM_BOOK_MCG)
     }
 }

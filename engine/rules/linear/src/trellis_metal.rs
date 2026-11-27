@@ -4,9 +4,11 @@ use crate::{Dense, launch_args};
 use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
+use tessera_lower::sites::Coded;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Knobs, Launch, Load, Needs, Shape, Source, Step, T, Tree, knob,
 };
+use tessera_mem::trellis::{parse_form, parse_mix_form};
 
 const BLOCK: usize = 128;
 const THREADS: usize = 256;
@@ -290,3 +292,74 @@ fn why(tree: &Tree, at: T) -> Option<String> {
 }
 
 tessera_lower::rule!("trellis_metal", propose, why = why, lacks = LACKS);
+
+/// Picked expert matmuls on Metal. Zero `bits` means mixed.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = self.site.form.suffixed(if self.site.turned { "picked_metal_t" } else { "picked_metal" }),
+    sizes = [self.site.rows, self.site.n, self.site.k],
+    work = self.site.rows * self.site.n * self.site.k,
+    guess = GUESS,
+    accepts = self.site.accepts(input, form),
+    emits = f32_only,
+    needs = picked_needs(),
+    order = Order::PerConfig,
+    source = fixed(picked_entry(self)),
+    launches = picked_launches,
+    load = Some(self.site.load(BLOCK, THREADS)),
+)]
+struct PickedTrellisMetal {
+    site: Coded,
+    bits: u32,
+    book: u32,
+}
+
+fn picked_entry(p: &PickedTrellisMetal) -> &'static str {
+    if p.bits == 0 && p.book == 2 && p.site.turned {
+        "tm_pickmix_pmcgx_t"
+    } else {
+        "tm_picked_gen"
+    }
+}
+
+fn picked_needs() -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes: DEC_SMEM,
+        group_threads: THREADS,
+        compiler: true,
+        lacks: LACKS,
+        ..Needs::default()
+    }
+}
+
+fn picked_launches(p: &PickedTrellisMetal, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: p.site.n / BLOCK,
+        down: p.site.rows,
+        threads: THREADS,
+    };
+    let args = p.site.args(step, p.bits, p.book);
+    vec![Launch { args, shape }]
+}
+
+/// Matches rotated or plain picked trellis matmuls of either kind.
+fn propose_picked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (site, reads) = Coded::find(tree, at, BLOCK)?;
+    let name = site.form.name();
+    let mixed = parse_mix_form(name).map(|book| (0, book));
+    let (bits, book) = parse_form(name).or(mixed)?;
+    let kernel = PickedTrellisMetal { site, bits, book };
+    Some(vec![Draft::new(kernel, reads, site.rows * site.n)])
+}
+
+fn picked_why(_: &Tree, _: T) -> Option<String> {
+    None
+}
+
+tessera_lower::rule!(
+    "picked_trellis_metal",
+    propose_picked,
+    why = picked_why,
+    lacks = LACKS
+);

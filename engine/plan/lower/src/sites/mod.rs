@@ -2,6 +2,7 @@
 
 mod attend;
 mod chain;
+mod coded;
 mod gather;
 mod matmul;
 mod near;
@@ -10,6 +11,7 @@ mod top;
 
 pub use attend::{Attend, Delta};
 pub use chain::Chain;
+pub use coded::Coded;
 pub use gather::Gather;
 pub use matmul::{After, Finished, Matmul, Picked, Rotated};
 pub use near::Near;

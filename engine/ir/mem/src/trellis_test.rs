@@ -2,7 +2,7 @@ use crate::block_test::same_part;
 use crate::form::Form;
 use crate::trellis::{
     Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, alloc_mixed, form_for, mixed_for, packed,
-    rotated,
+    parse_form, parse_mix_form, rotated,
 };
 use tessera_graph::F16;
 
@@ -166,4 +166,17 @@ fn mixed_widths_match() {
         same_part(mix, &set, [4, out, inp], [0, 128]);
         same_part(mix, &set, [4 * out, inp, 1], [0, 128]);
     }
+}
+
+#[test]
+fn mix_names_parse() {
+    let books = [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx];
+    for (book, codebook) in (0u32..).zip(books) {
+        let name = mixed_for(codebook).unwrap().name();
+        assert_eq!(parse_mix_form(name), Some(book));
+        assert_eq!(parse_form(name), None);
+    }
+    assert_eq!(parse_mix_form("trellis_k3_pmcgx"), None);
+    assert_eq!(parse_mix_form("trellis_mix_rot"), None);
+    assert_eq!(parse_form("trellis_k3_pmcgx"), Some((3, 2)));
 }

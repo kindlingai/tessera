@@ -455,3 +455,29 @@ fn graphs_lower() {
         lower(&stepper::<Coded>(&wide), 0, &ragged, &device).unwrap();
     }
 }
+
+/// Experts at mixed widths take the fast Metal launch.
+#[test]
+fn metal_experts_fast() {
+    let wide = Config {
+        stack: tessera_models::Stack::sized([64, 128, 8, 4, 4, 128], 2, 16),
+        ..Config::small()
+    };
+    let g = stepper::<Coded>(&wide);
+    let mixed = tessera_lower::form::named("trellis_mix_pmcgx").unwrap();
+    let mut pins = tessera_lower::Pins::default();
+    for set in ["gate", "up", "down"] {
+        pins = pins.pin(&format!("*.{set}"), mixed);
+    }
+    let device = Device::guess(&host()).on(metal()).pinned(pins);
+    let plan = lower(&g, 0, &[(Seqs, 2), (Rows, 4), (Context, 16)], &device).unwrap();
+    let fast = |s: &&tessera_lower::Step| match s.kernel.source() {
+        tessera_lower::Source::Fixed { entry, .. } => entry == "tm_pickmix_pmcgx_t",
+        tessera_lower::Source::Made(_) => false,
+    };
+    // Gate, up and down of each layer pass.
+    let count = plan.steps.iter().filter(fast).count() as u64;
+    assert!(count >= 3 * wide.stack.layers && count.is_multiple_of(3));
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert!(!names.iter().any(|n| n.ends_with("picked")), "{names:?}");
+}
