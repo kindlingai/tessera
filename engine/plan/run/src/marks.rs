@@ -2,9 +2,10 @@
 
 use crate::Error;
 use crate::profile::{Marks, Profile, Region};
+use std::ops::Range;
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs};
 use tessera_gpukit::launch::{KernelArgs, Launch};
-use tessera_lower::Plan;
+use tessera_lower::{Plan, Step};
 
 /// Put before kernel text to record its marks.
 pub const ON: &str = include_str!("marks.cuh");
@@ -25,6 +26,25 @@ pub(crate) const END: u32 = 2;
 pub(crate) const LANE_BEGIN: u32 = 3;
 pub(crate) const LANE_END: u32 = 4;
 pub(crate) const LAST_STEP: u32 = 5;
+
+/// Stamped steps of `range`: accumulator slot, step number, step.
+pub(crate) fn slots(plan: &Plan, range: Range<usize>) -> Vec<(usize, Option<usize>, &Step)> {
+    let (start, len) = (range.start, range.len());
+    let mut copies = 0;
+    let mut out = Vec::with_capacity(len);
+    for (i, step) in plan.sequence(range) {
+        let slot = match i {
+            Some(i) => i - start,
+            // Copy steps follow the span slot.
+            None => {
+                copies += 1;
+                len + copies
+            }
+        };
+        out.push((slot, i, step));
+    }
+    out
+}
 
 /// In-graph device clock accumulators for profiled graph replays.
 pub(crate) struct Stamps<D: Device> {
@@ -114,7 +134,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Stamps<D> {
             return Ok(());
         }
         ctx.finish()?;
-        let mut raw = vec![0u8; (n + 1) * 8];
+        let stamped = slots(plan, start..end);
+        let mut raw = vec![0u8; (stamped.len() + 1) * 8];
         let accum = self.buf.device_ptr() + ((self.cap + 1) * 8) as u64;
         ctx.download(accum, &mut raw)?;
         let ticks = ctx.ticks();
@@ -125,12 +146,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Stamps<D> {
             }
             return Ok(());
         };
-        for (k, bytes) in words[..n].iter().enumerate() {
-            let now = u64::from_ne_bytes(*bytes);
-            let secs = now.wrapping_sub(self.last[k]) as f64 / ticks;
-            self.last[k] = now;
-            let attr = attrs.get(start + k).copied().flatten();
-            profile.step_with(&plan.steps[start + k], secs, replays, attr);
+        for (slot, i, step) in stamped {
+            let now = u64::from_ne_bytes(words[slot]);
+            let secs = now.wrapping_sub(self.last[slot]) as f64 / ticks;
+            self.last[slot] = now;
+            let attr = i.and_then(|i| attrs.get(i).copied().flatten());
+            profile.step_with(step, secs, replays, attr);
         }
         let span_now = u64::from_ne_bytes(words[n]);
         let span = span_now.wrapping_sub(self.last[n]) as f64 / ticks;

@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::time::Instant;
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
+use tessera_lower::Step;
 
 impl<D: Device> Runner<D> {
     pub(super) fn override_launch(&self, step: usize) -> Option<&overrides::LaunchOverride> {
@@ -97,20 +98,48 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub(super) fn walk(&self, steps: Range<usize>) -> Result<Option<Vec<f64>>, Error> {
         let stamped = self.ctx.stamp()?;
         let mut waited = Vec::new();
-        for i in steps {
+        for (i, step) in self.base.plan.sequence(steps) {
             let start = Instant::now();
+            let Some(i) = i else {
+                self.stage(step, None)?;
+                self.clock(stamped, start, &mut waited)?;
+                continue;
+            };
             for launch in self.base.launches(i)? {
                 self.launch(i, &launch)?;
             }
-            match stamped {
-                true => _ = self.ctx.stamp()?,
-                false => {
-                    let clocked = self.ctx.finish()?;
-                    waited.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
-                }
-            }
+            self.clock(stamped, start, &mut waited)?;
         }
         Ok((!stamped).then_some(waited))
+    }
+
+    /// Ends one step's time: a stamp, else a wait.
+    fn clock(&self, stamped: bool, start: Instant, waited: &mut Vec<f64>) -> Result<(), Error> {
+        if stamped {
+            self.ctx.stamp()?;
+            return Ok(());
+        }
+        let clocked = self.ctx.finish()?;
+        waited.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
+        Ok(())
+    }
+
+    /// Queues a copy step, stamped at `slot` when given.
+    pub(super) fn stage(
+        &self,
+        step: &Step,
+        stamp: Option<(&marks::Stamps<D>, usize)>,
+    ) -> Result<(), Error> {
+        if let Some((stamps, slot)) = stamp {
+            stamps.emit(self.ctx, slot, marks::LANE_BEGIN)?;
+        }
+        if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
+            pager.stage(self.ctx, batch as usize)?;
+        }
+        if let Some((stamps, slot)) = stamp {
+            stamps.emit(self.ctx, slot, marks::LANE_END)?;
+        }
+        Ok(())
     }
 
     /// Opens the gate, then reads stamps. Errors discard stamps.
@@ -137,10 +166,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.close()?;
         let walked = self.walk(steps.clone());
         let (waited, stamps) = self.opened(walked)?;
-        for (i, s) in steps.zip(waited.unwrap_or(stamps)) {
-            if let Some(p) = self.base.profile.as_mut() {
-                let attr = self.attrs.get(i).copied().flatten();
-                p.step_with(&self.base.plan.steps[i], s, 1, attr);
+        let base = &mut self.base;
+        if let Some(p) = base.profile.as_mut() {
+            let order = base.plan.sequence(steps);
+            for ((i, step), s) in order.into_iter().zip(waited.unwrap_or(stamps)) {
+                let attr = i.and_then(|i| self.attrs.get(i).copied().flatten());
+                p.step_with(step, s, 1, attr);
             }
         }
         for (entry, found) in self.grid_marks() {
@@ -198,9 +229,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     pub(super) fn ensure_stamps(
         &mut self,
-        len: usize,
+        steps: &Range<usize>,
         sums: &mut Option<&mut (dyn Sum + 'static)>,
     ) -> Result<(), Error> {
+        let len = marks::slots(&self.base.plan, steps.clone()).len();
         let need = self.stamps.as_ref().is_none_or(|s| s.needs_grow(len));
         if !need {
             return Ok(());

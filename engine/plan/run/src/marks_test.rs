@@ -1,5 +1,36 @@
-use crate::marks::{ROOM, read};
+use crate::marks::{ROOM, read, slots};
 use crate::profile::Marks;
+use tessera_lower::kernels::{Map, Stage};
+use tessera_lower::{Plan, Slot};
+
+#[test]
+fn copies_follow_span() {
+    let at = Slot::floats(0, 4);
+    let copy = |batch| Stage { bytes: 8, batch }.step(at, Vec::new());
+    let mut step = copy(0);
+    step.kernel = tessera_lower::KernelRef::new(Map::plain(Vec::new()));
+    let plan = Plan {
+        steps: vec![step; 3],
+        staged: vec![(1, copy(0)), (3, copy(1))],
+        ..Plan::default()
+    };
+    let found = |range| -> Vec<_> {
+        let all = slots(&plan, range).into_iter();
+        all.map(|(slot, i, step)| (slot, i, step.kernel.staged()))
+            .collect()
+    };
+    assert_eq!(
+        found(0..3),
+        [
+            (0, Some(0), None),
+            (4, None, Some(0)),
+            (1, Some(1), None),
+            (2, Some(2), None),
+            (5, None, Some(1)),
+        ]
+    );
+    assert_eq!(found(1..2), [(2, None, Some(0)), (0, Some(1), None)]);
+}
 
 #[test]
 fn gaps_between_marks() {

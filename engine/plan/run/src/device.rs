@@ -368,7 +368,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             return Ok((secs, None));
         }
         if profiled {
-            self.ensure_stamps(steps.len(), &mut sums)?;
+            self.ensure_stamps(&steps, &mut sums)?;
             if self
                 .stamps
                 .as_ref()
@@ -532,28 +532,25 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         mut sums: Option<&mut (dyn Sum + 'static)>,
         stamped: bool,
     ) -> Result<(), Capture> {
-        let order = self.base.plan.sequence(steps.clone());
+        let order = marks::slots(&self.base.plan, steps.clone());
         let sync = match self.ctx.has_lanes() {
-            true => LaneSync::plan(order.iter().map(|(_, s)| *s)),
+            true => LaneSync::plan(order.iter().map(|(.., s)| *s)),
             false => LaneSync::default(),
         };
         let stamps = stamped.then_some(self.stamps.as_ref()).flatten();
-        let (start, len) = (steps.start, steps.len());
+        let len = steps.len();
         if let Some(st) = stamps {
             st.emit(self.ctx, len, marks::BEGIN)?;
         }
         sync.begin(self.ctx)?;
         let run = (|| -> Result<(), Capture> {
-            for (at, &(i, step)) in order.iter().enumerate() {
+            for (at, &(rel, i, step)) in order.iter().enumerate() {
                 sync.before(self.ctx, at, step.lane)?;
                 let Some(i) = i else {
-                    if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
-                        pager.stage(self.ctx, batch as usize)?;
-                    }
+                    self.stage(step, stamps.map(|st| (st, rel)))?;
                     sync.after(self.ctx, at, step.lane)?;
                     continue;
                 };
-                let rel = i - start;
                 if sync.active
                     && let Some(st) = stamps
                 {
