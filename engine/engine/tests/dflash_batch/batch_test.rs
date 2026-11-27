@@ -248,3 +248,31 @@ fn batch_dflash_packs_prefill() {
     );
     assert_eq!(got_tp, want_sampled);
 }
+
+#[test]
+fn taps_before_final_layer() {
+    let mut cfg = Config::toy(2, 32);
+    (cfg.tied, cfg.stack.layers, cfg.stack.taps) = (false, 4, vec![1, 2]);
+    let spec = target_spec(cfg.stack.vocab, cfg.stack.hidden, 4, false);
+    let mut d_cfg = dflash::Config::toy(&spec, 4, 0, 2, 32);
+    d_cfg.target_layers = vec![0, 1];
+    let (t_graph, d_graph) = (
+        stepper::<Norm, Swiglu>(&cfg),
+        dflash::stepper::<Norm>(&d_cfg),
+    );
+    let (tw, dw) = (
+        weights(&t_graph, &mut Noise(149)),
+        weights(&d_graph, &mut Noise(151)),
+    );
+    let prompt: Vec<u32> = (0..12).map(|i| (i % 7) + 1).collect();
+    let s = host_settings();
+    let want = gen_ids(&mut open_target(&t_graph, &tw, 32, &s), req(&prompt, 8));
+    // Chunked prefill must keep untapped tail layers.
+    assert_eq!(
+        run_solo_refs(&t_graph, &d_graph, &tw, &dw, 32, &s, &[(&prompt, 8)])[0],
+        want
+    );
+    let mut te = open_target(&t_graph, &tw, 32, &s);
+    let mut dr = open_drafter(&d_graph, &dw, 32, 4, 0, &s);
+    assert_eq!(run_batch_reqs(&mut te, &mut dr, &[(&prompt, 8)])[0], want);
+}

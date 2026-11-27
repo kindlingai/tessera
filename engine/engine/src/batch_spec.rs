@@ -694,7 +694,7 @@ impl BatchMtp<'_> {
         span(&mut rows, seq.slot, pos0, chunk.iter().copied());
         self.ensure_pages(&rows)?;
         if pos0 + len < n {
-            let (_, taps) = self.core.target.step_taps_local(&rows)?;
+            let taps = self.core.target.step_taps_only(&rows)?;
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
             if let Some((d_w, m_w)) = dual_widths {
                 if seq.solo_mode {

@@ -603,18 +603,29 @@ impl<'a> BatchDFlash<'a> {
                 || (end > s.seq.d_base && end - s.seq.d_base + self.block <= self.draft_ctx)
         });
         if !need_taps {
-            let last = [rows.len() as u32 - 1];
-            self.core
-                .target
-                .launch_local(&rows, &last, Head::Full(None), false, false)?;
+            self.core.target.fill_local(&rows)?;
             for mut s in packed {
                 s.seq.pos = s.pos0 + s.len;
                 self.prefilling.push_back(s.seq);
             }
             return Ok(rows.len());
         }
-        let (ids, raw_taps) = self.core.target.step_taps_local(&rows)?;
+        let picks: Vec<u32> = packed
+            .iter()
+            .filter(|s| s.pos0 + s.len == s.seq.request.tokens.len())
+            .map(|s| (s.off + s.len - 1) as u32)
+            .collect();
+        let (ids, raw_taps) = if picks.is_empty() {
+            (Vec::new(), self.core.target.step_taps_only(&rows)?)
+        } else {
+            let (ids, taps) =
+                self.core
+                    .target
+                    .launch_local(&rows, &picks, Head::Full(None), true, false)?;
+            (ids, taps.expect("taps were asked for"))
+        };
         let wants = self.drafter.draft_wants();
+        let mut pick_i = 0usize;
         for mut s in packed {
             let n = s.seq.request.tokens.len();
             let end = s.pos0 + s.len;
@@ -635,7 +646,8 @@ impl<'a> BatchDFlash<'a> {
                 s.seq.pos = end;
                 self.prefilling.push_back(s.seq);
             } else {
-                let anchor = ids[s.off + s.len - 1];
+                let anchor = ids[pick_i];
+                pick_i += 1;
                 let sampler = Sampler::new(s.seq.request.sampling);
                 let taps_in = taps_slice(&raw_taps, s.off, s.len, self.tap_width);
                 self.finish_dflash_prefill(s.seq, s.pos0, sampler, anchor, taps_in, wants)?;

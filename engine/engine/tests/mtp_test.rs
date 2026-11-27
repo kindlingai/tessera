@@ -11,10 +11,11 @@ use tessera_engine::{
     Allowed, BatchMtp, Drafter, Engine, Event, Fault, Guide, MtpDrafter, MtpSpeculate, Penalties,
     Prefix, Program, Reason, Recipe, Request, Scoped, SpecStats, Stacked, Steps, Term,
 };
-use tessera_graph::DimName::{Hidden, Vocab};
-use tessera_graph::{Graph, Parts, PathSeg, Role};
+use tessera_graph::DimName::{Context, Hidden, Picks, Rows, Segments, Seqs, Vocab};
+use tessera_graph::{DType, Graph, Parts, PathSeg, Role, shard_mode, trim};
 use tessera_interp::Tensor;
-use tessera_lower::Wants;
+use tessera_lower::form::{BF16_FORM, named};
+use tessera_lower::{Cache, Cluster, Device, Limits, Pins, Platform, Wants, ZoneKind};
 use tessera_models::{mla, mtp};
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
@@ -650,4 +651,160 @@ fn solo_mtp_paged() {
     let long: Vec<u32> = (0..=ctx as u32).map(|i| i % 16).collect();
     let (cap, _) = spec_events(|e| sp.generate(req(&long, 4), e));
     assert_eq!(cap, vec![Event::Done(Reason::Context)]);
+}
+
+#[test]
+fn taps_only_skips_head() {
+    let mut cfg = mla_cfg(true, 512);
+    cfg.stack.vocab = 600;
+    let tg = mla::stepper::<mla::Moe>(&cfg);
+    let mg = mtp::stepper::<mla::Moe>(&mtp::config(&cfg, true));
+    let parts = Parts::even(2);
+    let sh = mtp::shard(&mg, &parts, &|_, _, _, _| true, true)
+        .unwrap()
+        .graph;
+    let sharded = sh.wired(DType::F32);
+    let rows = 4u64;
+    let g = plan_gathers(&sharded, &parts, rows, Wants::role(&sharded, 0, Role::Taps));
+    assert!(!g.contains(&(2 * rows as usize * 2)) && !g.contains(&(rows as usize * 600)));
+    let dev = Device::guess(&host_settings());
+    let dims = [(Seqs, 1), (Rows, rows), (Context, rows), (Segments, 1)];
+    let mut cache = Cache::default();
+    let mut count = |w| {
+        let p = cache
+            .wanting(&tg, 0, w, &dims, &[Context, Segments], &dev)
+            .unwrap()
+            .0;
+        (
+            p.steps.len(),
+            p.steps.iter().any(|s| s.write.len == rows as usize * 600),
+        )
+    };
+    let (ts, tv) = count(Wants::role(&tg, 0, Role::Taps));
+    let (bs, bv) = count(Wants::roles(&tg, 0, &[Role::Tokens, Role::Taps]));
+    assert!(ts < bs && bv && !tv);
+    // Multi-chunk prefill with max_tokens=1 and max_tokens=6 matches baseline.
+    let mut c1 = mla_cfg(false, 16);
+    c1.stack.max_seqs = 2;
+    let g1 = mla::stepper::<mla::Moe>(&c1);
+    let m1 = mtp::stepper::<mla::Moe>(&mtp::config(&c1, false));
+    let (tw, mw, s) = (
+        weights(&g1, &mut Noise(173)),
+        weights(&m1, &mut Noise(179)),
+        host_settings(),
+    );
+    let mut base = open_target(&g1, &tw, 24, &s);
+    let mut target = open_target(&g1, &tw, 24, &s);
+    let mut drafter = open_mtp(&m1, &mw, 24, &s);
+    let prompt = [2u32, 5, 1, 8, 3, 6, 4];
+    let mut sp = MtpSpeculate::new(&mut target, &mut drafter, 2).unwrap();
+    sp = sp.with_prefill_chunk(2);
+    for max_tokens in [1, 6] {
+        let (got, _) = spec_events(|e| sp.generate(req(&prompt, max_tokens), e));
+        assert_eq!(
+            collect_ids(&got),
+            gen_ids(&mut base, req(&prompt, max_tokens))
+        );
+    }
+}
+
+#[test]
+fn glm53_tp4_skips_head() {
+    // Full 78-layer GLM-5.3 TP=4 32K prefill on GB10 CUDA platform.
+    let mut cfg = mla::Config::glm53(4, 32_768);
+    cfg.stack.taps = vec![mtp::tap_layer(&cfg)];
+    let vocab = cfg.stack.vocab as usize;
+    let tg = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let mut gpu = Platform::assumed(Limits::assumed());
+    (gpu.backend, gpu.name, gpu.units, gpu.bandwidth) =
+        ("cuda".into(), "NVIDIA GB10".into(), 48, 273e9);
+    gpu.row.as_mut().unwrap().bf16_tile = Some([16, 8, 16]);
+    let bf16 = "embed head *.norm *.q_norm *.kv_norm *.k_norm *.k_bias *.mlp_norm.* norm *.router *.router_bias *.weights";
+    let mxfp8 = named("mxfp8").unwrap();
+    let pins = bf16
+        .split_whitespace()
+        .fold(Pins::all(mxfp8), |p, k| p.pin(k, BF16_FORM));
+    let (parts, trimmed) = (Parts::even(4), trim(&tg, 0).unwrap());
+    let has_picks = trimmed.entries[0]
+        .inputs
+        .iter()
+        .any(|i| i.role == Role::Picks);
+    assert!(has_picks);
+    let sh = shard_mode(&trimmed, &parts, &pins.shares(&trimmed), false)
+        .unwrap()
+        .graph;
+    let sharded = sh.wired(DType::F32);
+    let dev = Device::default()
+        .on(gpu)
+        .pinned(pins)
+        .zoned(Cluster::mesh(4, ZoneKind::Gpu));
+    let dev = dev.ranked(vec![0, 1, 2, 3]).uneven(parts.0).as_rank(0);
+    let dims = [
+        (Seqs, 4),
+        (Rows, 1024),
+        (Context, 32_768),
+        (Segments, 1),
+        (Picks, 1),
+    ];
+    let mut cache = Cache::default();
+    let mut stats = |w| {
+        let p = cache
+            .wanting(&sharded, 0, w, &dims, &[Context, Segments], &dev)
+            .unwrap()
+            .0;
+        assert_eq!(p.ranks, 4);
+        let h = p
+            .steps
+            .iter()
+            .filter(|s| s.kernel.name() != "all_gather" && s.write.len == vocab / 4)
+            .count();
+        let g: Vec<_> = p
+            .steps
+            .iter()
+            .filter(|s| s.kernel.name() == "all_gather")
+            .map(|s| s.write.len)
+            .collect();
+        (p.steps.len(), h, g)
+    };
+    let (ts, th, tg_g) = stats(Wants::role(&sharded, 0, Role::Taps));
+    let (bs, bh, bg_g) = stats(Wants::roles(&sharded, 0, &[Role::Tokens, Role::Taps]));
+    // Proves spec_loop whole-step fallback (taps > both) never triggers.
+    assert!(ts < bs && th == 0 && bh >= 1 && !tg_g.contains(&vocab) && bg_g.contains(&vocab));
+    // BatchMtp multi-chunk prefill invokes head once (final chunk only).
+    let mut c1 = mla_cfg(false, 16);
+    (c1.stack.vocab, c1.stack.max_seqs) = (80, 2);
+    let g1 = mla::stepper::<mla::Moe>(&c1);
+    let m1 = mtp::stepper::<mla::Moe>(&mtp::config(&c1, false));
+    let (tw, mw, hs) = (
+        weights(&g1, &mut Noise(181)),
+        weights(&m1, &mut Noise(191)),
+        host_settings(),
+    );
+    let mut ps = host_settings();
+    ps.profile = Some(u64::MAX);
+    let mut base = open_target(&g1, &tw, 24, &hs);
+    let mut target = open_target(&g1, &tw, 24, &ps);
+    let mut drafter = open_mtp(&m1, &mw, 24, &hs);
+    let prompt = vec![1u32, 3, 5, 7, 2, 4, 6, 8];
+    let expected = greedy_answers(&mut base, &[(prompt.clone(), 1)]);
+    let mut batch = BatchMtp::new(&mut target, &mut drafter, 2).unwrap();
+    batch = batch.with_prefill_chunk(2);
+    run_batch_seq(&mut batch, &[(prompt, 1)], &expected);
+    drop(batch);
+    let prof = target.take_profile().expect("profile active");
+    let cnt = |f: fn(&str) -> bool| -> u64 {
+        prof.spent
+            .iter()
+            .filter(|(k, _)| f(k))
+            .map(|(_, v)| v.count)
+            .sum()
+    };
+    assert_eq!(prof.spent.get("engine: launch").map_or(0, |v| v.count), 4);
+    assert_eq!(
+        (
+            cnt(|k| k.contains("x80x64")),
+            cnt(|k| k.starts_with("argmax "))
+        ),
+        (1, 1)
+    );
 }

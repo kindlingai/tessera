@@ -5,7 +5,7 @@ use crate::lanes::{decode_patches, encode_patches};
 use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::spec_len::SpecStats;
 use crate::{Allowed, Edit, Engine, Error, Event, Guide, Head, Reason, Request, Row};
-use tessera_engine_comm::{Reader, Writer};
+use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::Role;
 use tessera_lower::{Slot, Wants};
 use tessera_run::{Error as RunError, Profile, Run};
@@ -449,12 +449,11 @@ pub(crate) fn run_speculate<D, S>(
         while pos < end {
             let len = step.min(end - pos);
             let rows = prompt_rows(&prompt[pos..pos + len], pos);
-            let all: Vec<u32> = (0..len as u32).collect();
-            let picks = if need_taps { &all[..] } else { &all[len - 1..] };
-            let (_, taps) =
-                target.launch_local(&rows, picks, Head::Full(None), need_taps, false)?;
-            if let Some(taps) = taps {
+            if need_taps {
+                let taps = target.step_taps_only(&rows)?;
                 on_chunk(target, drafter, pos, &prompt, len, taps)?;
+            } else {
+                target.fill_local(&rows)?;
             }
             pos += len;
         }
@@ -470,20 +469,15 @@ pub(crate) fn run_speculate<D, S>(
             match &guided {
                 Some(g) => target.pick_last(&last_rows, &g.next, need_taps)?,
                 None => {
-                    let all: Vec<u32> = (0..last_rows.len() as u32).collect();
-                    let picks = if need_taps {
-                        &all[..]
-                    } else {
-                        &all[all.len() - 1..]
-                    };
+                    let last = [last_rows.len() as u32 - 1];
                     let (ids, taps) = target.launch_local(
                         &last_rows,
-                        picks,
+                        &last,
                         Head::Full(None),
                         need_taps,
                         false,
                     )?;
-                    (*ids.last().expect("non-empty prompt"), taps)
+                    (ids[0], taps)
                 }
             }
         };
@@ -736,12 +730,105 @@ pub(crate) enum VerifyOut {
     Logits(Vec<f32>, usize),
 }
 
+#[cfg(test)]
+mod vote_test;
+
+/// Plan availability and preference bits exchanged across ranks.
+const CAN_OFF: u8 = 1;
+const CAN_ON: u8 = 2;
+const PREF_ON: u8 = 4;
+
+/// Coordinates `(headless, with_head)` plan selection across ranks before launch.
+fn decide_plan(
+    control: Option<&mut (dyn Transport + '_)>,
+    off: Result<usize, Error>,
+    on: Result<usize, Error>,
+) -> Result<bool, Error> {
+    let (vote, err) = match (off, on) {
+        (Ok(h), Ok(w)) => (CAN_OFF | CAN_ON | if h > w { PREF_ON } else { 0 }, None),
+        (Ok(_), Err(e @ Error::Lower(_))) => (CAN_OFF, Some(e)),
+        (Err(e @ Error::Lower(_)), Ok(_)) => (CAN_ON, Some(e)),
+        (Err(Error::Lower(_)), Err(e)) | (Err(e), _) | (_, Err(e)) => (0, Some(e)),
+    };
+    let votes = match control {
+        Some(c) => c
+            .exchange(&[vote])
+            .map_err(RunError::from)?
+            .iter()
+            .map(|p| (p.len() == 1).then(|| p[0]))
+            .collect::<Option<Vec<u8>>>()
+            .unwrap_or_default(),
+        None => vec![vote],
+    };
+    let all = |bit| !votes.is_empty() && votes.iter().all(|v| v & bit != 0);
+    match (all(CAN_OFF), all(CAN_ON)) {
+        (true, true) => Ok(votes.iter().any(|v| v & PREF_ON != 0)),
+        (false, true) => Ok(true),
+        (true, false) => Ok(false),
+        (false, false) => Err(err.unwrap_or_else(|| RunError::OutputsDisagree.into())),
+    }
+}
+
 impl Engine {
     /// A local launch picking after every row, with taps.
     pub(crate) fn step_taps_local(&mut self, rows: &[Row]) -> Result<(Vec<u32>, TapsBuf), Error> {
         let all: Vec<u32> = (0..rows.len() as u32).collect();
         let (ids, taps) = self.launch_local(rows, &all, Head::Full(None), true, false)?;
         Ok((ids, taps.expect("taps were asked for")))
+    }
+
+    /// Local prefill step appending kept state only.
+    pub(crate) fn fill_local(&mut self, rows: &[Row]) -> Result<(), Error> {
+        self.check_rows(rows)?;
+        let tokens = Wants::role(&self.graph, self.full, Role::Tokens);
+        let last = [rows.len() as u32 - 1];
+        if self.prefer_head(rows, &last, Wants::NONE, tokens)? {
+            self.launch_local(rows, &last, Head::Full(None), false, false)?;
+            return Ok(());
+        }
+        self.run_local(rows, &[], Head::Full(None), Wants::NONE, false)?;
+        self.report();
+        Ok(())
+    }
+
+    /// Local launch returning only taps without the head.
+    pub(crate) fn step_taps_only(&mut self, rows: &[Row]) -> Result<TapsBuf, Error> {
+        self.check_rows(rows)?;
+        let width = self.taps.ok_or(Error::Taps)?;
+        let wants = Wants::role(&self.graph, self.full, Role::Taps);
+        let both = Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]);
+        let last = [rows.len() as u32 - 1];
+        if self.prefer_head(rows, &last, wants, both)? {
+            let (_, buf) = self.launch_local(rows, &last, Head::Full(None), true, false)?;
+            return Ok(buf.expect("taps were asked for"));
+        }
+        let outputs = self.run_local(rows, &[], Head::Full(None), wants, false)?;
+        let buf = self.taps_buf(outputs[0], rows.len(), width)?;
+        self.report();
+        Ok(buf)
+    }
+
+    /// Whether all ranks should run `with_head` instead of `headless`.
+    fn prefer_head(
+        &mut self,
+        rows: &[Row],
+        last: &[u32],
+        headless: Wants,
+        with_head: Wants,
+    ) -> Result<bool, Error> {
+        // Probe both plans before voting across ranks.
+        let off = self.steps(rows, &[], headless);
+        let on = self.steps(rows, last, with_head);
+        let ctl = self.control.as_mut().map(|c| c.as_mut());
+        decide_plan(ctl, off, on)
+    }
+
+    /// Local launch picking the last row with taps.
+    pub(crate) fn step_taps_last(&mut self, rows: &[Row]) -> Result<(u32, TapsBuf), Error> {
+        self.check_rows(rows)?;
+        let last = [rows.len() as u32 - 1];
+        let (ids, taps) = self.launch_local(rows, &last, Head::Full(None), true, false)?;
+        Ok((ids[0], taps.expect("taps were asked for")))
     }
 
     /// Runs batched verify, reading logits when sampling.
@@ -769,8 +856,7 @@ impl Engine {
         sampler: &mut Sampler,
     ) -> Result<(u32, TapsBuf), Error> {
         if sampler.greedy() {
-            let (ids, taps) = self.step_taps_local(rows)?;
-            return Ok((*ids.last().expect("non-empty chunk"), taps));
+            return self.step_taps_last(rows);
         }
         let (mut logits, _, taps) = self.logits_local(rows, &[0], true, false)?;
         let anchor = sampler.draw_row(&mut logits, None, &[]);
@@ -852,18 +938,17 @@ impl Engine {
         if !taps {
             return Ok((out, None));
         }
-        let slot = outputs[taps_at];
-        let buf = if slot.form.name() == "f32"
+        let buf = self.taps_buf(outputs[taps_at], rows.len(), width)?;
+        Ok((out, Some(buf)))
+    }
+
+    /// Wraps a tap output slot on device or host.
+    fn taps_buf(&mut self, slot: Slot, rows: usize, width: usize) -> Result<TapsBuf, Error> {
+        if slot.form.name() == "f32"
             && let Some(addr) = self.runner.address(slot)
         {
-            TapsBuf::Device {
-                slot,
-                addr,
-                rows: rows.len(),
-            }
-        } else {
-            TapsBuf::Host(self.read_floats(slot, rows.len() * width)?)
-        };
-        Ok((out, Some(buf)))
+            return Ok(TapsBuf::Device { slot, addr, rows });
+        }
+        Ok(TapsBuf::Host(self.read_floats(slot, rows * width)?))
     }
 }
