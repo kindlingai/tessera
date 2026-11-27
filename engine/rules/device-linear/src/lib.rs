@@ -22,6 +22,7 @@ use tessera_lower::{
 
 const KERNEL: &str = include_str!("linear.cu");
 const PREFILL: &str = include_str!("prefill.cu");
+const INT4: &str = include_str!("int4.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
@@ -45,6 +46,18 @@ fn prefill_source_with<'a>(
     defs: impl IntoIterator<Item = (&'a str, usize)>,
 ) -> Source {
     tessera_device::cuda_source_with(prefill_source(), entry, defs)
+}
+
+pub(crate) fn int4_source() -> &'static str {
+    static INT4_SRC: OnceLock<&'static str> = OnceLock::new();
+    INT4_SRC.get_or_init(|| flatten_for(Backend::Cuda, "int4.kernel", INT4))
+}
+
+fn int4_source_with<'a>(
+    entry: &'static str,
+    defs: impl IntoIterator<Item = (&'a str, usize)>,
+) -> Source {
+    tessera_device::cuda_source_with(int4_source(), entry, defs)
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 //! Streaming BF16 and MXFP8 Tensor-Core small-batch matmul rule.
 
-use super::{CUDA_LACKS, cuda_source_with, f32_only, prefill_source_with, weight_accepts};
+use super::{
+    CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, prefill_source_with, weight_accepts,
+};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
@@ -58,7 +60,7 @@ impl MmKind {
 
     fn source(self, min_blocks: Option<u32>) -> tessera_lower::Source {
         match mm_blk_def(self) {
-            None => prefill_source_with(self.entry(), None::<(&str, usize)>),
+            None => int4_source_with(self.entry(), None::<(&str, usize)>),
             Some(def) => cuda_source_with(self.entry(), min_blocks.map(|v| (def, v as usize))),
         }
     }
