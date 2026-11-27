@@ -1,6 +1,9 @@
 //! Deterministic adaptive draft length controller for speculative decoding.
 
+use length::{ADAPTIVE, FIXED, LENGTHS};
 use tessera_engine_comm::{Reader, Writer};
+
+mod length;
 
 /// Speculative decoding telemetry for one generation call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,7 +124,8 @@ impl CostModel {
 /// Deterministic draft-length policy and acceptance rate estimator.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpecLen {
-    adaptive: bool,
+    /// The length choice, by wire index.
+    length: usize,
     max_k: usize,
     levels: Vec<usize>,
     pub cost: CostModel,
@@ -140,9 +144,9 @@ impl SpecLen {
     pub fn fixed(max_k: usize) -> Self {
         let cap = max_k.clamp(1, MAX_K);
         Self {
-            adaptive: false,
+            length: FIXED,
             max_k: cap,
-            levels: vec![cap],
+            levels: LENGTHS[FIXED].levels(cap),
             cost: CostModel::default(),
             seed: DEFAULT_SEEDS,
             pn: [0.0; MAX_K + 1],
@@ -159,17 +163,8 @@ impl SpecLen {
     pub fn adaptive(max_k: usize, cost: CostModel) -> Self {
         let cap = max_k.clamp(1, MAX_K);
         let mut s = Self::fixed(cap);
-        let mut levels = Vec::new();
-        for &k in &DEFAULT_LEVELS {
-            if k <= cap {
-                levels.push(k);
-            }
-        }
-        if levels.last().copied() != Some(cap) {
-            levels.push(cap);
-        }
-        s.adaptive = true;
-        s.levels = levels;
+        s.length = ADAPTIVE;
+        s.levels = LENGTHS[ADAPTIVE].levels(cap);
         s.cost = cost;
         s
     }
@@ -197,8 +192,9 @@ impl SpecLen {
         }
     }
 
-    pub fn is_adaptive(&self) -> bool {
-        self.adaptive
+    /// MTP drafts to chain from `avail`.
+    pub(crate) fn chain(&self, avail: usize) -> usize {
+        LENGTHS[self.length].chain(self, avail)
     }
 
     pub fn max_k(&self) -> usize {
@@ -277,43 +273,12 @@ impl SpecLen {
         if limit == 0 {
             return (0, 0.0);
         }
-        if !self.adaptive {
-            return (limit, self.ratio(limit, lp, drafted.max(limit)).1);
-        }
-        let mut best_k = 0usize;
-        let mut best_r = -1.0f64;
-        for &k in &self.levels {
-            if k > limit {
-                break;
-            }
-            let r = self.ratio(k, lp, drafted).1;
-            if r > best_r * (1.0 + 1e-9) {
-                best_r = r;
-                best_k = k;
-            }
-        }
-        if best_k == 0 {
-            (limit, self.ratio(limit, lp, drafted).1)
-        } else {
-            (best_k, best_r)
-        }
+        LENGTHS[self.length].pick(self, lp, limit, drafted)
     }
 
     /// Whether chaining another MTP draft past `n` improves rate.
     pub fn more(&self, lp: Option<&[f32]>, n: usize) -> bool {
-        if !self.adaptive {
-            return n < self.max_k;
-        }
-        let Some(&next) = self.levels.iter().find(|&&k| k > n) else {
-            return false;
-        };
-        let now = if self.levels.iter().any(|&k| k <= n) {
-            self.best_rate(lp, n, n)
-        } else {
-            0.0
-        };
-        let known = lp.map(|arr| &arr[..arr.len().min(n)]);
-        self.ratio(next, known, next).1 > now
+        LENGTHS[self.length].more(self, lp, n)
     }
 
     /// Updates estimates after verifying `k` drafts with `accepted` matches.
@@ -349,7 +314,7 @@ impl SpecLen {
     /// Encodes static policy settings for rank broadcast.
     pub(crate) fn encode(&self, w: &mut Writer) {
         let levels: Vec<u32> = self.levels.iter().map(|&k| k as u32).collect();
-        w.u32(u32::from(self.adaptive))
+        w.u32(self.length as u32)
             .u32(self.max_k as u32)
             .u32s(&levels)
             .f64(self.cost.base_ms)
@@ -364,7 +329,8 @@ impl SpecLen {
 
     /// Decodes static policy settings sent by rank 0.
     pub(crate) fn decode(r: &mut Reader) -> Option<Self> {
-        let adaptive = r.u32()? != 0;
+        let length = r.u32()? as usize;
+        LENGTHS.get(length)?;
         let max_k = r.u32()? as usize;
         let levels: Vec<usize> = r.u32s()?.into_iter().map(|k| k as usize).collect();
         let cost = CostModel {
@@ -378,7 +344,7 @@ impl SpecLen {
         let bucket_decay = r.f64()?;
         let prior = r.f64()?;
         let mut s = Self::fixed(max_k);
-        s.adaptive = adaptive;
+        s.length = length;
         s.levels = levels;
         s.cost = cost;
         s.seed = seed;

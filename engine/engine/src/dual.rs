@@ -5,7 +5,10 @@ use crate::spec_len::{CostModel, SpecLen};
 use crate::spec_loop::{SpecReq, TapsBuf, TapsIn, run_speculate, spec_entry};
 use crate::speculate::{Drafter, SpecStats};
 use crate::{Engine, Error, Event};
+use switch::{DWELL, SWITCHES};
 use tessera_engine_comm::{Reader, Writer};
+
+mod switch;
 
 #[derive(Clone, Debug, PartialEq)]
 struct PendingProbe {
@@ -22,6 +25,8 @@ pub struct DualSelector {
     pub dwell: usize,
     pub margin: f64,
     pub probe_every: usize,
+    /// The drafter choice, by wire index.
+    switch: usize,
     use_mtp: bool,
     since: usize,
     mtp_streak: usize,
@@ -38,6 +43,7 @@ impl DualSelector {
             dwell: 8,
             margin: 0.15,
             probe_every: 4,
+            switch: DWELL,
             use_mtp: false,
             since: 0,
             mtp_streak: 0,
@@ -66,10 +72,12 @@ impl DualSelector {
 
     /// Returns a fresh selector for a new request.
     pub fn fresh(&self) -> Self {
-        Self::new(self.dflash.fresh(), self.mtp.fresh())
+        let mut fresh = Self::new(self.dflash.fresh(), self.mtp.fresh())
             .with_dwell(self.dwell)
             .with_margin(self.margin)
-            .with_probe(self.probe_every)
+            .with_probe(self.probe_every);
+        fresh.switch = self.switch;
+        fresh
     }
 
     /// Whether the selector currently favors MTP over DFlash.
@@ -98,16 +106,7 @@ impl DualSelector {
             self.since += 1;
             return (true, switched);
         }
-        let want_mtp = if self.since < self.dwell {
-            self.use_mtp
-        } else {
-            let (rm, rd) = self.rates();
-            if self.use_mtp {
-                rm * (1.0 + self.margin) >= rd
-            } else {
-                rm > rd * (1.0 + self.margin)
-            }
-        };
+        let want_mtp = SWITCHES[self.switch].want_mtp(self);
         let switched = want_mtp != self.use_mtp;
         if switched {
             self.use_mtp = want_mtp;
@@ -174,7 +173,8 @@ impl DualSelector {
         self.mtp.encode(w);
         w.u32(self.dwell as u32)
             .f64(self.margin)
-            .u32(self.probe_every as u32);
+            .u32(self.probe_every as u32)
+            .u32(self.switch as u32);
     }
 
     /// Decodes static selector settings sent by rank 0.
@@ -184,12 +184,14 @@ impl DualSelector {
         let dwell = r.u32()? as usize;
         let margin = r.f64()?;
         let probe_every = r.u32()? as usize;
-        Some(
-            Self::new(dflash, mtp)
-                .with_dwell(dwell)
-                .with_margin(margin)
-                .with_probe(probe_every),
-        )
+        let switch = r.u32()? as usize;
+        SWITCHES.get(switch)?;
+        let mut selector = Self::new(dflash, mtp)
+            .with_dwell(dwell)
+            .with_margin(margin)
+            .with_probe(probe_every);
+        selector.switch = switch;
+        Some(selector)
     }
 
     fn feed_probe(&mut self, committed: &[u32]) {

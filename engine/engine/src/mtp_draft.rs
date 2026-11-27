@@ -615,15 +615,7 @@ pub(crate) fn draft_mtp(
     start: usize,
     avail: usize,
 ) -> Result<Vec<u32>, Error> {
-    let chain_n = if !spec.is_adaptive() {
-        avail
-    } else {
-        let mut n = 1;
-        while n < avail && spec.more(None, n) {
-            n += 1;
-        }
-        n
-    };
+    let chain_n = spec.chain(avail);
     let job = MtpJob {
         slot,
         old_start: start_pos,
