@@ -239,6 +239,19 @@ pub trait Device: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this device supports concurrent encoding with explicit barriers.
+    fn has_barriers(&self) -> bool {
+        false
+    }
+
+    /// Toggles concurrent launch mode on this thread's open encoder.
+    fn set_concurrent(&self, _on: bool) {}
+
+    /// Orders prior concurrent launches before subsequent ones.
+    fn barrier(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Queues `pinned` on the active lane. It must outlive that.
     fn queue_upload(&self, ptr: u64, pinned: &[u8]) -> Result<(), Error> {
         self.upload(ptr, pinned)

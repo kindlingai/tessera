@@ -12,11 +12,11 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -61,6 +61,7 @@ struct Pending {
     owner: usize,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    concurrent: bool,
 }
 
 impl Pending {
@@ -82,6 +83,8 @@ impl Pending {
 thread_local! {
     /// This thread's open command buffer. Encoders are not shared.
     static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+    /// Whether this thread encodes launches concurrently with explicit barriers.
+    static CONCURRENT: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Inner {
@@ -226,13 +229,35 @@ impl Context {
         Arc::as_ptr(&self.0) as usize
     }
 
+    fn open_encoder(
+        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+        concurrent: bool,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
+        let kind = match concurrent {
+            true => MTLDispatchType::Concurrent,
+            false => MTLDispatchType::Serial,
+        };
+        cmd.computeCommandEncoderWithDispatchType(kind)
+            .ok_or(Error::Gpu("encoder"))
+    }
+
     /// This thread's open encoder, or a new command buffer's.
     fn encoder(
         &self,
         pending: &mut Option<Pending>,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
+        let want = CONCURRENT.with(Cell::get);
         match pending {
-            Some(p) if p.owner == self.id() => return Ok(p.enc.clone()),
+            Some(p) if p.owner == self.id() && p.concurrent == want => return Ok(p.enc.clone()),
+            Some(p) if p.owner == self.id() => {
+                let enc = autoreleasepool(|_| {
+                    p.enc.endEncoding();
+                    Self::open_encoder(&p.cmd, want)
+                })?;
+                p.enc = enc;
+                p.concurrent = want;
+                return Ok(p.enc.clone());
+            }
             // Another context's work ends before this one's starts.
             Some(_) => drop(pending.take().map(Pending::finish)),
             None => {}
@@ -243,11 +268,16 @@ impl Context {
                 .queue
                 .commandBuffer()
                 .ok_or(Error::Gpu("command buffer"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
+            let enc = Self::open_encoder(&cmd, want)?;
             Ok::<_, Error>((cmd, enc))
         })?;
         let owner = self.id();
-        let made = pending.insert(Pending { owner, cmd, enc });
+        let made = pending.insert(Pending {
+            owner,
+            cmd,
+            enc,
+            concurrent: want,
+        });
         Ok(made.enc.clone())
     }
 }
@@ -418,5 +448,25 @@ impl Device for Context {
             }
         });
         Ok(taken.map(Pending::finish))
+    }
+
+    fn has_barriers(&self) -> bool {
+        true
+    }
+
+    fn set_concurrent(&self, on: bool) {
+        CONCURRENT.with(|c| c.set(on));
+    }
+
+    fn barrier(&self) -> Result<(), Error> {
+        PENDING.with(|p| {
+            if let Some(pending) = &*p.borrow()
+                && pending.owner == self.id()
+                && pending.concurrent
+            {
+                pending.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            }
+        });
+        Ok(())
     }
 }

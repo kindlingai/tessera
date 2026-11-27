@@ -22,8 +22,9 @@ use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
+use tessera_lower::hazard::Waves;
 use tessera_lower::kernels::crosses;
-use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
+use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, Step};
 use tessera_mem::{Buffer, DType};
 
 mod replan;
@@ -502,21 +503,29 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         stamped: bool,
     ) -> Result<(), Capture> {
         let order = marks::slots(&self.base.plan, steps.clone());
+        let ordered: Vec<&Step> = order.iter().map(|(.., s)| *s).collect();
         let sync = match self.ctx.has_lanes() {
-            true => LaneSync::plan(order.iter().map(|(.., s)| *s)),
+            true => LaneSync::plan(ordered.iter().copied()),
             false => LaneSync::default(),
         };
+        let mut waves = Waves::new(&self.base.plan, self.ctx.has_barriers() && !sync.active);
         let stamps = stamped.then_some(self.stamps.as_ref()).flatten();
         let len = steps.len();
         if let Some(st) = stamps {
             st.emit(self.ctx, len, marks::BEGIN)?;
         }
         sync.begin(self.ctx)?;
+        if waves.active() {
+            self.ctx.set_concurrent(true);
+        }
+        let bar = |ok: bool| if ok { self.ctx.barrier() } else { Ok(()) };
         let run = (|| -> Result<(), Capture> {
             for (at, &(rel, i, step)) in order.iter().enumerate() {
                 sync.before(self.ctx, at, step.lane)?;
                 let Some(i) = i else {
+                    bar(waves.before(&ordered, at, true))?;
                     self.stage(step, stamps.map(|st| (st, rel)))?;
+                    bar(waves.reset(at + 1))?;
                     sync.after(self.ctx, at, step.lane)?;
                     continue;
                 };
@@ -525,6 +534,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 {
                     st.emit(self.ctx, rel, marks::LANE_BEGIN)?;
                 }
+                let sp = crosses(step.kernel.name())
+                    || step.kernel.staged().is_some()
+                    || self.resident[i];
+                bar(waves.before(&ordered, at, sp))?;
                 if crosses(step.kernel.name())
                     && let Some(grid) = sums.as_deref_mut()
                 {
@@ -533,10 +546,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                         return Err(Capture::Split(i));
                     }
                 } else {
-                    for launch in self.base.launches(i)? {
-                        self.launch(i, &launch)?;
+                    for (k, launch) in self.base.launches(i)?.iter().enumerate() {
+                        bar(k > 0 && waves.reset(at))?;
+                        self.launch(i, launch)?;
                     }
                 }
+                bar(sp && waves.reset(at + 1))?;
                 if let Some(st) = stamps {
                     let mode = match (sync.active, rel + 1 == len) {
                         (true, _) => marks::LANE_END,
@@ -547,6 +562,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 }
                 sync.after(self.ctx, at, step.lane)?;
             }
+            bar(waves.active())?;
             sync.finish(self.ctx)?;
             if sync.active
                 && let Some(st) = stamps
@@ -555,6 +571,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             }
             Ok(())
         })();
+        if waves.active() {
+            self.ctx.set_concurrent(false);
+        }
         if sync.active {
             self.ctx.set_lane(0);
         }

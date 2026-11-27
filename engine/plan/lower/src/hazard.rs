@@ -1,14 +1,15 @@
 //! Which steps must keep their order, on any lane.
 
 use crate::kernels::{Stage, crosses};
-use crate::plan::{Slot, Step};
+use crate::plan::{Plan, Slot, Step};
 
 /// The lane cross-rank steps run on beside compute.
 pub(crate) const COMM_LANE: u8 = 1;
 /// The lane host copies run on beside compute.
 pub const COPY_LANE: u8 = 2;
 
-fn overlaps(a: Slot, b: Slot) -> bool {
+/// True when `a` and `b` overlap in one buffer.
+pub fn overlaps(a: Slot, b: Slot) -> bool {
     if a.buffer != b.buffer {
         return false;
     }
@@ -56,4 +57,60 @@ pub fn earliest(steps: &[Step], step: &Step, at: usize) -> usize {
         place -= 1;
     }
     place
+}
+
+/// Tracks concurrent compute waves and when a barrier is required.
+pub struct Waves {
+    active: bool,
+    kept: Vec<bool>,
+    start: usize,
+}
+
+impl Waves {
+    pub fn new(plan: &Plan, active: bool) -> Self {
+        let mut kept = vec![false; if active { plan.buffers.len() } else { 0 }];
+        for (_, slot) in &plan.kept {
+            if let Some(flag) = kept.get_mut(slot.buffer as usize) {
+                *flag = true;
+            }
+        }
+        Self {
+            active,
+            kept,
+            start: 0,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// True when `steps[at]` needs a barrier before running.
+    pub fn before(&mut self, steps: &[&Step], at: usize, special: bool) -> bool {
+        if !self.active || at <= self.start {
+            return false;
+        }
+        let step = steps[at];
+        let hit = special
+            || (self.start..at).any(|j| {
+                let prev = steps[j];
+                hazards(prev, step)
+                    || prev.reads.iter().any(|&a| {
+                        self.kept.get(a.buffer as usize).copied().unwrap_or(false)
+                            && step.reads.iter().any(|&b| overlaps(a, b))
+                    })
+            });
+        if hit {
+            self.start = at;
+        }
+        hit
+    }
+
+    /// Starts a new wave at `next` when active.
+    pub fn reset(&mut self, next: usize) -> bool {
+        if self.active {
+            self.start = next;
+        }
+        self.active
+    }
 }
