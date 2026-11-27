@@ -1,21 +1,33 @@
 #!/bin/sh
-# Fails a pull request that waits on a human.
-# Reads the PR live, so a rerun sees label and setting changes.
+# Fails a pull request that waits on a human or is stacked on a branch
+# other than the default branch. The other CI jobs still run on it.
+# Reads the PR live, so a rerun sees label, setting and base changes.
 # REVIEW holds the lint-<rule> labels that lint-gate.sh asks for. Each
 # must be on the PR, added by CI, so that its review was asked for.
 # Needs GH_TOKEN, PR and GITHUB_REPOSITORY in the environment.
 set -e
-# Two words: labeled for review, and a fork maintainers cannot push to.
+# Four words: labeled for review, a fork maintainers cannot push to,
+# the base branch and the default branch.
 state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '[
     (.labels | any(.name == "needs-human-review")),
-    (.head.repo.full_name != .base.repo.full_name and (.maintainer_can_modify | not))
+    (.head.repo.full_name != .base.repo.full_name and (.maintainer_can_modify | not)),
+    .base.ref, .base.repo.default_branch
 ] | map(tostring) | join(" ")')
+# Branch names cannot hold spaces.
+read -r review locked base main <<EOF
+$state
+EOF
 status=0
-if [ "${state% *}" = true ]; then
+if [ "$base" != "$main" ]; then
+    echo "This PR is stacked on $base. It can land only on $main."
+    echo "After $base merges, rebase onto $main and change the base to $main."
+    status=1
+fi
+if [ "$review" = true ]; then
     echo "Protected files changed or a size limit breached. A maintainer reviews, then removes needs-human-review."
     status=1
 fi
-if [ "${state#* }" = true ]; then
+if [ "$locked" = true ]; then
     echo "Tick \"Allow edits by maintainers\" on the PR, then rerun this check."
     status=1
 fi
