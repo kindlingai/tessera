@@ -335,13 +335,11 @@ impl<'a> Tree<'a> {
         let wanted = e.outputs.iter().enumerate().filter(|(i, _)| wants.has(*i));
         let outputs: Vec<usize> = wanted.map(|(_, o)| o.node.0 as usize).collect();
         let mut roots = outputs.clone();
-        if wants == Wants::NONE {
-            // The appends a launch of every output would make.
+        if wants != Wants::ALL {
+            // Keep every append a full launch would make.
             let all: Vec<usize> = e.outputs.iter().map(|o| o.node.0 as usize).collect();
             let full = needed(g, &all);
-            roots = (0..g.nodes.len())
-                .filter(|&i| full[i] && g.nodes[i].op.keeps())
-                .collect();
+            roots.extend((0..g.nodes.len()).filter(|&i| full[i] && g.nodes[i].op.keeps()));
         }
         let needed = needed(g, &roots);
         let roles = output_roles(g, entry);
