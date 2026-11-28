@@ -88,6 +88,7 @@ for offline analysis.
 <tr><td>&emsp;&emsp;<a href="engine/rules/kernels">kernels/</a></td><td>tessera-kernels</td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/linear">linear/</a></td><td>tessera-linear</td><td>Generated matmul kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/metal-attention">metal-attention/</a></td><td>tessera-metal-attention</td><td>Metal attention, indexer and DeltaNet kernels, registered as lowering rules</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/rules/metal-kernels">metal-kernels/</a></td><td>tessera-metal-kernels</td><td>Metal argmax, batched matmul and convolution kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/metal-linear">metal-linear/</a></td><td>tessera-metal-linear</td><td>Metal matmul, trellis and stacked kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/rules">rules/</a></td><td>tessera-rules</td><td>Links every lowering rule crate</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/wasm">wasm/</a></td><td>tessera-wasm</td><td>Lowering rules a sandboxed wasm module proposes, over JSON</td></tr>

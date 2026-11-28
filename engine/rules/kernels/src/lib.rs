@@ -2,7 +2,7 @@
 
 mod allow;
 mod argmax;
-mod batched;
+pub mod batched;
 mod by_sum;
 mod cast;
 mod causal;

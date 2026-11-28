@@ -1,9 +1,9 @@
-//! Products of two computed values, batch by batch.
+//! Native Metal coalesced decode and simdgroup_matrix prefill for batched matmuls.
 
-use tessera_codegen::prelude::*;
-use tessera_graph::{Op, Order};
+use tessera_graph::Order;
+use tessera_kernels::batched::site;
 use tessera_lower::{
-    Arg, Backend, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
+    Arg, Backend, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 
 const METAL_THREADS: usize = 128;
@@ -23,39 +23,6 @@ const DEC_ENTRIES: [&str; 8] = [
     "bm_dec_m7",
     "bm_dec_m8",
 ];
-
-/// One thread per output. Batches of `w` serve rows.
-#[kernel]
-fn batched(
-    x: Buf<F32>,
-    w: Buf<F32>,
-    mut out: BufMut<F32>,
-    len: u32,
-    n: u32,
-    k: u32,
-    x_rows: u32,
-    batches: u32,
-) {
-    if gid() >= len {
-        return;
-    }
-    let row = gid() / n;
-    let rows = len / n;
-    let x_at = (row / (rows / x_rows)) as u64 * k as u64;
-    let w_row = (row / (rows / batches)) * n + gid() % n;
-    out[gid() as u64] = x.dot(x_at, w, w_row as u64 * k as u64, k);
-}
-
-/// `x[.., k]` times `w[batches, n, k]` transposed.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(batched, threads = self.len, work = self.len * self.k)]
-pub(crate) struct Batched {
-    pub len: usize,
-    pub n: usize,
-    pub k: usize,
-    pub x_rows: usize,
-    pub batches: usize,
-}
 
 /// Native Metal coalesced decode and simdgroup_matrix prefill for batched matmuls.
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -167,72 +134,36 @@ fn metal_launches(k: &BatchedMetal, step: &Step) -> Vec<Launch> {
     }]
 }
 
-/// A matmul whose right side is a batch of matrices.
+/// Proposes the Metal kernel when the site fits.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let node = tree.node(at);
-    if node.term != Term::Op(Op::Matmul) {
+    let (site, reads) = site(tree, at)?;
+    let (len, n, k, batches) = (site.len, site.n, site.k, site.batches);
+    let rows = len / n;
+    if batches == 0 || n == 0 || k < 4 {
         return None;
     }
-    let (x, w) = (node.args[0], node.args[1]);
-    let floats = |t: T| tree.node(t).form.dtype().is_float();
-    let shape = &tree.node(w).shape;
-    // Gathers of kept rows are ours, not picked weights.
-    let wn = tree.node(w);
-    let picked = matches!(wn.term, Term::Op(Op::Select(_))) && !tree.appends(wn.args[0]);
-    if picked || shape.len() < 3 || !floats(x) || !floats(w) {
+    let m = rows / batches;
+    if m == 0 || !rows.is_multiple_of(batches) || !rows.is_multiple_of(site.x_rows) {
         return None;
     }
-    let [.., n, k] = shape[..] else {
+    let x_div = rows / site.x_rows;
+    let (mt, mma) = if m >= METAL_MMA_MIN_ROWS {
+        (0, true)
+    } else if k.is_multiple_of(4) && k >= 64 {
+        (m.min(METAL_TILE_ROWS), false)
+    } else {
         return None;
     };
-    let batches = tree.elements(w) / (n * k);
-    let x_rows = tree.elements(x) / k;
-    let len = tree.elements(at);
-    let rows = len / n;
-    let kernel = Batched {
-        len,
+    let kernel = BatchedMetal {
+        batches,
+        m,
         n,
         k,
-        x_rows,
-        batches,
+        x_div,
+        mt,
+        mma,
     };
-    let mut drafts = Vec::new();
-    let m = rows / batches;
-    if batches > 0
-        && m > 0
-        && rows.is_multiple_of(batches)
-        && rows.is_multiple_of(x_rows)
-        && n > 0
-        && k >= 4
-    {
-        let x_div = rows / x_rows;
-        if m >= METAL_MMA_MIN_ROWS {
-            let mma = BatchedMetal {
-                batches,
-                m,
-                n,
-                k,
-                x_div,
-                mt: 0,
-                mma: true,
-            };
-            drafts.push(Draft::new(mma, [x, w], len).choice(0));
-        } else if k.is_multiple_of(4) && k >= 64 {
-            let mt = m.min(METAL_TILE_ROWS);
-            let dec = BatchedMetal {
-                batches,
-                m,
-                n,
-                k,
-                x_div,
-                mt,
-                mma: false,
-            };
-            drafts.push(Draft::new(dec, [x, w], len).choice(0));
-        }
-    }
-    drafts.push(Draft::new(kernel, [x, w], len).choice(1));
-    Some(drafts)
+    Some(vec![Draft::new(kernel, reads, len)])
 }
 
-tessera_lower::rule!("batched", propose);
+tessera_lower::rule!("batched_metal", propose);

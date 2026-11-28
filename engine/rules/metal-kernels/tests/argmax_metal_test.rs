@@ -1,6 +1,7 @@
 //! CPU parity tests for Metal argmax and small-k top-k.
 
 use tessera_kernels as _;
+use tessera_metal_kernels as _;
 
 use tessera_graph::DimName::{Context, Rows, TopK};
 use tessera_graph::{DType, Dim, Placement, TensorType};

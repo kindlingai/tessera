@@ -549,14 +549,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     ])
 }
 
-tessera_lower::rule!("argmax", propose_all);
-
-mod metal;
-
-fn propose_all(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let mut drafts = propose(tree, at)?;
-    if let Some(mtl) = metal::drafts(tree, at) {
-        drafts.extend(mtl);
-    }
-    Some(drafts)
-}
+tessera_lower::rule!("argmax", propose);

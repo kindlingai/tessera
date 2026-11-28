@@ -1,6 +1,7 @@
 //! Parity tests for Metal 3x3 neighbours MMA kernel.
 
 use tessera_kernels as _;
+use tessera_metal_kernels as _;
 
 use tessera_graph::Dim;
 use tessera_graph::DimName::Seqs;
