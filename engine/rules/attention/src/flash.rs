@@ -11,8 +11,7 @@ use tessera_lower::{
     Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Source, Step, T, Tree, knob,
 };
 
-mod sunk;
-mod sunk_metal;
+pub mod sunk;
 use sunk::{fold_tiles, fold_tiles_inline, restore, restore_inline};
 
 knob!("flash", "bk", 16, 32);
@@ -25,7 +24,7 @@ pub(crate) const BQ: u32 = 32;
 pub(crate) const WAYS: [(u32, bool); 4] = [(16, false), (32, false), (16, true), (32, true)];
 
 /// Four SIMD groups. Scores take two per 16 keys.
-pub(crate) const THREADS: u32 = 128;
+pub const THREADS: u32 = 128;
 
 /// Query rows each SIMD group softens.
 const ROWS: u32 = BQ / (THREADS / LANES as u32);

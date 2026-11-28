@@ -2,6 +2,7 @@
 
 use tessera_attention as _;
 use tessera_kernels as _;
+use tessera_metal_attention as _;
 
 use tessera_graph::Dim;
 use tessera_graph::DimName::{Context, Rows, Segments, Seqs};

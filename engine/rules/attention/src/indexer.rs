@@ -236,7 +236,7 @@ indexer_pair!(
 
 /// Sizes and storage forms for one Lightning Indexer launch.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Sizes {
+pub struct Sizes {
     pub rows: usize,
     pub seqs: usize,
     pub queries: usize,
@@ -255,11 +255,11 @@ pub(crate) struct Sizes {
 }
 
 impl Sizes {
-    fn out_keys(&self) -> usize {
+    pub fn out_keys(&self) -> usize {
         self.keys.most()
     }
 
-    fn out_len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.rows * self.out_keys()
     }
 
@@ -277,7 +277,7 @@ impl Sizes {
         )
     }
 
-    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
+    pub fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         match input {
             0 => form.name() == self.q_form.name(),
             1 => form.name() == self.k_form.name(),
@@ -286,7 +286,7 @@ impl Sizes {
         }
     }
 
-    fn emits(&self, form: &dyn Stored) -> bool {
+    pub fn emits(&self, form: &dyn Stored) -> bool {
         form.name() == self.out_form.name()
     }
 
@@ -465,7 +465,7 @@ fn swaps_last(order: &[u32], rank: usize) -> bool {
 }
 
 /// Matches the Lightning Indexer scoring chain at `at`.
-fn find_site(tree: &Tree, at: T) -> Option<(Sizes, Vec<T>)> {
+pub fn find_site(tree: &Tree, at: T) -> Option<(Sizes, Vec<T>)> {
     let (mask, scores_mm) = strip_top(tree, at)?;
     let mm_node = tree.node(scores_mm);
     if mm_node.term != Term::Op(Op::Matmul) {
@@ -644,7 +644,7 @@ fn find_whole(
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (sizes, reads) = find_site(tree, at)?;
     let out = sizes.out_len();
-    let mut drafts = metal::drafts(sizes, &reads, out);
+    let mut drafts = Vec::new();
     let fits_warp =
         sizes.dim.is_multiple_of(WIDE as usize) && sizes.dim <= MAX_DIM && sizes.rows <= MAX_WARPS;
     let warps = tree
@@ -661,7 +661,3 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 }
 
 tessera_lower::rule!("indexer", propose);
-
-mod metal;
-
-pub(crate) use metal::{k_fmt_idx, kept_params, plain_fmt};

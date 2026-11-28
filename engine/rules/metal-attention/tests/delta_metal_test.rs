@@ -2,6 +2,7 @@
 
 use tessera_attention as _;
 use tessera_kernels as _;
+use tessera_metal_attention as _;
 
 use tessera_graph::DimName::{HeadDim, Heads, Hidden, KvHeads, Rows, Seqs};
 use tessera_graph::{DType, Dim, DimExpr, Graph, PathSeg, Role};

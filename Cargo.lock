@@ -2311,6 +2311,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-metal-attention"
+version = "0.1.0"
+dependencies = [
+ "tessera-attention",
+ "tessera-codegen",
+ "tessera-graph",
+ "tessera-interp",
+ "tessera-kernels",
+ "tessera-lower",
+ "tessera-run",
+ "tessera-testkit",
+ "tessera-trace",
+]
+
+[[package]]
 name = "tessera-metal-linear"
 version = "0.1.0"
 dependencies = [
@@ -2465,6 +2480,7 @@ dependencies = [
  "tessera-device-rules",
  "tessera-kernels",
  "tessera-linear",
+ "tessera-metal-attention",
  "tessera-metal-linear",
 ]
 

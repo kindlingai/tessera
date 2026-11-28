@@ -8,16 +8,16 @@ use tessera_lower::form::F32_FORM;
 use tessera_lower::{Backend, Shape};
 
 /// The tiles are tuned for Metal's matrix unit.
-pub(super) const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
+pub const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
 
 /// Seconds per multiply-add, until measured.
-pub(super) const GUESS: f64 = 1e-12;
+pub const GUESS: f64 = 1e-12;
 
 /// Fewer rows go to the split-K kernel.
 const MIN_ROWS: usize = 16;
 
 /// Keys per block.
-const BK: u32 = WAYS[0].0;
+pub const BK: u32 = WAYS[0].0;
 
 /// Spilled sums divide by each row's sum.
 const DIVIDE: bool = true;
@@ -529,11 +529,11 @@ fn flash_sunk(
     source = sunk_source,
     launches = sunk_launches,
 )]
-pub(crate) struct FlashSunk(pub Sizes, pub usize);
+pub struct FlashSunk(pub Sizes, pub usize);
 
 impl FlashSunk {
     /// The most keys one query sees.
-    pub(super) fn seen(&self) -> usize {
+    pub fn seen(&self) -> usize {
         let (keys, (back, ahead)) = (self.0.keys.most(), self.0.window);
         keys.min(back.saturating_add(ahead).saturating_add(1))
     }
@@ -545,7 +545,7 @@ impl FlashSunk {
     }
 }
 
-pub(super) fn sunk_accepts(k: &FlashSunk, input: usize, form: &dyn Stored) -> bool {
+pub fn sunk_accepts(k: &FlashSunk, input: usize, form: &dyn Stored) -> bool {
     match input {
         1 => form.name() == k.0.k_form.name(),
         2 => form.name() == k.0.v_form.name(),
@@ -555,7 +555,7 @@ pub(super) fn sunk_accepts(k: &FlashSunk, input: usize, form: &dyn Stored) -> bo
     }
 }
 
-pub(super) fn sunk_emits(k: &FlashSunk, form: &dyn Stored) -> bool {
+pub fn sunk_emits(k: &FlashSunk, form: &dyn Stored) -> bool {
     form.name() == k.0.out_form.name()
 }
 
@@ -569,7 +569,7 @@ fn sunk_source(k: &FlashSunk) -> Source {
 }
 
 /// Seven reads, the output, any table, then scalars.
-pub(super) fn sunk_launches(k: &FlashSunk, step: &Step) -> Vec<Launch> {
+pub fn sunk_launches(k: &FlashSunk, step: &Step) -> Vec<Launch> {
     let s = &k.0;
     let rows = s.lists() / s.heads;
     let reads = (0..step.reads.len()).map(|i| step.read(i));
@@ -607,7 +607,7 @@ fn sunk_needs(s: &Sizes) -> Needs {
 }
 
 /// Checks the rows, head width, forms and kept layout.
-pub(super) fn check_sunk(s: &Sizes, bk: u32) -> Result<(), String> {
+pub fn check_sunk(s: &Sizes, bk: u32) -> Result<(), String> {
     if !s.ragged || s.from_list {
         return Err("needs ragged rows over every key".into());
     }
@@ -634,11 +634,7 @@ pub(super) fn check_sunk(s: &Sizes, bk: u32) -> Result<(), String> {
 }
 
 /// The kernel and reads of a site that `fits`.
-pub(super) fn sited(
-    tree: &Tree,
-    at: T,
-    fits: fn(&Sizes) -> bool,
-) -> Option<(FlashSunk, [Read; 7])> {
+pub fn sited(tree: &Tree, at: T, fits: fn(&Sizes) -> bool) -> Option<(FlashSunk, [Read; 7])> {
     let (sizes, [q, k, v, _, slots, positions, sinks, rel]) = listed::site(tree, at)?;
     if !fits(&sizes) {
         return None;
@@ -654,14 +650,10 @@ pub(super) fn sited(
 /// One launch scores, softens and folds by tiles.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (sunk, reads) = sited(tree, at, |s| check_sunk(s, BK).is_ok())?;
-    let mut ways = vec![Draft::new(sunk, reads, sunk.0.len).choice(0)];
-    if super::sunk_metal::fits(&sunk.0) {
-        ways.push(super::sunk_metal::draft(sunk, reads).choice(1));
-    }
-    Some(ways)
+    Some(vec![Draft::new(sunk, reads, sunk.0.len)])
 }
 
-fn why_not(tree: &Tree, at: T) -> Option<String> {
+pub fn why_not(tree: &Tree, at: T) -> Option<String> {
     let (sizes, _) = listed::site(tree, at)?;
     check_sunk(&sizes, BK).err()
 }
