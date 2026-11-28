@@ -328,7 +328,16 @@
           "commands": {}
         },
         "embed": {
-          "flags": [],
+          "flags": [
+            {
+              "flag": "--dimensions",
+              "takes": true
+            },
+            {
+              "flag": "--image",
+              "takes": true
+            }
+          ],
           "words": true,
           "commands": {}
         },

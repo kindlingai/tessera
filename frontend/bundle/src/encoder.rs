@@ -53,11 +53,28 @@ pub(crate) struct Embeds {
     pub open: fn(&Path, [u64; 2], bool, &Overrides) -> Result<Encoder>,
 }
 
+/// Vision tower graph, weights, and preprocessing bounds.
+pub struct Vision {
+    pub graph: Graph,
+    pub weights: Vec<Weight>,
+    pub pins: Pins,
+    pub pos_grid: usize,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub image_token: u32,
+    pub deepstack: usize,
+    pub max_merged: usize,
+}
+
 pub struct Encoder {
     pub graph: Graph,
     pub weights: Vec<Weight>,
     pub pins: Pins,
     pub tokenizer: Hf,
+    /// Present for multimodal packed causal embedders like Qwen3-VL.
+    pub vision: Option<Vision>,
+    /// Output embedding width when known statically.
+    pub hidden: usize,
 }
 
 /// The embedding model in `dir` at its own launch sizes.
@@ -89,6 +106,8 @@ pub fn encoder(
         weights,
         pins,
         tokenizer,
+        vision: None,
+        hidden: 0,
     })
 }
 

@@ -1,4 +1,7 @@
-use super::Embedder;
+use super::api::{EmbedOptions, finish_vec};
+use super::embed::{BatchWorker, Embedder, Limits};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use tessera_bundle::Overrides;
 use tessera_engine::{Pick, Settings};
 use tessera_testkit::cosine_f32;
@@ -35,4 +38,88 @@ fn eg2_cases() {
         // The golden test's floor for the exlr8 release.
         assert!(cos > 0.98, "{case:?}: cos {cos}");
     }
+}
+
+#[test]
+fn coalesces_concurrent_requests() {
+    let limits = Limits {
+        seqs: 4,
+        rows: 10,
+        merged: 2,
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let gate = Arc::new(Barrier::new(2));
+    let gate_w = gate.clone();
+    let batches = Arc::new(AtomicUsize::new(0));
+    let max_batch = Arc::new(AtomicUsize::new(0));
+    let batches_w = batches.clone();
+    let max_w = max_batch.clone();
+    let (worker, ()) = BatchWorker::<(u32, usize, usize, EmbedOptions), Vec<f32>>::spawn(
+        move || Ok((false, (), limits)),
+        move |blocked, batch| {
+            let n = batch.len();
+            let rows: usize = batch.iter().map(|x| x.1).sum();
+            let merged: usize = batch.iter().map(|x| x.2).sum();
+            assert!(n <= limits.seqs && rows <= limits.rows && merged <= limits.merged);
+            batches_w.fetch_add(1, Ordering::SeqCst);
+            max_w.fetch_max(n, Ordering::SeqCst);
+            if !*blocked {
+                *blocked = true;
+                let _ = entered_tx.send(());
+                gate_w.wait();
+            }
+            let mut out = Vec::with_capacity(n);
+            for &(id, _, _, opts) in batch {
+                let raw = vec![id as f32 + 1.0, 2.0, 3.0, 4.0];
+                out.push(finish_vec(raw, opts.dimensions, opts.normalize)?);
+            }
+            Ok(out)
+        },
+    )
+    .unwrap();
+    let worker = Arc::new(worker);
+    let first = {
+        let w = worker.clone();
+        std::thread::spawn(move || {
+            w.submit(1, 3, 0, (0, 3, 0, EmbedOptions::default()))
+                .unwrap()
+        })
+    };
+    entered_rx.recv().unwrap();
+    let mut handles = Vec::new();
+    for i in 1u32..8 {
+        let w = worker.clone();
+        let opts = EmbedOptions {
+            dimensions: if i.is_multiple_of(2) { Some(2) } else { None },
+            normalize: !i.is_multiple_of(3),
+        };
+        let merged = usize::from(i == 3 || i == 4 || i == 5);
+        handles.push(std::thread::spawn(move || {
+            (
+                i,
+                opts,
+                w.submit(1, 3, merged, (i, 3, merged, opts)).unwrap(),
+            )
+        }));
+    }
+    while worker.pending() < 7 {
+        std::thread::yield_now();
+    }
+    gate.wait();
+    assert_eq!(
+        first.join().unwrap(),
+        finish_vec(vec![1.0, 2.0, 3.0, 4.0], None, true).unwrap()
+    );
+    for h in handles {
+        let (i, opts, got) = h.join().unwrap();
+        let want = finish_vec(
+            vec![i as f32 + 1.0, 2.0, 3.0, 4.0],
+            opts.dimensions,
+            opts.normalize,
+        )
+        .unwrap();
+        assert_eq!(got, want);
+    }
+    assert!(batches.load(Ordering::SeqCst) <= 4);
+    assert_eq!(max_batch.load(Ordering::SeqCst), 3);
 }

@@ -182,7 +182,16 @@ fn wide(shape: &[usize]) -> Vec<usize> {
 
 /// Whether `slice` has the shape, any when unknown.
 fn shaped(want: Option<&Vec<usize>>, slice: &Slice) -> bool {
-    want.is_none_or(|w| wide(w) == wide(&slice.shape))
+    want.is_none_or(|w| {
+        if wide(w) == wide(&slice.shape) {
+            return true;
+        }
+        // Flat linear weights may come from multi-axis conv kernels.
+        w.len() == 2
+            && slice.shape.len() > 2
+            && w[0] == slice.shape[0]
+            && w[1] == slice.shape[1..].iter().product::<usize>()
+    })
 }
 
 /// The claim on a slice, by rows when stacked.

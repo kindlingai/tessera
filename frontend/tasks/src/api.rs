@@ -149,9 +149,103 @@ pub struct Embedded {
     pub tokens: usize,
 }
 
-/// Texts to unit vectors. Calls can block.
+/// One multimodal piece inside an embedding message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmbedPart {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+/// One message inside a multimodal embedding request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbedMessage {
+    pub role: String,
+    pub parts: Vec<EmbedPart>,
+}
+
+/// One item to embed: text, ids, or messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmbedInput {
+    Text(String),
+    Tokens(Vec<u32>),
+    Messages {
+        messages: Vec<EmbedMessage>,
+        add_generation_prompt: bool,
+    },
+}
+
+/// Options for one embedding request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedOptions {
+    pub dimensions: Option<usize>,
+    pub normalize: bool,
+}
+
+impl Default for EmbedOptions {
+    fn default() -> Self {
+        Self {
+            dimensions: None,
+            normalize: true,
+        }
+    }
+}
+
+/// Applies optional MRL truncation and FP32 L2 normalization.
+pub fn finish_vec(
+    mut v: Vec<f32>,
+    dimensions: Option<usize>,
+    normalize: bool,
+) -> Result<Vec<f32>, Error> {
+    if let Some(d) = dimensions {
+        if d == 0 || d > v.len() {
+            return Err(format!("dimensions {d} out of range 1..={}", v.len()).into());
+        }
+        v.truncate(d);
+    }
+    if normalize {
+        let mut sum = 0.0f32;
+        for &x in &v {
+            sum += x * x;
+        }
+        let norm = sum.sqrt().max(1e-12);
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    Ok(v)
+}
+
+/// Texts or multimodal items to vectors. Calls can block.
 pub trait Embed: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Embedded, Error>;
+
+    fn embed_inputs(
+        &self,
+        inputs: &[EmbedInput],
+        options: EmbedOptions,
+    ) -> Result<Embedded, Error> {
+        let mut texts = Vec::with_capacity(inputs.len());
+        for item in inputs {
+            match item {
+                EmbedInput::Text(s) => texts.push(s.clone()),
+                EmbedInput::Tokens(_) => {
+                    return Err("this embedder does not accept token ids".into());
+                }
+                EmbedInput::Messages { .. } => {
+                    return Err("this embedder does not accept multimodal messages".into());
+                }
+            }
+        }
+        let mut got = self.embed(&texts)?;
+        if options.dimensions.is_some() {
+            let mut vectors = Vec::with_capacity(got.vectors.len());
+            for v in got.vectors {
+                vectors.push(finish_vec(v, options.dimensions, options.normalize)?);
+            }
+            got.vectors = vectors;
+        }
+        Ok(got)
+    }
 }
 
 /// One picture as row-major RGBA bytes.

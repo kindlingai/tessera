@@ -28,16 +28,16 @@ mod wire;
 #[cfg(test)]
 mod wire_test;
 
-use http::{Request, Response};
+use http::{Body, Request, Response};
 pub use images::base64;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::RenderOptions;
 use tessera_engine::progress::{Event, Open, Unit};
 use tessera_engine::turns::Turns;
 pub use tessera_tasks::api::Model;
-use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
+use wire::{Detokenize, Messages, Refusal, Tokenize, bad, refuse};
 
 /// The model once it loads. Until then routes answer 503.
 pub type Slot = Arc<OnceLock<Model>>;
@@ -264,24 +264,90 @@ fn detokenize(slot: &Slot, body: &[u8]) -> Response {
     })
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EmbedVec {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Serialize)]
+struct EmbedRow {
+    object: &'static str,
+    index: usize,
+    embedding: EmbedVec,
+}
+
+#[derive(Serialize)]
+struct EmbedUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct EmbedBody<'a> {
+    object: &'static str,
+    data: Vec<EmbedRow>,
+    model: &'a str,
+    usage: EmbedUsage,
+}
+
 fn embeddings(slot: &Slot, body: &[u8]) -> Response {
-    reply(slot, |m| {
+    let built = with_model(slot, |m| {
         let embed = m
             .embed
             .as_ref()
             .ok_or_else(|| refuse(404, "the model does not embed text", None))?;
-        let e: Embeddings = wire::parse(m, body)?;
-        let texts = e.input.list();
-        let got = embed
-            .embed(&texts)
-            .map_err(|e| bad(e.to_string(), "input"))?;
+        let (inputs, options, as_base64) = wire::parse_embeddings(m, body)?;
+        let got = embed.embed_inputs(&inputs, options).map_err(|err| {
+            let msg = err.to_string();
+            let param = if msg.contains("dimensions") {
+                "dimensions"
+            } else {
+                "input"
+            };
+            bad(msg, param)
+        })?;
         let mut data = Vec::with_capacity(got.vectors.len());
-        for (index, v) in got.vectors.iter().enumerate() {
-            data.push(json!({"object": "embedding", "index": index, "embedding": v}));
+        for (index, v) in got.vectors.into_iter().enumerate() {
+            let embedding = if as_base64 {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for x in v {
+                    bytes.extend_from_slice(&x.to_le_bytes());
+                }
+                EmbedVec::Base64(base64(&bytes))
+            } else {
+                EmbedVec::Float(v)
+            };
+            data.push(EmbedRow {
+                object: "embedding",
+                index,
+                embedding,
+            });
         }
-        let usage = json!({"prompt_tokens": got.tokens, "total_tokens": got.tokens});
-        Ok(json!({"object": "list", "data": data, "model": m.info.name, "usage": usage}))
-    })
+        let reply = EmbedBody {
+            object: "list",
+            data,
+            model: &m.info.name,
+            usage: EmbedUsage {
+                prompt_tokens: got.tokens,
+                total_tokens: got.tokens,
+            },
+        };
+        let bytes = serde_json::to_vec(&reply)
+            .map_err(|err| refuse(500, format!("encode embeddings: {err}"), None))?;
+        Ok(Response {
+            status: 200,
+            body: Body::Full {
+                content_type: "application/json",
+                bytes,
+            },
+        })
+    });
+    match built {
+        Ok(resp) => resp,
+        Err(refused) => refused.into(),
+    }
 }
 
 tessera_engine::metric_registry!(API = "api");

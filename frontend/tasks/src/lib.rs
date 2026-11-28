@@ -35,6 +35,9 @@ mod task_test;
 mod text;
 #[cfg(test)]
 mod text_test;
+pub mod vision;
+#[cfg(test)]
+mod vision_test;
 pub mod worker;
 
 pub use embed::{Embedder, Threaded};
