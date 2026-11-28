@@ -157,16 +157,16 @@ fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
 }
 
 /// A stored `[b*r, c]` matrix as `[b, r, c]` blocks.
-pub(super) struct Blocks {
-    pub(super) leaf: T,
+pub struct Blocks {
+    pub leaf: T,
     /// Rows per block, the first row read, the row width.
-    pub(super) rows: usize,
-    pub(super) first: usize,
-    pub(super) width: usize,
-    pub(super) swapped: bool,
+    pub rows: usize,
+    pub first: usize,
+    pub width: usize,
+    pub swapped: bool,
 }
 
-pub(super) fn blocks(tree: &Tree, mut w: T) -> Option<Blocks> {
+pub fn blocks(tree: &Tree, mut w: T) -> Option<Blocks> {
     let term = |t: T| &tree.node(t).term;
     let swapped = matches!(term(w), Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]);
     if swapped {
@@ -239,14 +239,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(kernel, [x, b.leaf], kernel.len)])
 }
 
-tessera_lower::rule!("stacked", propose_all);
-
-mod metal;
-
-fn propose_all(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let mut drafts = propose(tree, at)?;
-    if let Some(d) = metal::draft(tree, at) {
-        drafts.push(d);
-    }
-    Some(drafts)
-}
+tessera_lower::rule!("stacked", propose);

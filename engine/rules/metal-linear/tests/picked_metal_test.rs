@@ -3,6 +3,7 @@
 // The other matmul rules come from here.
 use tessera_kernels as _;
 use tessera_linear as _;
+use tessera_metal_linear as _;
 
 use tessera_codegen::trellis::{INPUT_SIDE, alloc_mixed, packed};
 use tessera_gpukit::platform::{Asked, Platform};

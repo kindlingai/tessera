@@ -1,7 +1,7 @@
 //! Metal tile-streaming trellis matmul for decode and prefill.
 
-use crate::{Dense, launch_args};
 use tessera_graph::Order;
+use tessera_linear::{Dense, launch_args};
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Coded;

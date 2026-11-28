@@ -1,6 +1,7 @@
 //! Verifies native Metal simdgroup_matrix prefill matmul across supported forms.
 
 use tessera_linear as _;
+use tessera_metal_linear as _;
 
 use tessera_graph::DimName::{Hidden, Rows, Vocab};
 use tessera_graph::{DType, Dim, PathSeg, Port, Role, TensorType};

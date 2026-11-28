@@ -2,6 +2,7 @@
 
 use tessera_kernels as _;
 use tessera_linear as _;
+use tessera_metal_linear as _;
 
 use tessera_graph::Dim;
 use tessera_graph::DimName::Rows;

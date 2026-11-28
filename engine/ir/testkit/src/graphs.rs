@@ -104,12 +104,20 @@ fn rows_of(bounded: &[Dim], width: DimName, dtype: DType) -> Port {
     }
 }
 
+/// A graph's work on its input and the product.
+pub type Finish = fn(&tessera_trace::Tensor, tessera_trace::Tensor) -> tessera_trace::Tensor;
+
 /// `k` inputs to `n` outputs: every matmul.
 pub fn linear(bounded: &[Dim], k: u64, n: u64) -> Graph {
+    linear_then(bounded, [k, n], |_, product| product)
+}
+
+/// The same, with `finish` after the matmul.
+pub fn linear_then(bounded: &[Dim], [k, n]: [u64; 2], finish: Finish) -> Graph {
     let m = model(bounded, &[(Hidden, k), (Ffn, n)]);
     let w: Layer = declare(&m);
     let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
-    m.finish([(Role::Logits, &x.matmul(&w.w))])
+    m.finish([(Role::Logits, &finish(&x, x.matmul(&w.w)))])
 }
 
 /// A product through `act`, then times and plus `y`.
