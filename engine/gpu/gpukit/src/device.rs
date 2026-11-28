@@ -400,6 +400,9 @@ impl<D: Device> DeviceBuffer<D> {
     }
 
     fn host(&self) -> Option<NonNull<u8>> {
+        if self.ctx.capturing() {
+            return None;
+        }
         self.host.or_else(|| self.ctx.mapped(self.ptr, self.size))
     }
 

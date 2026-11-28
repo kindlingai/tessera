@@ -2,8 +2,9 @@
 
 use crate::Error;
 
-/// Command buffer teardown hook for safe drop cleanup.
+/// Command buffer lifecycle hooks for drop teardown.
 pub(crate) trait PendingCmd {
+    fn commit_open(&self);
     fn wait_done(&self);
 }
 
@@ -27,8 +28,8 @@ pub(crate) trait PendingOps {
 /// Launches encoded on one queue since the last `finish`.
 pub(crate) struct Pending<C: PendingCmd, E: PendingEnc, K = ()> {
     /// The context whose queue holds this batch.
-    pub(crate) owner: usize,
-    pub(crate) cmd: C,
+    pub(crate) owner: u64,
+    pub(crate) cmd: Option<C>,
     pub(crate) enc: Option<E>,
     pub(crate) concurrent: bool,
     /// True when `cmd` uses unretained references.
@@ -47,9 +48,16 @@ impl<C: PendingCmd, E: PendingEnc, K> Drop for Pending<C, E, K> {
         if let Some(enc) = self.enc.take() {
             enc.end_open();
         }
-        // Drain committed unretained chunks before `keep` drops.
-        if let Some(last) = self.flushed.last() {
-            last.wait_done();
+        // Submit any encoded tail so teardown finishes the batch.
+        if let Some(cmd) = self.cmd.take()
+            && self.dispatches > 0
+        {
+            cmd.commit_open();
+            self.flushed.push(cmd);
+        }
+        // Drain every committed chunk before `keep` drops.
+        for cmd in &self.flushed {
+            cmd.wait_done();
         }
     }
 }
@@ -57,7 +65,7 @@ impl<C: PendingCmd, E: PendingEnc, K> Drop for Pending<C, E, K> {
 impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
     /// Opens a fresh command buffer and encoder for `owner`.
     pub(crate) fn open<O: PendingOps<Cmd = C, Enc = E>>(
-        owner: usize,
+        owner: u64,
         want: bool,
         unretained: bool,
         ops: &mut O,
@@ -66,7 +74,7 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
         let enc = ops.open_enc(&cmd, want)?;
         Ok(Self {
             owner,
-            cmd,
+            cmd: Some(cmd),
             enc: Some(enc),
             concurrent: want,
             unretained,
@@ -77,27 +85,32 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
         })
     }
 
-    /// Commits the open command buffer and opens a fresh one.
+    /// Commits the open buffer before acquiring its replacement.
     pub(crate) fn rotate<O: PendingOps<Cmd = C, Enc = E>>(
         &mut self,
         want: bool,
         unretained: bool,
         ops: &mut O,
     ) -> Result<(), Error> {
-        // Open replacement first so failure preserves `self`.
-        let cmd = ops.new_cmd(unretained)?;
-        let enc = ops.open_enc(&cmd, want)?;
+        // Release the current queue slot before requesting another buffer.
         if let Some(old_enc) = self.enc.take() {
             ops.end_enc(old_enc);
         }
-        ops.commit(&self.cmd);
-        let prev = std::mem::replace(&mut self.cmd, cmd);
-        self.flushed.push(prev);
-        self.enc = Some(enc);
-        self.concurrent = want;
-        self.unretained = unretained;
+        if let Some(prev) = self.cmd.take()
+            && self.dispatches > 0
+        {
+            ops.commit(&prev);
+            self.flushed.push(prev);
+        }
         self.dirty = false;
         self.dispatches = 0;
+        self.concurrent = want;
+        self.unretained = unretained;
+        let cmd = ops.new_cmd(unretained)?;
+        self.cmd = Some(cmd);
+        let cmd = self.cmd.as_ref().expect("open command buffer");
+        let enc = ops.open_enc(cmd, want)?;
+        self.enc = Some(enc);
         Ok(())
     }
 
@@ -105,8 +118,14 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
     pub(crate) fn ensure_mode<O: PendingOps<Cmd = C, Enc = E>>(
         &mut self,
         want: bool,
+        unretained: bool,
         ops: &mut O,
     ) -> Result<E, Error> {
+        if self.cmd.is_none() {
+            let cmd = ops.new_cmd(unretained)?;
+            self.unretained = unretained;
+            self.cmd = Some(cmd);
+        }
         if self.concurrent == want
             && let Some(enc) = &self.enc
         {
@@ -116,7 +135,8 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
             ops.end_enc(old);
         }
         self.dirty = false;
-        let enc = ops.open_enc(&self.cmd, want)?;
+        let cmd = self.cmd.as_ref().expect("open command buffer");
+        let enc = ops.open_enc(cmd, want)?;
         self.concurrent = want;
         Ok(self.enc.insert(enc).clone())
     }
@@ -142,10 +162,13 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
                 last_end = last_end.max(end);
             }
         };
-        if self.dispatches > 0 || self.flushed.is_empty() {
-            ops.commit(&self.cmd);
-            fold(ops.wait(&self.cmd));
+        if let Some(cmd) = self.cmd.take()
+            && (self.dispatches > 0 || self.flushed.is_empty())
+        {
+            ops.commit(&cmd);
+            fold(ops.wait(&cmd));
         }
+        self.dispatches = 0;
         for prev in &self.flushed {
             fold(ops.wait(prev));
         }
@@ -171,7 +194,7 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
     /// Returns an open retained encoder for `owner` in `want` mode.
     pub(crate) fn acquire<O: PendingOps<Cmd = C, Enc = E>>(
         slot: &mut Option<Self>,
-        owner: usize,
+        owner: u64,
         want: bool,
         ops: &mut O,
     ) -> Result<E, Error> {
@@ -181,7 +204,7 @@ impl<C: PendingCmd, E: PendingEnc + Clone, K> Pending<C, E, K> {
                 return Ok(p.enc.as_ref().expect("opened encoder").clone());
             }
             Some(p) if p.owner == owner => {
-                return p.ensure_mode(want, ops);
+                return p.ensure_mode(want, false, ops);
             }
             // Another context's work ends before this one's starts.
             Some(_) => {

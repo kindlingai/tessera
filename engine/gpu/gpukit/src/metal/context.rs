@@ -24,7 +24,11 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+/// Monotonic context identifier that never recycles across drops.
+static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Queue command buffer capacity for chunked graph replays.
 const MAX_COMMAND_BUFFERS: usize = 256;
@@ -69,6 +73,10 @@ type CompEnc = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 type MetalPending = Pending<CmdBuf, CompEnc, Arc<GraphData>>;
 
 impl PendingCmd for CmdBuf {
+    fn commit_open(&self) {
+        autoreleasepool(|_| self.commit());
+    }
+
     fn wait_done(&self) {
         autoreleasepool(|_| self.waitUntilCompleted());
     }
@@ -147,6 +155,7 @@ impl Drop for CaptureGuard {
 }
 
 struct Inner {
+    id: u64,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Arc<Pipelines>,
@@ -215,6 +224,7 @@ impl Context {
             .or_else(|| device.newCommandQueue())
             .ok_or(Error::Gpu("failed to create Metal command queue"))?;
         Ok(Self(Arc::new(Inner {
+            id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             device,
             queue,
             pipelines: Pipelines::shared(),
@@ -333,8 +343,8 @@ kernel void p(device bfloat *a [[buffer(0)]]) {
         Ok(buffer)
     }
 
-    fn id(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
+    fn id(&self) -> u64 {
+        self.0.id
     }
 
     fn ops(&self) -> MetalOps<'_> {
@@ -435,8 +445,8 @@ kernel void p(device bfloat *a [[buffer(0)]]) {
                                 p.rotate(want, true, &mut ops)?;
                                 last_pipe = 0;
                                 chunk_limit = NEXT_CHUNK;
-                            } else if p.concurrent != want || p.enc.is_none() {
-                                let _ = p.ensure_mode(want, &mut ops)?;
+                            } else if p.cmd.is_none() || p.concurrent != want || p.enc.is_none() {
+                                let _ = p.ensure_mode(want, true, &mut ops)?;
                                 last_pipe = 0;
                             }
                             let enc = p.enc.as_ref().expect("opened encoder");
@@ -683,6 +693,7 @@ impl Device for Context {
 
     /// Commits this thread's command buffer. Returns its GPU seconds.
     fn finish(&self) -> Result<Option<f64>, Error> {
+        self.reject_capture("finish")?;
         let taken = PENDING.with(|p| {
             let mut p = p.borrow_mut();
             match &*p {

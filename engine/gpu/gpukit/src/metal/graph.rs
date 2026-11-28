@@ -41,7 +41,7 @@ pub(super) enum Op {
 
 /// Immutable recorded Metal launches shared with command buffers.
 pub(super) struct GraphData {
-    pub(super) owner: usize,
+    pub(super) owner: u64,
     pub(super) initial_concurrent: bool,
     pub(super) last_dispatch: Option<usize>,
     pub(super) ops: Vec<Op>,
@@ -65,7 +65,7 @@ pub(super) struct Recording {
 }
 
 impl Recording {
-    pub(super) fn new(owner: usize, initial_concurrent: bool) -> Self {
+    pub(super) fn new(owner: u64, initial_concurrent: bool) -> Self {
         Self {
             data: GraphData {
                 owner,
@@ -80,7 +80,7 @@ impl Recording {
         }
     }
 
-    pub(super) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> u64 {
         self.data.owner
     }
 

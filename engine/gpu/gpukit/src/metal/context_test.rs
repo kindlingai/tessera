@@ -137,22 +137,33 @@ fn graph_replay_chunked() {
         let want = init + steps as f32;
         assert_eq!(got, want, "round {round}: got {got}, want {want}");
     }
+    // Worker teardown without explicit finish still commits the tail.
+    ctx.upload(ptr, &0.0f32.to_le_bytes()).expect("reset");
+    let (w_ctx, w_graph) = (ctx.clone(), graph.clone());
+    std::thread::spawn(move || w_ctx.replay(&w_graph).expect("worker replay"))
+        .join()
+        .expect("worker join");
+    let mut raw = [0u8; 4];
+    ctx.download(ptr, &mut raw).expect("download after drop");
+    assert_eq!(f32::from_le_bytes(raw), steps as f32);
     ctx.free(ptr);
 }
 
 /// Capture guards, mode flips, and mixed replay paths work.
 #[test]
 fn graph_capture_guards() {
-    use crate::device::Device;
+    use crate::device::{Device, DeviceBuffer};
     use crate::launch::{KernelArgs, Launch};
+    use tessera_mem::Backing;
 
     let Ok(ctx) = Context::new() else {
         eprintln!("skip: no Metal device");
         return;
     };
-    let other = Context::new().expect("second context");
     let kernel = ctx.compile_kernel(CHAIN_SRC, "add_one").expect("compile");
     let ptr = ctx.alloc(16).expect("alloc");
+    let mut pinned = DeviceBuffer::pinned(&ctx, 16).expect("pin");
+    pinned.upload(0, &[7u8; 4]).expect("init pinned");
     let empty = ctx
         .capture(|| -> Result<(), crate::Error> { Ok(()) })
         .expect("empty");
@@ -166,12 +177,17 @@ fn graph_capture_guards() {
                     .is_err()
             );
             assert!(ctx.replay(&empty).is_err());
+            assert!(ctx.finish().is_err());
             assert!(ctx.upload(ptr, &[0u8; 4]).is_err());
             let mut raw = [0u8; 4];
             assert!(ctx.download(ptr, &mut raw).is_err());
             assert!(ctx.zero(ptr, 4).is_err());
             assert!(ctx.copy_d2d(ptr, ptr, 4).is_err());
             assert!(ctx.mapped(ptr, 4).is_none());
+            assert!(pinned.mapped().is_none());
+            assert!(pinned.mapped_mut().is_none());
+            assert!(pinned.upload(0, &[9u8; 4]).is_err());
+            assert!(pinned.download(0, &mut raw).is_err());
 
             ctx.set_concurrent(true);
             let mut a1 = KernelArgs::new();
@@ -187,7 +203,9 @@ fn graph_capture_guards() {
             Ok(())
         })
         .expect("capture g1");
-    assert!(other.replay(&g1).is_err());
+    let mut check = [0u8; 4];
+    pinned.download(0, &mut check).expect("read pinned");
+    assert_eq!(check, [7u8; 4]);
 
     // Mixed direct launch and back-to-back graph replays.
     ctx.upload(ptr, &10.0f32.to_le_bytes()).expect("upload");
@@ -205,4 +223,12 @@ fn graph_capture_guards() {
     ctx.download(ptr, &mut raw).expect("download");
     assert_eq!(f32::from_le_bytes(raw), 22.0);
     ctx.free(ptr);
+    drop(pinned);
+    drop(ctx);
+
+    // Dropped context IDs never match fresh contexts.
+    for _ in 0..8 {
+        let fresh = Context::new().expect("fresh context");
+        assert!(fresh.replay(&g1).is_err());
+    }
 }
