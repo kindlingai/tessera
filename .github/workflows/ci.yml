@@ -437,7 +437,8 @@ jobs:
 
   style:
     # Comment and prose rules (stickler style) on a PR's added lines. The job
-    # fails on any hit, and does nothing on pushes, so `success` can need it.
+    # fails on any hit, so `success` can need it. A push to main fills
+    # the spaCy cache, because a cache that a PR saves serves that PR alone.
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
@@ -445,28 +446,34 @@ jobs:
       actions: write
     env:
       PULL: ${{ github.event_name == 'pull_request' }}
+      FILL: ${{ github.event_name == 'push' }}
       BASE: ${{ github.event.pull_request.base.sha }}
       HEAD: ${{ github.event.pull_request.head.sha }}
       STYLE: tools/scripts/stickler.sh style
     steps:
-      - if: env.PULL == 'true'
+      - if: env.PULL == 'true' || env.FILL == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.HEAD }}
-          fetch-depth: 0
+          ref: ${{ env.HEAD || github.sha }}
+          fetch-depth: ${{ env.PULL == 'true' && '0' || '1' }}
       # The pipeline revision lives in stickler, so its version keys the cache.
-      - if: env.PULL == 'true'
+      - if: env.PULL == 'true' || env.FILL == 'true'
         id: pin
         run: echo "stickler=$(sed -n 's/^stickler\.version = "\(.*\)"$/\1/p' lint.toml)" >> "$GITHUB_OUTPUT"
-      - if: env.PULL == 'true'
+      - if: env.PULL == 'true' || env.FILL == 'true'
         id: spacy
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/spacy
           key: spacy-stickler-${{ steps.pin.outputs.stickler }}
-      - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
+          lookup-only: ${{ env.FILL == 'true' }}
+      # A failed fill on main leaves the next push to try again.
+      - if: (env.PULL == 'true' || env.FILL == 'true') && steps.spacy.outputs.cache-hit != 'true'
+        id: fetch
+        continue-on-error: ${{ env.FILL == 'true' }}
         run: $STYLE fetch "$RUNNER_TEMP/spacy"
-      - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
+      - if: env.FILL == 'true' && steps.fetch.outcome == 'success'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/spacy
