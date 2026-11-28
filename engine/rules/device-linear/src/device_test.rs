@@ -1,12 +1,22 @@
 use crate::mm::{propose_mm, propose_mm_mx8};
 use crate::{cuda_source, hip_source, prefill_source, trellis_source};
+use tessera_gpukit::backend::{Backend, picked};
 use tessera_graph::DimName::Rows;
-use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
+use tessera_graph::{
+    Act, DType, Dim, F16, Graph, Node, NodeId, Op, PathSeg, Port, Role, Row, Stage, TensorType,
+};
+use tessera_interp::{Tensor, run};
 use tessera_kernels as _;
 use tessera_linear as _;
 use tessera_lower::form::{BF16_FORM, named};
-use tessera_lower::{Device, Knobs, Limits, Pins, Platform, Source, Tree, Wants, explain, lower};
-use tessera_testkit::graphs::linear;
+use tessera_lower::{
+    Device, Knobs, Limits, Pins, Platform, Source, Tree, Wants, Weight, explain, lower,
+};
+use tessera_mem::trellis;
+use tessera_run::open;
+use tessera_run::testing::runs;
+use tessera_testkit::graphs::{linear, turned};
+use tessera_testkit::{Noise, cosine_f32};
 
 fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static str, usize)> {
     mm_shaped(g, rows, form, Knobs::default())
@@ -59,7 +69,7 @@ fn mm_shaped(
     Some((name, entry, reads))
 }
 
-fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId {
+pub(super) fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId {
     let id = NodeId(g.nodes.len() as u32);
     g.nodes.push(Node {
         op,
@@ -70,7 +80,7 @@ fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId
     id
 }
 
-fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType>) -> Graph {
+pub(super) fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType>) -> Graph {
     let mat = g.entries[0].outputs[0].node;
     let ty = g.nodes[mat.0 as usize].ty.clone();
     let mut args = vec![mat];
@@ -115,10 +125,14 @@ fn linear_mm_entries() {
     }
     for entry in [
         "dtr_prep(",
-        "dtr_pre_k4_t8(",
-        "dtr_pre_k4_t16(",
-        "dtr_pre_gen8(",
-        "dtr_pre_gen16(",
+        "DTR_PRE_DEF(dtr_pre_k4_t8,",
+        "DTR_PRE_DEF(dtr_pre_k4_t8s,",
+        "DTR_PRE_DEF(dtr_pre_k4_t16,",
+        "DTR_PGEN_DEF(dtr_pre_gen8,",
+        "DTR_PGEN_DEF(dtr_pre_gen16,",
+        "dtr_reduce_epi(",
+        "tessera_mm_bf64(",
+        "tessera_mm_bf64_sk(",
         "tessera_mm_mxfp8_prep(",
         "tessera_mm_mxfp8_mx8(",
         "tessera_mm_mxfp8_mx8_sk(",
@@ -126,12 +140,16 @@ fn linear_mm_entries() {
         assert!(prefill_source().contains(entry), "missing {entry}");
     }
     for entry in [
+        "DTR_DEF(dtr_k4_t4s,",
         "DTR_DEF(dtr_k4_t4,",
         "DTR_GEN_DEF(dtr_gen4,",
         "dtr_reduce(",
         "ptr_gen(",
     ] {
         assert!(trellis_source().contains(entry), "missing {entry}");
+    }
+    for entry in ["I4_PAIR(r16,", "I4_PAIR(r64,"] {
+        assert!(crate::int4_source().contains(entry), "missing {entry}");
     }
 }
 
@@ -195,11 +213,53 @@ fn fast_mm_selection() {
             Some((kind, entry, 2))
         );
     }
+    // Tall BF16, unaligned K=4304 ViT MLP, and INT4_G32 shapes.
+    for &(k, n, m, form, name, entry) in &[
+        (
+            4304u64,
+            1152u64,
+            16u64,
+            "bf16",
+            "fast_mm_bf16_sk",
+            "tessera_mm_bf64_sk",
+        ),
+        (4304, 1152, 1024, "bf16", "fast_mm_bf16", "tessera_mm_bf64"),
+        (1152, 4304, 1024, "bf16", "fast_mm_bf16", "tessera_mm_bf64"),
+        (
+            6144,
+            2048,
+            64,
+            "int4_g32",
+            "fast_mm_int4_sk",
+            "tessera_mm_int4_r64_sk",
+        ),
+        (
+            6144,
+            2048,
+            1024,
+            "int4_g32",
+            "fast_mm_int4",
+            "tessera_mm_int4_r64",
+        ),
+        (
+            4096,
+            12288,
+            64,
+            "int4_g32",
+            "fast_mm_int4",
+            "tessera_mm_int4_r64",
+        ),
+    ] {
+        assert_eq!(
+            mm_entry(&linear(&rows, k, n), m, form),
+            Some((name, entry, 2))
+        );
+    }
     // One row and unaligned K decline. Tall M is accepted.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
     assert!(mm_entry(&linear(&rows, 6144, 576), 4096, "mxfp8").is_some());
     assert_eq!(mm_entry(&linear(&rows, 256, 64), 8, "mxfp8"), None);
-    // Fused epilogues: residual, bias, SwiGLU, mul, silu.
+    // Fused epilogues: residual, bias, SwiGLU, mul, silu, gelu.
     let base = linear(&rows, 4096, 12288);
     let out_ty = base.nodes[base.entries[0].outputs[0].node.0 as usize]
         .ty
@@ -207,12 +267,16 @@ fn fast_mm_selection() {
     let bias_ty = TensorType::new(vec![out_ty.shape.0[1].clone()], DType::F32);
     let add_res = with_stage(base.clone(), Stage::Add, Some(out_ty.clone()));
     let add_bias = with_stage(base.clone(), Stage::Add, Some(bias_ty));
+    let gelu_tanh = with_stage(add_bias.clone(), Stage::Act(Act::GeluTanh), None);
+    let gelu_exact = with_stage(add_bias.clone(), Stage::Act(Act::Gelu), None);
     let silu_only = with_stage(base.clone(), Stage::Act(Act::Silu), None);
     let swiglu = with_stage(silu_only.clone(), Stage::Mul, Some(out_ty.clone()));
     let mul_only = with_stage(base, Stage::Mul, Some(out_ty));
     for (g, reads) in [
         (add_res, 3),
         (add_bias, 3),
+        (gelu_tanh, 3),
+        (gelu_exact, 3),
         (swiglu, 3),
         (mul_only, 3),
         (silu_only, 2),
@@ -231,7 +295,7 @@ fn fast_mm_selection() {
 /// Fast-path diagnostics report rule and hardware rejections accurately.
 #[test]
 fn lowering_report_diagnostics() {
-    let rows = [Dim::bounded(Rows, 1 << 21)];
+    let rows = [Dim::bounded(Rows, 1 << 23)];
     let cuda = Platform {
         backend: "cuda".into(),
         ..Platform::host(Limits::assumed())
@@ -273,7 +337,7 @@ fn lowering_report_diagnostics() {
     // 4096 rows stay fast. The launch grid bounds fast_mm.
     let r = explain(&g_ok, 0, &[(Rows, 4096)], &dev).unwrap();
     assert!(!r.has_fallbacks(), "{}", r.format(10));
-    let msg = explain(&g_ok, 0, &[(Rows, 1 << 20)], &dev)
+    let msg = explain(&g_ok, 0, &[(Rows, 1 << 22)], &dev)
         .unwrap()
         .format(9);
     assert!(msg.contains("grid height 65536 exceeds 65535"), "{msg}");
@@ -536,6 +600,280 @@ fn bf16_inputs_skip_widen() {
         assert!(
             has_x && has_y,
             "{w_form} rows={rows}: missing X/Y_BF16 in {names:?}"
+        );
+    }
+}
+
+#[test]
+fn cuda_trellis_selection() {
+    let rows = [Dim::bounded(Rows, 2048)];
+    let cuda = Platform {
+        backend: "cuda".into(),
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        units: 48,
+        bandwidth: 273e9,
+        ..Platform::host(Limits {
+            group_bytes: 48 * 1024,
+            dynamic_group_bytes: 99 * 1024,
+            ..Limits::assumed()
+        })
+    };
+    let form = named("trellis_k4").unwrap();
+    let dev = Device::default()
+        .on(cuda.clone())
+        .pinned(Pins::default().pin("w", form));
+    let g = turned(&rows);
+    let step_names = |g: &Graph, m: u64, d: &Device| -> Vec<&'static str> {
+        lower(g, 0, &[(Rows, m)], d)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|s| s.kernel.name())
+            .collect()
+    };
+    assert_eq!(
+        step_names(&g, 24, &dev),
+        ["trellis_turned_trellis_k4", "trellis_reduce"]
+    );
+    assert_eq!(
+        step_names(&g, 64, &dev),
+        ["trellis_prep_f16", "trellis_turned_f16_trellis_k4"]
+    );
+    // Split-K prefill on k=2048, n=2048 at m=52/64 plus fused GeluTanh.
+    let tr_rot = named("trellis_k4_rot").unwrap();
+    let dev_rot = Device::default().on(cuda).pinned(Pins::all(tr_rot));
+    let g2k = linear(&rows, 2048, 2048);
+    assert_eq!(
+        step_names(&g2k, 52, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+    assert_eq!(
+        step_names(&with_mode(g2k, 6), 64, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+    let g4k = linear(&rows, 4096, 4096);
+    assert_eq!(
+        step_names(&with_mode(g4k, 8), 65, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+}
+
+fn with_bias_weight(mut g: Graph, bias_ty: TensorType) -> Graph {
+    let mat = g.entries[0].outputs[0].node;
+    let ty = g.nodes[mat.0 as usize].ty.clone();
+    let idx = g.weights.len() as u32;
+    g.weights.push(tessera_graph::Weight {
+        path: vec![PathSeg::Field("bias".into())],
+        ty: bias_ty.clone(),
+    });
+    let bias = push_node(&mut g, Op::Weight(idx), Vec::new(), bias_ty);
+    let out = push_node(&mut g, Op::Row(Row(vec![Stage::Add])), vec![mat, bias], ty);
+    g.entries[0].outputs[0].node = out;
+    g
+}
+
+fn with_mode(base: Graph, mode: u8) -> Graph {
+    let out_ty = base.nodes[base.entries[0].outputs[0].node.0 as usize]
+        .ty
+        .clone();
+    let bias_ty = TensorType::new(vec![out_ty.shape.0[1].clone()], DType::F32);
+    let add_bias = |g: Graph| {
+        if (mode & 16) != 0 {
+            with_bias_weight(g, bias_ty.clone())
+        } else {
+            with_stage(g, Stage::Add, Some(bias_ty.clone()))
+        }
+    };
+    match mode & 15 {
+        1 => with_stage(base, Stage::Add, Some(out_ty)),
+        2 => add_bias(base),
+        3 => with_stage(
+            with_stage(base, Stage::Act(Act::Silu), None),
+            Stage::Mul,
+            Some(out_ty),
+        ),
+        6 => with_stage(add_bias(base), Stage::Act(Act::GeluTanh), None),
+        7 => with_stage(add_bias(base), Stage::Act(Act::Gelu), None),
+        8 => with_stage(add_bias(base), Stage::Add, Some(out_ty)),
+        _ => base,
+    }
+}
+
+fn extra_inputs(mode: u8, m: usize, n: usize, rng: &mut Noise) -> (Vec<Tensor>, Option<Vec<f32>>) {
+    let mut bias_w = None;
+    let mut ins = Vec::new();
+    if matches!(mode & 15, 2 | 6 | 7 | 8) {
+        let vals: Vec<f32> = (0..n).map(|_| rng.draw() * 0.25).collect();
+        if (mode & 16) != 0 {
+            bias_w = Some(BF16_FORM.roundtrip(&vals));
+        } else {
+            ins.push(Tensor::f32(vec![n], vals));
+        }
+    }
+    if matches!(mode & 15, 1 | 3 | 8) {
+        ins.push(Tensor::f32(
+            vec![m, n],
+            (0..m * n).map(|_| rng.draw() * 0.5).collect(),
+        ));
+    }
+    (ins, bias_w)
+}
+
+#[test]
+fn cuda_gpu_parity() {
+    if picked() != Some(Backend::Cuda) {
+        return;
+    }
+    let Some(settings) = runs().into_iter().find(|s| s.gpu() == Some(Backend::Cuda)) else {
+        return;
+    };
+    let rows = [Dim::bounded(Rows, 2048)];
+    let probe = lower(
+        &linear(&rows, 64, 64),
+        0,
+        &[(Rows, 1)],
+        &Device::guess(&settings),
+    )
+    .unwrap();
+    let platform = open(probe, &settings).unwrap().platform();
+    let mut rng = Noise(0xC0DA_4304);
+
+    // Verify bf16 (bf64/bf128) and int4_g32 with epilogues.
+    let dense_cases: &[(&str, u64, u64, u64, u8)] = &[
+        ("bf16", 4304, 1152, 16, 2 | 16),
+        ("bf16", 1536, 1024, 16, 8 | 16),
+        ("bf16", 4304, 1152, 64, 0),
+        ("bf16", 1152, 4304, 40, 6 | 16),
+        ("bf16", 1152, 4304, 64, 7),
+        ("bf16", 1152, 4304, 192, 6 | 16),
+        ("bf16", 4304, 1152, 512, 8 | 16),
+        ("int4_g32", 1024, 512, 16, 0),
+        ("int4_g32", 2048, 1024, 64, 1),
+        ("int4_g32", 1024, 1024, 40, 3),
+        ("int4_g32", 1024, 2048, 256, 8 | 16),
+    ];
+    for &(fname, k, n, m, mode) in dense_cases {
+        let form = named(fname).unwrap();
+        let g = with_mode(linear(&rows, k, n), mode);
+        let mut pins = Pins::all(form);
+        if (mode & 16) != 0 {
+            pins = pins.pin("bias", BF16_FORM);
+        }
+        let dev = Device::default().on(platform.clone()).pinned(pins);
+        let plan = lower(&g, 0, &[(Rows, m)], &dev).unwrap();
+        assert!(
+            plan.steps.iter().all(|s| s.kernel.name() != "map"),
+            "{fname} {m}x{n}x{k} mode={mode}: unfused map in {:?}",
+            plan.steps
+                .iter()
+                .map(|s| s.kernel.name())
+                .collect::<Vec<_>>()
+        );
+        if fname == "bf16" && m >= 192 {
+            assert_eq!(plan.steps.len(), 1);
+            let Source::Fixed { entry, .. } = plan.steps[0].kernel.source() else {
+                panic!("fixed source");
+            };
+            assert_eq!(entry, "tessera_mm_bf128");
+        }
+        let x = Tensor::f32(
+            vec![m as usize, k as usize],
+            (0..m as usize * k as usize)
+                .map(|_| rng.draw() * 0.5)
+                .collect(),
+        );
+        let (extra, bias_w) = extra_inputs(mode, m as usize, n as usize, &mut rng);
+        let mut ins = vec![x];
+        ins.extend(extra);
+        let raw: Vec<f32> = (0..(n * k) as usize).map(|_| rng.draw() * 0.5).collect();
+        let w = Tensor::f32(vec![n as usize, k as usize], form.roundtrip(&raw));
+        let mut ws = vec![w.clone()];
+        if let Some(bv) = &bias_w {
+            ws.push(Tensor::f32(vec![n as usize], bv.clone()));
+        }
+        let want = run(&g, &ws, 0, &ins).unwrap();
+        let mut runner = open(plan, &settings).unwrap();
+        runner.load(0, w.view()).unwrap();
+        if let Some(bv) = &bias_w {
+            runner
+                .load_weight(1, &Weight::Packed(BF16_FORM, BF16_FORM.pack(bv)))
+                .unwrap();
+        }
+        let views: Vec<_> = ins.iter().map(Tensor::view).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(cos >= 0.99999, "{fname} {m}x{n}x{k} mode={mode}: cos={cos}");
+    }
+
+    // Verify rotated Trellis K4 across split-K, prefill, and epilogues.
+    let tr_form = named("trellis_k4_rot").unwrap();
+    for &(k, n, m, side, mode) in &[
+        (1024usize, 512usize, 24u64, 0u32, 0u8),
+        (1024, 512, 52, 0, 0),
+        (1024, 512, 64, 0, 6 | 16),
+        (1024, 512, 64, 2, 7),
+        (1024, 2048, 65, 0, 8 | 16),
+        (1024, 4096, 65, 2, 6 | 16),
+        (512, 2048, 128, 0, 8 | 16),
+        (512, 512, 128, 0, 3),
+        (256, 4096, 384, 0, 1),
+    ] {
+        let g = with_mode(linear(&rows, k as u64, n as u64), mode);
+        let entries: Vec<u8> = (0..n * k / 2).map(|_| (rng.word() & 0xFF) as u8).collect();
+        let mut bytes = trellis::packed(k, n, side, &entries);
+        let scales = (0..k + n).flat_map(|i| F16::from(1.0 + (i % 7) as f32 / 8.0).0.to_le_bytes());
+        bytes.extend(scales);
+        let w = Tensor::f32(vec![n, k], tr_form.unpack_all(&bytes));
+        let x = Tensor::f32(
+            vec![m as usize, k],
+            (0..m as usize * k).map(|_| rng.draw() * 0.5).collect(),
+        );
+        let (extra, bias_w) = extra_inputs(mode, m as usize, n, &mut rng);
+        let mut ins = vec![x];
+        ins.extend(extra);
+        let mut ws = vec![w];
+        if let Some(bv) = &bias_w {
+            ws.push(Tensor::f32(vec![n], bv.clone()));
+        }
+        let want = run(&g, &ws, 0, &ins).unwrap();
+        let mut pins = Pins::all(tr_form);
+        if (mode & 16) != 0 {
+            pins = pins.pin("bias", BF16_FORM);
+        }
+        let dev = Device::default().on(platform.clone()).pinned(pins);
+        let plan = lower(&g, 0, &[(Rows, m)], &dev).unwrap();
+        assert!(
+            plan.steps.iter().all(|s| s.kernel.name() != "map"),
+            "trellis_k4 {m}x{n}x{k} mode={mode}: unfused map"
+        );
+        let mut runner = open(plan, &settings).unwrap();
+        runner
+            .load_weight(0, &Weight::Packed(tr_form, bytes))
+            .unwrap();
+        if let Some(bv) = &bias_w {
+            runner
+                .load_weight(1, &Weight::Packed(BF16_FORM, BF16_FORM.pack(bv)))
+                .unwrap();
+        }
+        let views: Vec<_> = ins.iter().map(Tensor::view).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(
+            cos >= 0.99999,
+            "trellis_k4_rot {m}x{n}x{k} side={side} mode={mode}: cos={cos}"
         );
     }
 }

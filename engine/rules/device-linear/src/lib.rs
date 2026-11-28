@@ -1,5 +1,8 @@
 //! Device-accelerated trellis MMA, streaming decode GEMV, and small-batch matmul rules.
 
+mod cuda_fuse;
+#[cfg(test)]
+mod cuda_fuse_test;
 #[cfg(test)]
 mod device_test;
 mod gemv;
@@ -14,11 +17,9 @@ use gemv::{propose_gemv, why_gemv};
 use stacked::check_stacked;
 pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
 use tessera_graph::Order;
-use tessera_linear::{Dense, launch_args};
+use tessera_linear::launch_args;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Tree};
 
 const KERNEL: &str = include_str!("linear.cu");
 const TRELLIS: &str = include_str!("trellis.cu");
@@ -30,7 +31,6 @@ const WIDE_THREADS: usize = 128;
 const THREADS: usize = 256;
 const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
-const DTR_PRE_SMEM: usize = 40_960;
 
 macro_rules! cuda_module {
     ($vis:vis $src:ident, $with_vis:vis $with:ident, $name:literal, $text:expr) => {
@@ -86,45 +86,21 @@ macro_rules! dtr_knobs {
 dtr_knobs!("trellis_mma");
 dtr_knobs!("trellis_turned");
 
-fn dtr_ks(m: usize, n: usize, k: usize, tree: &Tree, rule: &str) -> usize {
-    let ibs = k / BLOCK;
-    if let Some(want) = tree.knobs.get(rule, "splits") {
-        let cap = ibs.clamp(1, 16);
-        let w = want.clamp(1, cap);
-        for d in w..=cap {
-            if ibs.is_multiple_of(d) {
-                return d;
-            }
-        }
-        for d in (1..w).rev() {
-            if ibs.is_multiple_of(d) {
-                return d;
-            }
-        }
-        return 1;
+/// The knob rule for a dense trellis matmul.
+pub(crate) fn dtr_rule(turned: bool) -> &'static str {
+    if turned {
+        "trellis_turned"
+    } else {
+        "trellis_mma"
     }
-    let split_max_rows = tree.knobs.get(rule, "split_max_rows").unwrap_or(16);
-    if m > split_max_rows || ibs <= 1 {
-        return 1;
-    }
-    let small = tree.knobs.get(rule, "target_small").unwrap_or(288);
-    let large = tree.knobs.get(rule, "target_large").unwrap_or(128);
-    let target = if m <= 2 { small } else { large };
-    let want = target.div_ceil(n / BLOCK).clamp(1, 16).min(ibs);
-    for d in want..=ibs.min(16) {
-        if ibs.is_multiple_of(d) {
-            return d;
-        }
-    }
-    for d in (1..want).rev() {
-        if ibs.is_multiple_of(d) {
-            return d;
-        }
-    }
-    1
 }
 
-fn dtr_tile(m: usize) -> usize {
+/// A trellis knob that lowers to a `u32` launch bound.
+pub(crate) fn dtr_blocks(tree: &Tree, turned: bool, knob: &str) -> Option<u32> {
+    tree.knobs.get(dtr_rule(turned), knob).map(|v| v as u32)
+}
+
+pub(crate) fn dtr_tile(m: usize) -> usize {
     if m <= 8 {
         8
     } else if m <= 16 {
@@ -142,6 +118,7 @@ fn dtr_entry(t: &TrellisMma) -> &'static str {
         (8, 4, 0, false, false) => "dtr_k4_p1",
         (16, 4, 0, true, true) => "dtr_k4_t2s",
         (16, 4, 0, true, false) => "dtr_k4_t2",
+        (32, 4, 0, true, true) => "dtr_k4_t4s",
         (32, 4, 0, true, false) => "dtr_k4_t4",
         (8, _, _, _, _) => "dtr_gen1",
         (16, _, _, _, _) => "dtr_gen2",
@@ -154,7 +131,7 @@ fn dtr_source(t: &TrellisMma) -> Source {
     let def = match entry {
         "dtr_k4_t1s" | "dtr_k4_t1" | "dtr_k4_p1s" | "dtr_k4_p1" => "DTR_T1_BLK",
         "dtr_k4_t2s" | "dtr_k4_t2" => "DTR_T2_BLK",
-        "dtr_k4_t4" => "DTR_T4_BLK",
+        "dtr_k4_t4s" | "dtr_k4_t4" => "DTR_T4_BLK",
         _ => "DTR_GEN_BLK",
     };
     trellis_source_with(
@@ -168,62 +145,90 @@ fn dtr_source(t: &TrellisMma) -> Source {
     )
 }
 
-fn dtr_needs(bytes: usize) -> Needs {
+pub(crate) fn dtr_needs(bytes: usize) -> Needs {
     Needs {
         bf16_tile: true,
         ..cuda_needs(bytes)
     }
 }
 
-macro_rules! dtr_mma_kernel {
+/// Defines that trim the prefill module for one entry.
+pub(crate) fn prefill_defs(entry: &str, mx8: bool) -> Vec<(&'static str, usize)> {
+    let mut defs = Vec::new();
+    if entry.starts_with("tessera_mm_mxfp8_") {
+        defs.push(("PRE_ONLY_MX8", 1));
+    } else if entry.starts_with("tessera_mm_") {
+        defs.push(("PRE_ONLY_MM", 1));
+    } else {
+        if !mx8 {
+            defs.push(("DTR_FORCE_FP16", 1));
+        }
+        if !entry.starts_with("dtr_pre_gen") {
+            defs.push(("PRE_ONLY_DTR_K4", 1));
+        }
+    }
+    defs
+}
+
+fn trellis_mma_name(t: &TrellisMma) -> &'static str {
+    t.form.suffixed(if t.turned {
+        "trellis_turned"
+    } else {
+        "trellis_mma"
+    })
+}
+
+fn mma_needs(_: &TrellisMma) -> Needs {
+    dtr_needs(DTR_SMEM)
+}
+
+macro_rules! define_trellis_kernel {
     (
         $(#[$meta:meta])*
-        struct $name:ident,
-        accepts = $accepts:ident,
-        emits = $emits:ident,
-        smem = $smem:expr,
-        source = $source:ident,
-        launches = $launches:ident,
-        load = $load:ident,
-        suffix = $suffix:literal
-        $(, extra: $extra:ident : $extra_ty:ty)?
+        struct $name:ident {
+            name: $kname:ident,
+            accepts: $accepts:ident,
+            emits: $emits:ident,
+            needs: $needs:ident,
+            source: $source:ident,
+            launches: $launches:ident,
+            load: $load:ident,
+            extra: { $($field:ident : $fty:ty,)* }
+        }
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, Kernel)]
         #[launch(
-            name = self.form.suffixed(if self.turned {
-                concat!("trellis_turned", $suffix)
-            } else {
-                concat!("trellis_mma", $suffix)
-            }),
+            name = $kname(self),
             sizes = [self.m, self.n, self.k],
             work = self.m * self.n * self.k,
-            accepts = $accepts, emits = $emits,
-            needs = dtr_needs($smem), order = Order::PerConfig,
-            source = $source(self), launches = $launches, load = $load,
+            accepts = $accepts,
+            emits = $emits,
+            needs = $needs(self),
+            order = Order::PerConfig,
+            source = $source(self),
+            launches = $launches,
+            load = $load,
             load_key = tessera_lower::load_key((
-                self.m, self.n, self.k, $(self.$extra,)? self.tile, self.min_blocks,
-                self.bits, self.book, self.turned, self.form.name(), self.x_bf16, self.y_bf16,
+                (self.m, self.n, self.k, self.ks, self.tile, self.min_blocks),
+                (self.bits, self.book, self.turned, self.form.name(), self.y_bf16),
+                ($(self.$field,)*),
             )),
             unproven,
         )]
-        struct $name {
-            m: usize,
-            n: usize,
-            k: usize,
-            $($extra: $extra_ty,)?
-            tile: usize,
-            min_blocks: Option<u32>,
-            bits: u32,
-            book: u32,
-            turned: bool,
-            x_bf16: bool,
-            y_bf16: bool,
-            form: &'static dyn Stored,
-        }
-
-        fn $accepts(k: &$name, input: usize, form: &dyn Stored) -> bool {
-            weight_x_accepts(input, k.x_bf16, k.form, form)
+        pub(crate) struct $name {
+            pub(crate) m: usize,
+            pub(crate) n: usize,
+            pub(crate) k: usize,
+            pub(crate) ks: usize,
+            pub(crate) tile: usize,
+            pub(crate) min_blocks: Option<u32>,
+            pub(crate) bits: u32,
+            pub(crate) book: u32,
+            pub(crate) turned: bool,
+            pub(crate) y_bf16: bool,
+            pub(crate) form: &'static dyn Stored,
+            $(pub(crate) $field: $fty,)*
         }
 
         fn $emits(k: &$name, form: &dyn Stored) -> bool {
@@ -232,17 +237,24 @@ macro_rules! dtr_mma_kernel {
     };
 }
 
-dtr_mma_kernel! {
+define_trellis_kernel! {
     /// Dense trellis matmul with warp-per-tile MMA and split-K.
-    struct TrellisMma,
-    accepts = mma_accepts,
-    emits = mma_emits,
-    smem = DTR_SMEM,
-    source = dtr_source,
-    launches = mma_launches,
-    load = mma_load,
-    suffix = "",
-    extra: ks: usize
+    struct TrellisMma {
+        name: trellis_mma_name,
+        accepts: mma_accepts,
+        emits: mma_emits,
+        needs: mma_needs,
+        source: dtr_source,
+        launches: mma_launches,
+        load: mma_load,
+        extra: {
+            x_bf16: bool,
+        }
+    }
+}
+
+fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
+    weight_x_accepts(input, k.x_bf16, k.form, form)
 }
 
 fn trellis_mma_load(
@@ -268,20 +280,22 @@ fn trellis_mma_load(
     })
 }
 
+fn elem(bf16: bool) -> usize {
+    if bf16 { 2 } else { 4 }
+}
+
 fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
     let scales: &[usize] = match (t.turned, t.ks) {
         (true, 1) => &[t.k, t.n],
         (true, _) => &[t.k],
         (false, _) => &[],
     };
-    let x_elem = if t.x_bf16 { 2 } else { 4 };
-    let y_elem = if t.y_bf16 { 2 } else { 4 };
     trellis_mma_load(
         t.form,
         [t.m, t.n, t.k, t.ks],
         t.tile,
-        x_elem,
-        y_elem,
+        elem(t.x_bf16),
+        elem(t.y_bf16),
         scales,
     )
 }
@@ -323,13 +337,13 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     )),
     unproven,
 )]
-struct TrellisReduce {
-    m: usize,
-    n: usize,
-    ks: usize,
-    min_blocks: Option<u32>,
-    turned: bool,
-    y_bf16: bool,
+pub(crate) struct TrellisReduce {
+    pub(crate) m: usize,
+    pub(crate) n: usize,
+    pub(crate) ks: usize,
+    pub(crate) min_blocks: Option<u32>,
+    pub(crate) turned: bool,
+    pub(crate) y_bf16: bool,
 }
 
 fn reduce_accepts(_: &TrellisReduce, _: usize, form: &dyn Stored) -> bool {
@@ -340,23 +354,24 @@ fn reduce_emits(r: &TrellisReduce, form: &dyn Stored) -> bool {
     x_accepts(r.y_bf16, form)
 }
 
-fn reduce_load(r: &TrellisReduce, _: usize) -> Option<Load> {
-    let partials = (4 * r.ks * r.m * r.n) as f64;
-    let reads = if r.turned {
-        vec![partials, (4 * r.n) as f64]
-    } else {
-        vec![partials]
-    };
-    let written = (if r.y_bf16 { 2 } else { 4 } * r.m * r.n) as f64;
+pub(crate) fn reduce_load_for([m, n, ks]: [usize; 3], turned: bool, y_bf16: bool) -> Option<Load> {
+    let mut reads = vec![(4 * ks * m * n) as f64];
+    if turned {
+        reads.push((4 * n) as f64);
+    }
     Some(Load {
-        threads: (r.n / BLOCK) * THREADS,
+        threads: (n / BLOCK) * THREADS,
         group: THREADS,
-        trips: r.ks as f64,
+        trips: ks as f64,
         reads,
-        written,
+        written: (elem(y_bf16) * m * n) as f64,
         flight: 512.0,
         ..Load::default()
     })
+}
+
+fn reduce_load(r: &TrellisReduce, _: usize) -> Option<Load> {
+    reduce_load_for([r.m, r.n, r.ks], r.turned, r.y_bf16)
 }
 
 fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
@@ -378,38 +393,57 @@ fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
+/// Prefill tile for `m` by `n`, or the knob value.
+pub(crate) fn dtr_pre_tile(tree: &Tree, turned: bool, m: usize, n: usize) -> usize {
+    let rule = dtr_rule(turned);
+    if let Some(tile) = tree.knobs.get(rule, "prefill_tile") {
+        return if tile >= 128 { 128 } else { 64 };
+    }
+    let large_rows = tree.knobs.get(rule, "prefill_large_rows");
+    let min_groups = tree.knobs.get(rule, "prefill_min_groups");
+    if large_rows.is_some() || min_groups.is_some() {
+        let large = m >= large_rows.unwrap_or(128)
+            && m.div_ceil(128) * (n / BLOCK) >= min_groups.unwrap_or(48);
+        return if large { 128 } else { 64 };
+    }
+    if (m > 64 && n >= 2048) || (m >= 128 && m.div_ceil(128) * (n / BLOCK) >= 48) {
+        128
+    } else {
+        64
+    }
+}
+
 fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
-    match (t.tile, t.bits, t.book, t.turned) {
-        (128, 4, 0, true) => "dtr_pre_k4_t16",
-        (64, 4, 0, true) => "dtr_pre_k4_t8",
-        (128, _, _, _) => "dtr_pre_gen16",
-        (_, _, _, _) => "dtr_pre_gen8",
+    match (t.tile, t.bits, t.book, t.turned, t.ks > 1, t.rot_out) {
+        (128, 4, 0, true, false, true) => "dtr_pre_k4_t16r",
+        (64, 4, 0, true, false, true) => "dtr_pre_k4_t8r",
+        (128, 4, 0, true, true, _) => "dtr_pre_k4_t16s",
+        (128, 4, 0, true, false, false) => "dtr_pre_k4_t16",
+        (64, 4, 0, true, true, _) => "dtr_pre_k4_t8s",
+        (64, 4, 0, true, false, false) => "dtr_pre_k4_t8",
+        (128, _, _, _, _, _) => "dtr_pre_gen16",
+        (_, _, _, _, _, _) => "dtr_pre_gen8",
     }
 }
 
 fn dtr_pre_source(t: &TrellisPreMma) -> Source {
     let entry = dtr_pre_entry(t);
-    let def = match entry {
-        "dtr_pre_k4_t16" => "DTR_T16_BLK",
-        "dtr_pre_k4_t8" => "DTR_T8_BLK",
-        "dtr_pre_gen16" => "DTR_GEN16_BLK",
-        _ => "DTR_GEN8_BLK",
+    let def = match (t.tile, entry.starts_with("dtr_pre_gen")) {
+        (128, false) => "DTR_T16_BLK",
+        (_, false) => "DTR_T8_BLK",
+        (128, true) => "DTR_GEN16_BLK",
+        (_, true) => "DTR_GEN8_BLK",
     };
-    prefill_source_with(
-        entry,
-        io_defs(
-            t.min_blocks.map(|v| (def, v as usize)),
-            false,
-            t.y_bf16,
-            false,
-        ),
-    )
+    let base = prefill_defs(entry, t.mx8)
+        .into_iter()
+        .chain(t.min_blocks.map(|v| (def, v as usize)));
+    prefill_source_with(entry, io_defs(base, false, t.y_bf16, false))
 }
 
 /// Rotates and quantizes dense inputs once per 64x128 block.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "trellis_prep",
+    name = if self.mx8 { "trellis_prep" } else { "trellis_prep_f16" },
     sizes = [self.m, self.k],
     work = self.m * self.k,
     accepts = prep_accepts,
@@ -418,20 +452,28 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
     order = Order::PerConfig,
     source = prefill_source_with(
         "dtr_prep",
-        x_defs(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)), self.x_bf16),
+        x_defs(
+            prefill_defs("dtr_prep", self.mx8)
+                .into_iter()
+                .chain(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize))),
+            self.x_bf16,
+        ),
     ),
     launches = prep_launches,
     load = prep_load,
-    load_key = tessera_lower::load_key((self.m, self.k, self.min_blocks, self.turned, self.x_bf16)),
+    load_key = tessera_lower::load_key((
+        self.m, self.k, self.min_blocks, self.turned, self.mx8, self.x_bf16,
+    )),
     shared,
     unproven,
 )]
-struct TrellisPrep {
-    m: usize,
-    k: usize,
-    min_blocks: Option<u32>,
-    turned: bool,
-    x_bf16: bool,
+pub(crate) struct TrellisPrep {
+    pub(crate) m: usize,
+    pub(crate) k: usize,
+    pub(crate) min_blocks: Option<u32>,
+    pub(crate) turned: bool,
+    pub(crate) mx8: bool,
+    pub(crate) x_bf16: bool,
 }
 
 fn prep_accepts(p: &TrellisPrep, input: usize, form: &dyn Stored) -> bool {
@@ -443,8 +485,7 @@ fn prep_accepts(p: &TrellisPrep, input: usize, form: &dyn Stored) -> bool {
 
 fn prep_load(p: &TrellisPrep, _: usize) -> Option<Load> {
     let groups = (p.k / BLOCK) * p.m.div_ceil(64);
-    let x_elem = if p.x_bf16 { 2 } else { 4 };
-    let mut reads = vec![(x_elem * p.m * p.k) as f64];
+    let mut reads = vec![(elem(p.x_bf16) * p.m * p.k) as f64];
     if p.turned {
         reads.push((4 * p.k) as f64);
     }
@@ -477,35 +518,97 @@ fn prep_launches(p: &TrellisPrep, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-dtr_mma_kernel! {
+fn trellis_pre_name(t: &TrellisPreMma) -> &'static str {
+    let base = match (t.turned, t.mx8) {
+        (true, true) => "trellis_turned_pf",
+        (false, true) => "trellis_mma_pf",
+        (true, false) => "trellis_turned_f16",
+        (false, false) => "trellis_mma_f16",
+    };
+    t.form.suffixed(base)
+}
+
+fn pre_mma_needs(t: &TrellisPreMma) -> Needs {
+    dtr_needs(if t.mx8 { 33_792 } else { 49_152 })
+}
+
+define_trellis_kernel! {
     /// Prefill dense trellis matmul from pre-rotated input blocks.
-    struct TrellisPreMma,
-    accepts = pre_mma_accepts,
-    emits = pre_mma_emits,
-    smem = DTR_PRE_SMEM,
-    source = dtr_pre_source,
-    launches = pre_mma_launches,
-    load = pre_mma_load,
-    suffix = "_pf"
+    struct TrellisPreMma {
+        name: trellis_pre_name,
+        accepts: pre_mma_accepts,
+        emits: pre_mma_emits,
+        needs: pre_mma_needs,
+        source: dtr_pre_source,
+        launches: pre_mma_launches,
+        load: pre_mma_load,
+        extra: {
+            mx8: bool,
+            mode: u32,
+            rot_out: bool,
+        }
+    }
+}
+
+fn pre_mma_accepts(k: &TrellisPreMma, input: usize, form: &dyn Stored) -> bool {
+    let other_at = 2 + usize::from(k.turned && k.ks == 1);
+    if k.ks == 1 && input >= other_at {
+        return gemv::epi_accepts(k.mode, input, other_at, form);
+    }
+    weight_x_accepts(input, false, k.form, form)
 }
 
 fn pre_mma_load(t: &TrellisPreMma, _: usize) -> Option<Load> {
-    let scales: &[usize] = if t.turned { &[t.n] } else { &[] };
-    let y_elem = if t.y_bf16 { 2 } else { 4 };
-    trellis_mma_load(t.form, [t.m, t.n, t.k, 1], t.tile, 1, y_elem, scales)
+    let scales: &[usize] = match (t.turned, t.ks) {
+        (true, 1) => &[t.n],
+        _ => &[],
+    };
+    let x_elem = if t.mx8 { 1 } else { 2 };
+    let mut load = trellis_mma_load(
+        t.form,
+        [t.m, t.n, t.k, t.ks],
+        t.tile,
+        x_elem,
+        elem(t.y_bf16),
+        scales,
+    )?;
+    if t.ks == 1 {
+        gemv::push_epi_reads(&mut load.reads, t.mode, [t.m, t.n], 4);
+        if t.rot_out {
+            load.reads.push((4 * t.n) as f64);
+            load.written = (x_elem * t.m * t.n) as f64;
+        }
+    }
+    Some(load)
 }
 
 fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
-        across: t.n / BLOCK,
+        across: (t.n / BLOCK) * t.ks,
         down: t.m.div_ceil(t.tile),
         threads: THREADS,
     };
-    let svh = if t.turned { step.read(2) } else { step.read(0) };
+    let has_svh = t.turned && t.ks == 1;
+    let svh = if has_svh { step.read(2) } else { step.read(0) };
+    let other_at = 2 + usize::from(has_svh);
+    let has_o = t.ks == 1 && gemv::has_other(t.mode);
+    let other = if has_o {
+        step.read(other_at)
+    } else {
+        step.read(0)
+    };
+    let bias_at = other_at + usize::from(has_o);
+    let bias = if t.ks == 1 && (gemv::has_bias2(t.mode) || t.rot_out) {
+        step.read(bias_at)
+    } else {
+        step.read(0)
+    };
     let args = vec![
         step.read(0),
         step.read(1),
         svh,
+        other,
+        bias,
         step.out(),
         Arg::count(t.m),
         Arg::count(t.n),
@@ -513,111 +616,15 @@ fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
         Arg::value(&t.bits),
         Arg::value(&t.book),
         Arg::count(usize::from(t.turned)),
+        Arg::value(&t.mode),
+        Arg::count(t.ks),
     ];
     vec![Launch { args, shape }]
 }
 
-fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> {
-    let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
-    let rule = if turned {
-        "trellis_turned"
-    } else {
-        "trellis_mma"
-    };
-    let ks = dtr_ks(m, n, k, tree, rule);
-    let pre_min_rows = tree.knobs.get(rule, "prefill_min_rows").unwrap_or(64);
-    if ks == 1 && m >= pre_min_rows {
-        let large_rows = tree.knobs.get(rule, "prefill_large_rows").unwrap_or(128);
-        let min_groups = tree.knobs.get(rule, "prefill_min_groups").unwrap_or(96);
-        let pre_tile = match tree.knobs.get(rule, "prefill_tile") {
-            Some(64) => 64,
-            Some(128) => 128,
-            Some(v) => return Some(Err(format!("prefill_tile={v} (requires 64 or 128)"))),
-            None => {
-                if m >= large_rows && m.div_ceil(128) * (n / BLOCK) >= min_groups {
-                    128
-                } else {
-                    64
-                }
-            }
-        };
-        let t8_blk = tree.knobs.get(rule, "t8_min_blocks");
-        let t16_blk = tree.knobs.get(rule, "t16_min_blocks");
-        let pre_blk = match (pre_tile, d.bits, d.book, turned) {
-            (128, 4, 0, true) => t16_blk.or_else(|| tree.knobs.get(rule, "min_blocks")),
-            (64, 4, 0, true) => t8_blk.or_else(|| tree.knobs.get(rule, "min_blocks")),
-            _ => tree.knobs.get(rule, "min_blocks"),
-        }
-        .map(|v| v as u32);
-        let [suh, svh] = d.turn.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
-        let p_reads = [d.x].into_iter().chain(suh).map(Read::Node);
-        let m_reads = [Read::Draft(0), Read::Node(d.w)]
-            .into_iter()
-            .chain(svh.map(Read::Node));
-        let prep = TrellisPrep {
-            m,
-            k,
-            min_blocks: tree.knobs.get(rule, "prep_min_blocks").map(|v| v as u32),
-            turned,
-            x_bf16: d.x_bf16,
-        };
-        let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
-        let mma = TrellisPreMma {
-            m,
-            n,
-            k,
-            tile: pre_tile,
-            min_blocks: pre_blk,
-            bits: d.bits,
-            book: d.book,
-            turned,
-            x_bf16: false,
-            y_bf16: d.y_bf16,
-            form: d.form,
-        };
-        return Some(Ok(vec![
-            Draft::new(prep, p_reads, pre_len),
-            Draft::new(mma, m_reads, m * n),
-        ]));
-    }
-    let tile = match tree.knobs.get(rule, "tile_rows") {
-        Some(8) => 8,
-        Some(16) => 16,
-        Some(32) => 32,
-        Some(v) => return Some(Err(format!("tile_rows={v} (requires 8, 16, or 32)"))),
-        None => dtr_tile(m),
-    };
-    let mma = TrellisMma {
-        m,
-        n,
-        k,
-        ks,
-        tile,
-        min_blocks: tree.knobs.get(rule, "min_blocks").map(|v| v as u32),
-        bits: d.bits,
-        book: d.book,
-        turned,
-        x_bf16: d.x_bf16,
-        y_bf16: ks == 1 && d.y_bf16,
-        form: d.form,
-    };
-    let red = TrellisReduce {
-        m,
-        n,
-        ks,
-        min_blocks: tree.knobs.get(rule, "reduce_min_blocks").map(|v| v as u32),
-        turned,
-        y_bf16: d.y_bf16,
-    };
-    Some(Ok(d.drafts(mma, ks, red)))
-}
-
 /// Rotated or plain dense trellis matmul.
 fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    match Dense::find_with(tree, at, BLOCK, true)? {
-        Ok(d) => trellis_drafts(tree, &d),
-        Err(e) => Some(Err(e)),
-    }
+    gemv::eval_trellis_for(tree, at)
 }
 
 /// One thread's trip. Bf16 widens with one integer op.
