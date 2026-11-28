@@ -1,7 +1,7 @@
 //! Native Metal decode and simdgroup_matrix prefill kernels for stacked matmuls.
 
-use super::blocks;
 use tessera_graph::{Op, Order};
+use tessera_linear::blocks;
 use tessera_lower::Backend;
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::{
@@ -154,7 +154,7 @@ fn metal_source(k: &MetalStacked) -> Source {
     let e = pick_entry(k);
     Source::Fixed {
         text: ByBackend([
-            tessera_lower::metal_source!(include_str!("metal.metal")),
+            tessera_lower::metal_source!(include_str!("stacked_metal.metal")),
             "",
             "",
         ]),
@@ -214,8 +214,8 @@ fn metal_launches(k: &MetalStacked, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-/// Returns a Metal draft when the stacked site fits.
-pub(super) fn draft(tree: &Tree, at: T) -> Option<Draft> {
+/// Proposes a Metal draft when the stacked site fits.
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
     if node.term != Term::Op(Op::Matmul) {
         return None;
@@ -254,5 +254,7 @@ pub(super) fn draft(tree: &Tree, at: T) -> Option<Draft> {
         w_form,
         out_form,
     };
-    Some(Draft::new(kernel, [x, b.leaf], tree.elements(at)).choice(1))
+    Some(vec![Draft::new(kernel, [x, b.leaf], tree.elements(at))])
 }
+
+tessera_lower::rule!("stacked_metal", propose);

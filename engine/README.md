@@ -42,6 +42,7 @@ and tokens.
 <tr><td>&emsp;<a href="rules/guest">guest/</a></td><td>tessera-guest</td><td>The recipe module ABI: memory hand-off and the table format</td></tr>
 <tr><td>&emsp;<a href="rules/kernels">kernels/</a></td><td>tessera-kernels</td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td>&emsp;<a href="rules/linear">linear/</a></td><td>tessera-linear</td><td>Generated matmul kernels, registered as lowering rules</td></tr>
+<tr><td>&emsp;<a href="rules/metal-linear">metal-linear/</a></td><td>tessera-metal-linear</td><td>Metal matmul, trellis and stacked kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;<a href="rules/rules">rules/</a></td><td>tessera-rules</td><td>Links every lowering rule crate</td></tr>
 <tr><td>&emsp;<a href="rules/wasm">wasm/</a></td><td>tessera-wasm</td><td>Lowering rules a sandboxed wasm module proposes, over JSON</td></tr>
 <tr><td><a href="settings">settings/</a></td><td>tessera-engine-settings</td><td>Knobs the front end sets once and the engine reads</td></tr>

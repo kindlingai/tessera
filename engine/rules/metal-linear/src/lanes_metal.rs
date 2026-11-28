@@ -1,9 +1,9 @@
 //! Small-batch Metal GEMV for small-K, small-N and wide-N shapes.
 
-use crate::product::{Product, Variant, place};
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
+use tessera_linear::{Product, Variant, place};
 use tessera_lower::form::{BF16_FORM, F32_FORM, Load as Stored};
 use tessera_lower::kernels::finish;
 use tessera_lower::{Backend, Draft, GUESS, Kernel, Launch, Load, Needs, Shape, Step, T, Tree};

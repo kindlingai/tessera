@@ -2,18 +2,31 @@
 
 use tessera_kernels as _;
 use tessera_linear as _;
+use tessera_metal_linear as _;
 
-#[allow(dead_code, reason = "only a subset of common helpers is used here")]
-mod common;
-use common::{Finish, finished, linear, noise};
 use tessera_graph::DimName::Rows;
+use tessera_graph::{Dim, Graph};
 use tessera_interp::{Tensor, run};
 use tessera_lower::form::{BF16_FORM, F32_FORM};
 use tessera_lower::{Backend, Device, Limits, Pins, Platform, lower};
 use tessera_run::open;
 use tessera_run::testing::{emulations as runs, host};
+use tessera_testkit::graphs::{Finish, linear_then};
 use tessera_testkit::{Noise, max_abs_diff};
 use tessera_trace::Act;
+
+fn finished(k: u64, n: u64, finish: Finish) -> Graph {
+    linear_then(&[Dim::bounded(Rows, 640)], [k, n], finish)
+}
+
+fn linear(k: u64, n: u64) -> Graph {
+    finished(k, n, |_, product| product)
+}
+
+fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
+    let data = (0..shape.iter().product()).map(|_| noise.draw()).collect();
+    Tensor::f32(shape, data)
+}
 
 #[test]
 fn lanes_metal_matches_cpu() {

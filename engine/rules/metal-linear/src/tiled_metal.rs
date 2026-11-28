@@ -1,7 +1,7 @@
 //! Metal bf16 matrix-unit matmul for dense prefill.
 
-use crate::product::Product;
 use tessera_graph::Order;
+use tessera_linear::Product;
 use tessera_lower::form::BF16_FORM;
 use tessera_lower::{
     Backend, ByBackend, Draft, GUESS, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,

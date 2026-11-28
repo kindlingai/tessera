@@ -41,6 +41,7 @@ fn grid_reaches_rules() {
         "mm_metal",
         "lanes_metal",
         "tiled_metal",
+        "stacked_metal",
         "conv_span",
         "flash_sunk",
         "listed_split",

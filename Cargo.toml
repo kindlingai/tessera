@@ -57,6 +57,7 @@ tessera-device-grid = { path = "engine/rules/device-grid" }
 tessera-device-linear = { path = "engine/rules/device-linear" }
 tessera-device-rules = { path = "engine/rules/device-rules" }
 tessera-linear = { path = "engine/rules/linear" }
+tessera-metal-linear = { path = "engine/rules/metal-linear" }
 tessera-attention = { path = "engine/rules/attention" }
 tessera-rules = { path = "engine/rules/rules" }
 tessera-lower = { path = "engine/plan/lower" }
