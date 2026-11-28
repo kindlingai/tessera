@@ -13,7 +13,7 @@ use tessera_lower::{
 
 mod sunk;
 mod sunk_metal;
-use sunk::{restore, restore_inline};
+use sunk::{fold_tiles, fold_tiles_inline, restore, restore_inline};
 
 knob!("flash", "bk", 16, 32);
 knob!("flash", "held", 0, 1);
@@ -428,31 +428,7 @@ fn fold_block(
         );
         barrier();
     }
-    // Each SIMD group owns up to two column pieces.
-    if simd * 16 < cw {
-        let col = simd * 16 * (bk + PAD);
-        fold_pair(
-            &mut st.o00,
-            &mut st.o01,
-            &st.p_s,
-            &st.kv_s,
-            &st.alpha_s,
-            col,
-            bk,
-        );
-    }
-    if (simd + 4) * 16 < cw {
-        let col = (simd + 4) * 16 * (bk + PAD);
-        fold_pair(
-            &mut st.o10,
-            &mut st.o11,
-            &st.p_s,
-            &st.kv_s,
-            &st.alpha_s,
-            col,
-            bk,
-        );
-    }
+    fold_tiles(st, simd, cw, bk);
     barrier();
 }
 

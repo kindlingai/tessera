@@ -387,8 +387,8 @@ fn flat(c: Case, n: usize, val: f32, sink: f32, shift: f32) -> Vec<Tensor> {
     ]
 }
 
-/// Host and Metal tiles give finite rows near `expected`.
-fn near(c: Case, n: usize, inputs: &[Tensor], expected: &[f32], label: &str) {
+/// Gives `check` each host and Metal tile output.
+fn tiled(c: Case, n: usize, inputs: &[Tensor], label: &str, check: impl Fn(&[f32], &str)) {
     let g = graph(c);
     let run = [(0u32, 0u32, n as u32)];
     for settings in runs() {
@@ -404,8 +404,14 @@ fn near(c: Case, n: usize, inputs: &[Tensor], expected: &[f32], label: &str) {
         let mut runner = open(plan, &settings).unwrap();
         let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
         let got = runner.run(&views).unwrap().remove(0);
-        let got = got.floats().unwrap();
         let on = format!("{label} on {} ({expect_kernel})", runner.device());
+        check(got.floats().unwrap(), &on);
+    }
+}
+
+/// Host and Metal tiles give finite rows near `expected`.
+fn near(c: Case, n: usize, inputs: &[Tensor], expected: &[f32], label: &str) {
+    tiled(c, n, inputs, label, |got, on| {
         assert!(got.iter().all(|v| v.is_finite()), "{on} non-finite");
         let rel = got
             .iter()
@@ -413,7 +419,7 @@ fn near(c: Case, n: usize, inputs: &[Tensor], expected: &[f32], label: &str) {
             .map(|(a, b)| (*a as f64 - *b as f64).abs() / (b.abs() as f64).max(1.0))
             .fold(0.0f64, f64::max);
         assert!(rel < 2e-2, "{on}: rel {rel:e}");
-    }
+    });
 }
 
 /// Large values, sinks and shifted logits stay finite and accurate.
@@ -473,6 +479,39 @@ fn weak_sink_stays_finite() {
                 let label = format!("w={width} mode={mode} sink={sink} val={val:e}");
                 near(c, n, &inputs, &expected, &label);
             }
+        }
+    }
+}
+
+/// Masked non-finite values stay out. Seen ones pass through.
+#[test]
+fn odd_values_masked() {
+    let n = 64usize;
+    // The first block, then a block after finite ones.
+    for pos in [1usize, 33] {
+        for width in [64usize, 128] {
+            let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+            let mut inputs = flat(c, n, 1.0, -30.0, 0.0);
+            let mut v = vec![1.0f32; n * width];
+            let odd = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+            v[pos * width..pos * width + 3].copy_from_slice(&odd);
+            inputs[2] = Tensor::f32(vec![n, 1, width], v);
+            let mut store = Store::default();
+            let want = run_kept(&graph(c), &[], &mut store, 0, &inputs).unwrap();
+            let want = want[0].floats().unwrap();
+            let label = format!("pos={pos} w={width}");
+            tiled(c, n, &inputs, &label, |got, on| {
+                for (i, (g, e)) in got.iter().zip(want).enumerate() {
+                    let (row, ch) = (i / (c.heads * width), i % width);
+                    if row >= pos && ch < 3 {
+                        let same = g.is_nan() && odd[ch].is_nan() || *g == odd[ch];
+                        assert!(same, "{on}: row {row} ch {ch} got {g}");
+                    } else {
+                        let off = (g - e).abs();
+                        assert!(off < 2e-2, "{on}: row {row} ch {ch} got {g}, not {e}");
+                    }
+                }
+            });
         }
     }
 }

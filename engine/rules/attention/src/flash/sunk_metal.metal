@@ -32,8 +32,8 @@ static inline void fs_put4(threadgroup ushort *at, ushort4 v) {
     at[3] = v.w;
 }
 
-// Stages `live` scaled rows as bf16, `step` apart.
-static inline void fs_stage(
+// Stages `live` scaled bf16 rows. True on infinity or NaN.
+static inline bool fs_stage(
     threadgroup ushort *bits,
     device const float *src,
     ulong row0,
@@ -41,15 +41,20 @@ static inline void fs_stage(
     uint live,
     uint tid,
     float gain) {
+    bool odd = false;
     for (uint i = tid; i < FS_BK * (FS_D / 4u); i += 128u) {
         uint t = i >> 5u;
         uint d = (i & 31u) << 2u;
         ushort4 v = ushort4(0u);
         if (t < live) {
-            v = fs_bf16(*(device const float4 *)(src + (row0 + ulong(t) * step) * FS_D + d) * gain);
+            float4 raw = *(device const float4 *)(src + (row0 + ulong(t) * step) * FS_D + d);
+            odd = odd || !fs_finite(raw.x) || !fs_finite(raw.y);
+            odd = odd || !fs_finite(raw.z) || !fs_finite(raw.w);
+            v = fs_bf16(raw * gain);
         }
         fs_put4(bits + t * FS_WIDE + d, v);
     }
+    return odd;
 }
 
 // Ragged rows in a window, on bf16 matrix units.
@@ -176,7 +181,10 @@ kernel void flash_sunk_metal(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Values replace keys while scores soften, scaled down.
-            fs_stage(kv_bits, values, row0, kv_heads, live, tid, 0.25f);
+            bool odd = fs_stage(kv_bits, values, row0, kv_heads, live, tid, 0.25f);
+            // Each SIMD group flags a spare score column.
+            uint flag = simd_or(odd ? 1u : 0u);
+            if (lane == 0u) p_s[simd][FS_BK] = float(flag);
             uint t = k0 + lane;
             for (uint i = 0u; i < 8u; i++) {
                 uint row = simd * 8u + i;
@@ -208,6 +216,7 @@ kernel void flash_sunk_metal(
                 float old_scale = (l_new > 0.0f) ? (prev / l_new) : 0.0f;
                 float w_norm = (l_new > 0.0f) ? (weight / l_new) : 0.0f;
                 w_bits[row * FS_NEAR + lane] = fs_bf16(float4(w_norm, 0.0f, 0.0f, 0.0f)).x;
+                p_s[row][lane] = w_norm;
                 l[i] = l_new;
                 m[i] = m_new;
                 if (lane == 0u) alpha_s[row] = old_scale;
@@ -216,30 +225,55 @@ kernel void flash_sunk_metal(
 
             // Each SIMD group folds 32 output columns.
             uint oc = simd * 32u;
-            simdgroup_float8x8 acc[4][4];
-            for (uint i = 0u; i < 4u; i++) {
-                for (uint j = 0u; j < 4u; j++) {
-                    acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                }
-            }
-            for (uint k8 = 0u; k8 < FS_BK; k8 += 8u) {
-                simdgroup_bfloat8x8 tv[4];
-                for (uint j = 0u; j < 4u; j++) {
-                    simdgroup_load(tv[j], &kv_s[k8][oc + j * 8u], FS_WIDE);
-                }
+            float odd_block = p_s[0][FS_BK] + p_s[1][FS_BK] + p_s[2][FS_BK] + p_s[3][FS_BK];
+            if (odd_block == 0.0f) {
+                simdgroup_float8x8 acc[4][4];
                 for (uint i = 0u; i < 4u; i++) {
-                    simdgroup_bfloat8x8 tw;
-                    simdgroup_load(tw, &w_s[i * 8u][k8], FS_NEAR);
                     for (uint j = 0u; j < 4u; j++) {
-                        simdgroup_multiply_accumulate(acc[i][j], tw, tv[j], acc[i][j]);
+                        acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                     }
                 }
-            }
-            for (uint i = 0u; i < 4u; i++) {
-                float alpha = alpha_s[i * 8u + er];
-                for (uint j = 0u; j < 4u; j++) {
-                    o[i][j][0] = o[i][j][0] * alpha + acc[i][j].thread_elements()[0];
-                    o[i][j][1] = o[i][j][1] * alpha + acc[i][j].thread_elements()[1];
+                for (uint k8 = 0u; k8 < FS_BK; k8 += 8u) {
+                    simdgroup_bfloat8x8 tv[4];
+                    for (uint j = 0u; j < 4u; j++) {
+                        simdgroup_load(tv[j], &kv_s[k8][oc + j * 8u], FS_WIDE);
+                    }
+                    for (uint i = 0u; i < 4u; i++) {
+                        simdgroup_bfloat8x8 tw;
+                        simdgroup_load(tw, &w_s[i * 8u][k8], FS_NEAR);
+                        for (uint j = 0u; j < 4u; j++) {
+                            simdgroup_multiply_accumulate(acc[i][j], tw, tv[j], acc[i][j]);
+                        }
+                    }
+                }
+                for (uint i = 0u; i < 4u; i++) {
+                    float alpha = alpha_s[i * 8u + er];
+                    for (uint j = 0u; j < 4u; j++) {
+                        o[i][j][0] = o[i][j][0] * alpha + acc[i][j].thread_elements()[0];
+                        o[i][j][1] = o[i][j][1] * alpha + acc[i][j].thread_elements()[1];
+                    }
+                }
+            } else {
+                // An odd block folds seen keys alone, in f32.
+                for (uint i = 0u; i < 4u; i++) {
+                    uint r = i * 8u + er;
+                    float alpha = alpha_s[r];
+                    for (uint j = 0u; j < 4u; j++) {
+                        uint col = oc + j * 8u + ec;
+                        float a0 = o[i][j][0] * alpha;
+                        float a1 = o[i][j][1] * alpha;
+                        for (uint t = 0u; t < live; t++) {
+                            uint key = k0 + t;
+                            if (key >= from_s[r] && key < to_s[r]) {
+                                float wv = p_s[r][t];
+                                ulong vb = (row0 + ulong(t) * kv_heads) * FS_D + col;
+                                a0 += wv * (values[vb] * 0.25f);
+                                a1 += wv * (values[vb + 1u] * 0.25f);
+                            }
+                        }
+                        o[i][j][0] = a0;
+                        o[i][j][1] = a1;
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

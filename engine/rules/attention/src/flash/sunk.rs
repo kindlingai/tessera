@@ -19,6 +19,9 @@ const MIN_ROWS: usize = 16;
 /// Keys per block.
 const BK: u32 = WAYS[0].0;
 
+/// Spilled sums divide by each row's sum.
+const DIVIDE: bool = true;
+
 thread_local! {
     /// Each kernel tree, by head width.
     static SUNK: RefCell<HashMap<u32, Body>> = RefCell::new(HashMap::new());
@@ -76,9 +79,16 @@ fn scale_sinks(top: &mut Tiles, bottom: &mut Tiles, alpha_s: &Shared<f32>) {
     bottom.scale(|r| alpha_s[16 + r]);
 }
 
-/// Folds each row's sink into its normalized output.
+/// Folds each row's sink into its sums, unless `spilled`.
 #[kernel]
-fn fold_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32, #[build] w: u32) {
+fn fold_sinks(
+    st: &mut Stream,
+    sinks: Buf<F32>,
+    hd: &Head,
+    sink_mode: u32,
+    spilled: bool,
+    #[build] w: u32,
+) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
         let q = hd.q0 + simd * ROWS + i;
@@ -104,15 +114,238 @@ fn fold_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32, #[bui
         if lane() == 0 {
             st.alpha_s[simd * ROWS + i] = h;
         }
+        if lane() == 0 && spilled {
+            st.l_s[simd * ROWS + i] = denom * 0.25;
+        }
     }
     barrier();
     // Apply `h` twice to avoid subnormal `exp(d)`.
-    if simd * 16 < w {
+    if !spilled && simd * 16 < w {
         scale_sinks(&mut st.o00, &mut st.o01, &st.alpha_s);
     }
-    if (simd + 4) * 16 < w {
+    if !spilled && (simd + 4) * 16 < w {
         scale_sinks(&mut st.o10, &mut st.o11, &st.alpha_s);
     }
+}
+
+/// Whether the staged values hold an infinity or NaN.
+#[kernel]
+fn any_odd(st: &mut Stream, #[build] w: u32, #[build] bk: u32) -> bool {
+    let simd = lid() / LANES as u32;
+    // Each thread checks the fours it staged.
+    let mut hit = 0.0f32;
+    for j in 0..(bk * (w / WIDE) + THREADS - 1) / THREADS {
+        let i = lid() + j * THREADS;
+        if i < bk * (w / WIDE) {
+            for e in 0..WIDE {
+                let staged = st.kv_s[((i / bk) * WIDE + e) * (bk + PAD) + i % bk];
+                if (staged.to_bits() & 0x7f80_0000) == 0x7f80_0000 {
+                    hit = 1.0;
+                }
+            }
+        }
+    }
+    hit = sum32(hit);
+    // Each SIMD group flags a spare score column.
+    if lane() == 0 {
+        st.p_s[simd * (bk + PAD) + bk] = hit;
+    }
+    barrier();
+    let mut flags = 0.0f32;
+    for g in 0..THREADS / LANES as u32 {
+        flags = flags + st.p_s[g * (bk + PAD) + bk];
+    }
+    flags > 0.0
+}
+
+/// Adds a block's seen keys to one sum in `out`.
+#[kernel]
+fn fold_seen(
+    st: &Stream,
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    hd: &Head,
+    row: u32,
+    col: u32,
+    k0: u32,
+    kept: f32,
+    first: bool,
+    #[build] w: u32,
+    #[build] bk: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
+    if st.to_s[row] > st.from_s[row] {
+        let at = ((hd.q0 + row) * hd.heads + hd.head) as u64 * w as u64 + col as u64;
+        // The first odd block moves the tile sum out.
+        let prev = if first { kept } else { out[at] };
+        let mut acc = prev * st.alpha_s[row];
+        for t in 0..bk {
+            if k0 + t >= st.from_s[row] && k0 + t < st.to_s[row] {
+                acc = acc + st.p_s[row * (bk + PAD) + t] * st.kv_s[col * (bk + PAD) + t];
+            }
+        }
+        out[at] = acc;
+    }
+}
+
+/// Folds a block into `out`, each thread its elements.
+#[kernel]
+fn seen_pair(
+    top: &Tiles,
+    bottom: &Tiles,
+    st: &Stream,
+    #[form(out_form)] out: BufMut<Dyn>,
+    hd: &Head,
+    k0: u32,
+    col: u32,
+    first: bool,
+    #[build] w: u32,
+    #[build] bk: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
+    top.each(|r, c, v| {
+        fold_seen(st, out, hd, r, col + c, k0, v, first, w, bk, out_form);
+    });
+    bottom.each(|r, c, v| {
+        fold_seen(st, out, hd, 16 + r, col + c, k0, v, first, w, bk, out_form);
+    });
+}
+
+/// Folds a sink into one spilled sum.
+#[kernel]
+fn write_seen(
+    st: &Stream,
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    hd: &Head,
+    row: u32,
+    col: u32,
+    #[build] w: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
+    if st.to_s[row] > st.from_s[row] {
+        let at = ((hd.q0 + row) * hd.heads + hd.head) as u64 * w as u64 + col as u64;
+        let h = st.alpha_s[row];
+        out[at] = restore((out[at] * h) * h, st.l_s[row], DIVIDE);
+    }
+}
+
+/// Writes two tiles' spilled sums, sinks folded in.
+#[kernel]
+fn write_seen_pair(
+    top: &Tiles,
+    bottom: &Tiles,
+    st: &Stream,
+    #[form(out_form)] out: BufMut<Dyn>,
+    hd: &Head,
+    col: u32,
+    #[build] w: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
+    // The tile sums are stale: only the owners matter.
+    top.each(|r, c, v| {
+        write_seen(st, out, hd, r, col + c, w, out_form);
+    });
+    bottom.each(|r, c, v| {
+        write_seen(st, out, hd, 16 + r, col + c, w, out_form);
+    });
+}
+
+/// Writes the spilled sums, sinks folded in.
+#[kernel]
+fn write_spilled(
+    st: &Stream,
+    #[form(out_form)] out: BufMut<Dyn>,
+    hd: &Head,
+    #[build] w: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
+    let simd = lid() / LANES as u32;
+    if simd * 16 < w {
+        write_seen_pair(&st.o00, &st.o01, st, out, hd, simd * 16, w, out_form);
+    }
+    if (simd + 4) * 16 < w {
+        let col = (simd + 4) * 16;
+        write_seen_pair(&st.o10, &st.o11, st, out, hd, col, w, out_form);
+    }
+}
+
+/// Folds staged values into the tile sums.
+#[kernel]
+pub(super) fn fold_tiles(st: &mut Stream, simd: u32, #[build] cw: u32, #[build] bk: u32) {
+    // Each SIMD group owns up to two column pieces.
+    if simd * 16 < cw {
+        let col = simd * 16 * (bk + PAD);
+        fold_pair(
+            &mut st.o00,
+            &mut st.o01,
+            &st.p_s,
+            &st.kv_s,
+            &st.alpha_s,
+            col,
+            bk,
+        );
+    }
+    if (simd + 4) * 16 < cw {
+        let col = (simd + 4) * 16 * (bk + PAD);
+        fold_pair(
+            &mut st.o10,
+            &mut st.o11,
+            &st.p_s,
+            &st.kv_s,
+            &st.alpha_s,
+            col,
+            bk,
+        );
+    }
+}
+
+/// Softens the scores, then folds values in. Odd values spill.
+#[kernel]
+fn fold_sunk(
+    st: &mut Stream,
+    #[form(v_form)] values: Buf<Dyn>,
+    #[form(out_form)] out: BufMut<Dyn>,
+    hd: &Head,
+    at: u32,
+    k0: u32,
+    count: u32,
+    spilled: bool,
+    #[build] w: u32,
+    #[build] bk: u32,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) -> bool {
+    let simd = lid() / LANES as u32;
+    soften(st, bk);
+    barrier();
+    stage_kv::<true>(&mut st.kv_s, values, hd, at, k0, count, 0, w, w, bk, v_form);
+    let spills = any_odd(st, w, bk) || spilled;
+    let first = !spilled;
+    if !spills {
+        fold_tiles(st, simd, w, bk);
+    }
+    if spills && simd * 16 < w {
+        seen_pair(
+            &st.o00,
+            &st.o01,
+            st,
+            out,
+            hd,
+            k0,
+            simd * 16,
+            first,
+            w,
+            bk,
+            out_form,
+        );
+    }
+    if spills && (simd + 4) * 16 < w {
+        let col = (simd + 4) * 16;
+        seen_pair(
+            &st.o10, &st.o11, st, out, hd, k0, col, first, w, bk, out_form,
+        );
+    }
+    barrier();
+    spills
 }
 
 /// The key blocks a pass reads.
@@ -232,6 +465,7 @@ fn flash_sunk(
             barrier();
             let span = span_of(&st, keys);
             clear(&mut st);
+            let mut spilled = false;
             for b in span.lo / bk..(span.hi + bk - 1) / bk {
                 let k0 = b * bk;
                 let at = kept_row(slot, k0);
@@ -242,12 +476,16 @@ fn flash_sunk(
                 score_chunk(&mut st, simd, w, bk, held_q);
                 scores_near(&mut st, &pos_s, rel_bias, &hd, simd, k0, scale, rel_win, bk);
                 barrier();
-                fold_block(
-                    &mut st, values, &hd, at, k0, span.hi, 0, w, w, bk, held_q, v_form,
+                spilled = fold_sunk(
+                    &mut st, values, out, &hd, at, k0, span.hi, spilled, w, bk, v_form, out_form,
                 );
             }
-            fold_sinks(&mut st, sinks, &hd, sink_mode, w);
-            write_all::<false, true>(&mut st, out, &hd, 0, w, w, out_form);
+            fold_sinks(&mut st, sinks, &hd, sink_mode, spilled, w);
+            if spilled {
+                write_spilled(&st, out, &hd, w, out_form);
+            } else {
+                write_all::<false, true>(&mut st, out, &hd, 0, w, w, out_form);
+            }
             barrier();
         }
     }
