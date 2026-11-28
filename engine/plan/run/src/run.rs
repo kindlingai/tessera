@@ -36,6 +36,8 @@ pub struct Base {
     pub(crate) streams: bool,
     /// Cold experts copy to VRAM ahead of their reader.
     pub(crate) stages: bool,
+    /// Set once a sum transport shares the host bus.
+    pub(crate) shared_bus: bool,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
     pub(crate) reads: Reads,

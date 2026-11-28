@@ -96,6 +96,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         {
             g.pause()?;
         }
+        self.base.shared_bus |= sum.as_deref().is_some_and(|s| s.shares_bus());
         let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, &self.base)?;
         self.base.beside = extra;
         let pager = self.pager.as_ref();

@@ -231,6 +231,8 @@ pub(crate) struct Pager<D: Device> {
     staging: Staging<D>,
     /// Per plan id: the size of its expert launches.
     sizes: HashMap<u64, u64>,
+    /// Whether cross-rank sums share the bus with copies.
+    shared_bus: bool,
 }
 
 impl<D: Device> Pager<D> {
@@ -340,6 +342,7 @@ impl<D: Device> Pager<D> {
             moves: Moves::default(),
             staging,
             sizes: HashMap::new(),
+            shared_bus: false,
         }))
     }
 
@@ -383,7 +386,7 @@ impl<D: Device> Pager<D> {
                 .filter_map(cold)
                 .collect()
         };
-        let turns = staging.forecast.turns();
+        let turns = staging.forecast.turns() && self.shared_bus;
         place(
             &mut out,
             &weights,
@@ -397,7 +400,7 @@ impl<D: Device> Pager<D> {
 
     /// Whether copies wait for cross-rank steps.
     pub(crate) fn turns(&self) -> bool {
-        self.staging.forecast.turns()
+        self.staging.forecast.turns() && self.shared_bus
     }
 
     /// Whether `plan`'s launches copy cold experts ahead.
@@ -715,6 +718,7 @@ pub(crate) fn prepare<'a, D: Device>(
     }
     match (pager.as_mut(), base.budget) {
         (Some(p), Some(limit)) => {
+            p.shared_bus = base.shared_bus;
             let plan = p.rewrite(plan);
             p.fit(ctx, &plan, limit)?;
             Ok((std::borrow::Cow::Owned(plan), p.vram_bytes()))

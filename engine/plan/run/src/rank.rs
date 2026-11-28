@@ -67,6 +67,10 @@ pub trait Sum {
     fn capturable(&self) -> bool {
         false
     }
+    /// Whether its traffic shares the host bus with host copies.
+    fn shares_bus(&self) -> bool {
+        false
+    }
     /// Stops a running grid before context-syncing device calls.
     fn pause(&mut self) -> Result<(), Error> {
         Ok(())
