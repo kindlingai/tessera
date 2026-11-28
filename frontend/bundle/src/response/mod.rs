@@ -61,6 +61,7 @@ struct ContentArgs {
     #[serde(default)]
     unquoted_keys: bool,
     /// `tags` content: a regex with `key` and `value` groups.
+    #[serde(alias = "tag_pattern")]
     pattern: Option<String>,
 }
 
@@ -69,6 +70,7 @@ struct FieldSpec {
     open: Option<Strings>,
     open_pattern: Option<String>,
     close: Option<Strings>,
+    close_pattern: Option<String>,
     content: Option<String>,
     #[serde(default)]
     content_args: ContentArgs,
@@ -181,10 +183,15 @@ impl Body {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         Ok(match kind {
             Some("json") => Body::Json(args),
-            Some("tags") => {
-                let pat = args
+            Some("tags" | "xml-inline" | "xml_params") => {
+                let raw = args
                     .pattern
                     .ok_or("tags content needs content_args.pattern")?;
+                let pat = if raw.starts_with("(?") {
+                    raw
+                } else {
+                    format!("(?s){raw}")
+                };
                 let delims = TagDelims::from_pattern(&pat);
                 Body::Tags {
                     regex: Regex::new(&pat)?,
@@ -259,13 +266,18 @@ impl ResponseParser {
         let mut tool_calls = None;
         let mut content_close = Vec::new();
         for (name, spec) in template.fields {
-            let close: Vec<String> = spec
+            let mut close: Vec<String> = spec
                 .close
                 .map(Strings::list)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect();
+            if close.is_empty()
+                && let Some(pat) = &spec.close_pattern
+            {
+                close = pattern_closers(pat);
+            }
             if name == "content" {
                 content_close = close;
                 continue;
@@ -282,7 +294,7 @@ impl ResponseParser {
                 call_prefix: spec.call_prefix.filter(|s| !s.is_empty()),
             };
             match name.as_str() {
-                "thinking" => thinking = Some(block),
+                "thinking" | "reasoning_content" => thinking = Some(block),
                 "tool_calls" => tool_calls = Some(block),
                 _ => {}
             }
@@ -343,7 +355,10 @@ impl ResponseParser {
         matches!(
             &self.thinking,
             Some(BlockSpec { open: Opener::Literal(opens), .. })
-                if opens.iter().any(|s| prompt.ends_with(s.as_str()))
+                if opens.iter().any(|s| {
+                    prompt.ends_with(s.as_str())
+                        || prompt.trim_end_matches('\n').ends_with(s.as_str())
+                })
         )
     }
 
@@ -746,7 +761,14 @@ fn literal_prefix(pattern: &str) -> String {
     out
 }
 
-/// Calls in one block, one per JSON list item.
+/// Extracts literal closer branches from a `close_pattern` regex.
+fn pattern_closers(pat: &str) -> Vec<String> {
+    pat.split('|')
+        .filter(|branch| !branch.starts_with("(?"))
+        .map(literal_prefix)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
     let (captures, rest) = spec.open.strip(block)?;
     let parsed = spec.body.parse(rest)?;

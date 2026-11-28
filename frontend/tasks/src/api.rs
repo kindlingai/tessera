@@ -134,6 +134,9 @@ pub type Sink = Box<dyn FnMut(Step) -> bool + Send>;
 /// Answers a prompt, a step at a time, into `sink`.
 pub trait Generator: Send + Sync {
     fn generate(&self, prompt: Vec<u32>, params: Params, sink: Sink) -> Result<(), Error>;
+    fn supports_guides(&self) -> bool {
+        true
+    }
 }
 
 /// Logits after chosen prompt rows, with no decoding.

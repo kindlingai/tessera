@@ -89,8 +89,12 @@ impl ResponseParser {
             return Some(format!("{outer}{}", tmpl.replace("{name}", name)));
         }
         match &block.open {
-            Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
-                Some(format!("{outer}{prefix}{name}"))
+            Opener::Pattern { prefix, regex } if !prefix.is_empty() => {
+                if regex.as_str().contains("<function=(?P<name>") {
+                    Some(format!("{outer}{prefix}\n<function={name}>\n"))
+                } else {
+                    Some(format!("{outer}{prefix}{name}"))
+                }
             }
             Opener::Literal(opens) if matches!(block.body, Body::Json(_)) => {
                 let open = opens.first()?;

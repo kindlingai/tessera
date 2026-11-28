@@ -24,6 +24,7 @@ struct Parsing {
     parallel_tools: bool,
     thinking: bool,
     tool_choice: ToolChoice,
+    forced_prefix: String,
 }
 
 impl Parsing {
@@ -34,6 +35,7 @@ impl Parsing {
             parallel_tools: true,
             thinking: false,
             tool_choice: ToolChoice::Auto,
+            forced_prefix: String::new(),
         }
     }
 }
@@ -231,8 +233,38 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
     if has_tools && parser.as_ref().is_none_or(|p| !p.supports_tools()) {
         return Err(bad("this model does not support tool calling", "tools"));
     }
-    let (prompt, tools) = crate::render(model, c.messages, allow_tools)?;
-    let thinking = parser.as_ref().is_some_and(|p| p.starts_thinking(&prompt));
+    let (mut prompt, tools) = crate::render(model, c.messages, allow_tools)?;
+    let mut thinking = parser.as_ref().is_some_and(|p| p.starts_thinking(&prompt));
+    let mut forced_prefix = String::new();
+    let mut tool_choice = tool_choice;
+    if tool_choice != ToolChoice::Auto
+        && model
+            .generator
+            .as_ref()
+            .is_some_and(|g| !g.supports_guides())
+    {
+        let name = match &tool_choice {
+            ToolChoice::Function(n) => Some(n.as_str()),
+            ToolChoice::Required | ToolChoice::Auto => None,
+        };
+        let open = parser
+            .as_ref()
+            .and_then(|p| p.call_prefix(name))
+            .ok_or_else(|| bad("this model cannot force a tool call", "tool_choice"))?;
+        if thinking {
+            let close = parser
+                .as_ref()
+                .and_then(|p| p.markers().think_close.into_iter().next())
+                .unwrap_or("</think>");
+            prompt.push('\n');
+            prompt.push_str(close);
+            prompt.push_str("\n\n");
+            thinking = false;
+        }
+        prompt.push_str(&open);
+        forced_prefix = open;
+        tool_choice = ToolChoice::Auto;
+    }
     let prompt = model
         .tokens
         .encode(&prompt)
@@ -244,6 +276,7 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
         parallel_tools: c.parallel_tool_calls.unwrap_or(true),
         thinking,
         tool_choice,
+        forced_prefix,
     };
     start(model, Kind::Chat, prompt, asked, c.common, parsing, ask)
 }
@@ -347,7 +380,7 @@ impl Started {
 
     /// Waits for the end and answers in one body.
     fn whole(self) -> Response {
-        let mut text = String::new();
+        let mut text = self.parsing.forced_prefix.clone();
         let mut reasoning = 0usize;
         let mut stream = self
             .parsing
@@ -355,6 +388,18 @@ impl Started {
             .as_ref()
             .map(|p| p.stream(self.parsing.tools, self.parsing.thinking));
         let mut events = Vec::new();
+        if !self.parsing.forced_prefix.is_empty()
+            && let Some(s) = &mut stream
+        {
+            feed_stream(
+                s,
+                &self.parsing.forced_prefix,
+                false,
+                &mut events,
+                &mut reasoning,
+            );
+            events.clear();
+        }
         while let Ok(step) = self.steps.recv() {
             match step {
                 Step::Token { text: piece, .. } => {
@@ -437,6 +482,15 @@ impl Started {
         let mut active_call: Option<usize> = None;
         let mut suppress_call = false;
         let mut reasoning = 0usize;
+        if !self.parsing.forced_prefix.is_empty() {
+            feed_stream(
+                &mut stream,
+                &self.parsing.forced_prefix,
+                false,
+                &mut events,
+                &mut reasoning,
+            );
+        }
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
                 Step::Token { text, .. } => (text, None),

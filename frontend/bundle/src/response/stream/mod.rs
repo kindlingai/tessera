@@ -45,7 +45,11 @@ impl TagDelims {
             }
         };
         let (vc, trim_trail_nl) = strip_opt_nl_start(after_val);
-        let val_close = unescape_lit(vc)?;
+        let val_close = unescape_lit(vc).or_else(|| {
+            let inner = vc.strip_prefix("(?:")?.strip_suffix(')')?;
+            let first = inner.split('|').next()?;
+            unescape_lit(first)
+        })?;
         if key_open.is_empty() || key_close.is_empty() || val_close.is_empty() {
             return None;
         }

@@ -107,6 +107,10 @@ impl Queued {
 }
 
 impl Generator for Queued {
+    fn supports_guides(&self) -> bool {
+        matches!(self.generate.steer, Steer::Guided(_))
+    }
+
     fn generate(&self, prompt: Vec<u32>, params: Params, mut sink: Sink) -> Result<(), Error> {
         let mut guides = Vec::new();
         let key = match params.penalties.neutral() {

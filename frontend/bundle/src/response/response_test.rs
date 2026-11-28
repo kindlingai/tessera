@@ -277,3 +277,20 @@ fn call_prefix_round_trips() {
         assert_eq!(parsed.tool_calls[0].function.name, "get_weather", "{name}");
     }
 }
+
+#[test]
+fn xml_inline_forced_prefix() {
+    let cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think>|(?=<tool_call>)","content":"text"},"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close_pattern":"</tool_call>|(?=<tool_call>)","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?(?:</parameter>|(?=<parameter=)|(?=</function>))"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}},"content":{"close":["<|im_end|>"],"content":"text"}}}}"#;
+    let parser = ResponseParser::from_config(cfg).unwrap().unwrap();
+    assert!(parser.supports_tools() && parser.starts_thinking("<|im_start|>assistant\n<think>\n"));
+    let prefix = parser.call_prefix(Some("echo")).unwrap();
+    assert_eq!(prefix, "<tool_call>\n<function=echo>\n");
+    let raw = format!("{prefix}<parameter=word>\namber\n</parameter>\n</function>\n</tool_call>");
+    let parsed = parser.parse(&raw, true, false);
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].function.name, "echo");
+    assert_eq!(
+        parsed.tool_calls[0].function.arguments,
+        json!({"word": "amber"})
+    );
+}
