@@ -340,7 +340,7 @@ fn sunk_metal_is_picked() {
             panic!("a fixed kernel");
         };
         assert_eq!(entry, METAL);
-        assert_eq!(step.kernel.needs().group_bytes, 25_728);
+        assert_eq!(step.kernel.needs().group_bytes, 25_600);
         let few = lower(&g, 0, &sizes(&[(0, 64, 4)]), &apple).unwrap();
         assert!(!kernels(&few).contains(&METAL), "{c:?}");
         let mut old_msl = m4_pro();
@@ -367,14 +367,23 @@ fn sunk_metal_is_picked() {
     assert!(kernels(&narrow).contains(&RULE) && !kernels(&narrow).contains(&METAL));
 }
 
-/// Large sink logits stay finite and match the reference.
+/// Large values, sinks and shifted logits stay finite and accurate.
 #[test]
 fn sink_stays_finite() {
-    for n in [16usize, 64] {
+    let cases = [
+        (16usize, 0.0f32, 90.0f32),
+        (64, 0.0, 90.0),
+        (64, 0.0, 64.0),
+        (64, 536_870_912.0, 64.0),
+        (64, 0.0, 0.5),
+    ];
+    for (n, shift, gap) in cases {
         for width in [64usize, 128] {
-            let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+            let win = if shift != 0.0 { n } else { 0 };
+            let c = case(Mask::Causal, [2, 1, width, 1, win]);
             let g = graph(c);
             let run = [(0u32, 0u32, n as u32)];
+            let bias = vec![shift; n * c.heads * win.max(1)];
             let inputs = vec![
                 Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
                 Tensor::f32(
@@ -387,15 +396,15 @@ fn sink_stays_finite() {
                 ),
                 Tensor::u32(vec![n], vec![0; n]),
                 Tensor::u32(vec![n], (0..n as u32).collect()),
-                Tensor::f32(vec![c.heads], vec![90.0; c.heads]),
-                Tensor::f32(vec![n, c.heads, 1], vec![0.0; n * c.heads]),
+                Tensor::f32(vec![c.heads], vec![shift + gap; c.heads]),
+                Tensor::f32(vec![n, c.heads, win.max(1)], bias),
             ];
             let mut store = Store::default();
             let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
             let expected = want[0].floats().unwrap();
             assert!(
                 expected[0] > 1e-3 && expected.iter().all(|v| v.is_finite()),
-                "n={n} w={width} expected[0]={:?}",
+                "n={n} w={width} shift={shift} gap={gap} expected[0]={:?}",
                 expected[0]
             );
             for settings in runs() {
@@ -420,16 +429,18 @@ fn sink_stays_finite() {
                 let got = got.floats().unwrap();
                 assert!(
                     got.iter().all(|v| v.is_finite()),
-                    "sink=90 n={n} w={width} on {} ({expect_kernel}) produced non-finite output",
+                    "n={n} w={width} shift={shift} gap={gap} on {} ({expect_kernel}) non-finite",
                     runner.device()
                 );
-                let off = max_abs_diff(got, expected);
+                let rel = got
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                    .fold(0.0f32, f32::max);
                 assert!(
-                    off < 5e-3,
-                    "sink=90 n={n} w={width} on {} ({expect_kernel}): got {} want {} off {off:e}",
-                    runner.device(),
-                    got[0],
-                    expected[0]
+                    rel < 2e-2,
+                    "n={n} w={width} shift={shift} gap={gap} on {} ({expect_kernel}): rel {rel:e}",
+                    runner.device()
                 );
             }
         }

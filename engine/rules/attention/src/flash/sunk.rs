@@ -55,24 +55,6 @@ fn scores_near(
     }
 }
 
-/// Stages each row's sink into `l_s` before the loop.
-#[kernel]
-fn stage_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32) {
-    if lid() < BQ {
-        let r = hd.q0 + lid();
-        let mut sink = f32::NEG_INFINITY;
-        if sink_mode > 0 && r < hd.queries {
-            let at = if sink_mode == 1 {
-                hd.head
-            } else {
-                r * hd.heads + hd.head
-            };
-            sink = sinks[at as u64];
-        }
-        st.l_s[lid()] = sink;
-    }
-}
-
 /// Scales two output tiles twice by `alpha_s`.
 #[kernel]
 fn scale_sinks(top: &mut Tiles, bottom: &mut Tiles, alpha_s: &Shared<f32>) {
@@ -82,34 +64,37 @@ fn scale_sinks(top: &mut Tiles, bottom: &mut Tiles, alpha_s: &Shared<f32>) {
     bottom.scale(|r| alpha_s[16 + r]);
 }
 
-/// Folds each row's sink into its sum without overflow.
+/// Folds each row's sink into its normalized output.
 #[kernel]
 fn fold_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32, #[build] w: u32) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
         let q = hd.q0 + simd * ROWS + i;
         let mut h = 1.0f32;
+        let mut denom = 1.0f32;
         if sink_mode > 0 && q < hd.queries {
             let list = q * hd.heads + hd.head;
             let at = if sink_mode == 1 { hd.head } else { list };
             let sink = sinks[at as u64];
-            if sink > f32::NEG_INFINITY {
+            let sum = st.state[(ROWS + i) as usize];
+            if sink > f32::NEG_INFINITY && sum > 0.0 {
                 let peak = st.state[i as usize];
-                let sum = st.state[(ROWS + i) as usize];
-                if sink > peak {
-                    h = exp(0.5 * (peak - sink));
-                    st.state[(ROWS + i) as usize] = (sum * h) * h + 1.0;
+                let d = (peak - sink) + log(sum);
+                if d >= 0.0 {
+                    denom = 1.0 + exp(-d);
                 } else {
-                    st.state[(ROWS + i) as usize] = sum + exp(sink - peak);
+                    h = exp(0.5 * d);
+                    denom = h * h + 1.0;
                 }
             }
         }
+        st.state[(ROWS + i) as usize] = denom;
         if lane() == 0 {
             st.alpha_s[simd * ROWS + i] = h;
         }
     }
     barrier();
-    // Apply `h` twice to avoid subnormal `exp(peak - sink)`.
+    // Apply `h` twice to avoid subnormal `exp(d)`.
     if simd * 16 < w {
         scale_sinks(&mut st.o00, &mut st.o01, &st.alpha_s);
     }
@@ -232,7 +217,6 @@ fn flash_sunk(
             see_rows(
                 &mut st, &mut pos_s, slots, positions, &hd, slot, keys, before, after,
             );
-            stage_sinks(&mut st, sinks, &hd, sink_mode);
             barrier();
             let span = span_of(&st, keys);
             clear(&mut st);
@@ -246,12 +230,12 @@ fn flash_sunk(
                 score_chunk(&mut st, simd, w, bk, held_q);
                 scores_near(&mut st, &pos_s, rel_bias, &hd, simd, k0, scale, rel_win, bk);
                 barrier();
-                fold_block::<true>(
+                fold_block(
                     &mut st, values, &hd, at, k0, span.hi, 0, w, w, bk, held_q, v_form,
                 );
             }
             fold_sinks(&mut st, sinks, &hd, sink_mode, w);
-            write_all(&mut st, out, &hd, 0, w, w, out_form);
+            write_all::<false, true>(&mut st, out, &hd, 0, w, w, out_form);
             barrier();
         }
     }

@@ -265,7 +265,7 @@ fn scores(st: &mut Stream, simd: u32, k0: u32, #[build] bk: u32) {
 
 /// A softmax step, `ROWS` rows per SIMD group.
 #[kernel]
-fn soften<const HAS_SINKS: bool>(st: &mut Stream, #[build] bk: u32) {
+fn soften(st: &mut Stream, #[build] bk: u32) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
         let row = simd * ROWS + i;
@@ -281,15 +281,7 @@ fn soften<const HAS_SINKS: bool>(st: &mut Stream, #[build] bk: u32) {
         top = max(top, shfl_xor(top, 4));
         top = max(top, shfl_xor(top, 2));
         top = max(top, shfl_xor(top, 1));
-        let mut floor = top;
-        if HAS_SINKS && top > f32::NEG_INFINITY {
-            let sink = st.l_s[row];
-            if sink > top {
-                let cap = top + 32.0;
-                floor = if sink < cap { sink } else { cap };
-            }
-        }
-        let m_new = max(st.state[i as usize], floor);
+        let m_new = max(st.state[i as usize], top);
         // A row that has seen nothing keeps zero sums.
         let safe = if m_new == f32::NEG_INFINITY {
             0.0
@@ -300,13 +292,17 @@ fn soften<const HAS_SINKS: bool>(st: &mut Stream, #[build] bk: u32) {
         let p = exp(s - safe);
         let mut sum = p;
         sum = sum32(sum);
+        let prev = st.state[(ROWS + i) as usize] * alpha;
+        let l_new = prev + sum;
+        let old_scale = if l_new > 0.0 { prev / l_new } else { 0.0 };
+        let w_norm = if l_new > 0.0 { p / l_new } else { 0.0 };
         if lane() < bk {
-            st.p_s[at] = p;
+            st.p_s[at] = w_norm;
         }
-        st.state[(ROWS + i) as usize] = st.state[(ROWS + i) as usize] * alpha + sum;
+        st.state[(ROWS + i) as usize] = l_new;
         st.state[i as usize] = m_new;
         if lane() == 0 {
-            st.alpha_s[row] = alpha;
+            st.alpha_s[row] = old_scale;
         }
     }
 }
@@ -337,9 +333,9 @@ fn fold_pair(
     bottom.block(p_s, 16 * (bk + PAD), kv_s, col, bk + PAD, bk);
 }
 
-/// Writes two tile sums over `l_s`, rows that saw keys.
+/// Writes two tile sums, optionally dividing by `l_s`.
 #[kernel]
-fn write_pair<const ZERO_EMPTY: bool>(
+fn write_pair<const ZERO_EMPTY: bool, const DIVIDE: bool>(
     top: &Tiles,
     bottom: &Tiles,
     #[form(out_form)] mut out: BufMut<Dyn>,
@@ -353,14 +349,22 @@ fn write_pair<const ZERO_EMPTY: bool>(
         let live = st.to_s[r] > st.from_s[r];
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + r < hd.queries)) {
             let at = ((hd.q0 + r) * hd.heads + hd.head) as u64 * w as u64;
-            out[at + (col + c) as u64] = if live { v / st.l_s[r] } else { 0.0 };
+            out[at + (col + c) as u64] = if live {
+                if DIVIDE { v / st.l_s[r] } else { v }
+            } else {
+                0.0
+            };
         }
     });
     bottom.each(|r, c, v| {
         let live = st.to_s[16 + r] > st.from_s[16 + r];
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + 16 + r < hd.queries)) {
             let at = ((hd.q0 + 16 + r) * hd.heads + hd.head) as u64 * w as u64;
-            out[at + (col + c) as u64] = if live { v / st.l_s[16 + r] } else { 0.0 };
+            out[at + (col + c) as u64] = if live {
+                if DIVIDE { v / st.l_s[16 + r] } else { v }
+            } else {
+                0.0
+            };
         }
     });
 }
@@ -384,12 +388,12 @@ fn take_block(
     let simd = lid() / LANES as u32;
     scores(st, simd, k0, bk);
     barrier();
-    fold_block::<false>(st, values, hd, at, k0, count, d0, cw, w, bk, held_q, v_form);
+    fold_block(st, values, hd, at, k0, count, d0, cw, w, bk, held_q, v_form);
 }
 
 /// Softens the scores in `p_s`, then folds values in.
 #[kernel]
-fn fold_block<const HAS_SINKS: bool>(
+fn fold_block(
     st: &mut Stream,
     #[form(v_form)] values: Buf<Dyn>,
     hd: &Head,
@@ -404,7 +408,7 @@ fn fold_block<const HAS_SINKS: bool>(
     #[build] v_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
-    soften::<HAS_SINKS>(st, bk);
+    soften(st, bk);
     barrier();
     // Held queries made room: values staged with the keys.
     if !held_q {
@@ -451,9 +455,9 @@ fn fold_block<const HAS_SINKS: bool>(
     barrier();
 }
 
-/// Writes the four tile sums over the sums in `state`.
+/// Writes the four tile sums, optionally dividing by `state`.
 #[kernel]
-fn write_all<const ZERO_EMPTY: bool>(
+fn write_all<const ZERO_EMPTY: bool, const DIVIDE: bool>(
     st: &mut Stream,
     #[form(out_form)] mut out: BufMut<Dyn>,
     hd: &Head,
@@ -463,18 +467,29 @@ fn write_all<const ZERO_EMPTY: bool>(
     #[build] out_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
-    for i in 0..ROWS {
-        if lane() == i {
-            st.l_s[simd * ROWS + i] = st.state[(ROWS + i) as usize];
+    if DIVIDE {
+        for i in 0..ROWS {
+            if lane() == i {
+                st.l_s[simd * ROWS + i] = st.state[(ROWS + i) as usize];
+            }
         }
+        barrier();
     }
-    barrier();
     // The first column, then each SIMD group's pieces.
     if simd * 16 < cw {
-        write_pair::<ZERO_EMPTY>(&st.o00, &st.o01, out, st, hd, d0 + simd * 16, w, out_form);
+        write_pair::<ZERO_EMPTY, DIVIDE>(
+            &st.o00,
+            &st.o01,
+            out,
+            st,
+            hd,
+            d0 + simd * 16,
+            w,
+            out_form,
+        );
     }
     if (simd + 4) * 16 < cw {
-        write_pair::<ZERO_EMPTY>(
+        write_pair::<ZERO_EMPTY, DIVIDE>(
             &st.o10,
             &st.o11,
             out,
@@ -569,7 +584,7 @@ pub(crate) fn flash_body(
             st, values, hd, k0, k0, keys, start, cw, w, bk, held_q, v_form,
         );
     }
-    write_all::<true>(st, out, hd, start, cw, w, out_form);
+    write_all::<true, false>(st, out, hd, start, cw, w, out_form);
 }
 
 /// Lanes keep their output shares across the key stream.
@@ -698,7 +713,7 @@ pub(crate) fn flash_rows(
                     &mut st, values, &hd, at, k0, last, 0, w, w, bk, held_q, v_form,
                 );
             }
-            write_all::<false>(&mut st, out, &hd, 0, w, w, out_form);
+            write_all::<false, false>(&mut st, out, &hd, 0, w, w, out_form);
             barrier();
         }
     }

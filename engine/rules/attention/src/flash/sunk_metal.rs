@@ -14,7 +14,7 @@ const WIDE: usize = 136;
 /// Staged elements per row of scores, padding included.
 const NEAR: usize = 40;
 /// Bytes of queries, keys, weights, scores and row state.
-const SMEM: usize = BLOCK * (2 * 2 * WIDE + (2 + 4) * NEAR + 5 * 4);
+const SMEM: usize = BLOCK * (2 * 2 * WIDE + (2 + 4) * NEAR + 4 * 4);
 /// bf16 tiles run four times the f32 rate.
 const SPEEDUP: f64 = 4.0;
 const SOURCE: &str = include_str!("sunk_metal.metal");
