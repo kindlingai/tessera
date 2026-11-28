@@ -134,7 +134,7 @@ fn offer_row_bounds() {
 
 #[test]
 fn plan_words_match() {
-    let cu = include_str!("moe.cu");
+    let cu = include_str!("shared.cuh");
     assert_eq!(define(cu, "MAX_ROWS"), MOST_ROWS);
     assert_eq!(define(cu, "MAX_SLOTS"), MAX_SLOTS);
     assert_eq!(define(cu, "PICKS"), PICKS);

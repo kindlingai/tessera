@@ -274,6 +274,8 @@ fn join_rope_matches() {
         (1usize, Pairs::Adjacent, F32_FORM, 1e-4f32),
         (8, Pairs::Adjacent, F32_FORM, 1e-4),
         (8, Pairs::Halves, BF16_FORM, 2e-2),
+        (8, Pairs::Adjacent, FP8_FORM, 0.25),
+        (8, Pairs::Halves, FP8_FORM, 0.25),
     ] {
         let g = absorbed_q(4, 32, 16, 16, pairs);
         let inputs = [
@@ -325,6 +327,11 @@ fn join_rope_matches() {
             .unwrap();
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
             assert_eq!(names, ["join_rope"], "rope_first={rope_first} rope={rope}");
+            let tessera_lower::Source::Made(body) = plan.steps[0].kernel.source() else {
+                panic!("expected Made source");
+            };
+            let flags: usize = body.entry.split('_').nth(3).unwrap().parse().unwrap();
+            assert_eq!((flags & 16) != 0, rope >= 8, "{}", body.entry);
             let mut runner = open(plan, &settings).unwrap();
             let got = runner.run(&views).unwrap().remove(0);
             let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());

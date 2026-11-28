@@ -85,3 +85,51 @@ fn shares_round_trip() {
         assert!(form.share(&bytes, [16, 2, 8], [1, 1]).is_none());
     }
 }
+
+#[test]
+fn pack_and_dot_edges() {
+    use crate::block::{INT2_G128, Nibble};
+
+    let forms: &[&dyn Form] = &[
+        &Q8_0, &Q4_0, &NVFP4, &MXFP8, &MXFP4, &INT4_G32, &INT4_G128, &INT2_G32, &INT2_G128,
+    ];
+    // Zero blocks must unpack to zero for every code bias.
+    let zeros = vec![0.0f32; 128];
+    for &form in forms {
+        let packed = form.pack(&zeros);
+        for i in 0..128 {
+            assert_eq!(form.unpack(&packed, i), 0.0, "{} zero {i}", form.name());
+        }
+        assert_eq!(
+            form.dot(&zeros, &packed, 0),
+            0.0,
+            "{} zero dot",
+            form.name()
+        );
+    }
+    // Partial trailing blocks and non-zero block offsets match unpack.
+    let data: Vec<f32> = (0..165)
+        .map(|i| ((i * 53) % 29) as f32 * 0.05 - 0.7)
+        .collect();
+    let x: Vec<f32> = (0..165).map(|i| ((i * 19) % 11) as f32 - 5.0).collect();
+    for &form in forms {
+        let packed = form.pack(&data);
+        let at = form.block();
+        let tail = &x[at..];
+        let want: f32 = tail
+            .iter()
+            .enumerate()
+            .map(|(i, xi)| xi * form.unpack(&packed, at + i))
+            .sum();
+        let got = form.dot(tail, &packed, at);
+        assert!(
+            (got - want).abs() <= 1e-3,
+            "{} offset tail: {got} vs {want}",
+            form.name()
+        );
+    }
+    // Symmetric nibble scale preserves first-occurrence sign on ties.
+    use crate::block::Encode;
+    assert!(Nibble::scale(&[2.0, -2.0, 0.5]) < 0.0);
+    assert!(Nibble::scale(&[-2.0, 2.0, 0.5]) > 0.0);
+}

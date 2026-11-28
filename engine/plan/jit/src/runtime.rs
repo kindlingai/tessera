@@ -341,6 +341,7 @@ macro_rules! unary {
 unary! {
     exp = f32::exp;
     tanh = f32::tanh;
+    erf = tessera_codegen::stage::erf;
     cos = f32::cos;
     sin = f32::sin;
 }

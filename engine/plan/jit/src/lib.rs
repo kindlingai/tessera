@@ -5,6 +5,9 @@ mod expr;
 mod lib_test;
 mod lower;
 mod runtime;
+mod scalar;
+#[cfg(test)]
+mod scalar_test;
 
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 use cranelift_codegen::settings::{self, Configurable};
@@ -93,6 +96,7 @@ helpers! {
     half(P, P, P) -> I32;
     exp(F32) -> F32;
     tanh(F32) -> F32;
+    erf(F32) -> F32;
     log(F32) -> F32;
     cos(F32) -> F32;
     sin(F32) -> F32;

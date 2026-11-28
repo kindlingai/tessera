@@ -119,6 +119,14 @@ fn dense_steps(shape: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// Whether `f` supports vectorized float loads and stores.
+fn float_form(f: &dyn Stored) -> bool {
+    matches!(
+        f.dtype(),
+        DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8
+    )
+}
+
 /// Up to four runs as a kernel, outer runs first.
 fn nested(
     runs: &[(usize, usize)],
@@ -140,12 +148,6 @@ fn nested(
     ] = all[..]
     else {
         return None;
-    };
-    let float_form = |f: &dyn Stored| {
-        matches!(
-            f.dtype(),
-            DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8
-        )
     };
     let wide = float_form(in_form)
         && float_form(out_form)
@@ -218,23 +220,87 @@ fn kept_join(
     #[build] a_form: &'static dyn Stored,
     #[build] b_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
+    #[build] wide: bool,
 ) {
-    let total = left + right;
-    if gid() >= rows * total {
-        return;
-    }
-    let r = gid() / total;
-    let j = gid() % total;
-    let kr = kept_row(r / keys, r % keys);
-    let mut v = 0.0f32;
-    if j < left {
-        let ar = if a_kept { kr } else { r };
-        v = a[(ar * left + j) as u64];
+    if wide {
+        let left4 = left / 4;
+        let total4 = left4 + right / 4;
+        if total4 == 0 || gid() >= rows * total4 {
+            return;
+        }
+        let r = gid() / total4;
+        let j4 = gid() - r * total4;
+        let kr = if a_kept && b_kept {
+            kept_row(r / keys, r % keys)
+        } else {
+            r
+        };
+        let mut vx = 0.0f32;
+        let mut vy = 0.0f32;
+        let mut vz = 0.0f32;
+        let mut vw = 0.0f32;
+        if j4 < left4 {
+            let ar = if a_kept && b_kept {
+                kr
+            } else if a_kept {
+                kept_row(r / keys, r % keys)
+            } else {
+                r
+            };
+            let v = a.load4((ar * left + j4 * 4) as u64);
+            vx = v.x;
+            vy = v.y;
+            vz = v.z;
+            vw = v.w;
+        } else {
+            let br = if a_kept && b_kept {
+                kr
+            } else if b_kept {
+                kept_row(r / keys, r % keys)
+            } else {
+                r
+            };
+            let v = b.load4((br * right + (j4 - left4) * 4) as u64);
+            vx = v.x;
+            vy = v.y;
+            vz = v.z;
+            vw = v.w;
+        }
+        out.store4((gid() * 4) as u64, F32x4::new(vx, vy, vz, vw));
     } else {
-        let br = if b_kept { kr } else { r };
-        v = b[(br * right + (j - left)) as u64];
+        let total = left + right;
+        if total == 0 || gid() >= rows * total {
+            return;
+        }
+        let r = gid() / total;
+        let j = gid() - r * total;
+        let kr = if a_kept && b_kept {
+            kept_row(r / keys, r % keys)
+        } else {
+            r
+        };
+        let mut v = 0.0f32;
+        if j < left {
+            let ar = if a_kept && b_kept {
+                kr
+            } else if a_kept {
+                kept_row(r / keys, r % keys)
+            } else {
+                r
+            };
+            v = a[(ar * left + j) as u64];
+        } else {
+            let br = if a_kept && b_kept {
+                kr
+            } else if b_kept {
+                kept_row(r / keys, r % keys)
+            } else {
+                r
+            };
+            v = b[(br * right + (j - left)) as u64];
+        }
+        out[gid() as u64] = v;
     }
-    out[gid() as u64] = v;
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -260,6 +326,7 @@ pub(crate) struct KeptJoin {
     pub a_form: &'static dyn Stored,
     pub b_form: &'static dyn Stored,
     pub out_form: &'static dyn Stored,
+    pub wide: bool,
 }
 
 fn kept_join_accepts(k: &KeptJoin, input: usize, form: &dyn Stored) -> bool {
@@ -276,12 +343,13 @@ fn kept_join_emits(k: &KeptJoin, form: &dyn Stored) -> bool {
 
 fn kept_join_source(k: &KeptJoin) -> Source {
     let body = kept::attach(
-        kept_join_ir(k.a_kept, k.b_kept, k.a_form, k.b_form, k.out_form),
+        kept_join_ir(k.a_kept, k.b_kept, k.a_form, k.b_form, k.out_form, k.wide),
         k.kept,
     );
     let flags = usize::from(k.a_kept) | (usize::from(k.b_kept) << 1);
+    let suffix = if k.wide { "_x4" } else { "" };
     let entry = format!(
-        "plan_kept_join_{}_{flags}_{}_{}_{}",
+        "plan_kept_join{suffix}_{}_{flags}_{}_{}_{}",
         k.kept.name(),
         k.a_form.name(),
         k.b_form.name(),
@@ -292,6 +360,7 @@ fn kept_join_source(k: &KeptJoin) -> Source {
 
 fn kept_join_launches(k: &KeptJoin, step: &Step) -> Vec<Launch> {
     let total = k.rows * (k.left + k.right);
+    let threads = if k.wide { total / 4 } else { total };
     let sizes = [k.rows, k.keys, k.left, k.right].map(Arg::count);
     let kept = k
         .kept
@@ -306,7 +375,7 @@ fn kept_join_launches(k: &KeptJoin, step: &Step) -> Vec<Launch> {
         .collect();
     vec![Launch {
         args,
-        shape: Shape::Line(total),
+        shape: Shape::Line(threads),
     }]
 }
 
@@ -399,6 +468,13 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             let right = side(y);
             let rows = tree.elements(x) / left.max(1);
             let keys = xs[1] * (rows / (xs[0] * xs[1]).max(1));
+            let a_form = plain(tree.node(x).form);
+            let b_form = plain(tree.node(y).form);
+            let wide = float_form(a_form)
+                && float_form(b_form)
+                && float_form(out_form)
+                && left.is_multiple_of(4)
+                && right.is_multiple_of(4);
             let kernel = KeptJoin {
                 rows,
                 keys,
@@ -409,9 +485,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                 a_kept: xk.is_some(),
                 b_kept: yk.is_some(),
                 kept: tree.kept,
-                a_form: plain(tree.node(x).form),
-                b_form: plain(tree.node(y).form),
+                a_form,
+                b_form,
                 out_form,
+                wide,
             };
             return Some(vec![Draft::new(kernel, [x, y], len)]);
         }
@@ -423,6 +500,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             b_form: plain(tree.node(y).form),
             out_form,
         };
+        if !join.fits() {
+            return None;
+        }
         return Some(vec![Draft::new(join, [x, y], len)]);
     }
     // Fuse a single-reader slice followed by a permute.

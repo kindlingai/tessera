@@ -4,7 +4,8 @@ use crate::Error;
 use crate::offer::{Offer, Slice, Stored};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use tessera_engine::block;
 use tessera_engine::storage::{self, Form};
@@ -30,6 +31,7 @@ pub enum Meta {
 pub enum GgufType {
     F32,
     F16,
+    BF16,
     Q4_0,
     Q8_0,
 }
@@ -45,6 +47,7 @@ impl GgufType {
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
             8 => Ok(Self::Q8_0),
+            30 => Ok(Self::BF16),
             _ => Err(Error::DType(format!("{name}: GGUF type {id}"))),
         }
     }
@@ -55,6 +58,7 @@ impl GgufType {
             Self::F16 => 1,
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::BF16 => 30,
         }
     }
 
@@ -63,6 +67,7 @@ impl GgufType {
         let (block, bytes) = match self {
             Self::F32 => of(&storage::F32),
             Self::F16 => (1, size_of::<tessera_engine::F16>()),
+            Self::BF16 => (1, size_of::<tessera_engine::Bf16>()),
             Self::Q4_0 => of(&block::Q4_0),
             Self::Q8_0 => of(&block::Q8_0),
         };
@@ -352,15 +357,44 @@ impl Gguf {
     pub fn bytes(&self, name: &str) -> Result<(GgufType, usize, Vec<u8>), Error> {
         let entry = self.entry(name)?;
         let mut bytes = vec![0; entry.bytes];
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(self.data + entry.offset))?;
-        file.read_exact(&mut bytes).map_err(format)?;
+        self.file
+            .read_exact_at(&mut bytes, self.data + entry.offset)
+            .map_err(format)?;
         Ok((entry.ty, entry.elements, bytes))
+    }
+
+    /// Whether two tensors have the same type and bytes.
+    pub fn same_bytes(&self, a: &str, b: &str) -> Result<bool, Error> {
+        let (ea, eb) = (self.entry(a)?, self.entry(b)?);
+        if ea.ty != eb.ty || ea.elements != eb.elements || ea.bytes != eb.bytes {
+            return Ok(false);
+        }
+        if ea.offset == eb.offset {
+            return Ok(true);
+        }
+        const CHUNK: usize = 64 << 10;
+        let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
+        let mut off = 0usize;
+        while off < ea.bytes {
+            let n = CHUNK.min(ea.bytes - off);
+            let at = self.data + off as u64;
+            self.file
+                .read_exact_at(&mut ba[..n], at + ea.offset)
+                .map_err(format)?;
+            self.file
+                .read_exact_at(&mut bb[..n], at + eb.offset)
+                .map_err(format)?;
+            if ba[..n] != bb[..n] {
+                return Ok(false);
+            }
+            off += n;
+        }
+        Ok(true)
     }
 
     pub fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
         match self.tensor_type(name)? {
-            GgufType::F32 | GgufType::F16 => {}
+            GgufType::F32 | GgufType::F16 | GgufType::BF16 => {}
             ty => return Err(Error::DType(format!("{name}: {ty:?} is packed"))),
         }
         let (ty, _, bytes) = self.bytes(name)?;
@@ -370,6 +404,12 @@ impl Gguf {
                 .0
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            GgufType::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from(tessera_engine::Bf16(u16::from_le_bytes(*b))))
                 .collect(),
             _ => tessera_engine::F16::floats(&bytes),
         })
@@ -382,6 +422,7 @@ impl Offer for Gguf {
         let stored = |ty: GgufType| match ty {
             GgufType::F32 => Stored::F32,
             GgufType::F16 => Stored::F16,
+            GgufType::BF16 => Stored::BF16,
             GgufType::Q8_0 => Stored::Form(&block::Q8_0),
             GgufType::Q4_0 => Stored::Form(&block::Q4_0),
         };

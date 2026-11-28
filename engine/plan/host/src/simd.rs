@@ -7,6 +7,9 @@ use std::sync::OnceLock;
 pub(crate) enum Level {
     /// The target's own baseline.
     Base,
+    /// ARM64 NEON with fused multiply-add.
+    #[cfg(target_arch = "aarch64")]
+    Neon,
     /// x86 AVX2 with fused multiply-add.
     #[cfg(target_arch = "x86_64")]
     Avx2,
@@ -30,8 +33,14 @@ impl Level {
         out
     }
 
+    /// Every level this CPU runs: baseline and NEON.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn all() -> Vec<Level> {
+        vec![Level::Base, Level::Neon]
+    }
+
     /// Every level this CPU runs: its baseline.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn all() -> Vec<Level> {
         vec![Level::Base]
     }
@@ -368,7 +377,7 @@ pub(crate) fn reduce(acc: &Lanes) -> [[f32; 4]; 4] {
 pub(crate) const WIDE: usize = 32;
 
 /// Depth one packed panel holds, so it stays in cache.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const PANEL: usize = 128;
 
 /// Rows of `w` as `[depth][WIDE]`, eight at a time.
@@ -420,6 +429,22 @@ unsafe fn pack(w: &[&[f32]], packed: &mut [f32]) {
 
 /// Rows of `x` by those of `w`, if `level` packs.
 pub(crate) fn panel_at(level: Level, x: &[&[f32]], w: &[&[f32]], acc: &mut [[f32; WIDE]]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    if level == Level::Neon && x.len() >= 5 && w.len() == WIDE {
+        let k = w[0].len();
+        let mut packed = [0.0f32; PANEL * WIDE];
+        let mut xs = Vec::with_capacity(x.len());
+        for start in (0..k).step_by(PANEL) {
+            let end = (start + PANEL).min(k);
+            let ws: [&[f32]; WIDE] = std::array::from_fn(|i| &w[i][start..end]);
+            xs.clear();
+            xs.extend(x.iter().map(|r| &r[start..end]));
+            let packed = &mut packed[..(end - start) * WIDE];
+            crate::neon::pack(&ws, packed);
+            crate::neon::panel(&xs, packed, acc);
+        }
+        return true;
+    }
     #[cfg(target_arch = "x86_64")]
     if level != Level::Base {
         let k = w[0].len();

@@ -90,6 +90,22 @@ impl Held {
         &self.all[self.bound[slot.buffer as usize]]
     }
 
+    /// The plan's largest scratch buffer, and the bytes it writes.
+    pub(crate) fn scratch_tail(&self, plan: &Plan) -> Option<(&Buffer, usize)> {
+        let mut best: Option<(&Buffer, usize)> = None;
+        for (b, &need) in plan.buffers.iter().enumerate() {
+            let at = self.bound[b];
+            if !self.scratch.values().any(|slots| slots.contains(&at)) {
+                continue;
+            }
+            let buf = &self.all[at];
+            if best.is_none_or(|(held, _)| buf.bytes() > held.bytes()) {
+                best = Some((buf, need));
+            }
+        }
+        best
+    }
+
     /// Bytes of every live buffer.
     pub fn total(&self) -> u64 {
         self.all.iter().map(|b| b.bytes() as u64).sum()

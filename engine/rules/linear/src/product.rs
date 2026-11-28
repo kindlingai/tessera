@@ -2,16 +2,17 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use tessera_codegen::{Dialect, hash};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
-use tessera_lower::kernels::{add_operand_forms, finish};
+use tessera_lower::kernels::{add_operand_forms, finish, hash_stages};
 use tessera_lower::sites;
 use tessera_lower::sites::{After, Near, Picked};
 use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree};
 
 /// Kernel, schedule, operands, flags, and extra tag.
-pub(crate) type Variant = (
+pub type Variant = (
     &'static str,
     usize,
     &'static str,
@@ -44,7 +45,7 @@ pub struct Product {
 }
 
 /// The index of the output at `row` and `col`.
-pub(crate) fn place(row: Expr, col: Expr) -> Expr {
+pub fn place(row: Expr, col: Expr) -> Expr {
     let u64 = |e| Expr::cast(Ty::U64, e);
     let o = Expr::bin(BinOp::Mul, u64(row), u64(Expr::var("n")));
     Expr::bin(BinOp::Add, o, u64(col))
@@ -52,7 +53,7 @@ pub(crate) fn place(row: Expr, col: Expr) -> Expr {
 
 impl Product {
     /// The finished matmul at `at`, with its reads.
-    pub(crate) fn find(tree: &Tree, at: T) -> Option<(Self, Vec<Read>)> {
+    pub fn find(tree: &Tree, at: T) -> Option<(Self, Vec<Read>)> {
         let site: sites::Finished = tree.site(at)?;
         let sites::Matmul {
             x,
@@ -92,7 +93,7 @@ impl Product {
     }
 
     /// The kernel for `key`, with the chain's operands added.
-    pub(crate) fn tree(&self, key: Variant, build: impl FnOnce() -> Body) -> Body {
+    pub fn tree(&self, key: Variant, build: impl FnOnce() -> Body) -> Body {
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         // The operands sit between the weights and the output.
         let at = 2 + usize::from(self.picked.is_some()) + usize::from(self.near.is_some());
@@ -101,7 +102,7 @@ impl Product {
     }
 
     /// Each row's sum through the stages, into its place.
-    pub(crate) fn rows(&self, row: &str, sums: &str, col: Expr) -> Stmt {
+    pub fn rows(&self, row: &str, sums: &str, col: Expr) -> Stmt {
         let sum = Expr::index(Expr::var(sums), Expr::var(row));
         Stmt::For {
             var: row.into(),
@@ -114,30 +115,58 @@ impl Product {
     }
 
     /// The tree under an entry name that hashes its text.
-    pub(crate) fn source(&self, mut body: Body, kind: &str) -> Source {
+    pub fn source(&self, mut body: Body, kind: &str) -> Source {
         let hashed = hash(&body.text().render(Dialect::Cuda));
         body.entry = format!("{kind}_{}_{hashed:x}", self.form.name());
         Source::Made(body)
     }
 
     /// One launch: the reads, the output, then `counts`.
-    pub(crate) fn launch(&self, step: &Step, counts: &[usize], shape: Shape) -> Vec<Launch> {
+    pub fn launch(&self, step: &Step, counts: &[usize], shape: Shape) -> Vec<Launch> {
         vec![Launch::plain(step, counts, shape)]
     }
 
-    pub(crate) fn outputs(&self) -> usize {
+    pub fn outputs(&self) -> usize {
         self.m * self.n
     }
 
-    pub(crate) fn sizes(&self) -> Vec<usize> {
+    pub fn sizes(&self) -> Vec<usize> {
         vec![self.m, self.n, self.k]
     }
 
-    pub(crate) fn work(&self) -> f64 {
+    pub fn work(&self) -> f64 {
         (self.m * self.n * self.k) as f64
     }
 
-    pub(crate) fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
+    /// Hash of every product field affecting `load()`.
+    pub fn load_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        (self.m, self.n, self.k).hash(&mut h);
+        self.form.name().hash(&mut h);
+        self.x_form.name().hash(&mut h);
+        self.out_form.name().hash(&mut h);
+        self.other_forms.len().hash(&mut h);
+        for form in &self.other_forms {
+            form.name().hash(&mut h);
+        }
+        self.after.sum.hash(&mut h);
+        hash_stages(&self.after.stages, &mut h);
+        self.picked
+            .map(|p| (p.count, p.stride, p.offset, p.repeat, p.first))
+            .hash(&mut h);
+        self.near.map(|n| (n.pixels, n.cin, n.taps)).hash(&mut h);
+        h.finish()
+    }
+
+    /// Combines the product load key with kernel-specific fields.
+    pub fn key_with(&self, extra: impl Hash) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.load_key().hash(&mut h);
+        extra.hash(&mut h);
+        h.finish()
+    }
+
+    pub fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         let extra = usize::from(self.picked.is_some()) + usize::from(self.near.is_some());
         match input {
             0 => form.name() == self.x_form.name(),
@@ -150,11 +179,11 @@ impl Product {
         }
     }
 
-    pub(crate) fn emits(&self, form: &dyn Stored) -> bool {
+    pub fn emits(&self, form: &dyn Stored) -> bool {
         form.name() == self.out_form.name()
     }
 
-    pub(crate) fn read_bytes(&self) -> Vec<f64> {
+    pub fn read_bytes(&self) -> Vec<f64> {
         let mut reads = vec![
             self.x_form.bytes(self.m * self.k) as f64,
             self.form.bytes(self.n * self.k) as f64,

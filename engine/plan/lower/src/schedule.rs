@@ -65,6 +65,15 @@ fn distinct(reads: &[Val]) -> impl Iterator<Item = Val> + '_ {
 
 /// Runs the ready op that grows live memory least.
 pub fn schedule(s: &Selected) -> Vec<usize> {
+    order(s, false)
+}
+
+/// Runs ready ops in concurrent waves with low growth.
+pub fn schedule_waves(s: &Selected) -> Vec<usize> {
+    order(s, true)
+}
+
+fn order(s: &Selected, waves: bool) -> Vec<usize> {
     // Track RAW, WAR, and WAW edges for shared kept buffers.
     let mut last_writer = vec![None::<usize>; s.values.len()];
     let mut readers_since = vec![Vec::<usize>::new(); s.values.len()];
@@ -96,6 +105,8 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
     let is_comm: Vec<bool> = s.ops.iter().map(|op| crosses(op.kernel.name())).collect();
     let mut comm_seq = vec![0u32; s.values.len()];
     let mut next_seq = 0u32;
+    let mut min_wave = vec![0u32; s.ops.len()];
+    let mut cur_wave = 0u32;
     let mut ready: Vec<usize> = (0..s.ops.len()).filter(|i| waiting[*i] == 0).collect();
     let mut lives = Lives::new(s);
     let mut order = Vec::with_capacity(s.ops.len());
@@ -113,10 +124,24 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
                 .unwrap_or(0);
             1 + age
         };
+        let wave_bucket = |idx: usize| -> u8 {
+            if !waves {
+                return 0;
+            }
+            // Drain active-wave ops before opening the next wave.
+            let w = min_wave[idx];
+            u8::from(w == 0 || w > cur_wave)
+        };
         let best = (0..ready.len())
-            .min_by_key(|at| (tier(ready[*at]), lives.growth(ready[*at]), ready[*at]))
+            .min_by_key(|at| {
+                let idx = ready[*at];
+                (tier(idx), wave_bucket(idx), lives.growth(idx), idx)
+            })
             .expect("ready is not empty");
         let next = ready.swap_remove(best);
+        if waves && min_wave[next] > cur_wave {
+            cur_wave = min_wave[next];
+        }
         lives.run(next);
         if is_comm[next] {
             next_seq += 1;
@@ -130,7 +155,15 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
             }
         }
         order.push(next);
+        let done_wave = if waves {
+            cur_wave.max(min_wave[next])
+        } else {
+            0
+        };
         for &r in &after[next] {
+            if waves {
+                min_wave[r] = min_wave[r].max(done_wave + 1);
+            }
             waiting[r] -= 1;
             if waiting[r] == 0 {
                 ready.push(r);

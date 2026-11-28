@@ -1,11 +1,14 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
-use crate::attend::{attend, heads_fit};
+mod attend;
+mod rows;
+
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
 use crate::node::{Graph, Op, View};
 use crate::select;
-use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
+use attend::{attend, heads_fit};
+use rows::{mean, mix, row, shift};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -27,6 +30,30 @@ pub struct TypeError {
     pub message: String,
 }
 
+impl ErrorKind {
+    pub(crate) fn err(self, message: impl Into<String>) -> TypeError {
+        TypeError {
+            kind: self,
+            message: message.into(),
+        }
+    }
+}
+
+/// A side operand must hold `dtype` and `placement`.
+pub(crate) fn side(
+    what: &str,
+    t: &TensorType,
+    dtype: DType,
+    placement: Placement,
+) -> Result<(), TypeError> {
+    need(t.dtype == dtype, ErrorKind::DType, || {
+        format!("{what} are {:?}, want {dtype:?}", t.dtype)
+    })?;
+    need(t.placement == placement, ErrorKind::Placement, || {
+        format!("{what} are {:?}, want {placement:?}", t.placement)
+    })
+}
+
 pub(crate) fn need(
     ok: bool,
     kind: ErrorKind,
@@ -35,17 +62,11 @@ pub(crate) fn need(
     if ok {
         return Ok(());
     }
-    Err(TypeError {
-        kind,
-        message: message(),
-    })
+    Err(kind.err(message()))
 }
 
 fn undeclared(name: DimName) -> TypeError {
-    TypeError {
-        kind: ErrorKind::Reference,
-        message: format!("undeclared dimension {name:?}"),
-    }
+    ErrorKind::Reference.err(format!("undeclared dimension {name:?}"))
 }
 
 pub(crate) fn poly(dims: &[Dim], e: &DimExpr) -> Result<Poly, TypeError> {
@@ -77,7 +98,7 @@ pub(crate) fn front(s: &Shape, n: usize) -> Shape {
     Shape(s.0[..n].to_vec())
 }
 
-fn finite(x: f32, what: &str) -> Result<(), TypeError> {
+pub(crate) fn finite(x: f32, what: &str) -> Result<(), TypeError> {
     need(x.is_finite(), ErrorKind::Value, || format!("{what} is {x}"))
 }
 
@@ -87,10 +108,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
     need(args.len() == want, ErrorKind::Arity, || {
         format!("{op:?} takes {want} arguments, got {}", args.len())
     })?;
-    let missing = || TypeError {
-        kind: ErrorKind::Reference,
-        message: format!("{op:?} names nothing in the graph"),
-    };
+    let missing = || ErrorKind::Reference.err(format!("{op:?} names nothing in the graph"));
     match op {
         Op::Input { entry, port } => g
             .entries
@@ -121,6 +139,11 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             need(!a.ragged || a.mask.causal(), ErrorKind::Value, || {
                 format!("ragged attention is causal only, got {:?}", a.mask)
             })?;
+            need(
+                !a.packed() || (!a.ragged && !a.picked && !a.sinks && !a.rel_bias),
+                ErrorKind::Value,
+                || "packed attention cannot combine with ragged, picked, sinks or rel_bias".into(),
+            )?;
             attend(&g.dims, a, args)
         }
         Op::Delta(d) => {
@@ -220,10 +243,9 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         (Split { axis }, Split { axis: k }) if axis == k && (axis as usize) < own => Split { axis },
         (Owned { axis }, Owned { axis: k }) if axis == k && (axis as usize) < own => Owned { axis },
         (xp, wp) => {
-            return Err(TypeError {
-                kind: ErrorKind::Placement,
-                message: format!("matmul cannot combine x {xp:?} with w {wp:?}"),
-            });
+            return Err(
+                ErrorKind::Placement.err(format!("matmul cannot combine x {xp:?} with w {wp:?}"))
+            );
         }
     };
     let mut shape = w.shape.0[..lead].to_vec();
@@ -234,6 +256,23 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         dtype: x.dtype,
         placement,
     })
+}
+
+/// Known `heads` must divide by `base`. Returns the base.
+pub(crate) fn groups(
+    dims: &[Dim],
+    heads: &DimExpr,
+    base: &DimExpr,
+    of: &str,
+    over: &str,
+) -> Result<Option<u64>, TypeError> {
+    let base = poly(dims, base)?.as_const();
+    if let (Some(h), Some(b)) = (poly(dims, heads)?.as_const(), base) {
+        need(b != 0 && h % b == 0, ErrorKind::Shape, || {
+            format!("{h} {of} heads do not group over {b} {over} heads")
+        })?;
+    }
+    Ok(base)
 }
 
 /// Rows `[Seqs, Context, C]` through taps `[C, K]`.
@@ -281,14 +320,7 @@ fn conv_rows(
         )
     })?;
     conv_types(x, w)?;
-    need(kept.dtype == DType::F32, ErrorKind::DType, || {
-        format!("conv state must be f32, got {:?}", kept.dtype)
-    })?;
-    need(
-        kept.placement == Placement::Replicated,
-        ErrorKind::Placement,
-        || format!("conv state must be replicated, got {:?}", kept.placement),
-    )?;
+    side("conv state", kept, DType::F32, Placement::Replicated)?;
     row_ids(dims, &x.shape, slots, positions)?;
     Ok(x.clone())
 }
@@ -338,7 +370,7 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             q.shape, k.shape, v.shape
         )
     })?;
-    heads_fit(dims, [v, q, k], 2, false)?;
+    heads_fit(dims, [v, q, k], 2, 2, false)?;
     delta_gates(dims, v, &a[3..5], 3)?;
     Ok(v.clone())
 }
@@ -359,13 +391,7 @@ fn delta_rows(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<Tens
             q.shape, k.shape, v.shape, kept.shape
         )
     })?;
-    let heads = poly(dims, &v.shape.0[1])?.as_const();
-    let kv_heads = poly(dims, &q.shape.0[1])?.as_const();
-    if let (Some(h), Some(kv)) = (heads, kv_heads) {
-        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
-            format!("{h} value heads do not group over {kv} key heads")
-        })?;
-    }
+    groups(dims, &v.shape.0[1], &q.shape.0[1], "value", "key")?;
     need(
         q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype && kept.dtype == DType::F32,
         ErrorKind::DType,
@@ -394,12 +420,7 @@ fn delta_gates(
         need(fits, ErrorKind::Shape, || {
             format!("gates {} do not match values {}", gate.shape, v.shape)
         })?;
-        need(gate.dtype == v.dtype, ErrorKind::DType, || {
-            format!("gates are {:?}, values {:?}", gate.dtype, v.dtype)
-        })?;
-        need(gate.placement == v.placement, ErrorKind::Placement, || {
-            format!("gates are {:?}, values {:?}", gate.placement, v.placement)
-        })?;
+        side("gates", gate, v.dtype, v.placement)?;
     }
     Ok(())
 }
@@ -444,346 +465,6 @@ pub(crate) fn valued(q: &TensorType, v: &TensorType) -> TensorType {
     out
 }
 
-/// Integer positions lead the rows of `x`, on every rank.
-fn positions(
-    dims: &[Dim],
-    x: &TensorType,
-    pos: &TensorType,
-    p: Placement,
-) -> Result<(), TypeError> {
-    let lead = pos.rank().min(x.rank() - 1);
-    let fits = pos.rank() < x.rank() && same_shape(dims, &front(&x.shape, lead), &pos.shape)?;
-    need(fits, ErrorKind::Shape, || {
-        format!("positions {} do not lead {}", pos.shape, x.shape)
-    })?;
-    need(pos.dtype.is_int(), ErrorKind::DType, || {
-        format!("positions must be integers, got {:?}", pos.dtype)
-    })?;
-    let last = x.rank() as u32 - 1;
-    let placed = pos.placement == Placement::Replicated
-        && match p {
-            Placement::Split { axis } => axis != last,
-            Placement::Owned { axis } => axis == 0 && axis != last,
-            _ => true,
-        };
-    need(placed, ErrorKind::Placement, || {
-        format!("{p:?} rows cannot follow {:?} positions", pos.placement)
-    })
-}
-
-/// The mask words, without any trailing edit words.
-fn masked(words: &DimExpr) -> &DimExpr {
-    match words {
-        DimExpr::Add(mask, _) => mask,
-        whole => whole,
-    }
-}
-
-/// One `u32` word per 32 entries of each row.
-fn allowed(dims: &[Dim], x: &TensorType, bits: &TensorType) -> Result<(), TypeError> {
-    let lead = x.rank() - 1;
-    let words = |s: &DimExpr| s.poly(dims).ok().and_then(|n| n.as_const());
-    let width = words(&x.shape.0[lead]);
-    let fits = bits.rank() == x.rank()
-        && same_shape(dims, &front(&x.shape, lead), &front(&bits.shape, lead))?
-        && words(masked(&bits.shape.0[lead])) == width.map(|w| w.div_ceil(32));
-    need(fits, ErrorKind::Shape, || {
-        format!("mask {} does not cover {}", bits.shape, x.shape)
-    })?;
-    need(bits.dtype == DType::U32, ErrorKind::DType, || {
-        format!("masks must be u32, got {:?}", bits.dtype)
-    })?;
-    need(
-        bits.placement == Placement::Replicated,
-        ErrorKind::Placement,
-        || "masks must be replicated".into(),
-    )
-}
-
-fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorType, TypeError> {
-    let x = args[0];
-    need(x.rank() >= 1, ErrorKind::Shape, || {
-        "a row op needs rank 1 or more".into()
-    })?;
-    need(x.dtype.is_float(), ErrorKind::DType, || {
-        format!("row stages need floats, got {:?}", x.dtype)
-    })?;
-    let last = x.rank() as u32 - 1;
-    let width = x.shape.0.last().expect("rank checked");
-    let mut p = x.placement;
-    let mut rest = args[1..].iter();
-    for s in stages {
-        let f = s.facts();
-        f.check.holds()?;
-        match *s {
-            Stage::L2Clip { eps, .. } => {
-                need(eps.is_finite() && eps >= 0.0, ErrorKind::Value, || {
-                    format!("l2 clip epsilon is {eps}")
-                })?
-            }
-            Stage::LogScale { alpha, .. } => finite(alpha, "log scale alpha")?,
-            _ => {}
-        }
-        let operand = (f.operand != Takes::Nothing).then(|| *rest.next().expect("arity checked"));
-        if let Some(o) = operand {
-            takes(dims, f.operand, s, x, o, p)?;
-        }
-        if f.blocks > 1 {
-            need(blocks(dims, width, f.blocks)?, ErrorKind::Shape, || {
-                format!("{s:?} needs rows in blocks of {}, got {width}", f.blocks)
-            })?;
-        }
-        p = place(f.place, s, p, x, operand)?;
-        if f.whole {
-            whole(p, last, s)?;
-        }
-    }
-    Ok(TensorType {
-        shape: x.shape.clone(),
-        dtype: x.dtype,
-        placement: p,
-    })
-}
-
-impl Check {
-    fn holds(self) -> Result<(), TypeError> {
-        match self {
-            Check::Pass => Ok(()),
-            Check::Finite(x, what) => finite(x, what),
-            Check::Positive(x, what) => need(x.is_finite() && x > 0.0, ErrorKind::Value, || {
-                format!("{what} is {x}")
-            }),
-            Check::PowerOfTwo(n) => need(n.is_power_of_two(), ErrorKind::Shape, || {
-                format!("blocks of {n} are not a power of two")
-            }),
-        }
-    }
-}
-
-/// Checks operand `o` of stage `s` against row input `x`.
-fn takes(
-    dims: &[Dim],
-    kind: Takes,
-    s: &Stage,
-    x: &TensorType,
-    o: &TensorType,
-    p: Placement,
-) -> Result<(), TypeError> {
-    match kind {
-        Takes::Nothing => Ok(()),
-        Takes::Broadcast => {
-            broadcast(dims, &x.shape, &o.shape)?;
-            need(o.dtype == x.dtype, ErrorKind::DType, || {
-                format!("{s:?} mixes {:?} and {:?}", x.dtype, o.dtype)
-            })
-        }
-        Takes::RowWeight => {
-            let width = std::slice::from_ref(x.shape.0.last().expect("rank checked"));
-            need(
-                same_shape(dims, &o.shape, &Shape(width.to_vec()))?,
-                ErrorKind::Shape,
-                || format!("row weight {} does not match rows of {}", o.shape, x.shape),
-            )?;
-            need(o.dtype == x.dtype, ErrorKind::DType, || {
-                "row weight dtype differs".into()
-            })?;
-            need(
-                o.placement == Placement::Replicated,
-                ErrorKind::Placement,
-                || "row weights must be replicated".into(),
-            )
-        }
-        Takes::Positions => positions(dims, x, o, p),
-        Takes::Bits => allowed(dims, x, o),
-    }
-}
-
-/// The placement stage `s` gives a row at `p`.
-fn place(
-    rule: Place,
-    s: &Stage,
-    p: Placement,
-    x: &TensorType,
-    operand: Option<&TensorType>,
-) -> Result<Placement, TypeError> {
-    let nonlinear = |ok| {
-        need(ok, ErrorKind::Placement, || {
-            format!("{s:?} is nonlinear, so it cannot read {p:?} values")
-        })
-        .map(|()| p)
-    };
-    let last = x.rank() as u32 - 1;
-    match rule {
-        Place::Keep => Ok(p),
-        Place::Sum | Place::Product => {
-            let o = operand.expect("joining stages take an operand");
-            combine(rule == Place::Sum, s, p, o.placement, x.rank() - o.rank())
-        }
-        Place::Replicated => nonlinear(p == Placement::Replicated),
-        Place::Nonlinear(keeps_zero) => {
-            nonlinear(p != Placement::Partial && (p != Placement::Routed || keeps_zero))
-        }
-        Place::Reduce => need(p == Placement::Partial, ErrorKind::Placement, || {
-            format!("{s:?} needs partial sums, got {p:?}")
-        })
-        .map(|()| Placement::Replicated),
-        Place::Gather => need(
-            p == Placement::Split { axis: last },
-            ErrorKind::Placement,
-            || format!("{s:?} needs a split last axis, got {p:?}"),
-        )
-        .map(|()| Placement::Replicated),
-        Place::Scatter => need(
-            p == Placement::Partial && x.rank() >= 2,
-            ErrorKind::Placement,
-            || format!("{s:?} needs partial sums over rows, got {p:?}"),
-        )
-        .map(|()| Placement::Owned { axis: 0 }),
-        Place::Join => need(
-            p == Placement::Owned { axis: 0 },
-            ErrorKind::Placement,
-            || format!("{s:?} needs owned rows, got {p:?}"),
-        )
-        .map(|()| Placement::Replicated),
-    }
-}
-
-/// The operand must match the row input's trailing axes.
-fn broadcast(dims: &[Dim], x: &Shape, o: &Shape) -> Result<(), TypeError> {
-    let off = x.rank().checked_sub(o.rank());
-    let fits = match off {
-        Some(off) => same_shape(dims, &Shape(x.0[off..].to_vec()), o)?,
-        None => false,
-    };
-    need(fits, ErrorKind::Shape, || {
-        format!("{o} does not broadcast to {x}")
-    })
-}
-
-/// A sum or product of `p` and operand placement `q`.
-fn combine(
-    sum: bool,
-    s: &Stage,
-    p: Placement,
-    q: Placement,
-    lead: usize,
-) -> Result<Placement, TypeError> {
-    use Placement::*;
-    match (p, q) {
-        (Partial, Partial) if sum => Ok(Partial),
-        (Partial, Replicated) if !sum => Ok(Partial),
-        (Routed, Routed) => Ok(Routed),
-        (Routed, Replicated) | (Replicated, Routed) if !sum => Ok(Routed),
-        // A rank takes its own rows of a whole operand.
-        (Owned { axis: 0 }, Replicated) => Ok(Owned { axis: 0 }),
-        (Owned { axis: 0 }, Owned { axis: 0 }) | (Replicated, Owned { axis: 0 }) if lead == 0 => {
-            Ok(Owned { axis: 0 })
-        }
-        (Owned { axis }, Replicated) if (axis as usize) < lead => Ok(Owned { axis }),
-        (Owned { axis: a }, Owned { axis: b }) if b + lead as u32 == a => Ok(Owned { axis: a }),
-        (_, Owned { .. }) | (Owned { .. }, _) => Err(TypeError {
-            kind: ErrorKind::Placement,
-            message: format!("{s:?} cannot combine {p:?} with {q:?}"),
-        }),
-        (a, b) if shift(b, lead) == a && a != Partial => Ok(a),
-        (Split { axis }, Replicated) if (axis as usize) < lead => Ok(p),
-        _ => Err(TypeError {
-            kind: ErrorKind::Placement,
-            message: format!("{s:?} cannot combine {p:?} with {q:?}"),
-        }),
-    }
-}
-
-/// An operand's split axis, counted in the row input's axes.
-fn shift(q: Placement, lead: usize) -> Placement {
-    match q {
-        Placement::Split { axis } => Placement::Split {
-            axis: axis + lead as u32,
-        },
-        q => q,
-    }
-}
-
-/// `x` without `axis`, as a sum over whole values.
-fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
-    need(
-        x.placement != Placement::Partial,
-        ErrorKind::Placement,
-        || "a mean cannot read partial sums".into(),
-    )?;
-    collapse(axis, x)
-}
-
-/// Drops `axis` from `x`, turning routed slices into partial sums.
-fn collapse(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
-    need(x.dtype.is_float(), ErrorKind::DType, || {
-        format!("a mean needs floats, got {:?}", x.dtype)
-    })?;
-    need((axis as usize) < x.rank(), ErrorKind::Shape, || {
-        format!("no axis {axis} in {}", x.shape)
-    })?;
-    need(
-        !matches!(x.placement, Placement::Owned { .. }),
-        ErrorKind::Placement,
-        || "a mean cannot read owned rows".into(),
-    )?;
-    let mut shape = x.shape.0.clone();
-    shape.remove(axis as usize);
-    // Each rank sums its own rows.
-    let placement = match x.placement {
-        Placement::Routed => Placement::Partial,
-        p => p,
-    };
-    Ok(TensorType {
-        shape: Shape(shape),
-        placement,
-        ..x.clone()
-    })
-}
-
-/// `x` without `axis`, each slice scaled by `w[.., axis]`.
-fn mix(dims: &[Dim], axis: u32, x: &TensorType, w: &TensorType) -> Result<TensorType, TypeError> {
-    let out = collapse(axis, x)?;
-    let lead = axis as usize + 1;
-    let fits = w.rank() == lead && same_shape(dims, &front(&x.shape, lead), &w.shape)?;
-    need(fits, ErrorKind::Shape, || {
-        format!(
-            "mix weights {} do not match {} up to axis {axis}",
-            w.shape, x.shape
-        )
-    })?;
-    need(w.dtype == x.dtype, ErrorKind::DType, || {
-        "mix weights dtype differs".into()
-    })?;
-    need(
-        w.placement == Placement::Replicated,
-        ErrorKind::Placement,
-        || "mix weights must be replicated".into(),
-    )?;
-    Ok(out)
-}
-
-/// Whether a known `width` is a multiple of `block`.
-fn blocks(dims: &[Dim], width: &DimExpr, block: u32) -> Result<bool, TypeError> {
-    let n = width.poly(dims).map_err(|d| TypeError {
-        kind: ErrorKind::Reference,
-        message: format!("{d:?} is not a dimension"),
-    })?;
-    Ok(n.as_const()
-        .is_none_or(|n| n.is_multiple_of(u64::from(block))))
-}
-
-fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
-    let ok = match p {
-        Placement::Replicated => true,
-        Placement::Split { axis } | Placement::Owned { axis } => axis < last,
-        Placement::Partial | Placement::Routed => false,
-    };
-    need(ok, ErrorKind::Placement, || {
-        format!("{s:?} needs whole rows, got {p:?}")
-    })
-}
-
 /// `slots` and `positions`: one integer each per row of `rows`.
 pub(crate) fn row_ids(
     dims: &[Dim],
@@ -802,7 +483,6 @@ pub(crate) fn row_ids(
     }
     Ok(())
 }
-
 /// Rows go to kept `[Seqs, Context, ..]` by slot and position.
 fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (rows, slots, positions) = (a[0], a[1], a[2]);

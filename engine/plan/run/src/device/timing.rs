@@ -134,7 +134,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             stamps.emit(self.ctx, slot, marks::LANE_BEGIN)?;
         }
         if let (Some(batch), Some(pager)) = (step.kernel.staged(), &self.pager) {
-            pager.stage(self.ctx, batch as usize)?;
+            pager.stage(self.ctx, batch as usize, self.base.plan.id)?;
         }
         if let Some((stamps, slot)) = stamp {
             stamps.emit(self.ctx, slot, marks::LANE_END)?;

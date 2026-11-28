@@ -2,25 +2,31 @@
 
 #[cfg(test)]
 mod device_test;
+mod epi;
 mod gemv;
 pub(crate) mod mm;
+mod moe;
+mod rocm_mm;
+#[cfg(test)]
+mod rocm_test;
+mod rocm_trellis;
 mod stacked;
+mod stacked_fused;
 #[cfg(test)]
 mod stacked_test;
 
 use gemv::{propose_gemv, why_gemv};
 use stacked::check_stacked;
-use std::sync::OnceLock;
-use tessera_device::{Backend, flatten_for};
-pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
+pub(crate) use tessera_device::{CUDA_LACKS, ROCM_LACKS, cuda_rule, f32_only, rocm_rule};
 use tessera_graph::Order;
 use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
 };
 
 const KERNEL: &str = include_str!("linear.cu");
+const TRELLIS: &str = include_str!("trellis.cu");
 const PREFILL: &str = include_str!("prefill.cu");
 const INT4: &str = include_str!("int4.cu");
 const BLOCK: usize = 128;
@@ -31,39 +37,36 @@ const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
 const DTR_PRE_SMEM: usize = 40_960;
 
-pub(crate) fn cuda_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "linear.kernel", KERNEL))
-}
+macro_rules! cuda_module {
+    ($vis:vis $src:ident, $with_vis:vis $with:ident, $name:literal, $text:expr) => {
+        $vis fn $src() -> &'static str {
+            static CUDA: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+            CUDA.get_or_init(|| {
+                tessera_device::flatten_for(tessera_device::Backend::Cuda, $name, $text)
+            })
+        }
 
-pub(crate) fn prefill_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prefill.kernel", PREFILL))
+        $with_vis fn $with<'a>(
+            entry: &'static str,
+            defs: impl IntoIterator<Item = (&'a str, usize)>,
+        ) -> tessera_lower::Source {
+            tessera_device::cuda_source_with($src(), entry, defs)
+        }
+    };
 }
+pub(crate) use cuda_module;
 
-fn prefill_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(prefill_source(), entry, defs)
-}
-
-pub(crate) fn int4_source() -> &'static str {
-    static INT4_SRC: OnceLock<&'static str> = OnceLock::new();
-    INT4_SRC.get_or_init(|| flatten_for(Backend::Cuda, "int4.kernel", INT4))
-}
-
-fn int4_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(int4_source(), entry, defs)
-}
+cuda_module!(pub(crate) cuda_source, pub(crate) cuda_source_with, "linear.kernel", KERNEL);
+cuda_module!(pub(crate) trellis_source, pub(crate) trellis_source_with, "trellis.kernel", TRELLIS);
+cuda_module!(pub(crate) prefill_source, pub(crate) prefill_source_with, "prefill.kernel", PREFILL);
+cuda_module!(pub(crate) int4_source, pub(crate) int4_source_with, "int4.kernel", INT4);
 
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
-    static HIP: OnceLock<&'static str> = OnceLock::new();
-    HIP.get_or_init(|| flatten_for(Backend::Rocm, "linear.kernel", KERNEL))
+    static HIP: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    HIP.get_or_init(|| {
+        tessera_device::flatten_for(tessera_device::Backend::Rocm, "linear.kernel", KERNEL)
+    })
 }
 
 macro_rules! dtr_knobs {
@@ -159,9 +162,14 @@ fn dtr_source(t: &TrellisMma) -> Source {
         "dtr_k4_t4" => "DTR_T4_BLK",
         _ => "DTR_GEN_BLK",
     };
-    cuda_source_with(
+    trellis_source_with(
         entry,
-        x_defs(t.min_blocks.map(|v| (def, v as usize)), t.x_bf16),
+        io_defs(
+            t.min_blocks.map(|v| (def, v as usize)),
+            t.x_bf16,
+            t.y_bf16,
+            false,
+        ),
     )
 }
 
@@ -172,48 +180,87 @@ fn dtr_needs(bytes: usize) -> Needs {
     }
 }
 
+pub(crate) fn rocm_source(text: &'static str, entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", "", text]),
+        entry,
+    }
+}
+
+pub(crate) fn rocm_needs(group_bytes: usize, group_threads: usize, tile: bool) -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes,
+        group_threads,
+        compiler: true,
+        tile,
+        lacks: ROCM_LACKS,
+        ..Needs::default()
+    }
+}
+
+fn trellis_name(form: &dyn Stored, rocm: bool, turned: bool, pre: bool) -> &'static str {
+    let base = match (rocm, turned, pre) {
+        (true, true, false) => "rocm_trellis_turned",
+        (true, false, false) => "rocm_trellis_mma",
+        (false, true, false) => "trellis_turned",
+        (false, false, false) => "trellis_mma",
+        (true, true, true) => "rocm_trellis_pf",
+        (true, false, true) => "rocm_trellis_plain_pf",
+        (false, true, true) => "trellis_turned_pf",
+        (false, false, true) => "trellis_mma_pf",
+    };
+    form.suffixed(base)
+}
+
 macro_rules! dtr_mma_kernel {
     (
         $(#[$meta:meta])*
         struct $name:ident,
+        pre = $pre:literal,
         accepts = $accepts:ident,
-        smem = $smem:expr,
-        source = $source:ident,
+        emits = $emits:ident,
+        needs = $needs:expr,
+        source = $source:expr,
         launches = $launches:ident,
-        load = $load:ident,
-        suffix = $suffix:literal
-        $(, extra: $extra:ident : $extra_ty:ty)?
+        load = $load:ident
+        $(, extra: { $($extra:ident : $extra_ty:ty,)* })?
     ) => {
         $(#[$meta])*
         #[derive(Clone, Debug, Kernel)]
         #[launch(
-            name = self.form.suffixed(if self.turned {
-                concat!("trellis_turned", $suffix)
-            } else {
-                concat!("trellis_mma", $suffix)
-            }),
+            name = trellis_name(self.form, self.rocm, self.turned, $pre),
             sizes = [self.m, self.n, self.k],
             work = self.m * self.n * self.k,
-            accepts = $accepts, emits = f32_only,
-            needs = dtr_needs($smem), order = Order::PerConfig,
-            source = $source(self), launches = $launches, load = $load, unproven,
+            accepts = $accepts, emits = $emits,
+            needs = ($needs)(self), order = Order::PerConfig,
+            source = ($source)(self), launches = $launches, load = $load,
+            load_key = tessera_lower::load_key((
+                self.m, self.n, self.k, self.ks, self.tile, self.min_blocks,
+                self.bits, self.book, (self.turned, self.x_bf16, self.y_bf16, self.rocm),
+                $($(self.$extra,)*)? self.form.name(),
+            )),
+            unproven,
         )]
-        struct $name {
-            m: usize,
-            n: usize,
-            k: usize,
-            $($extra: $extra_ty,)?
-            tile: usize,
-            min_blocks: Option<u32>,
-            bits: u32,
-            book: u32,
-            turned: bool,
-            x_bf16: bool,
-            form: &'static dyn Stored,
+        pub(crate) struct $name {
+            pub(crate) m: usize,
+            pub(crate) n: usize,
+            pub(crate) k: usize,
+            pub(crate) ks: usize,
+            pub(crate) tile: usize,
+            pub(crate) min_blocks: Option<u32>,
+            pub(crate) bits: u32,
+            pub(crate) book: u32,
+            pub(crate) turned: bool,
+            pub(crate) x_bf16: bool,
+            pub(crate) y_bf16: bool,
+            pub(crate) rocm: bool,
+            $($(pub(crate) $extra: $extra_ty,)*)?
+            pub(crate) form: &'static dyn Stored,
         }
 
-        fn $accepts(k: &$name, input: usize, form: &dyn Stored) -> bool {
-            weight_x_accepts(input, k.x_bf16, k.form, form)
+        fn $emits(k: &$name, form: &dyn Stored) -> bool {
+            x_accepts(k.y_bf16, form)
         }
     };
 }
@@ -221,13 +268,21 @@ macro_rules! dtr_mma_kernel {
 dtr_mma_kernel! {
     /// Dense trellis matmul with warp-per-tile MMA and split-K.
     struct TrellisMma,
+    pre = false,
     accepts = mma_accepts,
-    smem = DTR_SMEM,
-    source = dtr_source,
+    emits = mma_emits,
+    needs = |t: &TrellisMma| if t.rocm { rocm_trellis::small_needs(t.tile) } else { dtr_needs(DTR_SMEM) },
+    source = |t: &TrellisMma| if t.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), rocm_trellis::small_entry(t))
+    } else {
+        dtr_source(t)
+    },
     launches = mma_launches,
-    load = mma_load,
-    suffix = "",
-    extra: ks: usize
+    load = mma_load
+}
+
+fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
+    weight_x_accepts(input, k.x_bf16, k.form, form)
 }
 
 fn trellis_mma_load(
@@ -235,6 +290,7 @@ fn trellis_mma_load(
     dims: [usize; 4],
     tile: usize,
     x_elem: usize,
+    y_elem: usize,
     scales: &[usize],
 ) -> Option<Load> {
     let [m, n, k, ks] = dims;
@@ -246,7 +302,7 @@ fn trellis_mma_load(
         group: THREADS,
         trips: (k / BLOCK / ks) as f64,
         reads,
-        written: (4 * ks * m * n) as f64,
+        written: (y_elem * ks * m * n) as f64,
         flight: 1024.0,
         ..Load::default()
     })
@@ -259,7 +315,15 @@ fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
         (false, _) => &[],
     };
     let x_elem = if t.x_bf16 { 2 } else { 4 };
-    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], t.tile, x_elem, scales)
+    let y_elem = if t.y_bf16 { 2 } else { 4 };
+    trellis_mma_load(
+        t.form,
+        [t.m, t.n, t.k, t.ks],
+        t.tile,
+        x_elem,
+        y_elem,
+        scales,
+    )
 }
 
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
@@ -276,47 +340,76 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
 /// Deterministic split-K reduction and optional output rotation.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "trellis_reduce",
+    name = if self.rocm { "rocm_trellis_reduce" } else { "trellis_reduce" },
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = reduce_accepts,
-    emits = f32_only,
-    needs = dtr_needs(0),
+    emits = reduce_emits,
+    needs = if self.rocm { rocm_needs(0, THREADS, false) } else { dtr_needs(0) },
     order = Order::PerConfig,
-    source = cuda_source_with(
-        "dtr_reduce",
-        self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
-    ),
+    source = if self.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_reduce")
+    } else {
+        trellis_source_with(
+            "dtr_reduce",
+            io_defs(
+                self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
+                false,
+                self.y_bf16,
+                false,
+            ),
+        )
+    },
     launches = reduce_launches,
     load = reduce_load,
+    load_key = tessera_lower::load_key((
+        self.m, self.n, self.ks, self.min_blocks, self.turned, self.y_bf16, self.rocm,
+    )),
     unproven,
 )]
-struct TrellisReduce {
-    m: usize,
-    n: usize,
-    ks: usize,
-    min_blocks: Option<u32>,
-    turned: bool,
+pub(crate) struct TrellisReduce {
+    pub(crate) m: usize,
+    pub(crate) n: usize,
+    pub(crate) ks: usize,
+    pub(crate) min_blocks: Option<u32>,
+    pub(crate) turned: bool,
+    pub(crate) y_bf16: bool,
+    pub(crate) rocm: bool,
 }
 
 fn reduce_accepts(_: &TrellisReduce, _: usize, form: &dyn Stored) -> bool {
     form.name() == "f32"
 }
 
-fn reduce_load(r: &TrellisReduce, _: usize) -> Option<Load> {
-    let mut reads = vec![(4 * r.ks * r.m * r.n) as f64];
-    if r.turned {
-        reads.push((4 * r.n) as f64);
+fn reduce_emits(r: &TrellisReduce, form: &dyn Stored) -> bool {
+    x_accepts(r.y_bf16, form)
+}
+
+pub(crate) fn reduce_load_for(
+    m: usize,
+    n: usize,
+    ks: usize,
+    turned: bool,
+    y_bf16: bool,
+) -> Option<Load> {
+    let mut reads = vec![(4 * ks * m * n) as f64];
+    if turned {
+        reads.push((4 * n) as f64);
     }
+    let written = (if y_bf16 { 2 } else { 4 } * m * n) as f64;
     Some(Load {
-        threads: (r.n / BLOCK) * THREADS,
+        threads: (n / BLOCK) * THREADS,
         group: THREADS,
-        trips: r.ks as f64,
+        trips: ks as f64,
         reads,
-        written: (4 * r.m * r.n) as f64,
+        written,
         flight: 512.0,
         ..Load::default()
     })
+}
+
+fn reduce_load(r: &TrellisReduce, _: usize) -> Option<Load> {
+    reduce_load_for(r.m, r.n, r.ks, r.turned, r.y_bf16)
 }
 
 fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
@@ -355,34 +448,54 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
         "dtr_pre_gen16" => "DTR_GEN16_BLK",
         _ => "DTR_GEN8_BLK",
     };
-    prefill_source_with(entry, t.min_blocks.map(|v| (def, v as usize)))
+    prefill_source_with(
+        entry,
+        io_defs(
+            t.min_blocks.map(|v| (def, v as usize)),
+            false,
+            t.y_bf16,
+            false,
+        ),
+    )
 }
 
 /// Rotates and quantizes dense inputs once per 64x128 block.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "trellis_prep",
+    name = if self.rocm { "rocm_trellis_prep" } else { "trellis_prep" },
     sizes = [self.m, self.k],
     work = self.m * self.k,
     accepts = prep_accepts,
     emits = f32_only,
-    needs = dtr_needs(DTR_SMEM),
+    needs = if self.rocm {
+        rocm_needs(16 * 1024, THREADS, true)
+    } else {
+        dtr_needs(DTR_SMEM)
+    },
     order = Order::PerConfig,
-    source = prefill_source_with(
-        "dtr_prep",
-        x_defs(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)), self.x_bf16),
-    ),
+    source = if self.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_prep")
+    } else {
+        prefill_source_with(
+            "dtr_prep",
+            x_defs(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)), self.x_bf16),
+        )
+    },
     launches = prep_launches,
     load = prep_load,
+    load_key = tessera_lower::load_key((
+        self.m, self.k, self.min_blocks, self.turned, self.x_bf16, self.rocm,
+    )),
     shared,
     unproven,
 )]
-struct TrellisPrep {
-    m: usize,
-    k: usize,
-    min_blocks: Option<u32>,
-    turned: bool,
-    x_bf16: bool,
+pub(crate) struct TrellisPrep {
+    pub(crate) m: usize,
+    pub(crate) k: usize,
+    pub(crate) min_blocks: Option<u32>,
+    pub(crate) turned: bool,
+    pub(crate) x_bf16: bool,
+    pub(crate) rocm: bool,
 }
 
 fn prep_accepts(p: &TrellisPrep, input: usize, form: &dyn Stored) -> bool {
@@ -431,26 +544,93 @@ fn prep_launches(p: &TrellisPrep, step: &Step) -> Vec<Launch> {
 dtr_mma_kernel! {
     /// Prefill dense trellis matmul from pre-rotated input blocks.
     struct TrellisPreMma,
+    pre = true,
     accepts = pre_mma_accepts,
-    smem = DTR_PRE_SMEM,
-    source = dtr_pre_source,
+    emits = pre_mma_emits,
+    needs = |t: &TrellisPreMma| if t.rocm { rocm_trellis::pre_needs() } else { dtr_needs(DTR_PRE_SMEM) },
+    source = |t: &TrellisPreMma| if t.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), rocm_trellis::pre_entry(t))
+    } else {
+        dtr_pre_source(t)
+    },
     launches = pre_mma_launches,
     load = pre_mma_load,
-    suffix = "_pf"
+    extra: {
+        mode: u32,
+    }
+}
+
+fn pre_mma_accepts(k: &TrellisPreMma, input: usize, form: &dyn Stored) -> bool {
+    if k.rocm {
+        let other_at = 2 + usize::from(k.turned && k.ks == 1);
+        if k.ks == 1 && input >= other_at {
+            return epi::epi_accepts(k.mode, input, other_at, form);
+        }
+    }
+    weight_x_accepts(input, k.x_bf16, k.form, form)
 }
 
 fn pre_mma_load(t: &TrellisPreMma, _: usize) -> Option<Load> {
-    let scales: &[usize] = if t.turned { &[t.n] } else { &[] };
-    trellis_mma_load(t.form, [t.m, t.n, t.k, 1], t.tile, 1, scales)
+    let scales: &[usize] = match (t.turned, t.ks) {
+        (true, 1) => &[t.n],
+        _ => &[],
+    };
+    let x_elem = if t.rocm { 2 } else { 1 };
+    let y_elem = if t.y_bf16 { 2 } else { 4 };
+    let mut load = trellis_mma_load(
+        t.form,
+        [t.m, t.n, t.k, t.ks],
+        t.tile,
+        x_elem,
+        y_elem,
+        scales,
+    )?;
+    if t.rocm && t.ks == 1 {
+        epi::push_epi_reads(&mut load.reads, t.mode, t.m, t.n);
+    }
+    Some(load)
 }
 
 fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
-        across: t.n / BLOCK,
+        across: (t.n / BLOCK) * t.ks,
         down: t.m.div_ceil(t.tile),
         threads: THREADS,
     };
-    let svh = if t.turned { step.read(2) } else { step.read(0) };
+    let has_svh = t.turned && t.ks == 1;
+    let svh = if has_svh { step.read(2) } else { step.read(0) };
+    if t.rocm {
+        let other_at = 2 + usize::from(has_svh);
+        let has_o = t.ks == 1 && epi::has_other(t.mode);
+        let other = if has_o {
+            step.read(other_at)
+        } else {
+            step.read(0)
+        };
+        let bias_at = other_at + usize::from(has_o);
+        let bias = if t.ks == 1 && epi::has_bias2(t.mode) {
+            step.read(bias_at)
+        } else {
+            step.read(0)
+        };
+        let args = vec![
+            step.read(0),
+            step.read(1),
+            svh,
+            other,
+            bias,
+            step.out(),
+            Arg::count(t.m),
+            Arg::count(t.n),
+            Arg::count(t.k),
+            Arg::value(&t.bits),
+            Arg::value(&t.book),
+            Arg::count(usize::from(t.turned)),
+            Arg::value(&t.mode),
+            Arg::count(t.ks),
+        ];
+        return vec![Launch { args, shape }];
+    }
     let args = vec![
         step.read(0),
         step.read(1),
@@ -509,18 +689,23 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
             min_blocks: tree.knobs.get(rule, "prep_min_blocks").map(|v| v as u32),
             turned,
             x_bf16: d.x_bf16,
+            rocm: false,
         };
         let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
         let mma = TrellisPreMma {
             m,
             n,
             k,
+            ks: 1,
             tile: pre_tile,
             min_blocks: pre_blk,
             bits: d.bits,
             book: d.book,
             turned,
             x_bf16: false,
+            y_bf16: d.y_bf16,
+            rocm: false,
+            mode: 0,
             form: d.form,
         };
         return Some(Ok(vec![
@@ -546,6 +731,8 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
         book: d.book,
         turned,
         x_bf16: d.x_bf16,
+        y_bf16: ks == 1 && d.y_bf16,
+        rocm: false,
         form: d.form,
     };
     let red = TrellisReduce {
@@ -554,6 +741,8 @@ fn trellis_drafts(tree: &Tree, d: &Dense) -> Option<Result<Vec<Draft>, String>> 
         ks,
         min_blocks: tree.knobs.get(rule, "reduce_min_blocks").map(|v| v as u32),
         turned,
+        y_bf16: d.y_bf16,
+        rocm: false,
     };
     Some(Ok(d.drafts(mma, ks, red)))
 }
@@ -589,26 +778,49 @@ fn cuda_needs(group_bytes: usize) -> Needs {
     }
 }
 
-pub(crate) fn cuda_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(cuda_source(), entry, defs)
+pub(crate) fn io_defs<'a>(
+    base: impl IntoIterator<Item = (&'a str, usize)>,
+    x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
+) -> Vec<(&'a str, usize)> {
+    let mut defs: Vec<_> = base.into_iter().collect();
+    if x_bf16 {
+        defs.push(("X_BF16", 1));
+    }
+    if y_bf16 {
+        defs.push(("Y_BF16", 1));
+    }
+    if o_bf16 {
+        defs.push(("O_BF16", 1));
+    }
+    defs
 }
 
 pub(crate) fn x_defs<'a>(
     base: impl IntoIterator<Item = (&'a str, usize)>,
     x_bf16: bool,
 ) -> Vec<(&'a str, usize)> {
-    let mut defs: Vec<_> = base.into_iter().collect();
-    if x_bf16 {
-        defs.push(("X_BF16", 1));
-    }
-    defs
+    io_defs(base, x_bf16, false, false)
 }
 
 pub(crate) fn x_accepts(x_bf16: bool, form: &dyn Stored) -> bool {
     form.name() == if x_bf16 { "bf16" } else { "f32" }
+}
+
+pub(crate) fn weight_io_accepts(
+    input: usize,
+    x_bf16: bool,
+    o_bf16: bool,
+    expected: &dyn Stored,
+    form: &dyn Stored,
+) -> bool {
+    match input {
+        0 => x_accepts(x_bf16, form),
+        1 => form.name() == expected.name(),
+        2 => x_accepts(o_bf16, form),
+        _ => form.name() == "f32",
+    }
 }
 
 pub(crate) fn weight_x_accepts(
@@ -617,15 +829,7 @@ pub(crate) fn weight_x_accepts(
     expected: &dyn Stored,
     form: &dyn Stored,
 ) -> bool {
-    match input {
-        0 => x_accepts(x_bf16, form),
-        1 => form.name() == expected.name(),
-        _ => form.name() == "f32",
-    }
-}
-
-pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
-    weight_x_accepts(input, false, expected, form)
+    weight_io_accepts(input, x_bf16, false, expected, form)
 }
 
 cuda_rule!("trellis_mma", check = eval_trellis);

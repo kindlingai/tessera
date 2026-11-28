@@ -3,12 +3,12 @@
 use crate::kept::Kept;
 use crate::lanes::{decode_patches, encode_patches};
 use crate::{Asks, Engine, Error, Head, Place, Row};
-use tessera_engine_comm::{Reader, Transport, Writer};
+use tessera_engine_comm::{Backed, HostPool, Reader, Transport, Writer};
 use tessera_engine_hooks::open_rank;
 use tessera_graph::Graph;
 use tessera_kv::{DiskKv, DiskMsg, KvConfig, StoreStats, decode_msg};
 use tessera_lower::{Device, Recipe, Settings, Wants};
-use tessera_run::{Profile, Ranks};
+use tessera_run::{Profile, Ranks, Run};
 
 /// Profile state preserved while an engine is evicted.
 pub(crate) struct ParkedProfile {
@@ -376,6 +376,36 @@ impl Engine {
         ))
     }
 
+    /// Opens the host KV pool one box's ranks share.
+    fn open_host_pool(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+        let open = |runner: &mut Box<dyn Run>, by| match pages {
+            0 => Ok(HostPool::None),
+            _ => runner.open_host_kv(pages, page, by),
+        };
+        let Some(control) = self.control.as_mut().filter(|c| c.ranks() > 1) else {
+            return Ok(open(&mut self.runner, Backed::Own)? != HostPool::None);
+        };
+        // Every rank joins this round, with or without a pool.
+        let lead = control.rank() == 0;
+        let mut opened = match lead {
+            true => open(&mut self.runner, Backed::Lead)?,
+            false => HostPool::None,
+        };
+        let offer = match &opened {
+            HostPool::Shared(offer) => offer.as_bytes(),
+            _ => &[],
+        };
+        let parts = control.exchange(offer).map_err(tessera_run::Error::from)?;
+        if !lead {
+            let offer = parts.first().and_then(|p| std::str::from_utf8(p).ok());
+            let by = offer
+                .filter(|o| !o.is_empty())
+                .map_or(Backed::Own, Backed::Follow);
+            opened = open(&mut self.runner, by)?;
+        }
+        Ok(opened != HostPool::None)
+    }
+
     /// Attaches a tiered KV store from `cfg`.
     pub fn set_kv_store(&mut self, cfg: &KvConfig) -> Result<(), Error> {
         if cfg.disabled || cfg.tiers.is_empty() {
@@ -399,14 +429,15 @@ impl Engine {
                 .filter(|(_, i)| i.sparse && i.context > 1 && i.page_rows as usize == page)
                 .map(|((_, slot), info)| slot.form.bytes(page * info.width as usize))
                 .sum();
-            let lanes = self.lanes.as_mut().expect("lanes");
             let max_host = if sparse_page_bytes > 0 {
                 (bytes / sparse_page_bytes as u64) as usize
             } else {
                 0
             };
-            let host_pages = lanes.index_pages().min(max_host);
-            if host_pages > 0 && self.runner.open_host_kv(host_pages, page)? {
+            let index_pages = self.lanes.as_ref().expect("lanes").index_pages();
+            let host_pages = index_pages.min(max_host);
+            if self.open_host_pool(host_pages, page)? {
+                let lanes = self.lanes.as_mut().expect("lanes");
                 lanes.enable_tier(host_pages, Box::new(tessera_kv::Aged::default()));
                 self.disk = None;
                 return Ok(());

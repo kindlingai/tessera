@@ -51,6 +51,8 @@ pub trait Tiering: Send {
     fn victims(&mut self, short: usize, host_free: usize, level: Level) -> Vec<u32>;
     /// Host pages to promote, from `host` page and level pairs.
     fn promotes(&self, room: Room, level: Level, host: &[(u32, u8)]) -> Vec<u32>;
+    /// Free VRAM pages to hold after a step placed `need`.
+    fn reserve(&mut self, need: usize) -> usize;
 }
 
 /// Demotes by level, then the page longest in VRAM.
@@ -63,6 +65,10 @@ pub struct Aged {
     pub demote: usize,
     /// Most hot pages promoted per step.
     pub promote: usize,
+    /// Steps of page demand held free. Zero holds none.
+    pub ahead: usize,
+    /// Most pages one step placed.
+    peak: usize,
     order: VecDeque<u32>,
 }
 
@@ -73,6 +79,8 @@ impl Default for Aged {
             tail: 192,
             demote: 256,
             promote: 256,
+            ahead: 1,
+            peak: 0,
             order: VecDeque::new(),
         }
     }
@@ -184,5 +192,10 @@ impl Tiering for Aged {
             }
         }
         out
+    }
+
+    fn reserve(&mut self, need: usize) -> usize {
+        self.peak = self.peak.max(need);
+        self.peak * self.ahead
     }
 }

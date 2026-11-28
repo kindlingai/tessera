@@ -59,6 +59,24 @@ impl<'a> Printer<'a> {
         self.refused.get_or_insert(what);
     }
 
+    /// Zeros tile accumulators, directly on Metal or in shadow floats.
+    fn zero_tiles(&mut self, acc: &str, tm: &str, tn: &str) {
+        self.line("#pragma unroll".into());
+        self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("    #pragma unroll".into());
+        self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line("#ifdef TILE_DIRECT".into());
+        self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
+        self.line("#else".into());
+        self.line("        #pragma unroll".into());
+        self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+        self.line(format!("            {acc}[i][j][e] = 0.0f;"));
+        self.line("        }".into());
+        self.line("#endif".into());
+        self.line("    }".into());
+        self.line("}".into());
+    }
+
     pub(crate) fn uses(&mut self, i: Intrinsic) {
         if !self.used.contains(&i) {
             self.used.push(i);
@@ -372,29 +390,16 @@ impl<'a> Printer<'a> {
                 // The initializer reads names bound before this one.
                 let wide =
                     |form: &dyn Load, wgsl| if wgsl { form.wgsl_wide() } else { form.wide() };
-                let (ty, value, kind) = match (init, self.wide(init)) {
-                    // A zeroed four leaves the compiler to fill it.
-                    (Expr::Call(Intrinsic::Zero4, _), _) => {
-                        (self.ty_name(ty), None, Kind::Value(ty))
-                    }
-                    (_, Some(form)) => (
-                        wide(form, self.wgsl),
-                        Some(self.expr(init)),
-                        Kind::Wide(form),
-                    ),
-                    _ if ty == Ty::Bytes => (
-                        self.ty_name(ty),
-                        Some(self.expr(init)),
-                        Kind::Buffer(U8_FORM),
-                    ),
-                    _ => (self.ty_name(ty), Some(self.expr(init)), Kind::Value(ty)),
+                let (ty, kind) = match self.wide(init) {
+                    Some(form) => (wide(form, self.wgsl), Kind::Wide(form)),
+                    None if ty == Ty::Bytes => (self.ty_name(ty), Kind::Buffer(U8_FORM)),
+                    None => (self.ty_name(ty), Kind::Value(ty)),
                 };
+                let value = self.expr(init);
                 let name = self.declare(name, kind);
-                match (value, self.wgsl) {
-                    (Some(value), true) => self.line(format!("var {name}: {ty} = {value};")),
-                    (None, true) => self.line(format!("var {name}: {ty};")),
-                    (Some(value), false) => self.line(format!("{ty} {name} = {value};")),
-                    (None, false) => self.line(format!("{ty} {name};")),
+                match self.wgsl {
+                    true => self.line(format!("var {name}: {ty} = {value};")),
+                    false => self.line(format!("{ty} {name} = {value};")),
                 }
             }
             Stmt::Array { name, ty, len } => {
@@ -564,17 +569,10 @@ impl<'a> Printer<'a> {
                 self.lane = true;
                 let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
                 self.line(format!("tile_acc {name}_t[{tm}][{tn}];"));
+                self.line("#ifndef TILE_DIRECT".into());
                 self.line(format!("float {name}[{tm}][{tn}][TILE_COUNT];"));
-                self.line("#pragma unroll".into());
-                self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
-                self.line("    #pragma unroll".into());
-                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
-                self.line("        #pragma unroll".into());
-                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
-                self.line(format!("            {name}[i][j][e] = 0.0f;"));
-                self.line("        }".into());
-                self.line("    }".into());
-                self.line("}".into());
+                self.line("#endif".into());
+                self.zero_tiles(name, &tm, &tn);
                 self.bind(name, Kind::Tiles(*rows, *cols));
             }
             Stmt::TileHeld { name, rows, depth } => {
@@ -637,6 +635,7 @@ impl<'a> Printer<'a> {
                 let a = format!("({} + {})", self.expr(a), self.expr(a_at));
                 let b = format!("({} + {})", self.expr(b), self.expr(b_at));
                 let stride = self.expr(stride);
+                self.line("#ifndef TILE_DIRECT".into());
                 self.line("#pragma unroll".into());
                 self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
                 self.line("    #pragma unroll".into());
@@ -644,6 +643,7 @@ impl<'a> Printer<'a> {
                 self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
                 self.line("    }".into());
                 self.line("}".into());
+                self.line("#endif".into());
                 if *parts > 0 {
                     let apart = self.expr(apart);
                     self.parts(acc, [&a, &b, &stride, &apart], (&tm, &tn), *parts, *depth);
@@ -679,6 +679,7 @@ impl<'a> Printer<'a> {
                     self.line("}".into());
                 }
                 // The unit's sums truncate, so blocks add up in floats.
+                self.line("#ifndef TILE_DIRECT".into());
                 self.line("#pragma unroll".into());
                 self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
                 self.line("    #pragma unroll".into());
@@ -691,6 +692,7 @@ impl<'a> Printer<'a> {
                 self.line("        }".into());
                 self.line("    }".into());
                 self.line("}".into());
+                self.line("#endif".into());
             }
             Stmt::TileEach { acc, body } => {
                 let Kind::Tiles(rows, cols) = self.kind(acc) else {
@@ -705,7 +707,11 @@ impl<'a> Printer<'a> {
                 self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
                 self.line("            u32 r = i * TILE_M + TILE_ROW(e);".into());
                 self.line("            u32 c = j * TILE_N + TILE_COL(e);".into());
+                self.line("#ifdef TILE_DIRECT".into());
+                self.line(format!("            float v = TILE_VAL({acc}_t[i][j], e);"));
+                self.line("#else".into());
                 self.line(format!("            float v = {acc}[i][j][e];"));
+                self.line("#endif".into());
                 self.scope.push(HashMap::new());
                 for (name, ty) in [("r", Ty::U32), ("c", Ty::U32), ("v", Ty::F32)] {
                     self.bind(name, Kind::Value(ty));
@@ -722,16 +728,8 @@ impl<'a> Printer<'a> {
                 let Kind::Tiles(rows, cols) = self.kind(acc) else {
                     panic!("`{acc}` is not a tile block");
                 };
-                self.line("#pragma unroll".into());
-                self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
-                self.line(format!(
-                    "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
-                ));
-                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
-                self.line(format!("            {acc}[i][j][e] = 0.0f;"));
-                self.line("        }".into());
-                self.line("    }".into());
-                self.line("}".into());
+                let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+                self.zero_tiles(acc, &tm, &tn);
             }
             Stmt::TileScale { acc, by } => {
                 let Kind::Tiles(rows, cols) = self.kind(acc) else {
@@ -748,7 +746,11 @@ impl<'a> Printer<'a> {
                 ));
                 self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
                 self.line("            u32 r = i * TILE_M + TILE_ROW(e);".into());
+                self.line("#ifdef TILE_DIRECT".into());
+                self.line(format!("            TILE_SCALE({acc}_t[i][j], e, {by});"));
+                self.line("#else".into());
                 self.line(format!("            {acc}[i][j][e] *= {by};"));
+                self.line("#endif".into());
                 self.line("        }".into());
                 self.line("    }".into());
                 self.line("}".into());

@@ -31,7 +31,9 @@ jobs:
       (github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.triggering_actor.login != 'github-actions[bot]' &&
       !(github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'success'))
-    runs-on: ubuntu-slim
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     outputs:
       rerun: ${{ steps.scope.outputs.rerun }}
     steps:
@@ -50,7 +52,9 @@ jobs:
   rerun:
     needs: scope
     if: needs.scope.outputs.rerun != ''
-    runs-on: ubuntu-slim
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}

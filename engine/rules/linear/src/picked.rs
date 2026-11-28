@@ -20,6 +20,7 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Shape, Step, T, Tree};
     launches = picked_launches,
     shape = Shape::Line(self.product.m * self.product.n),
     load = picked_load,
+    load_key = self.product.load_key(),
     unproven,
 )]
 pub(crate) struct Picked {

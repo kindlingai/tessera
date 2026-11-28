@@ -16,7 +16,9 @@ concurrency:
 jobs:
   pr-title:
     if: github.event.pull_request.draft != true
-    runs-on: orble-1
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     timeout-minutes: 5
     steps:
       - uses: amannn/action-semantic-pull-request@66e72920af32222769c386d81f89656ebcb6d6d5 # v6.1.4

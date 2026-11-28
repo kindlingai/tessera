@@ -23,10 +23,56 @@ unsafe extern "C" {
 const PROT_READ_WRITE: c_int = 3;
 const MAP_SHARED: c_int = 1;
 /// How long a rank waits at a round.
-const ROUND: Duration = Duration::from_secs(300);
+pub(crate) const ROUND: Duration = Duration::from_secs(300);
 
 /// Each rank's block starts on its own 64 KiB page.
-const BLOCK: usize = 1 << 16;
+pub(crate) const BLOCK: usize = 1 << 16;
+
+/// A file's first `len` bytes, mapped and shared.
+pub(crate) struct Mapped {
+    base: *mut u8,
+    len: usize,
+    _file: File,
+}
+
+// Shared memory. Each user states who writes which bytes.
+unsafe impl Send for Mapped {}
+
+impl Mapped {
+    pub(crate) fn over(file: File, len: usize) -> Result<Self, Error> {
+        let (prot, fd) = (PROT_READ_WRITE, file.as_raw_fd());
+        let base = unsafe { mmap(std::ptr::null_mut(), len, prot, MAP_SHARED, fd, 0) };
+        if base as isize == -1 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        Ok(Mapped {
+            base: base as *mut u8,
+            len,
+            _file: file,
+        })
+    }
+
+    pub(crate) fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The word at byte `at`, which is 8-byte aligned.
+    pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
+        assert!(at.is_multiple_of(8) && at + 8 <= self.len);
+        // SAFETY: checked in bounds and aligned in a page-aligned map.
+        unsafe { &*(self.base.add(at) as *const AtomicU64) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        unsafe { munmap(self.base as *mut c_void, self.len) };
+    }
+}
 
 fn padded(n: usize) -> usize {
     n.next_multiple_of(16)
@@ -48,14 +94,9 @@ pub struct ShmLink {
     /// Region offsets in a rank's block, then its size.
     offsets: Vec<usize>,
     block: usize,
-    base: *mut u8,
-    len: usize,
+    map: Mapped,
     done: Vec<u64>,
-    _file: File,
 }
-
-// Shared memory. A rank writes others' regions only by put.
-unsafe impl Send for ShmLink {}
 
 impl ShmLink {
     /// The file size `ranks` need for these region sizes.
@@ -76,21 +117,14 @@ impl ShmLink {
             offsets.push(at);
             at += padded(n);
         }
-        let (prot, fd) = (PROT_READ_WRITE, file.as_raw_fd());
-        let base = unsafe { mmap(std::ptr::null_mut(), len, prot, MAP_SHARED, fd, 0) };
-        if base as isize == -1 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
-        }
         Ok(ShmLink {
             rank,
             ranks,
             sizes: regions.to_vec(),
             offsets,
             block: block(regions),
-            base: base as *mut u8,
-            len,
+            map: Mapped::over(file, len)?,
             done: Vec::new(),
-            _file: file,
         })
     }
 
@@ -101,19 +135,13 @@ impl ShmLink {
         }
         fits(&self.sizes, at, align)?;
         let offset = rank as usize * self.block + self.offsets[at.region] + at.at;
-        Ok(unsafe { self.base.add(offset) })
+        Ok(unsafe { self.map.base().add(offset) })
     }
 
     fn atomic(&self, rank: u32, at: Span) -> Result<&AtomicU64, Error> {
         let word = self.at(rank, Span::new(at.region, at.at, 8), 8)?;
         // Checked: in bounds and 8-byte aligned.
         Ok(unsafe { &*(word as *const AtomicU64) })
-    }
-}
-
-impl Drop for ShmLink {
-    fn drop(&mut self) {
-        unsafe { munmap(self.base as *mut c_void, self.len) };
     }
 }
 

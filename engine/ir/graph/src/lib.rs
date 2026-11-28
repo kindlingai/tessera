@@ -1,6 +1,5 @@
 //! The model graph: typed nodes, symbolic shapes, a JSON form.
 
-mod attend;
 mod chain;
 mod dims;
 mod infer;
@@ -26,7 +25,7 @@ pub use infer::{ErrorKind, TypeError, infer};
 pub use json::{FormatError, VERSION};
 pub use node::{
     Act, Attend, CalibTap, Composite, Conv, Delta, Entry, EntryKind, Graph, Mask, Node, NodeId, Op,
-    Output, Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight,
+    Output, Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight, erf,
 };
 pub use numerics::{Math, Numerics, Order, sums_ranks};
 pub use own::{own_rows, own_rows_attn};

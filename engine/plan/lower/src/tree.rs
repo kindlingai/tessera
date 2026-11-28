@@ -13,10 +13,10 @@ use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 pub use own::sliding_ring;
 use std::collections::HashMap;
-use tessera_codegen::kept::{self, Layout};
+use tessera_codegen::kept::Layout;
 use tessera_graph::{
-    Composite, DType, DimExpr, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region,
-    Role, Shape, Stage, View,
+    Composite, DType, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region, Role,
+    Shape, Stage, View,
 };
 
 /// Max rows per launch a sliding ring reserves.
@@ -80,6 +80,30 @@ pub struct Node {
     pub from: NodeId,
 }
 
+impl Node {
+    pub(crate) fn new(
+        term: Term,
+        args: Vec<T>,
+        (shape, extents): (Vec<usize>, Vec<Extent>),
+        form: &'static dyn Load,
+        from: NodeId,
+    ) -> Self {
+        Self {
+            term,
+            args,
+            shape,
+            extents,
+            form,
+            from,
+        }
+    }
+}
+
+/// A dimension's size among `sizes`.
+pub(crate) fn lookup(sizes: &[(DimName, u64)], name: DimName) -> Option<u64> {
+    sizes.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
 /// The nodes an entry needs, with their sizes and readers.
 pub struct Tree<'a> {
     pub g: &'a Graph,
@@ -115,6 +139,12 @@ pub struct Tree<'a> {
     at: Vec<Option<T>>,
     /// Per node: a region output a region rule claims.
     ends: Vec<bool>,
+    /// First append node for each kept tensor.
+    kept_appends: Vec<Option<T>>,
+    /// Whether each kept tensor feeds only picked attention.
+    sparse_kept: Vec<bool>,
+    /// Sliding-window ring capacity for each kept tensor, if smaller.
+    kept_rings: Vec<Option<usize>>,
 }
 
 /// Rows that lower to `Map`. Other stages lower unfused.
@@ -269,12 +299,12 @@ fn sized(
     let at = |e: &tessera_graph::DimExpr, vary: DimName, value: u64| {
         let size = |name| match name == vary {
             true => Some(value),
-            false => sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n),
+            false => lookup(sizes, name),
         };
         e.value(&g.dims, &size).map(|v| v as i64)
     };
     let most = |e: &tessera_graph::DimExpr| {
-        let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n);
+        let size = |name| lookup(sizes, name);
         e.value(&g.dims, &size).map(|n| n as usize)
     };
     let dim = |e: &tessera_graph::DimExpr| -> Option<Extent> {
@@ -363,6 +393,9 @@ impl<'a> Tree<'a> {
             shares: Vec::new(),
             at: Vec::new(),
             ends: Vec::new(),
+            kept_appends: Vec::new(),
+            sparse_kept: Vec::new(),
+            kept_rings: Vec::new(),
         };
         let ranks = parts.ranks();
         for port in &e.inputs {
@@ -397,8 +430,7 @@ impl<'a> Tree<'a> {
                 let a = axis as usize;
                 let whole = extents[a].most();
                 let fixed = extents[a] == Extent::Fixed(whole);
-                let Some((first, count)) = parts.part(whole, rank as usize).filter(|_| fixed)
-                else {
+                let Some((first, count)) = tree.part(whole).filter(|_| fixed) else {
                     let (shape, parts) = (n.ty.shape.clone(), parts.clone());
                     return Err(Size::Split {
                         axis: a,
@@ -464,17 +496,8 @@ impl<'a> Tree<'a> {
             ) && all_causal(&tree, &args);
             let mut push = |term: Term, args: Vec<T>, node_form: &'static dyn Load| {
                 let (shape, extents) = (shape.clone(), extents.clone());
-                tree.nodes.push(Node {
-                    term,
-                    args,
-                    shape,
-                    extents,
-                    form: node_form,
-                    from,
-                });
-                tree.shares
-                    .push(share.filter(|_| matches!(n.op, Op::Weight(_))));
-                T(tree.nodes.len() as u32 - 1)
+                let node = Node::new(term, args, (shape, extents), node_form, from);
+                tree.add(node, share.filter(|_| matches!(n.op, Op::Weight(_))))
             };
             at[i] = Some(match &n.op {
                 Op::Input { entry: e, port } if *e as usize == entry => {
@@ -503,6 +526,15 @@ impl<'a> Tree<'a> {
                     );
                     let last = stages.len().saturating_sub(1);
                     for (idx, stage) in stages.into_iter().enumerate() {
+                        if matches!(stage, Stage::OwnRows) {
+                            crossed = true;
+                            let whole = tree.node(cur).shape[0];
+                            let (first, count) = parts.rows(whole, rank as usize);
+                            if count != whole || first != 0 {
+                                cur = own::slice_axis0(&mut tree, cur, first, count, &mut sliced);
+                            }
+                            continue;
+                        }
                         if crossing(stage) {
                             crossed = true;
                         }
@@ -518,17 +550,9 @@ impl<'a> Tree<'a> {
                             true => (shape.clone(), extents.clone()),
                             false => (in_shape.clone(), in_extents.clone()),
                         };
-                        cur = tree.add(
-                            Node {
-                                term: Term::Stage(stage.clone()),
-                                args: stage_args,
-                                shape: sh,
-                                extents: ex,
-                                form: stage_form,
-                                from,
-                            },
-                            None,
-                        );
+                        let term = Term::Stage(stage.clone());
+                        let node = Node::new(term, stage_args, (sh, ex), stage_form, from);
+                        cur = tree.add(node, None);
                     }
                     cur
                 }
@@ -552,6 +576,7 @@ impl<'a> Tree<'a> {
                 tree.readers[a.0 as usize] += 1;
             }
         }
+        tree.index_kept();
         for o in outputs {
             let t = tree.at[o].expect("outputs are needed");
             tree.readers[t.0 as usize] += 1;
@@ -582,79 +607,6 @@ impl<'a> Tree<'a> {
         self.nodes.push(node);
         self.shares.push(share);
         T(self.nodes.len() as u32 - 1)
-    }
-
-    /// A rotated weight's leaves: codes, `suh` and `svh`.
-    fn turned(
-        &mut self,
-        weight: u32,
-        (shape, extents): (&[usize], &[Extent]),
-        share: Option<Share>,
-        codes: &'static dyn Load,
-        from: NodeId,
-    ) -> [T; 3] {
-        let leaf = |part: u8, axis: usize, form: &'static dyn Load| Node {
-            term: Term::Leaf(Home::Part(weight, part)),
-            args: Vec::new(),
-            shape: match part {
-                0 => shape.to_vec(),
-                _ => vec![shape[axis]],
-            },
-            extents: match part {
-                0 => extents.to_vec(),
-                _ => vec![extents[axis]],
-            },
-            form,
-            from,
-        };
-        let along = |axis: u32| {
-            let cut = |s: Share| Share {
-                axis: 0,
-                inner: 1,
-                ..s
-            };
-            share.filter(|s| s.axis == axis).map(cut)
-        };
-        let f32 = crate::form::F32_FORM;
-        [
-            self.add(leaf(0, 0, codes), share),
-            self.add(leaf(1, 1, f32), along(1)),
-            self.add(leaf(2, 0, f32), along(0)),
-        ]
-    }
-
-    /// `x` through a rotated matmul: scale, turn, codes, turn, scale.
-    fn turn(
-        &mut self,
-        x: T,
-        [codes, suh, svh]: [T; 3],
-        (shape, extents): (&[usize], &[Extent]),
-        out_form: &'static dyn Load,
-        from: NodeId,
-    ) -> T {
-        let (rows, wide) = (self.node(x).shape.clone(), self.node(x).extents.clone());
-        let turn = Stage::Hadamard { block: 128 };
-        let mut step = |term: Term, args: Vec<T>, out: bool, form: &'static dyn Load| {
-            let (shape, extents) = match out {
-                true => (shape.to_vec(), extents.to_vec()),
-                false => (rows.clone(), wide.clone()),
-            };
-            let node = Node {
-                term,
-                args,
-                shape,
-                extents,
-                form,
-                from,
-            };
-            self.add(node, None)
-        };
-        let f32 = F32_FORM;
-        let scaled = step(Term::Stage(Stage::Mul), vec![x, suh], false, f32);
-        let turned = step(Term::Stage(turn.clone()), vec![scaled], false, f32);
-        let product = step(Term::Op(Op::Matmul), vec![turned, codes], true, f32);
-        let back = step(Term::Stage(turn), vec![product], true, f32);
-        step(Term::Stage(Stage::Mul), vec![back, svh], true, out_form)
     }
 
     /// Whether `t` reuses its input buffer without copying.
@@ -696,17 +648,10 @@ impl<'a> Tree<'a> {
         if g.ty.placement != (Placement::Split { axis: last }) || self.parts.ranks() <= 1 {
             return (0, width);
         }
-        let lookup = |d| self.sizes.iter().find(|(n, _)| *n == d).map(|(_, v)| *v);
-        let Some(whole) = g.ty.shape.0[last as usize]
-            .value(&self.g.dims, &lookup)
-            .map(|v| v as usize)
-        else {
+        let Some(whole) = self.eval(&g.ty.shape.0[last as usize]).map(|v| v as usize) else {
             return (0, width);
         };
-        let first = self
-            .parts
-            .part(whole, self.rank as usize)
-            .map_or(0, |(f, _)| f);
+        let first = self.part(whole).map_or(0, |(f, _)| f);
         (first, whole)
     }
 
@@ -789,25 +734,6 @@ impl<'a> Tree<'a> {
         P::find(self, t)
     }
 
-    /// Whether `t` closes a rotated matmul chain.
-    fn closes_turn(&self, t: T) -> bool {
-        let n = self.node(t);
-        if n.term != Term::Stage(Stage::Mul) {
-            return false;
-        }
-        let Some(&back) = n.args.first() else {
-            return false;
-        };
-        let b = self.node(back);
-        if !matches!(b.term, Term::Stage(Stage::Hadamard { .. })) {
-            return false;
-        }
-        let Some(&prod) = b.args.first() else {
-            return false;
-        };
-        self.node(prod).term == Term::Op(Op::Matmul)
-    }
-
     /// Whether `t` is an elementwise stage only its reader needs.
     pub(crate) fn joins(&self, t: T) -> bool {
         let map = matches!(&self.node(t).term, Term::Stage(s) if map_stage(s).is_some());
@@ -840,97 +766,14 @@ impl<'a> Tree<'a> {
         self.at.get(id.0 as usize).copied().flatten()
     }
 
-    /// The node appending to kept `index`, and rows per slot.
-    pub fn kept_rows(&self, index: u32) -> Option<(T, usize)> {
-        let append = Term::Op(Op::Append(index));
-        let t = (0..self.len() as u32)
-            .map(T)
-            .find(|t| self.node(*t).term == append)?;
-        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
-            return None;
-        };
-        // A slot holds the axis's bound, whatever this launch sees.
-        let most = self.g.dims.iter().find(|d| d.name == *axis);
-        Some((t, most.map_or(0, |d| d.size.max() as usize)))
-    }
-
-    /// Append node, layout, and rows per slot for kept `index`.
-    pub fn kept_layout(&self, index: u32) -> Option<(T, &'static dyn Layout, usize)> {
-        let (t, context) = self.kept_rows(index)?;
-        match sliding_ring(self.g, index) {
-            Some(ring) => Some((t, kept::RING, ring)),
-            None => Some((t, self.kept, context)),
-        }
-    }
-
-    /// True if kept `index` feeds only picked attention.
-    pub fn is_sparse_kept(&self, index: u32) -> bool {
-        let mut stack: Vec<NodeId> = self
-            .g
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.op == Op::Append(index))
-            .map(|(i, _)| NodeId(i as u32))
-            .collect();
-        if stack.is_empty() {
-            return false;
-        }
-        let mut found = false;
-        while let Some(cur) = stack.pop() {
-            for (i, n) in self.g.nodes.iter().enumerate().skip(cur.0 as usize + 1) {
-                if !n.args.contains(&cur) {
-                    continue;
-                }
-                match &n.op {
-                    Op::View(_) => stack.push(NodeId(i as u32)),
-                    Op::Attend(a) if a.picked => found = true,
-                    _ => return false,
-                }
-            }
-        }
-        found
-    }
-
-    /// True if any kept tensor is sparse-read.
-    pub fn has_sparse_kept(&self) -> bool {
-        (0..self.g.kept.len() as u32).any(|i| self.is_sparse_kept(i))
-    }
-
-    /// Fixed shape of kept state `index`, split for this rank.
-    pub fn fixed_kept(&self, index: u32) -> Option<Vec<usize>> {
-        let k = self.g.kept.get(index as usize)?;
-        let size = |name| {
-            self.sizes
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| *v)
-                .or_else(|| {
-                    self.g
-                        .dims
-                        .iter()
-                        .find(|d| d.name == name)
-                        .map(|d| d.size.max())
-                })
-        };
-        let mut shape: Vec<usize> = k
-            .shape
-            .0
-            .iter()
-            .map(|e| e.value(&self.g.dims, &size).map(|n| n as usize))
-            .collect::<Option<_>>()?;
-        if let Placement::Split { axis } = k.placement
-            && self.parts.ranks() > 1
-        {
-            let a = axis as usize;
-            shape[a] = self.parts.part(shape[a], self.rank as usize)?.1;
-        }
-        Some(shape)
-    }
-
     /// A dimension's size in this view.
     pub fn size(&self, name: DimName) -> Option<u64> {
-        self.sizes.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+        lookup(&self.sizes, name)
+    }
+
+    /// This rank's `(first, count)` of `whole` along a split axis.
+    pub(crate) fn part(&self, whole: usize) -> Option<(usize, usize)> {
+        self.parts.part(whole, self.rank as usize)
     }
 
     /// Roots inside a cover at `t`. `None` if one leaks.
@@ -987,7 +830,6 @@ impl<'a> Tree<'a> {
 
     /// Evaluates a dimension expression at this tree's concrete sizes.
     pub fn eval(&self, expr: &tessera_graph::DimExpr) -> Option<u64> {
-        let lookup = |name| self.sizes.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
-        expr.value(&self.g.dims, &lookup)
+        expr.value(&self.g.dims, &|name| self.size(name))
     }
 }

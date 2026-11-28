@@ -96,6 +96,7 @@ fn turned(
     order = Order::PerConfig,
     source = turned_source,
     load = turned_load,
+    load_key = tessera_lower::load_key((self.m, self.n, self.k, self.rows_cap, self.form.name())),
     unproven,
 )]
 pub struct Turned {

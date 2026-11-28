@@ -104,12 +104,20 @@ fn rows_of(bounded: &[Dim], width: DimName, dtype: DType) -> Port {
     }
 }
 
+/// A graph's work on its input and the product.
+pub type Finish = fn(&tessera_trace::Tensor, tessera_trace::Tensor) -> tessera_trace::Tensor;
+
 /// `k` inputs to `n` outputs: every matmul.
 pub fn linear(bounded: &[Dim], k: u64, n: u64) -> Graph {
+    linear_then(bounded, [k, n], |_, product| product)
+}
+
+/// The same, with `finish` after the matmul.
+pub fn linear_then(bounded: &[Dim], [k, n]: [u64; 2], finish: Finish) -> Graph {
     let m = model(bounded, &[(Hidden, k), (Ffn, n)]);
     let w: Layer = declare(&m);
     let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
-    m.finish([(Role::Logits, &x.matmul(&w.w))])
+    m.finish([(Role::Logits, &finish(&x, x.matmul(&w.w)))])
 }
 
 /// A product through `act`, then times and plus `y`.
@@ -205,6 +213,30 @@ pub fn clipped(bounded: &[Dim], width: u64) -> Graph {
         [rows_of(bounded, Hidden, DType::F32), pos],
     );
     let out = x.l2_clip(4.0, 1e-6).log_scale(&at, 4.0, 0.5);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Centered RMS layer norm over `Hidden`.
+pub fn layer_norm(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, width)]);
+    let w: Scale = declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
+    let out = x.center().rms_norm(&w.norm, 1e-6);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Packed variable-length attention over `Rows`.
+pub fn packed_attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
+    let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
+    let m = model(bounded, &fixed);
+    let kv = || floats([Rows, KvHeads, HeadDim]);
+    let bounds = Port {
+        role: Role::Tokens,
+        ty: TensorType::new(vec![Rows.into(), 2u64.into()], DType::U32),
+    };
+    let ports = [floats([Rows, Heads, HeadDim]), kv(), kv(), bounds];
+    let [q, k, v, b] = m.entry(EntryKind::Forward, ports);
+    let out = m.attend_packed(false, 0.1, [&q, &k, &v], &b);
     m.finish([(Role::Logits, &out)])
 }
 

@@ -22,8 +22,10 @@ using namespace tessera;
 #endif
 #ifdef IDX_MIN_BLOCKS
 #define IDX_BOUNDS __launch_bounds__(128, IDX_MIN_BLOCKS)
+#define IDX_D128_BOUNDS __launch_bounds__(128, IDX_MIN_BLOCKS)
 #else
 #define IDX_BOUNDS __launch_bounds__(128)
+#define IDX_D128_BOUNDS __launch_bounds__(128, 4)
 #endif
 #ifndef IDX_QT_MIN_BLOCKS
 #define IDX_QT_MIN_BLOCKS 2
@@ -196,7 +198,7 @@ static __device__ __forceinline__ void attn_ldm_x4_t(u32 d[4], const void* s) {
 }
 static __device__ __forceinline__ void attn_cp_async16(void* dst, const void* src, u32 bytes) {
     u32 a = u32(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                  :: "r"(a), "l"(src), "r"(bytes) : "memory");
 }
 static __device__ __forceinline__ void attn_cp_commit() {
@@ -222,6 +224,43 @@ static __device__ __forceinline__ u32 mla_pick_id(const u32* ids, u32 row, u32 p
     if (p >= p_end) return 0xFFFFFFFFu;
     u32 c = (fl == 1u) ? ids[u64(row) * picks + p] : p;
     return (c >= from && c < to) ? c : 0xFFFFFFFFu;
+}
+
+struct mla_window {
+    u32 row, h0, slot, from, to, p_begin, p_end;
+};
+
+template <u32 TILE_SHIFT, typename SM>
+static __device__ __forceinline__ mla_window mla_window_for(
+    const u32* ids, const u32* slots, const u32* positions, const float* sinks, u32 rows, u32 keys,
+    u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, u32 has_sinks, SM& sm) {
+    constexpr u32 MASK = (1u << TILE_SHIFT) - 1u;
+    u32 tid = threadIdx.x, split = blockIdx.x, hgroups = heads >> 4u;
+    u32 row = rows - 1u - blockIdx.y / hgroups;
+    u32 h0 = (blockIdx.y % hgroups) << 4u, slot = slots[row], pos = positions[row];
+    u32 from = (pos > before) ? (pos - before) : 0u;
+    u32 to = (pos + after < keys) ? (pos + after + 1u) : keys;
+    u32 start = (from_list == 0u) ? from : 0u;
+    if (tid == 0u) {
+        u32 stop = (from_list == 0u && to < picks) ? to : picks;
+        if (from_list == 1u && picks > 0u && ids[u64(row) * picks + picks - 1u] >= keys) {
+            u32 lo = 0u, hi = picks;
+            for (u32 s = 0u; s < 16u; s++) {
+                u32 mid = (lo + hi) >> 1u;
+                if (mid < hi) { if (ids[u64(row) * picks + mid] < keys) lo = mid + 1u; else hi = mid; }
+            }
+            stop = lo;
+        }
+        sm.stop = stop;
+    }
+    if (tid < 16u) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
+    prim::block_sync();
+    u32 stop = sm.stop, total_p = (stop > start) ? (stop - start) : 0u;
+    u32 per = ((((total_p + MASK) >> TILE_SHIFT) + splits - 1u) / splits) << TILE_SHIFT;
+    u32 p_begin = start + split * per, p_end = p_begin + per;
+    if (p_begin > stop) p_begin = stop;
+    if (p_end > stop) p_end = stop;
+    return {row, h0, slot, from, to, p_begin, p_end};
 }
 
 static __device__ __forceinline__ u64 kv_row_at(const u32* pt, u32 slot, u32 pos, u32 ctx, u32 sh) {
@@ -353,32 +392,12 @@ static __device__ __forceinline__ void mla_attend_body(
     constexpr u32 NT = OUT_W >> 6u;
     constexpr u32 OUT_STRIDE = OUT_W + 4u;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
-    u32 wg = warp >> 2, wl = warp & 3u, hgroups = heads >> 4;
-    u32 split = blockIdx.x, rb = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
-    if (rb >= rows || split >= splits) return;
-    u32 row = (rows - 1u) - rb, h0 = hg << 4, slot = slots[row], pos = positions[row];
-    u32 from = (pos > before) ? (pos - before) : 0u;
-    u32 to = (pos + after < keys) ? (pos + after + 1u) : keys;
-    u32 start = (from_list == 0u) ? from : 0u;
-    if (tid == 0u) {
-        u32 stop = (from_list == 0u && to < picks) ? to : picks;
-        if (from_list == 1u && picks > 0u && ids[u64(row) * picks + picks - 1u] >= keys) {
-            u32 lo = 0u, hi = picks;
-            for (u32 s = 0u; s < 16u; s++) {
-                u32 mid = (lo + hi) >> 1;
-                if (mid < hi) { if (ids[u64(row) * picks + mid] < keys) lo = mid + 1u; else hi = mid; }
-            }
-            stop = lo;
-        }
-        sm.stop = stop;
-    }
-    if (tid < 16u) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
-    prim::block_sync();
-    u32 stop = sm.stop, total_p = (stop > start) ? (stop - start) : 0u;
-    u32 per = ((((total_p + 31u) >> 5) + splits - 1u) / splits) << 5;
-    u32 p_begin = start + split * per, p_end = p_begin + per;
-    if (p_begin > stop) p_begin = stop;
-    if (p_end > stop) p_end = stop;
+    u32 wg = warp >> 2, wl = warp & 3u, split = blockIdx.x;
+    if (blockIdx.y / (heads >> 4) >= rows || split >= splits) return;
+    auto win = mla_window_for<5u>(ids, slots, positions, sinks, rows, keys, heads, picks,
+                                  from_list, before, after, splits, has_sinks, sm);
+    u32 row = win.row, h0 = win.h0, slot = win.slot;
+    u32 from = win.from, to = win.to, p_begin = win.p_begin, p_end = win.p_end;
     if (p_begin >= p_end) {
         attn_store_empty<OUT_W, OUT_STRIDE, 256u>(part, sinks, has_sinks, row, heads, h0, 16u, split, splits, tid);
         return;
@@ -548,6 +567,242 @@ MLA_DEF(tessera_mla_attend_fp8, tessera_mla_attend_512_fp8, u8, 0u)
 MLA_DEF(tessera_mla_attend_bf16, tessera_mla_attend_512_bf16, u16, 1u)
 MLA_DEF(tessera_mla_attend_f32, tessera_mla_attend_512_f32, float, 2u)
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+static __device__ __forceinline__ u32 mla_pack4_fp8(float4 v, float inv) {
+    return u32(trellis::f2_e4m3x2(v.x * inv, v.y * inv)) |
+           (u32(trellis::f2_e4m3x2(v.z * inv, v.w * inv)) << 16u);
+}
+static __device__ __forceinline__ u32 mla_max4_scale(float4 a, float4 b, float& inv) {
+    float mx = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w)));
+    mx = fmaxf(mx, fmaxf(fmaxf(fabsf(b.x), fabsf(b.y)), fmaxf(fabsf(b.z), fabsf(b.w))));
+    mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 1u, 4));
+    mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 2u, 4));
+    return trellis::mx_scale(mx, inv) * 0x01010101u;
+}
+static __device__ __forceinline__ u32 mla_prmt(u32 a, u32 b, u32 sel) {
+    u32 out;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(a), "r"(b), "r"(sel));
+    return out;
+}
+
+// SM120 FP8 MLA with double-buffered KV and 512V.
+struct alignas(16) mla_fp8_smem {
+    u8 nope[2][32][512], rope[2][32][64];
+    float red[4][16][32];
+    u16 p8[16][16];
+    u32 p_sc[16];
+    float m[16], l[16], corr[16];
+    u32 stop, valid_mask;
+};
+
+static __device__ __forceinline__ void mla_stage_fp8(mla_fp8_smem& sm, u32 b, const u8* kv,
+                                                      const u8* kv_host, const u32* pt, u32 slot,
+                                                      u32 j, u32 ctx, u32 sh, u32 tid) {
+    u32 r = tid >> 3, lane8 = tid & 7u;
+    bool is_host = false;
+    const u8* src = (j != 0xFFFFFFFFu)
+        ? kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull, is_host)
+        : kv;
+    if (is_host) {
+#pragma unroll
+        for (u32 i = 0u; i < 5u; i++) {
+            u32 ch = lane8 + i * 8u;
+            if (ch < 32u) *reinterpret_cast<uint4*>(&sm.nope[b][r][((ch ^ (r & 7u)) << 4u)]) =
+                *reinterpret_cast<const uint4*>(src + ch * 16u);
+            else if (ch < 36u) *reinterpret_cast<uint4*>(&sm.rope[b][r][(ch - 32u) << 4u]) =
+                *reinterpret_cast<const uint4*>(src + ch * 16u);
+        }
+    } else {
+        u32 bytes = (j != 0xFFFFFFFFu) ? 16u : 0u;
+#pragma unroll
+        for (u32 i = 0u; i < 5u; i++) {
+            u32 ch = lane8 + i * 8u;
+            if (ch < 32u) attn_cp_async16(&sm.nope[b][r][((ch ^ (r & 7u)) << 4u)], src + ch * 16u, bytes);
+            else if (ch < 36u) attn_cp_async16(&sm.rope[b][r][(ch - 32u) << 4u], src + ch * 16u, bytes);
+        }
+    }
+    attn_cp_commit();
+}
+static __device__ __forceinline__ const u8* mla_nope_at(const mla_fp8_smem& sm, u32 b,
+                                                         u32 r, u32 col) {
+    return &sm.nope[b][r][(((col >> 4u) ^ (r & 7u)) << 4u) + (col & 15u)];
+}
+
+static __device__ __forceinline__ void mla_fp8_v512_body(
+    const float* q, const u8* kv, const u8* kv_host, const u32* ids, const u32* slots,
+    const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys,
+    u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits,
+    const u32* page_table, u32 page_shift, u32 has_sinks, mla_fp8_smem& sm) {
+    u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
+    u32 wg = warp >> 2u, wl = warp & 3u, split = blockIdx.x;
+    if (blockIdx.y / (heads >> 4u) >= rows || split >= splits) return;
+    auto win = mla_window_for<5u>(ids, slots, positions, sinks, rows, keys, heads, picks,
+                                  from_list, before, after, splits, has_sinks, sm);
+    u32 row = win.row, h0 = win.h0, slot = win.slot;
+    u32 from = win.from, to = win.to, p_begin = win.p_begin, p_end = win.p_end;
+    if (p_begin >= p_end) {
+        attn_store_empty<512u, 516u, 256u>(part, sinks, has_sinks, row, heads, h0, 16u, split, splits, tid);
+        return;
+    }
+    u32 qa[5][4], q_sa[5];
+    const float* q0 = q + u64(row * heads + h0 + g) * 576ull;
+    const float* q8 = q + u64(row * heads + h0 + g + 8u) * 576ull;
+#pragma unroll
+    for (u32 s = 0u; s < 5u; s++) {
+        u32 k0 = (wl * 5u + s) * 32u + (t << 2u);
+        float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f), b0 = a0, a1 = a0, b1 = a0;
+        if (k0 < 576u) {
+            a0 = *reinterpret_cast<const float4*>(q0 + k0);
+            b0 = *reinterpret_cast<const float4*>(q0 + k0 + 16u);
+            a1 = *reinterpret_cast<const float4*>(q8 + k0);
+            b1 = *reinterpret_cast<const float4*>(q8 + k0 + 16u);
+        }
+        float inv0, inv1;
+        u32 sc0 = mla_max4_scale(a0, b0, inv0);
+        u32 sc1 = mla_max4_scale(a1, b1, inv1);
+        q_sa[s] = (lane & 1u) ? sc1 : sc0;
+        qa[s][0] = mla_pack4_fp8(a0, inv0); qa[s][1] = mla_pack4_fp8(a1, inv1);
+        qa[s][2] = mla_pack4_fp8(b0, inv0); qa[s][3] = mla_pack4_fp8(b1, inv1);
+    }
+    float o[8][4] = {};
+    u32 tk = tid >> 3u, vrow = lane;
+    u32 krow = wg * 16u + ((lane >> 4u) << 3u) + (lane & 7u);
+    u32 kcol = ((lane >> 3u) & 1u) << 4u;
+    u32 cur = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
+    mla_stage_fp8(sm, 0u, kv, kv_host, page_table, slot, cur, context, page_shift, tid);
+    u32 b = 0u, d_base = warp << 6u;
+    for (u32 p0 = p_begin; p0 < p_end; p0 += 32u) {
+        if (tid < 32u) {
+            u32 j = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tid, p_end);
+            u32 mask = __ballot_sync(0xFFFFFFFFu, j != 0xFFFFFFFFu);
+            if (tid == 0u) sm.valid_mask = mask;
+        }
+        bool next = p0 + 32u < p_end;
+        if (next) {
+            u32 nj = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end);
+            mla_stage_fp8(sm, b ^ 1u, kv, kv_host, page_table, slot, nj, context, page_shift, tid);
+            attn_cp_wait1();
+        } else attn_cp_wait0();
+        prim::block_sync();
+        u32 mask = sm.valid_mask;
+        if (mask != 0u) {
+            float s0[4] = {}, s1[4] = {};
+#pragma unroll
+            for (u32 s = 0u; s < 5u; s++) {
+                u32 k0 = (wl * 5u + s) << 5u;
+                if (k0 >= 576u) continue;
+                u32 kb[4];
+                const u8* kp = k0 < 512u ? mla_nope_at(sm, b, krow, k0 + kcol)
+                                           : &sm.rope[b][krow][k0 - 512u + kcol];
+                attn_ldm_x4(kb, kp);
+                u32 b0[2] = {kb[0], kb[1]}, b1[2] = {kb[2], kb[3]};
+                u32 sa = q_sa[s];
+                trellis::mma_mx8(s0, qa[s], b0, sa, 0x7F7F7F7Fu);
+                trellis::mma_mx8(s1, qa[s], b1, sa, 0x7F7F7F7Fu);
+            }
+            u32 cb = wg << 4u;
+            *reinterpret_cast<float2*>(&sm.red[wl][g][cb + t * 2u]) = make_float2(s0[0], s0[1]);
+            *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][cb + t * 2u]) = make_float2(s0[2], s0[3]);
+            *reinterpret_cast<float2*>(&sm.red[wl][g][cb + 8u + t * 2u]) = make_float2(s1[0], s1[1]);
+            *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][cb + 8u + t * 2u]) = make_float2(s1[2], s1[3]);
+            prim::block_sync();
+            u32 h = (warp << 1u) | (lane >> 4u), seg = lane & 15u, c = seg << 1u;
+            float2 r0v = *reinterpret_cast<const float2*>(&sm.red[0][h][c]);
+            float2 r1v = *reinterpret_cast<const float2*>(&sm.red[1][h][c]);
+            float2 r2v = *reinterpret_cast<const float2*>(&sm.red[2][h][c]);
+            float2 r3v = *reinterpret_cast<const float2*>(&sm.red[3][h][c]);
+            float x0 = ((mask >> c) & 1u) ? (r0v.x + r1v.x + r2v.x + r3v.x) * scale : attn_neg_inf();
+            float x1 = ((mask >> (c + 1u)) & 1u) ? (r0v.y + r1v.y + r2v.y + r3v.y) * scale : attn_neg_inf();
+            float mx = fmaxf(x0, x1);
+#pragma unroll
+            for (u32 off = 8u; off > 0u; off >>= 1u) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off, 16));
+            float old_m = sm.m[h], old_l = sm.l[h], nm = fmaxf(old_m, mx);
+            float corr = old_l > 0.0f ? __expf(old_m - nm) : 0.0f;
+            float p0v = ((mask >> c) & 1u) ? __expf(x0 - nm) : 0.0f;
+            float p1v = ((mask >> (c + 1u)) & 1u) ? __expf(x1 - nm) : 0.0f;
+            float psum = p0v + p1v, pmax = fmaxf(p0v, p1v);
+#pragma unroll
+            for (u32 off = 8u; off > 0u; off >>= 1u) {
+                psum += __shfl_xor_sync(0xFFFFFFFFu, psum, off, 16);
+                pmax = fmaxf(pmax, __shfl_xor_sync(0xFFFFFFFFu, pmax, off, 16));
+            }
+            float pinv;
+            u32 pscale = trellis::mx_scale(pmax, pinv) * 0x01010101u;
+            sm.p8[h][((seg & 3u) << 1u) | ((seg >> 2u) & 1u) | ((seg >> 3u) << 3u)] =
+                trellis::f2_e4m3x2(p0v * pinv, p1v * pinv);
+            if (seg == 0u) {
+                sm.m[h] = nm; sm.l[h] = old_l * corr + psum; sm.corr[h] = corr;
+                sm.p_sc[h] = pscale;
+            }
+            prim::block_sync();
+            float c0 = sm.corr[g], c1 = sm.corr[g + 8u];
+#pragma unroll
+            for (u32 nt = 0u; nt < 8u; nt++) {
+                o[nt][0] *= c0; o[nt][1] *= c0; o[nt][2] *= c1; o[nt][3] *= c1;
+            }
+            u32 pa[4] = {*reinterpret_cast<const u32*>(&sm.p8[g][t << 1u]),
+                         *reinterpret_cast<const u32*>(&sm.p8[g + 8u][t << 1u]),
+                         *reinterpret_cast<const u32*>(&sm.p8[g][8u + (t << 1u)]),
+                         *reinterpret_cast<const u32*>(&sm.p8[g + 8u][8u + (t << 1u)])};
+            u32 sa = sm.p_sc[g + ((lane & 1u) << 3u)];
+#pragma unroll
+            for (u32 nt = 0u; nt < 8u; nt += 2u) {
+                u32 raw[4], even[2], odd[2];
+                attn_ldm_x4_t(raw, mla_nope_at(sm, b, vrow, d_base + nt * 8u));
+                even[0] = mla_prmt(raw[0], raw[1], 0x6420u);
+                even[1] = mla_prmt(raw[2], raw[3], 0x6420u);
+                odd[0] = mla_prmt(raw[0], raw[1], 0x7531u);
+                odd[1] = mla_prmt(raw[2], raw[3], 0x7531u);
+                trellis::mma_mx8(o[nt], pa, even, sa, 0x7F7F7F7Fu);
+                trellis::mma_mx8(o[nt + 1u], pa, odd, sa, 0x7F7F7F7Fu);
+            }
+        }
+        if (next) prim::block_sync();
+        b ^= 1u;
+    }
+#pragma unroll
+    for (u32 hi = 0u; hi < 2u; hi++) {
+        u32 head = g + (hi << 3u);
+        float inv = splits == 1u && sm.l[head] > 0.0f ? 1.0f / sm.l[head] : 1.0f;
+        u64 base = splits == 1u ? u64(row * heads + h0 + head) * 512ull
+                                 : (u64(row * heads + h0 + head) * splits + split) * 516ull;
+#pragma unroll
+        for (u32 nt = 0u; nt < 8u; nt++) {
+            u32 col = d_base + (nt >> 1u) * 16u + (t << 2u) + (nt & 1u);
+            float a = o[nt][hi * 2u] * inv, z = o[nt][hi * 2u + 1u] * inv;
+            asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(part + base + col), "f"(a));
+            asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(part + base + col + 2u), "f"(z));
+        }
+    }
+    if (splits > 1u && tid < 16u) {
+        u64 base = (u64(row * heads + h0 + tid) * splits + split) * 516ull;
+        part[base + 512u] = sm.m[tid]; part[base + 513u] = sm.l[tid];
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, MLA_MIN_BLOCKS) void tessera_mla_attend_fp8_v512(
+    const float* q, const u8* kv, const u32* ids, const u32* slots, const u32* positions,
+    const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads,
+    u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table,
+    u32 page_shift, u32 has_sinks, const u8* kv_host) {
+    __shared__ mla_fp8_smem sm;
+    mla_fp8_v512_body(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys,
+                      context, heads, picks, from_list, before, after, splits, page_table,
+                      page_shift, has_sinks, sm);
+}
+#else
+extern "C" __global__ __launch_bounds__(256, MLA_MIN_BLOCKS) void tessera_mla_attend_fp8_v512(
+    const float* q, const u8* kv, const u32* ids, const u32* slots, const u32* positions,
+    const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads,
+    u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table,
+    u32 page_shift, u32 has_sinks, const u8* kv_host) {
+    __shared__ mla_smem sm;
+    mla_attend_body<0u, 512u>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows,
+                              keys, context, heads, picks, from_list, before, after, splits,
+                              page_table, page_shift, has_sinks, sm);
+}
+#endif
+
 // Combines split-K MLA partials for one row and head.
 extern "C" __global__ __launch_bounds__(MLA_REDUCE_THREADS, MLA_REDUCE_MIN_BLOCKS) void tessera_mla_reduce(
     const float* part, float* out, u32 lists, u32 splits, u32 out_w) {
@@ -706,265 +961,5 @@ extern "C" __global__ __launch_bounds__(128, GQA_REDUCE_MIN_BLOCKS) void tessera
     }
     *reinterpret_cast<float4*>(out + u64(list) * 128ull + d4) = make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
 }
-
-constexpr u32 IDX_SM_WORDS = 4608u;
-struct alignas(16) idx_smem { u32 q[IDX_SM_WORDS], k[IDX_SM_WORDS]; float w[128]; };
-static __device__ __forceinline__ u32 idx_e4m3x2_bf16x2(u16 q) {
-    u32 h = attn_e4m3_f16x2(q);
-    return attn_pack2<true>(trellis::f16_to_f32(h & 0xFFFFu), trellis::f16_to_f32(h >> 16u));
-}
-
-template <u32 KV_FMT>
-static __device__ __forceinline__ void idx_load_k16(
-    const void* kp, u32* sk, u32 slot, u32 ctx, u32 dim, u32 stride, u32 j0, u32 to,
-    const u32* pt, u32 sh, u32 lane) {
-    u32 qw = dim >> 2, tot = qw << 4;
-    for (u32 idx = lane; idx < tot; idx += 32u) {
-        u32 kr = idx / qw, q4 = idx % qw, j = j0 + kr;
-        uint2 pk = make_uint2(0u, 0u);
-        if (j < to) {
-            u64 b = kv_row_at(pt, slot, j, ctx, sh) * dim + (u64(q4) << 2);
-            if constexpr (KV_FMT == 0u) {
-                u32 r = *reinterpret_cast<const u32*>(static_cast<const u8*>(kp) + b);
-                pk = make_uint2(idx_e4m3x2_bf16x2(u16(r)), idx_e4m3x2_bf16x2(u16(r >> 16)));
-            } else if constexpr (KV_FMT == 1u) {
-                pk = *reinterpret_cast<const uint2*>(static_cast<const u16*>(kp) + b);
-            } else {
-                float4 v = *reinterpret_cast<const float4*>(static_cast<const float*>(kp) + b);
-                pk = make_uint2(attn_pack2<true>(v.x, v.y), attn_pack2<true>(v.z, v.w));
-            }
-        }
-        *reinterpret_cast<uint2*>(sk + kr * stride + (q4 << 1)) = pk;
-    }
-}
-
-template <u32 KV_FMT>
-static __device__ __forceinline__ void idx_body(
-    const float* q, const void* k_ptr, const float* weights, const u32* slots,
-    const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context,
-    u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift,
-    idx_smem& sm) {
-    u32 row = blockIdx.y, j_begin = blockIdx.x * tile_keys, j_end = j_begin + tile_keys;
-    if (j_end > out_keys) j_end = out_keys;
-    if (row >= rows || j_begin >= j_end) return;
-    u32 tid = threadIdx.x, slot = slots[row], to = live_keys;
-    if (masked == 1u && positions[row] < to) to = positions[row] + 1u;
-    float* out_row = out + u64(row) * out_keys;
-    float neg = attn_neg_inf();
-    if (j_begin >= to) {
-        for (u32 j = j_begin + tid; j < j_end; j += 128u) out_row[j] = neg;
-        return;
-    }
-    if (tid < heads) sm.w[tid] = weights[u64(row) * heads + tid];
-    u32 stride = (dim >> 1) + 2u, q_words = dim >> 2, total_q4 = heads * q_words;
-    const float* q_base = q + u64(row) * heads * dim;
-    for (u32 idx = tid; idx < total_q4; idx += 128u) {
-        u32 h = idx / q_words, q4 = idx % q_words;
-        float4 v = *reinterpret_cast<const float4*>(q_base + u64(h) * dim + (u64(q4) << 2));
-        *reinterpret_cast<uint2*>(sm.q + h * stride + (q4 << 1)) =
-            make_uint2(attn_pack2<true>(v.x, v.y), attn_pack2<true>(v.z, v.w));
-    }
-    prim::block_sync();
-    u32 warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u, d_steps = dim >> 4;
-    u32* sk = sm.k + warp * 16u * stride;
-    for (u32 j0 = j_begin + (warp << 4); j0 < j_end; j0 += 64u) {
-        if (j0 >= to) { if (lane < 16u && j0 + lane < j_end) out_row[j0 + lane] = neg; continue; }
-        idx_load_k16<KV_FMT>(k_ptr, sk, slot, context, dim, stride, j0, to, page_table, page_shift, lane);
-        __syncwarp();
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
-        for (u32 h0 = 0u; h0 < heads; h0 += 16u) {
-            float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
-            for (u32 ds = 0u; ds < d_steps; ds++) {
-                u32 k0 = ds << 3;
-                u32 a[4] = {sm.q[(h0 + g) * stride + k0 + t], sm.q[(h0 + g + 8u) * stride + k0 + t],
-                            sm.q[(h0 + g) * stride + k0 + t + 4u], sm.q[(h0 + g + 8u) * stride + k0 + t + 4u]};
-                u32 b0[2] = {sk[g * stride + k0 + t], sk[g * stride + k0 + t + 4u]};
-                u32 b1[2] = {sk[(g + 8u) * stride + k0 + t], sk[(g + 8u) * stride + k0 + t + 4u]};
-                attn_mma<true>(s0, a, b0); attn_mma<true>(s1, a, b1);
-            }
-            float w0 = sm.w[h0 + g], w1 = sm.w[h0 + g + 8u];
-            acc[0] += fmaxf(s0[0], 0.f) * w0 + fmaxf(s0[2], 0.f) * w1;
-            acc[1] += fmaxf(s0[1], 0.f) * w0 + fmaxf(s0[3], 0.f) * w1;
-            acc[2] += fmaxf(s1[0], 0.f) * w0 + fmaxf(s1[2], 0.f) * w1;
-            acc[3] += fmaxf(s1[1], 0.f) * w0 + fmaxf(s1[3], 0.f) * w1;
-        }
-#pragma unroll
-        for (u32 i = 0u; i < 4u; i++) {
-            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 4u);
-            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 8u);
-            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 16u);
-        }
-        if (g == 0u) {
-            u32 k0 = j0 + (t << 1), k2 = j0 + 8u + (t << 1);
-            if (k0 < j_end) out_row[k0] = (k0 < to) ? acc[0] : neg;
-            if (k0 + 1u < j_end) out_row[k0 + 1u] = (k0 + 1u < to) ? acc[1] : neg;
-            if (k2 < j_end) out_row[k2] = (k2 < to) ? acc[2] : neg;
-            if (k2 + 1u < j_end) out_row[k2 + 1u] = (k2 + 1u < to) ? acc[3] : neg;
-        }
-    }
-}
-
-struct alignas(16) idx_qt_smem {
-    u16 k[2][32][136];
-    u32 max_to, same_slot;
-};
-
-template <u32 KV_FMT>
-static __device__ __forceinline__ void idx_qt_load_k(
-    const void* kp, u16 dst[32][136], u32 slot, u32 ctx, u32 j0, u32 lim,
-    const u32* pt, u32 sh, u32 tid) {
-    u32 kr = tid >> 3, c = tid & 7u, j = j0 + kr;
-    u32* d = reinterpret_cast<u32*>(dst[kr]) + c * 8u;
-    if (j >= lim) {
-        *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
-        *reinterpret_cast<uint4*>(d + 4u) = make_uint4(0u, 0u, 0u, 0u);
-        return;
-    }
-    u64 b = kv_row_at(pt, slot, j, ctx, sh) * 128ull + u64(c) * 16ull;
-    if constexpr (KV_FMT == 0u) {
-        uint4 r = *reinterpret_cast<const uint4*>(static_cast<const u8*>(kp) + b);
-        *reinterpret_cast<uint4*>(d) = make_uint4(idx_e4m3x2_bf16x2(u16(r.x)), idx_e4m3x2_bf16x2(u16(r.x >> 16)), idx_e4m3x2_bf16x2(u16(r.y)), idx_e4m3x2_bf16x2(u16(r.y >> 16)));
-        *reinterpret_cast<uint4*>(d + 4u) = make_uint4(idx_e4m3x2_bf16x2(u16(r.z)), idx_e4m3x2_bf16x2(u16(r.z >> 16)), idx_e4m3x2_bf16x2(u16(r.w)), idx_e4m3x2_bf16x2(u16(r.w >> 16)));
-    } else if constexpr (KV_FMT == 1u) {
-        const u16* p = static_cast<const u16*>(kp) + b;
-        *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(p);
-        *reinterpret_cast<uint4*>(d + 4u) = *reinterpret_cast<const uint4*>(p + 8u);
-    } else {
-        const float* p = static_cast<const float*>(kp) + b;
-        float4 v0 = *reinterpret_cast<const float4*>(p), v1 = *reinterpret_cast<const float4*>(p + 4u);
-        float4 v2 = *reinterpret_cast<const float4*>(p + 8u), v3 = *reinterpret_cast<const float4*>(p + 12u);
-        *reinterpret_cast<uint4*>(d) = make_uint4(attn_pack2<true>(v0.x, v0.y), attn_pack2<true>(v0.z, v0.w), attn_pack2<true>(v1.x, v1.y), attn_pack2<true>(v1.z, v1.w));
-        *reinterpret_cast<uint4*>(d + 4u) = make_uint4(attn_pack2<true>(v2.x, v2.y), attn_pack2<true>(v2.z, v2.w), attn_pack2<true>(v3.x, v3.y), attn_pack2<true>(v3.z, v3.w));
-    }
-}
-
-template <u32 KV_FMT>
-static __device__ __forceinline__ void idx_qtile_body(
-    const float* q, const void* k_ptr, const float* weights, const u32* slots,
-    const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context,
-    u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift, idx_qt_smem& sm) {
-    u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
-    u32 r0 = blockIdx.y << 3, row = r0 + warp;
-    u32 j_begin = blockIdx.x * tile_keys, j_end = j_begin + tile_keys;
-    if (j_end > out_keys) j_end = out_keys;
-    if (r0 >= rows || j_begin >= j_end) return;
-    u32 nr = (rows - r0 < 8u) ? (rows - r0) : 8u;
-    if (tid < 8u) {
-        u32 r = r0 + tid, ok = tid < nr;
-        u32 to = ok ? ((masked == 1u && positions[r] < live_keys) ? (positions[r] + 1u) : live_keys) : 0u;
-        u32 s0 = slots[r0], same = ok ? (slots[r] == s0 ? 1u : 0u) : 1u;
-        to = max(to, __shfl_xor_sync(0xFFu, to, 1u));
-        to = max(to, __shfl_xor_sync(0xFFu, to, 2u));
-        to = max(to, __shfl_xor_sync(0xFFu, to, 4u));
-        same &= __shfl_xor_sync(0xFFu, same, 1u);
-        same &= __shfl_xor_sync(0xFFu, same, 2u);
-        same &= __shfl_xor_sync(0xFFu, same, 4u);
-        if (tid == 0u) { sm.max_to = to; sm.same_slot = same; }
-    }
-    prim::block_sync();
-    u32 max_to = sm.max_to, same_slot = sm.same_slot;
-    u32 my_to = (row < rows) ? ((masked == 1u && positions[row] < live_keys) ? (positions[row] + 1u) : live_keys) : 0u;
-    float* out_row = (row < rows) ? (out + u64(row) * out_keys) : nullptr;
-    float neg = attn_neg_inf();
-    if (j_begin >= max_to) {
-        if (row < rows) for (u32 j = j_begin + lane; j < j_end; j += 32u) out_row[j] = neg;
-        return;
-    }
-    u32 q_reg[2][8][4];
-    float w_reg[2][2];
-    if (row < rows) {
-        const float* qb = q + u64(row) * 4096ull;
-        const float* wb = weights + u64(row) * 32ull;
-#pragma unroll
-        for (u32 hi = 0u; hi < 2u; hi++) {
-            u32 h0 = hi * 16u;
-            w_reg[hi][0] = wb[h0 + g]; w_reg[hi][1] = wb[h0 + g + 8u];
-            const float* q0 = qb + u64(h0 + g) * 128ull;
-            const float* q8 = qb + u64(h0 + g + 8u) * 128ull;
-#pragma unroll
-            for (u32 ds = 0u; ds < 8u; ds++) {
-                u32 k0 = ds * 16u + (t << 1);
-                float2 a0 = *reinterpret_cast<const float2*>(q0 + k0), a1 = *reinterpret_cast<const float2*>(q8 + k0);
-                float2 a2 = *reinterpret_cast<const float2*>(q0 + k0 + 8u), a3 = *reinterpret_cast<const float2*>(q8 + k0 + 8u);
-                q_reg[hi][ds][0] = attn_pack2<true>(a0.x, a0.y); q_reg[hi][ds][1] = attn_pack2<true>(a1.x, a1.y);
-                q_reg[hi][ds][2] = attn_pack2<true>(a2.x, a2.y); q_reg[hi][ds][3] = attn_pack2<true>(a3.x, a3.y);
-            }
-        }
-    }
-    u32 krow0 = ((lane >> 4) << 3) + (lane & 7u), krow1 = 16u + krow0, kcol = ((lane >> 3) & 1u) * 8u;
-    u32 passes = same_slot ? 1u : nr;
-    for (u32 pass = 0u; pass < passes; pass++) {
-        u32 cur_slot = slots[r0 + pass];
-        bool active = same_slot ? (row < rows) : (warp == pass);
-        u32 lim = same_slot ? max_to : ((masked == 1u && positions[r0 + pass] < live_keys) ? (positions[r0 + pass] + 1u) : live_keys);
-        u32 st = 0u;
-        idx_qt_load_k<KV_FMT>(k_ptr, sm.k[0], cur_slot, context, j_begin, lim, page_table, page_shift, tid);
-        prim::block_sync();
-        for (u32 j0 = j_begin; j0 < j_end; j0 += 32u) {
-            u32 nst = st ^ 1u;
-            bool has_next = (j0 + 32u < j_end && j0 + 32u < lim);
-            if (has_next) idx_qt_load_k<KV_FMT>(k_ptr, sm.k[nst], cur_slot, context, j0 + 32u, lim, page_table, page_shift, tid);
-            if (active) {
-                if (j0 >= my_to) {
-                    if (j0 + lane < j_end) out_row[j0 + lane] = neg;
-                } else {
-                    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-                    for (u32 hi = 0u; hi < 2u; hi++) {
-                        float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
-                        float s2[4] = {0.f, 0.f, 0.f, 0.f}, s3[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-                        for (u32 ds = 0u; ds < 8u; ds++) {
-                            u32 b01[4], b23[4];
-                            attn_ldm_x4(b01, &sm.k[st][krow0][ds * 16u + kcol]);
-                            attn_ldm_x4(b23, &sm.k[st][krow1][ds * 16u + kcol]);
-                            u32 b0[2] = {b01[0], b01[1]}, b1[2] = {b01[2], b01[3]};
-                            u32 b2[2] = {b23[0], b23[1]}, b3[2] = {b23[2], b23[3]};
-                            attn_mma<true>(s0, q_reg[hi][ds], b0); attn_mma<true>(s1, q_reg[hi][ds], b1);
-                            attn_mma<true>(s2, q_reg[hi][ds], b2); attn_mma<true>(s3, q_reg[hi][ds], b3);
-                        }
-                        float w0 = w_reg[hi][0], w1 = w_reg[hi][1];
-                        acc[0] += fmaxf(s0[0], 0.f) * w0 + fmaxf(s0[2], 0.f) * w1; acc[1] += fmaxf(s0[1], 0.f) * w0 + fmaxf(s0[3], 0.f) * w1;
-                        acc[2] += fmaxf(s1[0], 0.f) * w0 + fmaxf(s1[2], 0.f) * w1; acc[3] += fmaxf(s1[1], 0.f) * w0 + fmaxf(s1[3], 0.f) * w1;
-                        acc[4] += fmaxf(s2[0], 0.f) * w0 + fmaxf(s2[2], 0.f) * w1; acc[5] += fmaxf(s2[1], 0.f) * w0 + fmaxf(s2[3], 0.f) * w1;
-                        acc[6] += fmaxf(s3[0], 0.f) * w0 + fmaxf(s3[2], 0.f) * w1; acc[7] += fmaxf(s3[1], 0.f) * w0 + fmaxf(s3[3], 0.f) * w1;
-                    }
-#pragma unroll
-                    for (u32 i = 0u; i < 8u; i++) {
-                        acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 4u);
-                        acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 8u);
-                        acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 16u);
-                    }
-                    if (g == 0u) {
-                        u32 p0 = j0 + (t << 1);
-#pragma unroll
-                        for (u32 c = 0u; c < 4u; c++) {
-                            u32 k0 = p0 + (c << 3);
-                            if (k0 < j_end) out_row[k0] = (k0 < my_to) ? acc[c * 2u] : neg;
-                            if (k0 + 1u < j_end) out_row[k0 + 1u] = (k0 + 1u < my_to) ? acc[c * 2u + 1u] : neg;
-                        }
-                    }
-                }
-            }
-            if (has_next) prim::block_sync();
-            st = nst;
-        }
-        if (pass + 1u < passes) prim::block_sync();
-    }
-}
-
-#define IDX_DEF(NAME, QT_NAME, FMT) \
-    extern "C" __global__ IDX_BOUNDS void NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
-        __shared__ idx_smem sm; \
-        idx_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads, dim, masked, tile_keys, page_table, page_shift, sm); \
-    } \
-    extern "C" __global__ __launch_bounds__(256, IDX_QT_MIN_BLOCKS) void QT_NAME(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) { \
-        (void)heads; (void)dim; __shared__ idx_qt_smem sm; \
-        idx_qtile_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, masked, tile_keys, page_table, page_shift, sm); \
-    }
-
-IDX_DEF(tessera_indexer_fp8, tessera_indexer_qt_fp8, 0u)
-IDX_DEF(tessera_indexer_bf16, tessera_indexer_qt_bf16, 1u)
-IDX_DEF(tessera_indexer_f32, tessera_indexer_qt_f32, 2u)
 
 #endif

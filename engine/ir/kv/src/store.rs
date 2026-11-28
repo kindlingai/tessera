@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -32,6 +32,7 @@ impl PageKey {
     }
 }
 
+#[inline(always)]
 fn sip_round(v: &mut [u64; 4]) {
     v[0] = v[0].wrapping_add(v[1]);
     v[1] = v[1].rotate_left(13) ^ v[0];
@@ -45,24 +46,42 @@ fn sip_round(v: &mut [u64; 4]) {
     v[2] = v[2].rotate_left(32);
 }
 
-fn siphash24(k0: u64, k1: u64, words: &[u64]) -> u64 {
-    let mut v = [k0 ^ K0, k1 ^ K1, k0 ^ K2, k1 ^ K3];
-    for &m in words {
-        v[3] ^= m;
-        sip_round(&mut v);
-        sip_round(&mut v);
-        v[0] ^= m;
+#[inline(always)]
+fn sip_absorb(va: &mut [u64; 4], vb: &mut [u64; 4], m: u64) {
+    va[3] ^= m;
+    vb[3] ^= m;
+    sip_round(va);
+    sip_round(vb);
+    sip_round(va);
+    sip_round(vb);
+    va[0] ^= m;
+    vb[0] ^= m;
+}
+
+/// Runs two independent SipHash-2-4 passes in lockstep over `chunk`.
+fn siphash_pair(cur: [u64; 2], chunk: &[u32]) -> [u64; 2] {
+    let mut va = [cur[0] ^ K0, cur[1] ^ K1, cur[0] ^ K2, cur[1] ^ K3];
+    let (bk0, bk1) = (cur[1] ^ K1, cur[0] ^ K2);
+    let mut vb = [bk0 ^ K0, bk1 ^ K1, bk0 ^ K2, bk1 ^ K3];
+    sip_absorb(&mut va, &mut vb, chunk.len() as u64);
+    let (pairs, rem) = chunk.as_chunks::<2>();
+    for &[lo, hi] in pairs {
+        let m = u64::from(lo) | (u64::from(hi) << 32);
+        sip_absorb(&mut va, &mut vb, m);
     }
-    let last = ((words.len() as u64) & 0xff) << 56;
-    v[3] ^= last;
-    sip_round(&mut v);
-    sip_round(&mut v);
-    v[0] ^= last;
-    v[2] ^= 0xff;
+    if let [tail] = rem {
+        sip_absorb(&mut va, &mut vb, u64::from(*tail));
+    }
+    let n_words = 1 + chunk.len().div_ceil(2);
+    let last = ((n_words as u64) & 0xff) << 56;
+    sip_absorb(&mut va, &mut vb, last);
+    va[2] ^= 0xff;
+    vb[2] ^= 0xff;
     for _ in 0..4 {
-        sip_round(&mut v);
+        sip_round(&mut va);
+        sip_round(&mut vb);
     }
-    v[0] ^ v[1] ^ v[2] ^ v[3]
+    [va[0] ^ va[1] ^ va[2] ^ va[3], vb[0] ^ vb[1] ^ vb[2] ^ vb[3]]
 }
 
 /// Chained content keys for each full `page` of `tokens`.
@@ -71,19 +90,9 @@ pub fn page_keys(seed: [u64; 2], tokens: &[u32], page: usize) -> Vec<PageKey> {
         return Vec::new();
     }
     let mut cur = seed;
-    let mut words = Vec::with_capacity(page.div_ceil(2) + 1);
     let mut out = Vec::with_capacity(tokens.len() / page);
     for chunk in tokens.chunks_exact(page) {
-        words.clear();
-        words.push(page as u64);
-        for pair in chunk.chunks(2) {
-            let lo = pair[0] as u64;
-            let hi = pair.get(1).copied().unwrap_or(0) as u64;
-            words.push(lo | (hi << 32));
-        }
-        let a = siphash24(cur[0], cur[1], &words);
-        let b = siphash24(cur[1] ^ K1, cur[0] ^ K2, &words);
-        cur = [a, b];
+        cur = siphash_pair(cur, chunk);
         out.push(PageKey(cur));
     }
     out
@@ -115,6 +124,10 @@ impl LruClock {
         let t = self.tick;
         self.stamps.insert(key, t);
         self.order.push_back((key, t));
+        let cap = self.stamps.len().saturating_mul(2).max(64);
+        if self.order.len() > cap {
+            self.order.retain(|(k, s)| self.stamps.get(k) == Some(s));
+        }
     }
 
     /// Removes `key` from live tracking.
@@ -146,6 +159,7 @@ pub struct PageStore {
     used_bytes: u64,
     entries: HashMap<PageKey, u64>,
     lru: LruClock,
+    dirs: [u64; 4],
     hits: u64,
     misses: u64,
     saves: u64,
@@ -195,6 +209,7 @@ impl PageStore {
             used_bytes: 0,
             entries: HashMap::new(),
             lru: LruClock::default(),
+            dirs: [0; 4],
             hits: 0,
             misses: 0,
             saves: 0,
@@ -229,17 +244,21 @@ impl PageStore {
             return Ok(false);
         }
         let path = self.page_path(key);
-        let Ok(raw) = fs::read(&path) else {
+        let Ok(mut file) = fs::File::open(&path) else {
             self.drop_key(key);
             self.misses += 1;
             return Ok(false);
         };
-        if raw.len() != dst.len() {
+        let Ok(meta) = file.metadata() else {
+            self.drop_key(key);
+            self.misses += 1;
+            return Ok(false);
+        };
+        if meta.len() != dst.len() as u64 || file.read_exact(dst).is_err() {
             self.drop_key(key);
             self.misses += 1;
             return Ok(false);
         }
-        dst.copy_from_slice(&raw);
         self.lru.touch(key);
         self.hits += 1;
         Ok(true)
@@ -257,11 +276,25 @@ impl PageStore {
         }
         self.evict_for(len);
         let path = self.page_path(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let bucket = (key.0[0] >> 56) as usize;
+        let bit = 1u64 << (bucket & 63);
+        if self.dirs[bucket >> 6] & bit == 0 {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            self.dirs[bucket >> 6] |= bit;
         }
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&tmp, data)?;
+        if let Err(err) = fs::write(&tmp, data) {
+            if err.kind() == io::ErrorKind::NotFound
+                && let Some(parent) = path.parent()
+            {
+                fs::create_dir_all(parent)?;
+                fs::write(&tmp, data)?;
+            } else {
+                return Err(err);
+            }
+        }
         fs::rename(&tmp, &path)?;
         self.record(key, len);
         self.saves += 1;
@@ -281,8 +314,23 @@ impl PageStore {
     }
 
     fn page_path(&self, key: PageKey) -> PathBuf {
-        let hex = key.hex();
-        self.dir.join(&hex[..2]).join(format!("{hex}.kv"))
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 35];
+        for (w, &val) in key.0.iter().enumerate() {
+            for i in 0..16 {
+                buf[w * 16 + i] = HEX[((val >> (60 - i * 4)) & 0xf) as usize];
+            }
+        }
+        buf[32] = b'.';
+        buf[33] = b'k';
+        buf[34] = b'v';
+        // SAFETY: `buf` contains only ASCII hex digits and `.kv`.
+        let name = unsafe { std::str::from_utf8_unchecked(&buf) };
+        let mut path = PathBuf::with_capacity(self.dir.as_os_str().len() + 39);
+        path.push(&self.dir);
+        path.push(&name[..2]);
+        path.push(name);
+        path
     }
 
     fn record(&mut self, key: PageKey, len: u64) {

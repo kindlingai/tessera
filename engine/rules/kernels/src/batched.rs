@@ -29,7 +29,7 @@ fn batched(
 /// `x[.., k]` times `w[batches, n, k]` transposed.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(batched, threads = self.len, work = self.len * self.k)]
-pub(crate) struct Batched {
+pub struct Batched {
     pub len: usize,
     pub n: usize,
     pub k: usize,
@@ -37,8 +37,8 @@ pub(crate) struct Batched {
     pub batches: usize,
 }
 
-/// A matmul whose right side is a batch of matrices.
-fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+/// A matmul by a batch of matrices, with its reads.
+pub fn site(tree: &Tree, at: T) -> Option<(Batched, [T; 2])> {
     let node = tree.node(at);
     if node.term != Term::Op(Op::Matmul) {
         return None;
@@ -55,16 +55,19 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let [.., n, k] = shape[..] else {
         return None;
     };
-    let batches = tree.elements(w) / (n * k);
-    let x_rows = tree.elements(x) / k;
     let kernel = Batched {
         len: tree.elements(at),
         n,
         k,
-        x_rows,
-        batches,
+        x_rows: tree.elements(x) / k,
+        batches: tree.elements(w) / (n * k),
     };
-    Some(vec![Draft::new(kernel, [x, w], kernel.len)])
+    Some((kernel, [x, w]))
+}
+
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (kernel, reads) = site(tree, at)?;
+    Some(vec![Draft::new(kernel, reads, kernel.len)])
 }
 
 tessera_lower::rule!("batched", propose);

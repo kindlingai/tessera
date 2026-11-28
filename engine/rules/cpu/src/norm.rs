@@ -1,29 +1,38 @@
 //! RMS norm, a thread per row in small groups.
 
+use tessera_codegen::ir::{Body, Expr, Intrinsic, Stmt, Ty};
 use tessera_codegen::prelude::*;
-use tessera_lower::{Draft, Kernel, Launch, Step, T, Tree, ZoneKind, sites};
-use tessera_lower::{GUESS, small, source};
+use tessera_codegen::stage::Row;
+use tessera_lower::{Draft, Kernel, Launch, Shape, Step, T, Tree, ZoneKind, sites};
+use tessera_lower::{GUESS, source};
 
 /// The squares in one sum, then each element scaled.
 #[kernel]
-fn cpu_rms_norm(
-    x: Buf<F32>,
-    w: Buf<F32>,
-    mut out: BufMut<F32>,
-    rows: u32,
-    width: u32,
-    eps: f32,
-    #[build] weighted: u32,
-) {
+fn cpu_rms_norm(x: Buf<F32>, w: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32, eps: f32) {
     if gid() >= rows {
         return;
     }
     let at = gid() as u64 * width as u64;
     let inv = rsqrt(x.dot(at, x, at, width) / width as f32 + eps);
-    for i in 0..width {
-        let gain = if weighted == 1 { w[i as u64] } else { 1.0 };
-        out[at + i as u64] = x[at + i as u64] * inv * gain;
+    out.mix(at, 0.0, inv, x, at, width);
+}
+
+fn norm_body(weighted: bool) -> Body {
+    let mut body = cpu_rms_norm_ir();
+    if weighted {
+        let args = vec![
+            Expr::var("out"),
+            Expr::var("at"),
+            Expr::var("width"),
+            Expr::lit(Row::Mul.code()),
+            Expr::Float(1.0),
+            Expr::var("w"),
+            Expr::cast(Ty::U64, Expr::lit(0)),
+        ];
+        body.stmts
+            .push(Stmt::Expr(Expr::Call(Intrinsic::Stage, args)));
     }
+    body
 }
 
 /// Rows scaled by their root mean square and gains.
@@ -35,7 +44,7 @@ fn cpu_rms_norm(
     work = self.rows * self.width,
     guess = GUESS,
     runs_on = ZoneKind::Cpu,
-    source = source("cpu_rms_norm", cpu_rms_norm_ir(u32::from(self.weighted))),
+    source = source("cpu_rms_norm", norm_body(self.weighted)),
     launches = norm_launches,
 )]
 pub struct RmsNorm {
@@ -46,7 +55,13 @@ pub struct RmsNorm {
 }
 
 fn norm_launches(k: &RmsNorm, step: &Step) -> Vec<Launch> {
-    let mut launch = Launch::plain(step, &[k.rows, k.width], small(k.rows));
+    // One thread per row splits small batches across workers.
+    let shape = Shape::Grid {
+        across: k.rows,
+        down: 1,
+        threads: 1,
+    };
+    let mut launch = Launch::plain(step, &[k.rows, k.width], shape);
     launch.args.push(tessera_lower::Arg::value(&k.eps));
     vec![launch]
 }

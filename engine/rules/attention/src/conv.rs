@@ -5,9 +5,15 @@ use tessera_codegen::prelude::*;
 use tessera_graph::Op;
 use tessera_lower::form::{Load as Stored, plain};
 use tessera_lower::{
-    Arg, Draft, Extent, GUESS, Keeping, Kernel, KernelRef, Launch, Read, Shape, Step, T, Term,
-    Tree, source,
+    Arg, Backend, Draft, Extent, GUESS, Keeping, Kernel, KernelRef, Launch, Needs, Read, Shape,
+    Step, T, Term, Tree, source,
 };
+
+/// One thread per row suits Metal's many small cores.
+const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
+
+/// Fewer rows scan as fast per slot.
+const SPAN_ROWS: usize = 32;
 
 /// Largest history depth held in thread registers.
 const MAX_HIST: usize = 16;
@@ -117,6 +123,143 @@ slot_scan!(
     },
 );
 
+/// A channel's inputs by lag. Lag 0 is its own.
+#[derive(Group)]
+struct Lags {
+    val: [f32; 17],
+    /// The lag the next stepped row fills.
+    m: u32,
+    /// The row whose taps weigh the lags.
+    taps_row: u32,
+}
+
+/// Fills older lags from kept state, then writes.
+#[kernel]
+fn close_span(
+    lg: &mut Lags,
+    #[form(w_form)] w: Buf<Dyn>,
+    state: BufMut<F32>,
+    mut out: BufMut<F32>,
+    mut keep: BufMut<F32>,
+    phase: u32,
+    fresh: u32,
+    s: u32,
+    #[build] width: u32,
+    #[build] taps: u32,
+    #[build] dilation: u32,
+    #[build] dynamic: u32,
+    #[build] w_form: &'static dyn Stored,
+) {
+    let c = gid() % width;
+    let hist_len = (taps - 1) * dilation;
+    let base = (s * hist_len) as u64 * width as u64 + c as u64;
+    if fresh == 0 {
+        for l in (lg.m + 1)..(hist_len + 1) {
+            lg.val[l as usize] = state[base + ((hist_len + lg.m - l) * width) as u64];
+        }
+    }
+    if phase == 0 {
+        let mut wc = c;
+        if dynamic != 0 {
+            wc = lg.taps_row * width + c;
+        }
+        let mut sum = 0.0f32;
+        for j in 0..taps {
+            sum += w[wc as u64 * taps as u64 + j as u64]
+                * lg.val[((taps - 1 - j) * dilation) as usize];
+        }
+        out[gid() as u64] = sum;
+    } else {
+        for k in 0..hist_len {
+            keep[base + (k * width) as u64] = lg.val[(hist_len - k) as usize];
+        }
+    }
+}
+
+/// Phase 0: a thread per output. Phase 1: state.
+#[kernel]
+fn causal_conv_span(
+    x: Buf<F32>,
+    #[form(w_form)] w: Buf<Dyn>,
+    slots: Buf<U32>,
+    positions: Buf<U32>,
+    state: BufMut<F32>,
+    out: BufMut<F32>,
+    keep: BufMut<F32>,
+    jobs: u32,
+    rows: u32,
+    phase: u32,
+    #[build] width: u32,
+    #[build] taps: u32,
+    #[build] dilation: u32,
+    #[build] dynamic: u32,
+    #[build] w_form: &'static dyn Stored,
+) {
+    if gid() >= jobs || (phase == 0 && gid() / width >= rows) {
+        return;
+    }
+    let c = gid() % width;
+    let hist_len = (taps - 1) * dilation;
+    // An output walks back from its row. State, the end.
+    let mut s = gid() / width;
+    let mut top = rows;
+    if phase == 0 {
+        s = slots[(gid() / width) as u64];
+        top = gid() / width + 1;
+    }
+    let mut lg = Lags {
+        val: [0.0f32; 17],
+        m: phase,
+        taps_row: 0,
+    };
+    for l in 0..(hist_len + 1) {
+        lg.val[l as usize] = 0.0;
+    }
+    let mut have = 0u32;
+    let mut cand = 0u32;
+    let mut cpos = 0u32;
+    for back in 0..top {
+        let i = top - 1 - back;
+        if slots[i as u64] == s {
+            let p = positions[i as u64];
+            if have == 0 {
+                have = 1;
+                cand = i;
+                cpos = p;
+            } else if p == cpos {
+                // The later row was a filler of this one.
+                cand = i;
+            } else {
+                lg.val[lg.m as usize] = x[(cand * width + c) as u64];
+                if lg.m == 0 {
+                    lg.taps_row = cand;
+                }
+                // Position 0 starts afresh. Nothing older counts.
+                if cpos == 0 || lg.m == hist_len {
+                    close_span(
+                        &mut lg, w, state, out, keep, phase, 1, s, width, taps, dilation, dynamic,
+                        w_form,
+                    );
+                    return;
+                }
+                lg.m += 1;
+                cand = i;
+                cpos = p;
+            }
+        }
+    }
+    if have == 1 {
+        lg.val[lg.m as usize] = x[(cand * width + c) as u64];
+        if lg.m == 0 {
+            lg.taps_row = cand;
+        }
+        let fresh = if cpos == 0 { 1 } else { 0 };
+        close_span(
+            &mut lg, w, state, out, keep, phase, fresh, s, width, taps, dilation, dynamic, w_form,
+        );
+    }
+}
+
 /// Whole sequences of `rows`, each `width` channels.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
@@ -148,7 +291,7 @@ fn conv_accepts(k: &Conv, input: usize, form: &dyn Stored) -> bool {
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     crate = tessera_lower,
-    name = self.w_form.suffixed("conv_rows"),
+    name = self.w_form.suffixed(self.entry()),
     sizes = vec![
         self.seqs,
         self.rows.most(),
@@ -157,19 +300,11 @@ fn conv_accepts(k: &Conv, input: usize, form: &dyn Stored) -> bool {
         self.dilation,
         usize::from(self.dynamic),
     ],
-    work = self.rows.most() * self.width * self.taps * 2,
+    work = self.rows.most() * self.width * self.taps * self.passes(),
     guess = GUESS,
+    needs = rows_needs(self),
     accepts = rows_accepts,
-    source = source(
-        self.w_form.suffixed("conv_rows"),
-        causal_conv_rows_ir(
-            self.width as u32,
-            self.taps as u32,
-            self.dilation as u32,
-            u32::from(self.dynamic),
-            self.w_form,
-        )
-    ),
+    source = source(self.w_form.suffixed(self.entry()), self.body()),
     launches = rows_launches,
     commit = rows_commit,
 )]
@@ -181,7 +316,39 @@ pub(crate) struct ConvRows {
     dilation: usize,
     dynamic: bool,
     keeping: Keeping,
+    /// A thread per row and channel, not per slot.
+    span: bool,
     w_form: &'static dyn Stored,
+}
+
+impl ConvRows {
+    fn entry(&self) -> &'static str {
+        match self.span {
+            true => "conv_span",
+            false => "conv_rows",
+        }
+    }
+
+    /// A scan reads and shifts. A span only reads.
+    fn passes(&self) -> usize {
+        2 - usize::from(self.span)
+    }
+
+    fn body(&self) -> tessera_codegen::ir::Body {
+        let (width, taps) = (self.width as u32, self.taps as u32);
+        let (dilation, dynamic) = (self.dilation as u32, u32::from(self.dynamic));
+        match self.span {
+            true => causal_conv_span_ir(width, taps, dilation, dynamic, self.w_form),
+            false => causal_conv_rows_ir(width, taps, dilation, dynamic, self.w_form),
+        }
+    }
+}
+
+fn rows_needs(k: &ConvRows) -> Needs {
+    Needs {
+        lacks: if k.span { LACKS } else { &[] },
+        ..Needs::default()
+    }
 }
 
 fn rows_accepts(k: &ConvRows, input: usize, form: &dyn Stored) -> bool {
@@ -194,14 +361,42 @@ fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
     let at = launch.args.len() - 1;
     launch.args.insert(at, k.keeping.keep(step));
     launch.args.push(Arg::size(k.keeping.rows(k.rows)));
-    vec![launch]
+    if !k.span {
+        return vec![launch];
+    }
+    // Every output first: the state launch may overwrite its reads.
+    let all = k.rows.most() * k.width;
+    let mut outputs = launch.clone();
+    outputs.args[at + 1] = Arg::count(all);
+    outputs.shape = Shape::Line(all);
+    outputs.args.push(Arg::count(0));
+    launch.args.push(Arg::count(1));
+    vec![outputs, launch]
 }
 
 fn rows_commit(k: &ConvRows) -> Option<KernelRef> {
     k.keeping.twin(|keeping| ConvRows { keeping, ..*k })
 }
 
+/// Long launches: every row and channel at once.
+fn propose_span(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let Term::Op(Op::Conv(c)) = tree.node(at).term else {
+        return None;
+    };
+    c.state?;
+    let rows = tree.node(tree.node(at).args[0]).extents[0].most();
+    if rows < SPAN_ROWS {
+        return None;
+    }
+    rows_drafts(tree, at, true)
+}
+
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    rows_drafts(tree, at, false)
+}
+
+/// The filter at `at`. A span reads rows in parallel.
+fn rows_drafts(tree: &Tree, at: T, span: bool) -> Option<Vec<Draft>> {
     let node = tree.node(at);
     let Term::Op(Op::Conv(c)) = node.term else {
         return None;
@@ -228,6 +423,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             dilation,
             dynamic,
             keeping: Keeping::of(tree),
+            span,
             w_form: plain(tree.node(w).form),
         };
         let reads = [
@@ -265,3 +461,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 }
 
 tessera_lower::rule!("conv", propose);
+tessera_lower::rule!("conv_span", propose_span);

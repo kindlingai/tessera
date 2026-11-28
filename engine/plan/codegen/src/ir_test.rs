@@ -62,6 +62,14 @@ fn constants_fold() {
     assert_eq!(f32.trip().width, 16.0);
 }
 
+#[test]
+fn metal_tile_direct() {
+    assert!(crate::tile::METAL.contains("#define TILE_DIRECT 1"));
+    assert!(crate::tile::METAL.contains("#define TILE_SCALE("));
+    assert!(!crate::tile::cuda().contains("TILE_DIRECT"));
+    assert!(!crate::tile::hip().contains("TILE_DIRECT"));
+}
+
 /// Shadowing in a nested block and in the same block.
 #[kernel]
 fn shadows(mut out: BufMut<F32>, base: u32, second: bool) {
@@ -157,7 +165,10 @@ fn bump<F: Form>(x: Buf<F>, mut out: BufMut<F>) {
 fn packed_fours_decode() {
     let text = bump_ir::<Bf16>().text();
     for rendered in [text.render(Dialect::Metal), text.render(Dialect::Cuda)] {
-        assert!(rendered.contains("float4 s;"), "{rendered}");
+        assert!(
+            rendered.contains("float4 s = f_make4(0.0f, 0.0f, 0.0f, 0.0f);"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("f_store4_bf16(out + 4, f_make4("),
             "{rendered}"

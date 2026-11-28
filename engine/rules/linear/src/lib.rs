@@ -7,10 +7,10 @@ mod product;
 mod stacked;
 mod thin;
 mod tiled;
-mod trellis_metal;
 mod turned;
 
 pub use dense::{Dense, launch_args};
-pub use product::Product;
+pub use product::{Product, Variant, place};
+pub use stacked::blocks;
 pub use tiled::{BF16, PARTS, SCHEDULES, Schedule, Tiled};
 pub use turned::Turned;

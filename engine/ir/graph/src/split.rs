@@ -1,7 +1,7 @@
 //! Splits a step graph into two microbatches for comm/compute overlap.
 
 use crate::dims::{Dim, DimExpr, DimName, Shape, Size};
-use crate::infer::{ErrorKind, TypeError, infer};
+use crate::infer::{ErrorKind, infer};
 use crate::node::{Composite, EntryKind, Graph, Node, NodeId, Op, Region, View};
 use crate::types::{DType, TensorType};
 use crate::verify::{VerifyError, verify};
@@ -13,10 +13,7 @@ pub const HALF_ROWS: DimName = DimName::named("HalfRows");
 fn err(node: Option<u32>, message: String) -> VerifyError {
     VerifyError {
         node,
-        error: TypeError {
-            kind: ErrorKind::Shape,
-            message,
-        },
+        error: ErrorKind::Shape.err(message),
     }
 }
 

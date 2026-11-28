@@ -140,9 +140,11 @@ macro_rules! define_reads {
             impl Scale for $s {
                 const BYTES: usize = size_of::<$repr>();
                 const MAX: f32 = $smax;
+                #[inline(always)]
                 fn put(scale: f32, into: &mut [u8]) {
                     into[..Self::BYTES].copy_from_slice(&$s::from(scale).0.to_le_bytes());
                 }
+                #[inline(always)]
                 fn get(from: &[u8]) -> f32 {
                     $get(from)
                 }
@@ -152,6 +154,7 @@ macro_rules! define_reads {
             impl Code for $c {
                 const BITS: u32 = $bits;
                 const MAX: f32 = $cmax;
+                #[inline(always)]
                 fn decode(w: u32, low: u32) -> f32 {
                     $field(w, low)
                 }
@@ -187,9 +190,22 @@ impl Encode for Nibble {
 
     /// Keeps the sign: the widest value lands on -8.
     fn scale(block: &[f32]) -> f32 {
-        let top = block
-            .iter()
-            .fold(0.0f32, |m, x| if x.abs() > m.abs() { *x } else { m });
+        let (mut hi, mut lo) = (0.0f32, 0.0f32);
+        for &x in block {
+            hi = hi.max(x);
+            lo = lo.min(x);
+        }
+        let neg = -lo;
+        let top = if hi > neg {
+            hi
+        } else if neg > hi {
+            lo
+        } else if hi == 0.0 {
+            0.0
+        } else {
+            // First occurrence breaks +hi and -hi ties.
+            block.iter().copied().find(|x| x.abs() == hi).unwrap_or(hi)
+        };
         top / -8.0
     }
 }
@@ -244,6 +260,115 @@ impl<S: Scale, C: Encode, const B: usize, const HALVES: bool, const HEAD: bool>
             false => 1.0,
         }
     }
+    /// Packs one full block using its bit width and layout.
+    #[inline(always)]
+    fn pack_full(block: &[f32], codes: &mut [u8], mut enc: impl FnMut(f32) -> u32) {
+        if C::BITS == 8 {
+            for (dst, &x) in codes.iter_mut().zip(block) {
+                *dst = enc(x) as u8;
+            }
+        } else if C::BITS == 4 && HALVES {
+            let (lo, hi) = block.split_at(B / 2);
+            for ((dst, &a), &b) in codes.iter_mut().zip(lo).zip(hi) {
+                *dst = (enc(a) | (enc(b) << 4)) as u8;
+            }
+        } else if C::BITS == 4 {
+            for (dst, pair) in codes.iter_mut().zip(block.as_chunks::<2>().0) {
+                *dst = (enc(pair[0]) | (enc(pair[1]) << 4)) as u8;
+            }
+        } else if C::BITS == 2 {
+            for (dst, quad) in codes.iter_mut().zip(block.as_chunks::<4>().0) {
+                let b =
+                    enc(quad[0]) | (enc(quad[1]) << 2) | (enc(quad[2]) << 4) | (enc(quad[3]) << 6);
+                *dst = b as u8;
+            }
+        } else {
+            for (j, &x) in block.iter().enumerate() {
+                let (byte, shift) = Self::place(j);
+                codes[byte] |= (enc(x) << shift) as u8;
+            }
+        }
+    }
+
+    /// Sums one full block against `xs`.
+    #[inline(always)]
+    fn dot_full(xs: &[f32], codes: &[u8]) -> f32 {
+        if C::BITS == 8 {
+            let mut acc = [0.0f32; 4];
+            let (xc, xr) = xs.as_chunks::<4>();
+            let (cc, cr) = codes.as_chunks::<4>();
+            for (xv, cv) in xc.iter().zip(cc) {
+                for i in 0..4 {
+                    acc[i] += xv[i] * C::decode(u32::from(cv[i]), 0);
+                }
+            }
+            let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for (&xj, &b) in xr.iter().zip(cr) {
+                sum += xj * C::decode(u32::from(b), 0);
+            }
+            sum
+        } else if C::BITS == 4 && HALVES {
+            let (lo, hi) = xs.split_at(B / 2);
+            let mut acc = [0.0f32; 4];
+            let (lc, lr) = lo.as_chunks::<4>();
+            let (hc, hr) = hi.as_chunks::<4>();
+            let (cc, cr) = codes.as_chunks::<4>();
+            for ((lv, hv), cv) in lc.iter().zip(hc).zip(cc) {
+                for i in 0..4 {
+                    let w = u32::from(cv[i]);
+                    acc[i] += lv[i] * C::decode(w, 0) + hv[i] * C::decode(w, 4);
+                }
+            }
+            let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for ((&a, &b), &byte) in lr.iter().zip(hr).zip(cr) {
+                let w = u32::from(byte);
+                sum += a * C::decode(w, 0) + b * C::decode(w, 4);
+            }
+            sum
+        } else if C::BITS == 4 {
+            let mut acc = [0.0f32; 4];
+            let (xc, xr) = xs.as_chunks::<4>();
+            let (cc, cr) = codes.as_chunks::<2>();
+            for (xv, cv) in xc.iter().zip(cc) {
+                let (w0, w1) = (u32::from(cv[0]), u32::from(cv[1]));
+                acc[0] += xv[0] * C::decode(w0, 0);
+                acc[1] += xv[1] * C::decode(w0, 4);
+                acc[2] += xv[2] * C::decode(w1, 0);
+                acc[3] += xv[3] * C::decode(w1, 4);
+            }
+            let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for (pair, &byte) in xr.as_chunks::<2>().0.iter().zip(cr) {
+                let w = u32::from(byte);
+                sum += pair[0] * C::decode(w, 0) + pair[1] * C::decode(w, 4);
+            }
+            sum
+        } else if C::BITS == 2 {
+            let mut acc = [0.0f32; 4];
+            for (quad, &byte) in xs.as_chunks::<4>().0.iter().zip(codes) {
+                let w = u32::from(byte);
+                acc[0] += quad[0] * C::decode(w, 0);
+                acc[1] += quad[1] * C::decode(w, 2);
+                acc[2] += quad[2] * C::decode(w, 4);
+                acc[3] += quad[3] * C::decode(w, 6);
+            }
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        } else {
+            let mut part = 0.0;
+            for (j, &xj) in xs.iter().enumerate() {
+                let (byte, shift) = Self::place(j);
+                part += xj * C::decode(u32::from(codes[byte]), shift);
+            }
+            part
+        }
+    }
+
+    /// True when `s` has an exact power-of-two reciprocal.
+    #[inline(always)]
+    fn exact_pow2(s: f32) -> bool {
+        let bits = s.to_bits();
+        let exp = (bits >> 23) & 0xff;
+        (bits & 0x7f_ffff) == 0 && (1..=253).contains(&exp)
+    }
 }
 
 impl<S: Scale, C: Encode, const B: usize, const HALVES: bool, const HEAD: bool> Form
@@ -287,16 +412,22 @@ impl<S: Scale, C: Encode, const B: usize, const HALVES: bool, const HEAD: bool> 
     fn dot(&self, x: &[f32], bytes: &[u8], at: usize) -> f32 {
         assert!(at.is_multiple_of(B), "a dot starts on a block");
         let head = Self::head(bytes);
+        let first = Self::HEAD_BYTES + (at / B) * Self::BLOCK_BYTES;
+        let blocks = bytes[first..].chunks(Self::BLOCK_BYTES);
         let mut sum = 0.0;
-        for (b, xs) in x.chunks(B).enumerate() {
-            let start = Self::HEAD_BYTES + (at / B + b) * Self::BLOCK_BYTES;
-            let codes = &bytes[start + S::BYTES..start + Self::BLOCK_BYTES];
-            let mut part = 0.0;
-            for (j, xj) in xs.iter().enumerate() {
-                let (byte, shift) = Self::place(j);
-                part += xj * C::decode(u32::from(codes[byte]), shift);
-            }
-            sum += S::get(&bytes[start..]) * part;
+        for (xs, slot) in x.chunks(B).zip(blocks) {
+            let codes = &slot[S::BYTES..];
+            let part = if xs.len() == B {
+                Self::dot_full(xs, codes)
+            } else {
+                let mut part = 0.0;
+                for (j, xj) in xs.iter().enumerate() {
+                    let (byte, shift) = Self::place(j);
+                    part += xj * C::decode(u32::from(codes[byte]), shift);
+                }
+                part
+            };
+            sum += S::get(slot) * part;
         }
         head * sum
     }
@@ -315,16 +446,31 @@ impl<S: Scale, C: Encode, const B: usize, const HALVES: bool, const HEAD: bool> 
         if HEAD {
             out[..4].copy_from_slice(&tensor.to_le_bytes());
         }
-        for (b, block) in data.chunks(B).enumerate() {
-            let at = Self::HEAD_BYTES + b * Self::BLOCK_BYTES;
+        let body = &mut out[Self::HEAD_BYTES..];
+        for (block, slot) in data.chunks(B).zip(body.chunks_mut(Self::BLOCK_BYTES)) {
             let scale = C::scale(block) / tensor;
-            S::put(scale, &mut out[at..]);
+            S::put(scale, slot);
             // Codes see the scale as it was stored.
-            let stored = S::get(&out[at..]) * tensor;
-            for (j, x) in block.iter().enumerate() {
-                let scaled = if stored == 0.0 { 0.0 } else { x / stored };
-                let (byte, shift) = Self::place(j);
-                out[at + S::BYTES + byte] |= (C::encode(scaled) << shift) as u8;
+            let stored = S::get(slot) * tensor;
+            let codes = &mut slot[S::BYTES..];
+            if block.len() == B {
+                if stored == 0.0 {
+                    let zero = C::encode(0.0);
+                    if zero != 0 {
+                        Self::pack_full(block, codes, |_| zero);
+                    }
+                } else if Self::exact_pow2(stored) {
+                    let inv = 1.0 / stored;
+                    Self::pack_full(block, codes, |x| C::encode(x * inv));
+                } else {
+                    Self::pack_full(block, codes, |x| C::encode(x / stored));
+                }
+            } else {
+                for (j, x) in block.iter().enumerate() {
+                    let scaled = if stored == 0.0 { 0.0 } else { x / stored };
+                    let (byte, shift) = Self::place(j);
+                    codes[byte] |= (C::encode(scaled) << shift) as u8;
+                }
             }
         }
         out

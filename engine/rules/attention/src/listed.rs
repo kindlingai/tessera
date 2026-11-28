@@ -1,5 +1,7 @@
 //! Masked attention over listed keys, or computed keys by row.
 
+mod split;
+
 use tessera_codegen::kept::{self, Dense, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
@@ -25,7 +27,7 @@ const MAX_SLOTS: usize = MAX_WIDTH / LANES;
 /// Unroll bound for per-lane wide-load loops.
 const MAX_QUADS: u32 = (MAX_SLOTS / WIDE as usize) as u32;
 
-/// Fused split-K attention: one group per query and head.
+/// Fused split-K attention: `splits` groups per query and head.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 fn listed_attend(
@@ -53,13 +55,14 @@ fn listed_attend(
     rel_win: u32,
     #[build] width: u32,
     #[build] warps: u32,
+    #[build] splits: u32,
     #[build] threads: u32,
     #[build] q_form: &'static dyn Stored,
     #[build] k_form: &'static dyn Stored,
     #[build] v_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
 ) {
-    let list = gid() / threads;
+    let list = gid() / (threads * splits);
     if list >= lists {
         return;
     }
@@ -84,7 +87,7 @@ fn listed_attend(
     } else {
         keys
     };
-    let q_at = list as u64 * width as u64;
+    let mut q_at = list as u64 * width as u64;
     let quads = (width + LANES as u32 * WIDE - 1) / (LANES as u32 * WIDE);
     let mut qr = [0.0f32; MAX_SLOTS];
     let mut acc = [0.0f32; MAX_SLOTS];
@@ -105,7 +108,11 @@ fn listed_attend(
     }
     let mut peak = f32::NEG_INFINITY;
     let mut total = 0.0f32;
-    let start = if from_list == 0 { from } else { 0 };
+    let mut hits = 0u32;
+    let mut start = if from_list == 0 { from } else { 0 };
+    if splits > 1 {
+        start += (gid() / threads % splits) * warps;
+    }
     let mut stop = if from_list == 0 && to < picks {
         to
     } else {
@@ -129,7 +136,7 @@ fn listed_attend(
             stop = lo;
         }
     }
-    for p in (start + warp..stop).by(warps) {
+    for p in (start + warp..stop).by(warps * splits) {
         let mut j = p;
         if from_list == 1 {
             j = ids[row as u64 * picks as u64 + p as u64];
@@ -150,20 +157,29 @@ fn listed_attend(
             if rel_win > 0 && j <= position && position - j < rel_win {
                 score += rel_bias[list as u64 * rel_win as u64 + (position - j) as u64];
             }
-            let next = max(peak, score);
-            let corr = if total > 0.0 { exp(peak - next) } else { 0.0 };
-            let wt = exp(score - next);
+            hits = 1;
+            // A -inf score weighs zero, yet its values still count.
+            let dropped = score.to_bits() == 0xff80_0000;
+            let seen = (total.to_bits() & 0x7fff_ffff) != 0;
+            let next = if seen { max(peak, score) } else { score };
+            let prev = if seen { total * exp(peak - next) } else { 0.0 };
+            let wt = exp(score - if dropped { 0.0 } else { next });
+            let sum_l = prev + wt;
+            let live = (sum_l.to_bits() & 0x7fff_ffff) != 0;
+            let old_s = if live { prev / sum_l } else { 1.0 };
+            let new_s = if live { wt / sum_l } else { wt };
             peak = next;
-            total = total * corr + wt;
+            total = sum_l;
             for s in (0..quads).unroll(MAX_QUADS) {
                 let d = s * (LANES as u32 * WIDE) + l * WIDE;
                 let b = (s * WIDE) as usize;
                 if d < width {
                     let vv = v.load4(k_at + d as u64);
-                    acc[b] = acc[b] * corr + wt * vv.x;
-                    acc[b + 1] = acc[b + 1] * corr + wt * vv.y;
-                    acc[b + 2] = acc[b + 2] * corr + wt * vv.z;
-                    acc[b + 3] = acc[b + 3] * corr + wt * vv.w;
+                    // A quarter-scaled running mean cannot overflow.
+                    acc[b] = acc[b] * old_s + new_s * (vv.x * 0.25);
+                    acc[b + 1] = acc[b + 1] * old_s + new_s * (vv.y * 0.25);
+                    acc[b + 2] = acc[b + 2] * old_s + new_s * (vv.z * 0.25);
+                    acc[b + 3] = acc[b + 3] * old_s + new_s * (vv.w * 0.25);
                 }
             }
         }
@@ -172,7 +188,10 @@ fn listed_attend(
     let mut l_s = shared::<f32>(warps);
     let mut o_s = shared::<f32>(warps * width);
     if l == 0 {
-        m_s[warp] = peak;
+        // A dead warp that saw keys leaves a NaN.
+        let dead = (total.to_bits() & 0x7fff_ffff) == 0;
+        let mark = if hits > 0 { peak * total } else { 0.0 };
+        m_s[warp] = if dead { mark } else { peak };
         l_s[warp] = total;
     }
     for s in (0..quads).unroll(MAX_QUADS) {
@@ -195,29 +214,68 @@ fn listed_attend(
         sink = sinks[list as u64];
     }
     let mut best = sink;
+    let mut hole = 0.0f32;
+    let mut any_hit = 0u32;
     for w in 0..warps {
-        if l_s[w] > 0.0 {
+        if (l_s[w].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, m_s[w]);
+            any_hit = 1;
+        } else {
+            if (m_s[w].to_bits() & 0x7fff_ffff) != 0 {
+                any_hit = 1;
+            }
+            hole += m_s[w];
         }
     }
     let mut denom = 0.0f32;
-    if sink_mode > 0 && sink > f32::NEG_INFINITY {
+    if sink_mode > 0 && sink.to_bits() != 0xff80_0000 {
         denom = exp(sink - best);
     }
     for w in 0..warps {
-        if l_s[w] > 0.0 {
+        if (l_s[w].to_bits() & 0x7fff_ffff) != 0 {
             denom += l_s[w] * exp(m_s[w] - best);
         }
     }
-    let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+    let empty = (denom.to_bits() & 0x7fff_ffff) == 0;
+    // Empty picks yield zero. Zero weight yields NaN.
+    let mut inv = if any_hit == 0 {
+        0.0
+    } else if empty {
+        hole
+    } else {
+        1.0 / denom
+    };
+    if splits > 1 {
+        // A part keeps its peak, sum and scaled mean.
+        q_at = (gid() / threads) as u64 * (width + 2) as u64 + 2;
+        if lid() == 0 {
+            out[q_at - 2] = if empty { hole } else { best };
+            out[q_at - 1] = denom;
+        }
+        if empty {
+            inv = 0.0;
+        }
+    }
     for d in (lid()..width).by(threads) {
         let mut sum = 0.0f32;
         for w in 0..warps {
-            if l_s[w] > 0.0 {
-                sum += o_s[w * width + d] * exp(m_s[w] - best);
-            }
+            // A dead warp weighs zero, yet passes on a NaN.
+            let live = (l_s[w].to_bits() & 0x7fff_ffff) != 0;
+            let share = if live { exp(m_s[w] - best) } else { 1.0 };
+            sum += o_s[w * width + d] * ((l_s[w] * share) * inv);
         }
-        out[q_at + d as u64] = sum * inv;
+        if splits > 1 {
+            out[q_at + d as u64] = sum;
+        } else {
+            // A finite mean stays finite at full scale.
+            let r = sum * 4.0;
+            let finite = (sum.to_bits() & 0x7f80_0000) != 0x7f80_0000;
+            out[q_at + d as u64] = if finite {
+                clamp(r, f32::MIN, f32::MAX)
+            } else {
+                r
+            };
+        }
     }
 }
 
@@ -401,7 +459,7 @@ fn listed_mix(
 
 /// Query rows over `[Seqs, Keys, KvHeads, Width]` keys.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Sizes {
+pub struct Sizes {
     pub len: usize,
     pub seqs: usize,
     /// Queries per sequence. Ragged rows have one each.
@@ -451,7 +509,7 @@ impl Sizes {
     }
 
     /// One list of picks per row and head.
-    fn lists(&self) -> usize {
+    pub(crate) fn lists(&self) -> usize {
         self.len / self.width
     }
 
@@ -536,25 +594,30 @@ impl Sizes {
     /// Single-launch split-K attention when width fits.
     fn fused(self, reads: [T; 8], warps: u32) -> Option<Vec<Draft>> {
         self.check_fused().ok()?;
-        Some(vec![Draft::new(ListedAttend(self, warps), reads, self.len)])
+        Some(vec![Draft::new(
+            ListedAttend(self, warps, 1),
+            reads,
+            self.len,
+        )])
     }
 }
 
 /// Fused split-K attention over listed or ragged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "listed_attend",
+    name = split::name(self.2),
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.scores() * self.0.width,
+    guess = split::guess(self.2),
     needs = attend_needs(self),
     order = Order::PerConfig,
     accepts = attend_accepts,
     emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
-    shape = Shape::grid((self.0.lists(), 1), (self.1 * LANES as u32) as usize),
+    shape = Shape::grid((self.0.lists() * self.2 as usize, 1), (self.1 * LANES as u32) as usize),
 )]
-pub(crate) struct ListedAttend(pub Sizes, pub u32);
+pub(crate) struct ListedAttend(pub Sizes, pub u32, pub u32);
 
 fn attend_accepts(k: &ListedAttend, input: usize, form: &dyn Stored) -> bool {
     match input {
@@ -579,6 +642,7 @@ fn attend_source(k: &ListedAttend) -> Source {
         listed_attend_ir(
             s.width as u32,
             warps,
+            k.2,
             warps * LANES as u32,
             s.q_form,
             s.k_form,
@@ -587,16 +651,17 @@ fn attend_source(k: &ListedAttend) -> Source {
         ),
         s.kept,
     );
-    let tag = if warps == WARPS {
-        String::new()
-    } else {
-        format!("_w{warps}")
+    let tag = match (k.2, warps) {
+        (1, WARPS) => String::new(),
+        (1, _) => format!("_w{warps}"),
+        (splits, _) => format!("_w{warps}_s{splits}"),
     };
     let suffix = Sizes::form_suffix(&[s.q_form, s.k_form, s.v_form, s.out_form]);
     Source::named(
         body,
         format!(
-            "plan_listed_attend_{}_{}{suffix}{tag}",
+            "plan_{}_{}_{}{suffix}{tag}",
+            split::name(k.2),
             s.kept.name(),
             s.width
         ),
@@ -609,6 +674,7 @@ fn attend_needs(k: &ListedAttend) -> Needs {
         lanes: LANES,
         group_bytes: 4 * (warps * (k.0.width + 2)),
         group_threads: warps * LANES,
+        lacks: split::lacks(k.2),
         ..Needs::default()
     }
 }
@@ -629,7 +695,8 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
         usize::from(s.from_list),
         s.window.0,
         s.window.1,
-        s.sink_mode,
+        // The merge folds the sinks of split lists.
+        if k.2 > 1 { 0 } else { s.sink_mode },
         s.rel_win,
     ];
     args.extend(counts.into_iter().map(Arg::count));
@@ -740,7 +807,7 @@ fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
 }
 
 /// Ragged or whole attention: listed keys, sinks, or bias.
-fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 8])> {
+pub(crate) fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 8])> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;

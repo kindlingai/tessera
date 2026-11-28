@@ -10,14 +10,9 @@ head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha 2>/dev/null) |
 reuse=false
 if [ -n "$pr" ] && [ -n "$head" ] && git fetch -q origin "$head" 2>/dev/null &&
     [ "$(git rev-parse "HEAD^{tree}")" = "$(git rev-parse "$head^{tree}")" ]; then
-    # Any attempt that passed counts. tiers.yml reruns only the
-    # success job. The build results stay as they were. The latest
-    # attempt may still run.
-    passed=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?check_name=success&filter=all" \
-        --jq '[.check_runs[] | select(.conclusion == "success")] | length')
-    if [ "$passed" -gt 0 ]; then
-        reuse=true
-    fi
+    # tiers.yml reruns only the success job, so the latest attempt
+    # may still run.
+    reuse=$(tools/scripts/check-passed.sh "$head" success)
 fi
 echo "pull request: ${pr:-none}, head: ${head:-none}, reuse: $reuse" >&2
 echo "$reuse"

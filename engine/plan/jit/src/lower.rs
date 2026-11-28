@@ -27,6 +27,10 @@ pub(crate) fn trusted() -> MemFlagsData {
 pub(crate) enum Kind {
     /// One value per thread, in a lane array.
     Lanes(Ty, StackSlot),
+    /// One scalar value in an SSA register.
+    Reg(Ty, Variable),
+    /// One four-wide float value in four SSA registers.
+    Reg4([Variable; 4]),
     /// One value, the same for every thread.
     One(Ty, Value),
     Buffer {
@@ -37,6 +41,8 @@ pub(crate) enum Kind {
     },
     /// A local array per thread, `len` long.
     Array(Ty, StackSlot, usize),
+    /// A single-thread local array in independent lowering.
+    LocalArray(Ty, StackSlot),
     /// Group memory, `len` long.
     Shared(Ty, StackSlot, usize),
     Tiles(Value),
@@ -48,7 +54,7 @@ pub(crate) struct Lowerer<'a, 'b> {
     frontend: TargetFrontendConfig,
     pub(crate) ptr: Type,
     helpers: HashMap<&'static str, FuncRef>,
-    scope: Vec<HashMap<String, Kind>>,
+    pub(crate) scope: Vec<HashMap<String, Kind>>,
     /// Masks of the enclosing blocks, outermost first.
     masks: Vec<StackSlot>,
     pub(crate) n: Value,
@@ -105,14 +111,23 @@ impl Lowerer<'_, '_> {
     pub(crate) fn slot(&mut self, bytes: usize) -> StackSlot {
         let data = StackSlotData::new(StackSlotKind::ExplicitSlot, bytes as u32, 4);
         let slot = self.b.create_sized_stack_slot(data);
-        let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
-        let flags = MemFlagsData::trusted();
-        self.b
-            .emit_small_memset(self.frontend, addr, 0, bytes as u64, 16, flags);
+        if bytes > 0 {
+            let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
+            let align = bytes.isolate_lowest_one().min(16) as u8;
+            self.b
+                .emit_small_memset(self.frontend, addr, 0, bytes as u64, align, trusted());
+        }
         slot
     }
 
-    /// A lane array of `ty`.
+    /// A lane array of `ty`, uninitialized.
+    pub(crate) fn raw_lane_slot(&mut self, ty: Ty) -> StackSlot {
+        let bytes = elem_size(ty) * THREADS;
+        let data = StackSlotData::new(StackSlotKind::ExplicitSlot, bytes as u32, 4);
+        self.b.create_sized_stack_slot(data)
+    }
+
+    /// A lane array of `ty`, zeroed.
     pub(crate) fn lane_slot(&mut self, ty: Ty) -> StackSlot {
         self.slot(elem_size(ty) * THREADS)
     }
@@ -186,7 +201,7 @@ impl Lowerer<'_, '_> {
     /// `e` under the mask, in a fresh array of `ty`.
     fn lane_array(&mut self, e: &Expr, ty: Ty) -> Res<StackSlot> {
         let e = self.hoist(e)?;
-        let slot = self.lane_slot(ty);
+        let slot = self.raw_lane_slot(ty);
         let mask = self.mask();
         self.lanes(Some(mask), |s, t| {
             let v = s.expr_as(&e, ty, t)?;
@@ -196,13 +211,32 @@ impl Lowerer<'_, '_> {
         Ok(slot)
     }
 
+    /// Whether `span` bytes at `at * stride` fit.
+    pub(crate) fn guarded_span(
+        &mut self,
+        [ptr, len, at]: [Value; 3],
+        stride: i64,
+        span: i64,
+    ) -> [Value; 2] {
+        let off = if stride == 1 {
+            at
+        } else {
+            let size = self.iconst(self.ptr, stride);
+            self.b.ins().imul(at, size)
+        };
+        let end = self.b.ins().iadd_imm_u(off, span);
+        let no_wrap = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, end, off);
+        let in_len = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, len);
+        let fits = self.b.ins().band(no_wrap, in_len);
+        [fits, self.b.ins().iadd(ptr, off)]
+    }
+
     /// Whether element `at` fits in `len` bytes, and its address.
     pub(crate) fn guarded(&mut self, [ptr, len, at]: [Value; 3], bytes: i64) -> [Value; 2] {
-        let size = self.iconst(self.ptr, bytes);
-        let off = self.b.ins().imul(at, size);
-        let end = self.b.ins().iadd(off, size);
-        let fits = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, len);
-        [fits, self.b.ins().iadd(ptr, off)]
+        self.guarded_span([ptr, len, at], bytes, bytes)
     }
 
     /// `fast` where the element fits, else the checking helper.
@@ -213,25 +247,42 @@ impl Lowerer<'_, '_> {
         slow: impl FnOnce(&mut Self) -> Option<Value>,
         ty: Option<Type>,
     ) -> Option<Value> {
+        let types = ty.as_slice();
+        self.either_many(
+            fits,
+            |s| fast(s).into_iter().collect(),
+            |s| slow(s).into_iter().collect(),
+            types,
+        )
+        .first()
+        .copied()
+    }
+
+    /// `fast` where `fits` holds, else `slow`, merging `types`.
+    pub(crate) fn either_many(
+        &mut self,
+        fits: Value,
+        fast: impl FnOnce(&mut Self) -> Vec<Value>,
+        slow: impl FnOnce(&mut Self) -> Vec<Value>,
+        types: &[Type],
+    ) -> Vec<Value> {
         let (yes, no, merge) = (
             self.b.create_block(),
             self.b.create_block(),
             self.b.create_block(),
         );
-        if let Some(ty) = ty {
+        for &ty in types {
             self.b.append_block_param(merge, ty);
         }
         self.b.ins().brif(fits, yes, &[], no, &[]);
         self.b.switch_to_block(yes);
-        let v = fast(self);
-        let args: Vec<_> = v.into_iter().map(Into::into).collect();
+        let args: Vec<_> = fast(self).into_iter().map(Into::into).collect();
         self.b.ins().jump(merge, &args);
         self.b.switch_to_block(no);
-        let v = slow(self);
-        let args: Vec<_> = v.into_iter().map(Into::into).collect();
+        let args: Vec<_> = slow(self).into_iter().map(Into::into).collect();
         self.b.ins().jump(merge, &args);
         self.b.switch_to_block(merge);
-        self.b.block_params(merge).first().copied()
+        self.b.block_params(merge).to_vec()
     }
 
     /// A lane array's element `t` of `ty`.
@@ -284,7 +335,7 @@ impl Lowerer<'_, '_> {
     }
 
     /// `target = value` for lane `t`, or `target op= value`.
-    fn store(
+    pub(crate) fn store(
         &mut self,
         target: &Expr,
         op: Option<tessera_codegen::ir::BinOp>,
@@ -296,14 +347,30 @@ impl Lowerer<'_, '_> {
             None => value.clone(),
         };
         match target {
-            Expr::Var(name) => {
-                let Kind::Lanes(ty, slot) = self.kind(name)? else {
-                    return Err(format!("`{name}` is not a lane variable"));
-                };
-                let v = self.expr_as(&combined, ty, t)?;
-                self.store_lane(slot, ty, t, v);
-                Ok(())
-            }
+            Expr::Var(name) => match self.kind(name)? {
+                Kind::Lanes(ty, slot) => {
+                    let v = self.expr_as(&combined, ty, t)?;
+                    self.store_lane(slot, ty, t, v);
+                    Ok(())
+                }
+                Kind::Reg(ty, var) => {
+                    let Val::S(v) = self.expr_as(&combined, ty, t)? else {
+                        return Err("a four-wide value in a scalar".into());
+                    };
+                    self.b.def_var(var, v);
+                    Ok(())
+                }
+                Kind::Reg4(vars) => {
+                    let Val::V(parts) = self.expr_as(&combined, Ty::F32x4, t)? else {
+                        return Err("a scalar in a four-wide variable".into());
+                    };
+                    for (var, part) in vars.into_iter().zip(parts) {
+                        self.b.def_var(var, part);
+                    }
+                    Ok(())
+                }
+                _ => Err(format!("`{name}` is not a lane variable")),
+            },
             Expr::Index(base, at) => {
                 let Expr::Var(name) = &**base else {
                     return Err("an index names what it writes".into());
@@ -335,16 +402,24 @@ impl Lowerer<'_, '_> {
                                 let check = |s: &mut Self| s.call(st, &[ptr, len, at, v]);
                                 self.either(fits, store, check, None);
                             }
-                            tessera_codegen::form::Read::Bf16
-                            | tessera_codegen::form::Read::Fp8 => {
-                                let st = match form.read() {
-                                    tessera_codegen::form::Read::Bf16 => "st_bf16",
-                                    _ => "st_fp8",
-                                };
+                            tessera_codegen::form::Read::Bf16 => {
                                 let Val::S(v) = self.expr_as(&combined, Ty::F32, t)? else {
                                     return Err("a four-wide value stored by index".into());
                                 };
-                                self.call(st, &[ptr, len, at, v]);
+                                let [fits, addr] = self.guarded([ptr, len, at], 2);
+                                let store = |s: &mut Self| {
+                                    let bits = s.f32_to_bf16(v);
+                                    s.b.ins().istore16(MemFlagsData::new(), bits, addr, 0);
+                                    None
+                                };
+                                let check = |s: &mut Self| s.call("st_bf16", &[ptr, len, at, v]);
+                                self.either(fits, store, check, None);
+                            }
+                            tessera_codegen::form::Read::Fp8 => {
+                                let Val::S(v) = self.expr_as(&combined, Ty::F32, t)? else {
+                                    return Err("a four-wide value stored by index".into());
+                                };
+                                self.call("st_fp8", &[ptr, len, at, v]);
                             }
                             other => return Err(format!("cannot write form {other:?}")),
                         }
@@ -363,6 +438,13 @@ impl Lowerer<'_, '_> {
                         self.store_at(addr, ty, v);
                         Ok(())
                     }
+                    Kind::LocalArray(ty, slot) => {
+                        let idx = self.index(at, t)?;
+                        let addr = self.at(slot, idx, elem_size(ty));
+                        let v = self.expr_as(&combined, ty, t)?;
+                        self.store_at(addr, ty, v);
+                        Ok(())
+                    }
                     _ => Err(format!("indexed writes to `{name}` are unsupported")),
                 }
             }
@@ -370,19 +452,25 @@ impl Lowerer<'_, '_> {
                 let Expr::Var(name) = &**base else {
                     return Err("a field names its value".into());
                 };
-                let Kind::Lanes(Ty::F32x4, slot) = self.kind(name)? else {
-                    return Err(format!("`{name}` is not four wide"));
-                };
                 let i = ['x', 'y', 'z', 'w']
                     .iter()
                     .position(|c| c == h)
                     .unwrap_or(3);
-                let addr = self.at(slot, t, 16);
                 let Val::S(v) = self.expr_as(&combined, Ty::F32, t)? else {
                     return Err("a four-wide value in a field".into());
                 };
-                self.b.ins().store(trusted(), v, addr, 4 * i as i32);
-                Ok(())
+                match self.kind(name)? {
+                    Kind::Lanes(Ty::F32x4, slot) => {
+                        let addr = self.at(slot, t, 16);
+                        self.b.ins().store(trusted(), v, addr, 4 * i as i32);
+                        Ok(())
+                    }
+                    Kind::Reg4(vars) => {
+                        self.b.def_var(vars[i], v);
+                        Ok(())
+                    }
+                    _ => Err(format!("`{name}` is not four wide")),
+                }
             }
             other => Err(format!("cannot assign to {other:?}")),
         }
@@ -516,7 +604,7 @@ impl Lowerer<'_, '_> {
                 let counter = self.lane_array(from, Ty::U32)?;
                 let to = self.lane_array(to, Ty::U32)?;
                 let step = self.lane_array(step, Ty::U32)?;
-                let live = self.lane_slot(Ty::Bool);
+                let live = self.raw_lane_slot(Ty::Bool);
                 let (header, run, exit) = (
                     self.b.create_block(),
                     self.b.create_block(),
@@ -714,11 +802,11 @@ impl Lowerer<'_, '_> {
             }
             Stmt::TileEach { acc, body } => {
                 let tiles = self.tiles_of(acc)?;
-                let live = self.lane_slot(Ty::Bool);
+                let live = self.raw_lane_slot(Ty::Bool);
                 let (r, c, v) = (
-                    self.lane_slot(Ty::U32),
-                    self.lane_slot(Ty::U32),
-                    self.lane_slot(Ty::F32),
+                    self.raw_lane_slot(Ty::U32),
+                    self.raw_lane_slot(Ty::U32),
+                    self.raw_lane_slot(Ty::F32),
                 );
                 self.each_sum(tiles, |s, e| {
                     s.lanes(None, |s, t| {
@@ -884,15 +972,19 @@ pub(crate) fn function(
     l.b.switch_to_block(group);
     let start = l.b.ins().imul(gv, n);
     l.b.def_var(first, start);
-    let m0 = l.lane_slot(Ty::Bool);
-    l.lanes(None, |s, t| {
-        let on = s.iconst(types::I8, 1);
-        s.set_mask(m0, t, on);
-        Ok(())
-    })?;
-    l.block(&body.stmts, m0)?;
-    for tiles in std::mem::take(&mut l.tiles) {
-        l.call("tiles_free", &[tiles]);
+    if crate::scalar::is_independent(&body.stmts) {
+        l.run_independent(&body.stmts)?;
+    } else {
+        let m0 = l.raw_lane_slot(Ty::Bool);
+        l.lanes(None, |s, t| {
+            let on = s.iconst(types::I8, 1);
+            s.set_mask(m0, t, on);
+            Ok(())
+        })?;
+        l.block(&body.stmts, m0)?;
+        for tiles in std::mem::take(&mut l.tiles) {
+            l.call("tiles_free", &[tiles]);
+        }
     }
     let one = l.iconst(ptr, 1);
     let next = l.b.ins().iadd(gv, one);

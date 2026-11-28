@@ -176,10 +176,66 @@ fn mem_available() -> Option<u64> {
         }
         None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_available()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_available() -> Option<u64> {
+    use std::ffi::{CStr, c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            old: *mut c_void,
+            len: *mut usize,
+            new: *const c_void,
+            new_len: usize,
+        ) -> c_int;
+    }
+
+    let query = |name: &CStr| -> Option<u64> {
+        let mut raw = [0u8; 8];
+        let mut len = raw.len();
+        // SAFETY: `sysctlbyname` writes at most `len` bytes into `raw`.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                raw.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        match len {
+            4 => Some(u64::from(u32::from_ne_bytes(raw[..4].try_into().ok()?))),
+            8 => Some(u64::from_ne_bytes(raw)),
+            _ => None,
+        }
+    };
+
+    let page_bytes = query(c"hw.pagesize")?;
+    let keys = [
+        c"vm.page_free_count",
+        c"vm.page_speculative_count",
+        c"vm.page_purgeable_count",
+        c"vm.page_pageable_external_count",
+    ];
+    let mut pages = 0u64;
+    for key in keys {
+        pages = pages.saturating_add(query(key).unwrap_or(0));
+    }
+    let bytes = pages.saturating_mul(page_bytes);
+    (bytes > 0).then_some(bytes)
 }
 
 enum Backend {

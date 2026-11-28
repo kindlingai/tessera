@@ -64,9 +64,46 @@ TESSERA_FN void note_hit(const u8* base, u32 m) {
     if (side & PAGED) {
         u64 hits = *reinterpret_cast<const u64*>(base + HEAD);
         if (hits != 0ull) {
+#if defined(TESSERA_HIP)
+            prim::fetch_add_gpu(reinterpret_cast<u32*>(hits) + m, 1u);
+#else
             atomicAdd(reinterpret_cast<u32*>(hits) + m, 1u);
+#endif
         }
     }
+}
+
+// Shuffle indices and bit shift for direct tile decode.
+struct word_map {
+    u32 i0, i1, sh;
+};
+
+template <u32 K>
+TESSERA_FN word_map map_word(u32 lane) {
+    u32 b0 = (lane * 8u + 1u) * K + 256u * K - 16u;
+    u32 i0 = (b0 >> 5u) % (8u * K);
+    return {i0, (i0 + 1u) % (8u * K), b0 & 31u};
+}
+
+// Stores one cooperatively loaded 64-tile block into shared memory.
+template <u32 K>
+TESSERA_FN void blk_store(const u32 reg[8], u32 tid, u32* smem) {
+    uint4* dst = reinterpret_cast<uint4*>(smem);
+    dst[tid] = make_uint4(reg[0], reg[1], reg[2], reg[3]);
+    if constexpr (K == 3u) {
+        if (tid < 128u) dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
+    } else if constexpr (K == 4u) {
+        dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
+    }
+}
+
+// Reads four floats from 16-byte aligned `p`.
+TESSERA_FN void load4(const float* p, float v[4]) {
+    float4 f = *reinterpret_cast<const float4*>(p);
+    v[0] = f.x;
+    v[1] = f.y;
+    v[2] = f.z;
+    v[3] = f.w;
 }
 
 #if defined(TESSERA_CUDA)
@@ -124,6 +161,14 @@ TESSERA_FN u32 shf_l(u32 lo, u32 hi, u32 shift) {
     return out;
 }
 
+TESSERA_FN u32 shfl_u32(u32 v, u32 src) {
+    return __shfl_sync(0xFFFFFFFFu, v, src);
+}
+
+TESSERA_FN float shfl_xor_f32(float v, u32 mask) {
+    return __shfl_xor_sync(0xFFFFFFFFu, v, mask);
+}
+
 TESSERA_FN u32 prmt(u32 a, u32 b, u32 sel) {
     u32 out;
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(a), "r"(b), "r"(sel));
@@ -150,6 +195,164 @@ TESSERA_FN float4 ld_cg_f4(const float* p) {
     return out;
 }
 
+template <u32 BOOK>
+TESSERA_FN u32 decode_pair_f16x2(u32 a, u32 b) {
+    if constexpr (BOOK == BOOK_MUL1) {
+        u32 sx, sy, v;
+        asm("dp4a.u32.u32 %0, %1, %2, %3;"
+            : "=r"(sx)
+            : "r"(a * MUL1), "r"(0x01010101u), "r"(0x6400u));
+        asm("dp4a.u32.u32 %0, %1, %2, %3;"
+            : "=r"(sy)
+            : "r"(b * MUL1), "r"(0x01010101u), "r"(0x6400u));
+        asm("fma.rn.f16x2 %0, %1, %2, %3;"
+            : "=r"(v)
+            : "r"(prmt(sx, sy, 0x5410u)), "r"(0x1EEE1EEEu), "r"(0xC931C931u));
+        return v;
+    } else {
+        u32 x = a * MCG, y = b * MCG, sum;
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+            : "=r"(x)
+            : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+            : "=r"(y)
+            : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+        // Pair sums use FMA, not ALU: this decode is ALU-bound.
+        asm("{.reg .b16 xl, xh, yl, yh; .reg .b32 xhh, yll, yhh;\n"
+            " mov.b32 {xl, xh}, %1; mov.b32 {yl, yh}, %2;\n"
+            " mov.b32 xhh, {xh, xh}; mov.b32 yll, {yl, yl}; mov.b32 yhh, {yh, yh};\n"
+            " fma.rn.f16x2 %0, xhh, %3, %1;\n"
+            " fma.rn.f16x2 %0, yll, %4, %0;\n"
+            " fma.rn.f16x2 %0, yhh, %4, %0;}"
+            : "=r"(sum)
+            : "r"(x), "r"(y), "r"(0xBC003C00u), "r"(0x3C000000u));
+        return sum;
+    }
+}
+
+TESSERA_FN u32 decode_pmcgx_f16x2(u32 w) {
+    u32 x = w * MCG, y = w * PMCG2, sum;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+        : "=r"(x)
+        : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+        : "=r"(y)
+        : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(sum) : "r"(x), "r"(prmt(y, y, 0x1032u)));
+    return sum;
+}
+
+TESSERA_FN u32 narrow_pair_e4m3(u32 h) {
+    return narrow_f16x2_e4m3(h);
+}
+
+TESSERA_FN float narrow_f32(float v) {
+    return f16_to_f32(narrow_f16x2_e4m3(f32x2_to_f16x2(v, v)) & 0xFFFFu);
+}
+
+#elif defined(TESSERA_HIP)
+
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
+typedef _Float16 f16x16 __attribute__((ext_vector_type(16)));
+
+TESSERA_FN float f16_to_f32(u32 h) {
+    return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<u16>(h)));
+}
+
+TESSERA_FN u16 f32_to_f16(float v) {
+    return __builtin_bit_cast(u16, static_cast<_Float16>(v));
+}
+
+TESSERA_FN u32 f32x2_to_f16x2(float lo, float hi) {
+    return u32(f32_to_f16(lo)) | (u32(f32_to_f16(hi)) << 16u);
+}
+
+TESSERA_FN u32 shf_l(u32 lo, u32 hi, u32 shift) {
+    return (shift == 0u) ? hi : ((hi << shift) | (lo >> (32u - shift)));
+}
+
+TESSERA_FN u32 shfl_u32(u32 v, u32 src) {
+    return static_cast<u32>(
+        __builtin_amdgcn_ds_bpermute(static_cast<int>(src << 2u), static_cast<int>(v)));
+}
+
+TESSERA_FN float shfl_xor_f32(float v, u32 mask) {
+    return __shfl_xor(v, static_cast<int>(mask));
+}
+
+TESSERA_FN u32 ld_nc_u32(const u8* p) {
+    return *reinterpret_cast<const u32*>(p);
+}
+
+TESSERA_FN void ld_nc_v4(const u8* p, u32 dst[4]) {
+    uint4 v = *reinterpret_cast<const uint4*>(p);
+    dst[0] = v.x;
+    dst[1] = v.y;
+    dst[2] = v.z;
+    dst[3] = v.w;
+}
+
+// Branchless packed f16x2-to-E4M3 RNE for bounded codebook pairs.
+TESSERA_FN u32 narrow_f16x2_e4m3_fast(u32 h) {
+    u32 sign = h & 0x80008000u, mag = h & 0x7FFF7FFFu;
+    f16x2 av = __builtin_bit_cast(f16x2, mag);
+    const f16x2 two = {static_cast<_Float16>(2.0f), static_cast<_Float16>(2.0f)};
+    u32 sub = __builtin_bit_cast(u32, (av + two) - two);
+    u32 m0 = mag & 0xFFFFu, m1 = mag >> 16u;
+    u32 n0 = (m0 + 0x3Fu + ((m0 >> 7u) & 1u)) & ~0x7Fu;
+    u32 n1 = (m1 + 0x3Fu + ((m1 >> 7u) & 1u)) & ~0x7Fu;
+    return sign | (m0 < 0x2400u ? (sub & 0xFFFFu) : n0) |
+           ((m1 < 0x2400u ? (sub >> 16u) : n1) << 16u);
+}
+
+TESSERA_FN u32 narrow_pair_e4m3(u32 h) {
+    return narrow_f16x2_e4m3_fast(h);
+}
+
+// Rounds one f16 value to E4M3, saturated at 448.
+TESSERA_FN float narrow_f32(float v) {
+    u16 h = f32_to_f16(v);
+    u32 sign = h & 0x8000u, mag = h & 0x7FFFu;
+    if (mag > 0x7C00u) return f16_to_f32(sign | 0x7E00u);
+    if (mag >= 0x5F00u) return f16_to_f32(sign | 0x5F00u);
+    u32 res = narrow_f16x2_e4m3_fast(u32(h)) & 0xFFFFu;
+    return f16_to_f32((res & 0x7FFFu) >= 0x5F00u ? (sign | 0x5F00u) : res);
+}
+
+template <u32 BOOK>
+TESSERA_FN u32 decode_pair_f16x2(u32 a, u32 b) {
+    if constexpr (BOOK == BOOK_MUL1) {
+        u32 za = a * MUL1, zb = b * MUL1;
+        u32 sa = (za & 255u) + ((za >> 8u) & 255u) + ((za >> 16u) & 255u) + (za >> 24u);
+        u32 sb = (zb & 255u) + ((zb >> 8u) & 255u) + ((zb >> 16u) & 255u) + (zb >> 24u);
+        return f32x2_to_f16x2(float(1024u + sa) * MUL1_SCALE + MUL1_OFFSET,
+                              float(1024u + sb) * MUL1_SCALE + MUL1_OFFSET);
+    } else {
+        u32 x = ((a * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+        u32 y = ((b * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+        f16x2 sum = __builtin_bit_cast(f16x2, __builtin_amdgcn_perm(y, x, 0x05040100u)) +
+                    __builtin_bit_cast(f16x2, __builtin_amdgcn_perm(y, x, 0x07060302u));
+        return __builtin_bit_cast(u32, sum);
+    }
+}
+
+TESSERA_FN u32 decode_pmcgx_f16x2(u32 w) {
+    u32 x = ((w * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    u32 y = ((w * PMCG2) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    f16x2 sum = __builtin_bit_cast(f16x2, x) +
+                __builtin_bit_cast(f16x2, __builtin_amdgcn_perm(y, y, 0x01000302u));
+    return __builtin_bit_cast(u32, sum);
+}
+
+TESSERA_FN v8f wmma_f16(v8f acc, f16x16 a, f16x16 b) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+}
+
+#endif
+
+#if defined(TESSERA_CUDA) || defined(TESSERA_HIP)
+
 // Register-only 128-point Walsh-Hadamard transform over one warp.
 TESSERA_FN void wht128(float v[4], float scale) {
     u32 lane = threadIdx.x & 31u;
@@ -164,13 +367,101 @@ TESSERA_FN void wht128(float v[4], float scale) {
         float sign = (lane & mask) ? -1.0f : 1.0f;
 #pragma unroll
         for (u32 i = 0u; i < 4u; i++) {
-            float peer = __shfl_xor_sync(0xFFFFFFFFu, v[i], mask);
-            v[i] = peer + sign * v[i];
+            v[i] = shfl_xor_f32(v[i], mask) + sign * v[i];
         }
     }
 #pragma unroll
     for (u32 i = 0u; i < 4u; i++) v[i] *= scale;
 }
+
+template <u32 BOOK>
+TESSERA_FN u32 decode_pair(u32 a, u32 b) {
+    return narrow_pair_e4m3(decode_pair_f16x2<BOOK>(a, b));
+}
+
+TESSERA_FN u32 decode_pmcgx(u32 w) {
+    return narrow_pair_e4m3(decode_pmcgx_f16x2(w));
+}
+
+// Loads one 64-tile block (2048*K bytes) cooperatively with 128-bit loads.
+template <u32 K>
+TESSERA_FN void blk_load(const u8* blk, u32 tid, bool aligned, u32 reg[8]) {
+    if (aligned) {
+        ld_nc_v4(blk + (tid << 4u), reg);
+        if constexpr (K == 3u) {
+            if (tid < 128u) ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
+        } else if constexpr (K == 4u) {
+            ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
+        }
+        return;
+    }
+#pragma unroll
+    for (u32 i = 0u; i < 4u; i++) reg[i] = ld_nc_u32(blk + (tid << 4u) + (i << 2u));
+    if constexpr (K == 3u) {
+        if (tid < 128u) {
+#pragma unroll
+            for (u32 i = 0u; i < 4u; i++) {
+                reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
+            }
+        }
+    } else if constexpr (K == 4u) {
+#pragma unroll
+        for (u32 i = 0u; i < 4u; i++) {
+            reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
+        }
+    }
+}
+
+// Decodes one warp-held tile word into four f16x2 pairs.
+template <u32 K, u32 BOOK>
+TESSERA_FN void decode_word(u32 raw, const word_map& wm, u32 frag[4]) {
+    u32 a = shfl_u32(raw, wm.i0);
+    u32 b = (K == 4u) ? raw : shfl_u32(raw, wm.i1);
+    u32 s0 = (K == 4u) ? 20u : wm.sh;
+    if constexpr (BOOK == BOOK_PMCGX) {
+        u32 sp = s0 - (4u - K);
+        u32 hi = shf_l(b, a, sp);
+        u32 lo = b << sp;
+        frag[0] = decode_pmcgx(shf_l(lo, hi, 0u) >> 12u);
+        frag[2] = decode_pmcgx(shf_l(lo, hi, 2u * K) >> 12u);
+        frag[1] = decode_pmcgx(shf_l(lo, hi, 4u * K) >> 12u);
+        frag[3] = decode_pmcgx(shf_l(lo, hi, 6u * K) >> 12u);
+    } else {
+        u32 hi = shf_l(b, a, s0);
+        u32 lo = b << s0;
+        u32 st[8];
+#pragma unroll
+        for (u32 s = 0u; s < 8u; s++) st[s] = shf_l(lo, hi, K * s) >> 16u;
+        frag[0] = decode_pair<BOOK>(st[0], st[1]);
+        frag[1] = decode_pair<BOOK>(st[4], st[5]);
+        frag[2] = decode_pair<BOOK>(st[2], st[3]);
+        frag[3] = decode_pair<BOOK>(st[6], st[7]);
+    }
+}
+
+TESSERA_FN float half_to_f32(u32 h) {
+    return f16_to_f32(h);
+}
+
+#endif
+
+#if defined(TESSERA_HIP)
+
+// Decodes one 16x16 tile into an RDNA WMMA fragment.
+template <u32 K, u32 BOOK>
+TESSERA_FN f16x16 decode_tile_hip(u32 raw, const word_map& wm, u32 lane, u32* w_lds) {
+    u32 fa[4];
+    decode_word<K, BOOK>(raw, wm, fa);
+    u32 g = lane >> 2u, p = lane & 3u;
+    w_lds[g * 12u + p] = fa[0];
+    w_lds[(g + 8u) * 12u + p] = fa[1];
+    w_lds[g * 12u + p + 4u] = fa[2];
+    w_lds[(g + 8u) * 12u + p + 4u] = fa[3];
+    asm volatile("" ::: "memory");
+    return *reinterpret_cast<const f16x16*>(w_lds + (lane & 15u) * 12u);
+}
+
+#elif defined(TESSERA_CUDA)
 
 template <u32 K>
 TESSERA_FN void tile_load(const u8* p, u32 lane, bool wide, u32 reg[8]) {
@@ -217,142 +508,6 @@ TESSERA_FN lane_map map_lane(u32 lane) {
                                      : (K * (8u * lane + 1u) + ring - 16u) % ring;
     u32 q = start >> 5u;
     return {q, (q + 1u) % words, (q + 2u) % words, start & 31u};
-}
-
-template <u32 BOOK>
-TESSERA_FN u32 decode_pair_f16x2(u32 a, u32 b) {
-    if constexpr (BOOK == BOOK_MUL1) {
-        u32 sx, sy, v;
-        asm("dp4a.u32.u32 %0, %1, %2, %3;"
-            : "=r"(sx)
-            : "r"(a * MUL1), "r"(0x01010101u), "r"(0x6400u));
-        asm("dp4a.u32.u32 %0, %1, %2, %3;"
-            : "=r"(sy)
-            : "r"(b * MUL1), "r"(0x01010101u), "r"(0x6400u));
-        asm("fma.rn.f16x2 %0, %1, %2, %3;"
-            : "=r"(v)
-            : "r"(prmt(sx, sy, 0x5410u)), "r"(0x1EEE1EEEu), "r"(0xC931C931u));
-        return v;
-    } else {
-        u32 x = a * MCG, y = b * MCG, sum;
-        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-            : "=r"(x)
-            : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-            : "=r"(y)
-            : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-        // Pair sums use FMA, not ALU: this decode is ALU-bound.
-        asm("{.reg .b16 xl, xh, yl, yh; .reg .b32 xhh, yll, yhh;\n"
-            " mov.b32 {xl, xh}, %1; mov.b32 {yl, yh}, %2;\n"
-            " mov.b32 xhh, {xh, xh}; mov.b32 yll, {yl, yl}; mov.b32 yhh, {yh, yh};\n"
-            " fma.rn.f16x2 %0, xhh, %3, %1;\n"
-            " fma.rn.f16x2 %0, yll, %4, %0;\n"
-            " fma.rn.f16x2 %0, yhh, %4, %0;}"
-            : "=r"(sum)
-            : "r"(x), "r"(y), "r"(0xBC003C00u), "r"(0x3C000000u));
-        return sum;
-    }
-}
-
-template <u32 BOOK>
-TESSERA_FN u32 decode_pair(u32 a, u32 b) {
-    return narrow_f16x2_e4m3(decode_pair_f16x2<BOOK>(a, b));
-}
-
-TESSERA_FN u32 decode_pmcgx_f16x2(u32 w) {
-    u32 x = w * MCG, y = w * PMCG2, sum;
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(x)
-        : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(y)
-        : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(sum) : "r"(x), "r"(prmt(y, y, 0x1032u)));
-    return sum;
-}
-
-TESSERA_FN u32 decode_pmcgx(u32 w) {
-    return narrow_f16x2_e4m3(decode_pmcgx_f16x2(w));
-}
-
-// Shuffle indices and bit shift for direct tile decode.
-struct word_map {
-    u32 i0, i1, sh;
-};
-
-template <u32 K>
-TESSERA_FN word_map map_word(u32 lane) {
-    u32 b0 = (lane * 8u + 1u) * K + 256u * K - 16u;
-    u32 i0 = (b0 >> 5u) % (8u * K);
-    return {i0, (i0 + 1u) % (8u * K), b0 & 31u};
-}
-
-// Loads one 64-tile block (2048*K bytes) cooperatively with 128-bit loads.
-template <u32 K>
-TESSERA_FN void blk_load(const u8* blk, u32 tid, bool aligned, u32 reg[8]) {
-    if (aligned) {
-        ld_nc_v4(blk + (tid << 4u), reg);
-        if constexpr (K == 3u) {
-            if (tid < 128u) ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
-        } else if constexpr (K == 4u) {
-            ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
-        }
-        return;
-    }
-#pragma unroll
-    for (u32 i = 0u; i < 4u; i++) reg[i] = ld_nc_u32(blk + (tid << 4u) + (i << 2u));
-    if constexpr (K == 3u) {
-        if (tid < 128u) {
-#pragma unroll
-            for (u32 i = 0u; i < 4u; i++) {
-                reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
-            }
-        }
-    } else if constexpr (K == 4u) {
-#pragma unroll
-        for (u32 i = 0u; i < 4u; i++) {
-            reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
-        }
-    }
-}
-
-// Stores one cooperatively loaded 64-tile block into shared memory.
-template <u32 K>
-TESSERA_FN void blk_store(const u32 reg[8], u32 tid, u32* smem) {
-    uint4* dst = reinterpret_cast<uint4*>(smem);
-    dst[tid] = make_uint4(reg[0], reg[1], reg[2], reg[3]);
-    if constexpr (K == 3u) {
-        if (tid < 128u) dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
-    } else if constexpr (K == 4u) {
-        dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
-    }
-}
-
-// Decodes one warp-held tile word into an MMA A fragment.
-template <u32 K, u32 BOOK>
-TESSERA_FN void decode_word(u32 raw, const word_map& wm, u32 frag[4]) {
-    u32 a = __shfl_sync(0xFFFFFFFFu, raw, wm.i0);
-    u32 b = (K == 4u) ? raw : __shfl_sync(0xFFFFFFFFu, raw, wm.i1);
-    u32 s0 = (K == 4u) ? 20u : wm.sh;
-    if constexpr (BOOK == BOOK_PMCGX) {
-        u32 sp = s0 - (4u - K);
-        u32 hi = shf_l(b, a, sp);
-        u32 lo = b << sp;
-        frag[0] = decode_pmcgx(shf_l(lo, hi, 0u) >> 12u);
-        frag[2] = decode_pmcgx(shf_l(lo, hi, 2u * K) >> 12u);
-        frag[1] = decode_pmcgx(shf_l(lo, hi, 4u * K) >> 12u);
-        frag[3] = decode_pmcgx(shf_l(lo, hi, 6u * K) >> 12u);
-    } else {
-        u32 hi = shf_l(b, a, s0);
-        u32 lo = b << s0;
-        u32 st[8];
-#pragma unroll
-        for (u32 s = 0u; s < 8u; s++) st[s] = shf_l(lo, hi, K * s) >> 16u;
-        frag[0] = decode_pair<BOOK>(st[0], st[1]);
-        frag[1] = decode_pair<BOOK>(st[4], st[5]);
-        frag[2] = decode_pair<BOOK>(st[2], st[3]);
-        frag[3] = decode_pair<BOOK>(st[6], st[7]);
-    }
 }
 
 // Stores one 128-vector into an MMA B fragment table.
@@ -590,57 +745,97 @@ union alignas(16) stage_smem {
     Out out;
 };
 
-// Reads four floats from 16-byte aligned `p`.
-TESSERA_FN void load4(const float* p, float v[4]) {
-    float4 f = *reinterpret_cast<const float4*>(p);
-    v[0] = f.x;
-    v[1] = f.y;
-    v[2] = f.z;
-    v[3] = f.w;
-}
-
 #if defined(X_BF16)
 using x_t = u16;
 #else
 using x_t = float;
 #endif
+#if defined(Y_BF16)
+using y_t = u16;
+#else
+using y_t = float;
+#endif
+#if defined(O_BF16)
+using o_t = u16;
+#else
+using o_t = float;
+#endif
 
-// Reads two activation elements as float2.
-TESSERA_FN float2 load_x2(const x_t* p) {
-#if defined(X_BF16)
+// Reads one element as float.
+TESSERA_FN float load_e(const float* p, u64 idx) { return p[idx]; }
+TESSERA_FN float load_e(const u16* p, u64 idx) { return __uint_as_float(u32(p[idx]) << 16u); }
+
+// Reads two elements as float2.
+TESSERA_FN float2 load_e2(const float* p) { return *reinterpret_cast<const float2*>(p); }
+TESSERA_FN float2 load_e2(const u16* p) {
     u32 h = *reinterpret_cast<const u32*>(p);
     return make_float2(__uint_as_float(h << 16u), __uint_as_float(h & 0xFFFF0000u));
-#else
-    return *reinterpret_cast<const float2*>(p);
-#endif
 }
 
-// Reads four activation elements as float4.
-TESSERA_FN float4 load_x4(const x_t* p) {
-#if defined(X_BF16)
+// Reads four elements as float4.
+TESSERA_FN float4 load_e4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+TESSERA_FN float4 load_e4(const u16* p) {
     uint2 h = *reinterpret_cast<const uint2*>(p);
     return make_float4(__uint_as_float(h.x << 16u), __uint_as_float(h.x & 0xFFFF0000u),
                        __uint_as_float(h.y << 16u), __uint_as_float(h.y & 0xFFFF0000u));
-#else
-    return *reinterpret_cast<const float4*>(p);
-#endif
 }
 
-// Reads four activation elements into `v`.
-TESSERA_FN void load_x4(const x_t* p, float v[4]) {
-    float4 f = load_x4(p);
+template <typename E>
+TESSERA_FN void load_e4(const E* p, float v[4]) {
+    float4 f = load_e4(p);
     v[0] = f.x;
     v[1] = f.y;
     v[2] = f.z;
     v[3] = f.w;
 }
 
-TESSERA_FN float half_to_f32(u32 h) {
-    return f16_to_f32(h);
+TESSERA_FN u32 f32x2_to_bf16x2(float lo, float hi) {
+    u32 out;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
+    return out;
 }
 
-TESSERA_FN float narrow_f32(float v) {
-    return f16_to_f32(narrow_f16x2_e4m3(f32x2_to_f16x2(v, v)) & 0xFFFFu);
+// Stores one, two, or four output elements.
+TESSERA_FN void store_e(float* p, u64 idx, float v) { p[idx] = v; }
+TESSERA_FN void store_e(u16* p, u64 idx, float v) { p[idx] = f32_to_bf16(v); }
+TESSERA_FN void store_e2(float* p, float v0, float v1) {
+    *reinterpret_cast<float2*>(p) = make_float2(v0, v1);
+}
+TESSERA_FN void store_e2(u16* p, float v0, float v1) {
+    *reinterpret_cast<u32*>(p) = f32x2_to_bf16x2(v0, v1);
+}
+TESSERA_FN void store_e4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+TESSERA_FN void store_e4(u16* p, float4 v) {
+    *reinterpret_cast<uint2*>(p) =
+        make_uint2(f32x2_to_bf16x2(v.x, v.y), f32x2_to_bf16x2(v.z, v.w));
+}
+
+TESSERA_FN float2 load_x2(const x_t* p) { return load_e2(p); }
+TESSERA_FN float4 load_x4(const x_t* p) { return load_e4(p); }
+TESSERA_FN void load_x4(const x_t* p, float v[4]) { load_e4(p, v); }
+TESSERA_FN float load_o(const o_t* p, u64 idx) { return load_e(p, idx); }
+TESSERA_FN float2 load_o2(const o_t* p) { return load_e2(p); }
+TESSERA_FN void load_o4(const o_t* p, float v[4]) { load_e4(p, v); }
+TESSERA_FN void store_y(y_t* p, u64 idx, float v) { store_e(p, idx, v); }
+TESSERA_FN void store_y2(y_t* p, float v0, float v1) { store_e2(p, v0, v1); }
+TESSERA_FN void store_y4(y_t* p, float4 v) { store_e4(p, v); }
+
+// Stores a trellis MMA accumulator tile directly to `out`.
+template <u32 NT>
+TESSERA_FN void store_tile(y_t* out, u32 r0, u32 m, u32 stride, u32 col0, u32 col, u32 rc,
+                           const float acc[NT][4]) {
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        u32 r = r0 + (ti << 3u) + rc;
+        if (r < m) {
+            store_y(out, u64(r) * stride + col0 + col, acc[ti][0]);
+            store_y(out, u64(r) * stride + col0 + col + 8u, acc[ti][2]);
+        }
+        if (r + 1u < m) {
+            store_y(out, u64(r + 1u) * stride + col0 + col, acc[ti][1]);
+            store_y(out, u64(r + 1u) * stride + col0 + col + 8u, acc[ti][3]);
+        }
+    }
 }
 
 #else

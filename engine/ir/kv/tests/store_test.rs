@@ -2,6 +2,66 @@ use std::path::PathBuf;
 use tessera_kv::{Keep, KvConfig, PageStore, RamStore, StoreKind, TieredStore, page_keys};
 
 #[test]
+fn direct_load_keys() {
+    let toks = [1u32, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert_eq!(
+        page_keys([11, 29], &toks, 1)[0].0,
+        [0x20852c94059f33a7, 0x08cbcf7a9a80d7d4]
+    );
+    let k3: Vec<[u64; 2]> = page_keys([11, 29], &toks, 3)
+        .into_iter()
+        .map(|k| k.0)
+        .collect();
+    assert_eq!(
+        k3,
+        vec![
+            [0xd2b3f162ebe97c67, 0x621df6b2e953a359],
+            [0xd13436d96f2d7c32, 0x42ef9e526411e139],
+            [0xce85b8bac416e7b8, 0xca6f0307427291c2],
+        ]
+    );
+    let k4: Vec<[u64; 2]> = page_keys([11, 29], &toks, 4)
+        .into_iter()
+        .map(|k| k.0)
+        .collect();
+    assert_eq!(
+        k4,
+        vec![
+            [0x1828dadddf0044e1, 0x51565db3b4066eef],
+            [0xfb714ee916f5a96f, 0xc5b029aeab7c4fc1],
+        ]
+    );
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tessera-kv-direct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ks = page_keys([11, 29], &toks, 3);
+    let mut store = PageStore::open_mode(&dir, 32, false).unwrap();
+    assert!(store.save(ks[0], &[5u8; 16]).unwrap());
+    assert!(store.save(ks[1], &[6u8; 16]).unwrap());
+    // Repeated hits trigger LRU compaction while keeping ks[0] hottest.
+    let mut dst = [0u8; 16];
+    for _ in 0..100 {
+        assert!(store.load(ks[0], &mut dst).unwrap());
+    }
+    assert_eq!(dst, [5u8; 16]);
+    assert!(store.save(ks[2], &[7u8; 16]).unwrap());
+    assert!(store.has(ks[0]) && !store.has(ks[1]) && store.has(ks[2]));
+    // Corrupted oversized or truncated files miss and get dropped.
+    let hex = ks[0].hex();
+    let path = dir.join(&hex[..2]).join(format!("{hex}.kv"));
+    std::fs::write(&path, [9u8; 20]).unwrap();
+    assert!(!store.load(ks[0], &mut dst).unwrap());
+    assert!(!store.has(ks[0]));
+    let hex2 = ks[2].hex();
+    let path2 = dir.join(&hex2[..2]).join(format!("{hex2}.kv"));
+    std::fs::write(&path2, [9u8; 8]).unwrap();
+    assert!(!store.load(ks[2], &mut dst).unwrap());
+    assert!(!store.has(ks[2]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn pages_persist_and_evict() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("tessera-kv-store-{}", std::process::id()));
@@ -118,5 +178,45 @@ fn tiered_ram_ssd_cascade() {
     drop(tiered);
     let reopened = TieredStore::open(&cfg, 0, 1).unwrap();
     assert!(!reopened.has(keys[0]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn spare_ram_caches() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tessera-kv-spare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let keys = page_keys([5, 9], &[1, 2, 3, 4], 4);
+    let payload = [7u8; 64];
+    let make_cfg = |floor: u64| KvConfig {
+        tiers: vec![tessera_kv::TierSpec {
+            name: "ssd".into(),
+            store: StoreKind::Ssd {
+                path: dir.clone(),
+                bytes: 256,
+                persist: false,
+            },
+            keep: Some(Keep::All),
+            spare_ram: Some(floor),
+        }],
+        ..KvConfig::default()
+    };
+
+    // A 1-byte floor caches pages in spare RAM.
+    let mut cached = TieredStore::open(&make_cfg(1), 0, 1).unwrap();
+    assert!(cached.save(keys[0], &payload).unwrap());
+    let mut got = [0u8; 64];
+    assert!(cached.load(keys[0], &mut got).unwrap());
+    assert_eq!(got, payload);
+    assert_eq!(cached.stats().hits, 0);
+    drop(cached);
+
+    // An unreachable floor bypasses spare RAM for disk.
+    let mut uncached = TieredStore::open(&make_cfg(u64::MAX), 0, 1).unwrap();
+    assert!(uncached.save(keys[0], &payload).unwrap());
+    let mut got2 = [0u8; 64];
+    assert!(uncached.load(keys[0], &mut got2).unwrap());
+    assert_eq!(got2, payload);
+    assert_eq!(uncached.stats().hits, 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

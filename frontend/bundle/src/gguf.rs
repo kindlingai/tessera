@@ -172,11 +172,10 @@ pub(crate) fn load(
     let mut config = config(&gguf, arch, slots, context)?;
     config.stack.steps = steps;
     // An output table unlike the embedding is the head's own.
-    config.tied = !gguf.has("output.weight")
-        || gguf.bytes("output.weight")? == gguf.bytes("token_embd.weight")?;
+    config.tied =
+        !gguf.has("output.weight") || gguf.same_bytes("output.weight", "token_embd.weight")?;
     let graph = (crate::decoder::family(arch)?.step)(&config);
     let layers = config.stack.layers;
-    let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
     let mut template = gguf
         .str("tokenizer.chat_template")
         .map(|s| Template::new(s.to_owned()))
@@ -191,11 +190,13 @@ pub(crate) fn load(
             }
         }
     }
+    let tokenizer = tokenizer(&gguf)?;
+    let (graph, weights, pins) = crate::streamed(graph, Box::new(gguf), layers, user.to_vec())?;
     Ok(Bundle {
         graph,
-        weights: crate::Weights::Held(weights),
+        weights,
         pins: Some(pins),
-        tokenizer: tokenizer(&gguf)?,
+        tokenizer,
         template,
         response,
         stop,

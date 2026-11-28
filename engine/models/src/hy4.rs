@@ -2,8 +2,12 @@
 
 use crate::keys::{At, Keys};
 use crate::shared::{
-    CalibTaps, Dense, NOPE, ROPE, Rotated, Stack, Steps, Swiglu, part, rows, swiglu_tapped,
+    CalibTaps, NOPE, ROPE, Stack, Steps, Swiglu, cat, declare_parts, each_part, part, rows,
 };
+use moe::LatentMoe;
+
+mod moe;
+pub use moe::{LatentExperts, PlainLatent, RotatedLatent};
 use serde_json::json;
 use std::marker::PhantomData;
 use tessera_trace::DimName::*;
@@ -12,10 +16,10 @@ use tessera_trace::hf::{
 };
 use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear,
-    Linears, Mask, Model, Norm, Pairs, PathSeg, Port, Role, Shape, Size, Tensor, TensorType,
-    Vector, Weights,
+    Mask, Model, Norm, Pairs, PathSeg, Port, Role, Shape, Size, Tensor, TensorType, Vector,
+    Weights,
 };
-use tessera_trace::{mask_port, pick};
+use tessera_trace::{pick, step_ports_with, tokens};
 
 const Q_LATENT: DimName = DimName::named("QLatent");
 const LATENT: DimName = DimName::named("Latent");
@@ -36,8 +40,6 @@ const ENGRAM_DIM: DimName = DimName::named("EngramDim");
 
 /// Epsilon for Engram RMSNorm layers.
 const ENGRAM_EPS: f32 = f32::EPSILON;
-/// Hadamard rotation block size for rotated experts.
-const ROTATION: u32 = 128;
 
 /// Multi-layer Engram lookup dimensions.
 #[derive(Clone, Debug)]
@@ -263,19 +265,6 @@ fn read_rope_theta(k: &mut Keys, at: &At, sub: &str, default: f32) -> f32 {
     k.read_or(at, key.as_str(), default)
 }
 
-/// Concatenates `lead` axes with `tail`.
-fn cat<const N: usize>(lead: &[DimExpr], tail: [DimExpr; N]) -> Vec<DimExpr> {
-    lead.iter().cloned().chain(tail).collect()
-}
-
-/// Clamps `gate <= limit` and `-limit <= up <= limit`.
-fn clamp_swiglu(gate: Tensor, up: Tensor, limit: Option<f32>) -> [Tensor; 2] {
-    match limit {
-        Some(lim) => [gate.min(lim), up.min(lim).max(-lim)],
-        None => [gate, up],
-    }
-}
-
 /// Non-combined 4-stream iHC pre-mixer and post-injector.
 #[derive(Weights)]
 struct HyperConn {
@@ -364,24 +353,6 @@ struct EngramBlock {
     norm_query: Vec<Norm>,
     pre_gamma: Vector,
     hc_scales: Vec<Vector>,
-}
-
-fn declare_parts<T: Weights>(
-    m: &Model,
-    p: &mut Vec<PathSeg>,
-    name: &str,
-    n: usize,
-    shape: &[DimExpr],
-) -> Vec<T> {
-    (0..n)
-        .map(|i| {
-            p.push(PathSeg::Field(name.into()));
-            p.push(PathSeg::Index(i as u32));
-            let item = T::declare(m, p, shape);
-            p.truncate(p.len() - 2);
-            item
-        })
-        .collect()
 }
 
 impl EngramBlock {
@@ -602,157 +573,6 @@ struct DenseMlp {
     post_fc2_norm: Norm,
 }
 
-/// Routed latent experts in `ROUTED_HIDDEN` space.
-pub trait LatentExperts: Weights {
-    type Shared: Dense;
-
-    fn apply_routed(
-        &self,
-        m: &Model,
-        x_lat: &Tensor,
-        picks: [&Tensor; 2],
-        limit: Option<f32>,
-    ) -> Tensor;
-}
-
-/// Plain routed latent experts.
-#[derive(Weights)]
-pub struct PlainLatent {
-    #[shape(Experts, ROUTED_HIDDEN, Ffn)]
-    pub ex_gate: Linears,
-    #[shape(Experts, ROUTED_HIDDEN, Ffn)]
-    pub ex_up: Linears,
-    #[shape(Experts, Ffn, ROUTED_HIDDEN)]
-    pub ex_down: Linears,
-}
-
-impl LatentExperts for PlainLatent {
-    type Shared = Linear;
-
-    fn apply_routed(
-        &self,
-        m: &Model,
-        x_lat: &Tensor,
-        [ids, gates]: [&Tensor; 2],
-        limit: Option<f32>,
-    ) -> Tensor {
-        let on = |set: &Linears, x: &Tensor| x.matmul_rows(&m.pick(set, ids));
-        let [g, u] = clamp_swiglu(on(&self.ex_gate, x_lat), on(&self.ex_up, x_lat), limit);
-        let inner = g.act(Act::Silu).mul(&u);
-        let picks = x_lat.ty().rank() as u32 - 1;
-        on(&self.ex_down, &inner).mix(picks, gates)
-    }
-}
-
-/// Exlr8 rotated routed latent experts.
-#[derive(Weights)]
-pub struct RotatedLatent {
-    #[shape(ROUTED_HIDDEN)]
-    pub signs_in: Vector,
-    #[shape(ROUTED_HIDDEN)]
-    pub signs_out: Vector,
-    #[shape(Experts, ROUTED_HIDDEN, Ffn)]
-    pub ex_gate: Linears,
-    #[shape(Experts, ROUTED_HIDDEN)]
-    pub ex_gate_su: Embed,
-    #[shape(Experts, Ffn)]
-    pub ex_gate_sv: Embed,
-    #[shape(Experts, ROUTED_HIDDEN, Ffn)]
-    pub ex_up: Linears,
-    #[shape(Experts, ROUTED_HIDDEN)]
-    pub ex_up_su: Embed,
-    #[shape(Experts, Ffn)]
-    pub ex_up_sv: Embed,
-    #[shape(Experts, Ffn, ROUTED_HIDDEN)]
-    pub ex_down: Linears,
-    #[shape(Experts, Ffn)]
-    pub ex_down_su: Embed,
-    #[shape(Experts, ROUTED_HIDDEN)]
-    pub ex_down_sv: Embed,
-}
-
-impl LatentExperts for RotatedLatent {
-    type Shared = Rotated;
-
-    fn apply_routed(
-        &self,
-        m: &Model,
-        x_lat: &Tensor,
-        [ids, gates]: [&Tensor; 2],
-        limit: Option<f32>,
-    ) -> Tensor {
-        let picks = x_lat.ty().rank() as u32 - 1;
-        let lead = &x_lat.ty().shape.0[..picks as usize];
-        let x_rot = x_lat
-            .mul_vector(&self.signs_in)
-            .reshape(cat(lead, [DimExpr::Const(1), ROUTED_HIDDEN.into()]))
-            .expand(picks, TopK);
-        let turn = |x: &Tensor, set: &Linears, su: &Embed, sv: &Embed| {
-            let turned = x
-                .mul(&m.embed(ids, su))
-                .hadamard(ROTATION)
-                .matmul_rows(&m.pick(set, ids));
-            turned.hadamard(ROTATION).mul(&m.embed(ids, sv))
-        };
-        let g = turn(&x_rot, &self.ex_gate, &self.ex_gate_su, &self.ex_gate_sv);
-        let u = turn(&x_rot, &self.ex_up, &self.ex_up_su, &self.ex_up_sv);
-        let [g, u] = clamp_swiglu(g, u, limit);
-        let inner = g.act(Act::Silu).mul(&u);
-        let out = turn(&inner, &self.ex_down, &self.ex_down_su, &self.ex_down_sv);
-        out.mix(picks, gates).mul_vector(&self.signs_out)
-    }
-}
-
-/// LatentMoE block with shared expert and combine norm.
-struct LatentMoe<E: LatentExperts> {
-    post_attn_norm: Norm,
-    router: Linear,
-    router_bias: Vector,
-    routed_down: Linear,
-    routed: E,
-    routed_up: Linear,
-    shared: Swiglu<E::Shared>,
-    combine_norm: Norm,
-}
-
-impl<E: LatentExperts> Weights for LatentMoe<E> {
-    fn declare(m: &Model, path: &mut Vec<PathSeg>, _shape: &[DimExpr]) -> Self {
-        let hid: DimExpr = Hidden.into();
-        let r_hid: DimExpr = ROUTED_HIDDEN.into();
-        let exp: DimExpr = Experts.into();
-        Self {
-            post_attn_norm: part(m, path, "post_attn_norm", std::slice::from_ref(&hid)),
-            router: part(m, path, "router", &[hid.clone(), exp.clone()]),
-            router_bias: part(m, path, "router_bias", &[exp]),
-            routed_down: part(m, path, "routed_down", &[hid.clone(), r_hid.clone()]),
-            routed: part(m, path, "routed", &[]),
-            routed_up: part(m, path, "routed_up", &[r_hid, hid.clone()]),
-            shared: part(m, path, "shared", &[hid.clone(), Ffn.into()]),
-            combine_norm: part(m, path, "combine_norm", &[hid]),
-        }
-    }
-}
-
-impl<E: LatentExperts> LatentMoe<E> {
-    fn apply(&self, m: &Model, c: &Config, h_in: &Tensor, taps: &CalibTaps) -> Tensor {
-        let h = h_in.rms_norm(&self.post_attn_norm, c.eps);
-        let probs = h.matmul(&self.router).act(Act::Sigmoid);
-        let ids = probs.add_vector(&self.router_bias).top_k(TopK);
-        let gates = probs.take(&ids).unit_sum().scale(c.route_scale);
-        taps.note(CalibTap::RouterIds, &ids);
-        taps.note(CalibTap::RouterGates, &gates);
-        let x_lat = h.matmul(&self.routed_down);
-        let y_lat = self
-            .routed
-            .apply_routed(m, &x_lat, [&ids, &gates], c.swiglu_limit);
-        let y_routed = y_lat.matmul(&self.routed_up);
-        let [y_shared, sh_in] =
-            swiglu_tapped(&h, [&self.shared.gate, &self.shared.up, &self.shared.down]);
-        taps.note(CalibTap::SharedDownIn, &sh_in);
-        y_routed.add(&y_shared).rms_norm(&self.combine_norm, c.eps)
-    }
-}
-
 struct Hy4<E: LatentExperts> {
     embed: Embed,
     engram: Vec<EngramBlock>,
@@ -776,15 +596,7 @@ impl<E: LatentExperts> Hy4<E> {
         let moe_n = c.stack.layers.saturating_sub(c.dense_layers) as usize;
         Self {
             embed: part(m, &mut p, "embed", &[Vocab.into(), hid.clone()]),
-            engram: (0..eng_n)
-                .map(|i| {
-                    p.push(PathSeg::Field("engram".into()));
-                    p.push(PathSeg::Index(i as u32));
-                    let item = EngramBlock::declare(m, &mut p, c);
-                    p.truncate(p.len() - 2);
-                    item
-                })
-                .collect(),
+            engram: each_part(&mut p, "engram", eng_n, |p| EngramBlock::declare(m, p, c)),
             attn_hc: declare_parts(m, &mut p, "attn_hc", layers, &[]),
             mlp_hc: declare_parts(m, &mut p, "mlp_hc", layers, &[]),
             dsa: declare_parts(m, &mut p, "dsa", c.dsa_count() as usize, &[]),
@@ -911,11 +723,9 @@ fn port(role: Role, shape: impl Into<tessera_trace::Shape>, dtype: DType) -> Por
 pub fn program<E: LatentExperts>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w = Hy4::<E>::declare(&m, c);
-    let (tp, pp) = (
-        port(Role::Tokens, [Seqs, Context], DType::U32),
-        port(Role::Positions, [Seqs, Context], DType::U32),
-    );
     let (tokens, positions, ple) = if c.engram.is_some() {
+        let tp = port(Role::Tokens, [Seqs, Context], DType::U32);
+        let pp = port(Role::Positions, [Seqs, Context], DType::U32);
         let ep = port(
             Role::Ple,
             vec![Seqs.into(), Context.into(), ENGRAM_LAYERS * ENGRAM_DIM],
@@ -924,7 +734,7 @@ pub fn program<E: LatentExperts>(c: &Config) -> Graph {
         let [t, p, ple] = m.entry(EntryKind::Forward, [tp, pp, ep]);
         (t, p, Some(ple))
     } else {
-        let [t, p] = m.entry(EntryKind::Forward, [tp, pp]);
+        let [t, p] = tokens(&m);
         (t, p, None)
     };
     let calib = CalibTaps::default();
@@ -941,34 +751,12 @@ pub fn stepper<E: LatentExperts>(c: &Config) -> Graph {
     });
     let m = Model::new(dims);
     let w = Hy4::<E>::declare(&m, c);
-    let [t, p, s] =
-        [Role::Tokens, Role::Positions, Role::Slots].map(|r| port(r, [Rows], DType::U32));
-    let ep = || {
-        port(
-            Role::Ple,
-            vec![Rows.into(), ENGRAM_LAYERS * ENGRAM_DIM],
-            DType::F32,
-        )
-    };
+    let ple = c.engram.is_some().then(|| {
+        let shape = vec![Rows.into(), ENGRAM_LAYERS * ENGRAM_DIM];
+        port(Role::Ple, shape, DType::F32)
+    });
     let masked = c.stack.steps == Steps::Masked;
-    let (tokens, positions, slots, ple_in, allowed) = match (c.engram.is_some(), masked) {
-        (true, true) => {
-            let [t, p, s, ple, mask] = m.entry(EntryKind::Step, [t, p, s, ep(), mask_port()]);
-            (t, p, s, Some(ple), Some(mask))
-        }
-        (true, false) => {
-            let [t, p, s, ple] = m.entry(EntryKind::Step, [t, p, s, ep()]);
-            (t, p, s, Some(ple), None)
-        }
-        (false, true) => {
-            let [t, p, s, mask] = m.entry(EntryKind::Step, [t, p, s, mask_port()]);
-            (t, p, s, None, Some(mask))
-        }
-        (false, false) => {
-            let [t, p, s] = m.entry(EntryKind::Step, [t, p, s]);
-            (t, p, s, None, None)
-        }
-    };
+    let ([tokens, positions, slots], ple_in, allowed) = step_ports_with(&m, masked, ple);
     let kv_ty = TensorType::new(rows([DimExpr::Const(1), LATENT + ROPE]), DType::F32);
     let kv = (0..c.stack.layers).map(|_| m.kept(kv_ty.clone())).collect();
     let state = StepState {

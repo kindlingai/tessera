@@ -93,9 +93,17 @@ impl Fixture {
 }
 
 fn held(weights: crate::Weights) -> Vec<Weight> {
-    let crate::Weights::Held(all) = weights else {
-        panic!("a gguf file holds its weights");
-    };
+    let mut all = Vec::new();
+    weights
+        .each(|_, w| -> Result<(), std::convert::Infallible> {
+            all.push(match w {
+                Weight::Floats(t) => Weight::Floats(t.clone()),
+                Weight::Packed(f, b) => Weight::Packed(*f, b.clone()),
+                Weight::Filed(f, file) => Weight::Filed(*f, file.clone()),
+            });
+            Ok(())
+        })
+        .unwrap();
     all
 }
 

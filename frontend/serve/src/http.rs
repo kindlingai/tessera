@@ -257,6 +257,47 @@ fn connection(mut stream: TcpStream, limits: &Limits, route: &dyn Fn(&Request) -
     }
 }
 
+/// Reads `dst` completely from `stream` before `deadline`.
+fn read_into(stream: &mut TcpStream, mut dst: &mut [u8], deadline: Instant) -> Result<(), Fail> {
+    while !dst.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::from(ErrorKind::TimedOut).into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        let n = stream.read(dst)?;
+        if n == 0 {
+            return Err(Fail::Gone);
+        }
+        dst = &mut dst[n..];
+    }
+    Ok(())
+}
+
+/// Reads `length` body bytes from `buffer` and `stream` directly.
+fn read_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    length: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, Fail> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if buffer.len() >= length {
+        if buffer.len() == length {
+            return Ok(std::mem::take(buffer));
+        }
+        return Ok(buffer.drain(..length).collect());
+    }
+    let mut body = vec![0u8; length];
+    let have = buffer.len();
+    body[..have].copy_from_slice(buffer);
+    buffer.clear();
+    read_into(stream, &mut body[have..], deadline)?;
+    Ok(body)
+}
+
 /// Reads until `deadline`. `Ok(0)`: the peer closed.
 fn fill(stream: &mut TcpStream, buffer: &mut Vec<u8>, deadline: Instant) -> io::Result<usize> {
     let left = deadline.saturating_duration_since(Instant::now());
@@ -351,14 +392,7 @@ fn read(
         let deadline = Instant::now() + limits.body_timeout;
         request.body = match chunked {
             true => read_chunked(stream, buffer, limits, deadline)?,
-            false => {
-                while buffer.len() < length {
-                    if fill(stream, buffer, deadline)? == 0 {
-                        return Err(Fail::Gone);
-                    }
-                }
-                buffer.drain(..length).collect()
-            }
+            false => read_body(stream, buffer, length, deadline)?,
         };
         return Ok(Some((request, close)));
     }
@@ -416,17 +450,23 @@ fn read_chunked(
         if next > limits.max_body {
             return Err(Fail::Status(413));
         }
-        let need = size.checked_add(2).ok_or(Fail::Status(413))?;
-        while buffer.len() < need {
+        let start = body.len();
+        body.resize(next, 0);
+        let take = buffer.len().min(size);
+        body[start..start + take].copy_from_slice(&buffer[..take]);
+        buffer.drain(..take);
+        if take < size {
+            read_into(stream, &mut body[start + take..], deadline)?;
+        }
+        while buffer.len() < 2 {
             if fill(stream, buffer, deadline)? == 0 {
                 return Err(Fail::Gone);
             }
         }
-        if &buffer[size..size + 2] != b"\r\n" {
+        if &buffer[..2] != b"\r\n" {
             return Err(Fail::Status(400));
         }
-        body.extend_from_slice(&buffer[..size]);
-        buffer.drain(..size + 2);
+        buffer.drain(..2);
     }
 }
 

@@ -42,9 +42,14 @@ fn sample(alignment: u64) -> Vec<u8> {
         dims: vec![count],
         bytes,
     };
+    let bf16: Vec<u8> = [1.5f32, -2.25]
+        .iter()
+        .flat_map(|f| tessera_engine::Bf16::from(*f).0.to_le_bytes())
+        .collect();
     let tensors = [
         tensor("f", GgufType::F32, 2, floats.collect()),
         tensor("h", GgufType::F16, 2, vec![0, 0x3c, 0, 0xc0]),
+        tensor("b", GgufType::BF16, 2, bf16),
         tensor("q8", GgufType::Q8_0, 32, vec![23; 34]),
         tensor("q4", GgufType::Q4_0, 32, vec![45; 18]),
     ];
@@ -92,6 +97,7 @@ fn reads_gguf() {
         metadata(&g);
         assert_eq!(g.floats("f").unwrap(), [1.25, -2.5]);
         assert_eq!(g.floats("h").unwrap(), [1., -2.]);
+        assert_eq!(g.floats("b").unwrap(), [1.5, -2.25]);
         assert_eq!(g.bytes("q8").unwrap(), (GgufType::Q8_0, 32, vec![23; 34]));
         assert_eq!(g.bytes("q4").unwrap(), (GgufType::Q4_0, 32, vec![45; 18]));
         assert_eq!(g.dims("q8").unwrap(), [32]);
@@ -100,12 +106,14 @@ fn reads_gguf() {
         assert!(g.has("q8") && !g.has("absent"));
         let slices = g.slices();
         let names: Vec<&str> = slices.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["f", "h", "q4", "q8"]);
-        let q8 = &slices[3];
+        assert_eq!(names, ["b", "f", "h", "q4", "q8"]);
+        assert_eq!((slices[0].elements(), slices[0].stored), (2, Stored::BF16));
+        let q8 = &slices[4];
         assert_eq!(
             (q8.elements(), q8.stored),
             (32, Stored::Form(&tessera_engine::block::Q8_0))
         );
+        assert_eq!(Offer::packed(&g, "b").unwrap().len(), 4);
         assert_eq!(Offer::packed(&g, "q8").unwrap(), vec![23; 34]);
         assert!(matches!(Offer::packed(&g, "f"), Err(Error::DType(_))));
         let mut v2 = bytes.clone();

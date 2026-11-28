@@ -6,7 +6,10 @@ use tessera_lower::form::Load as Stored;
 use tessera_lower::sites;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
 
-/// One thread per output element, widened from the table.
+/// Elements handled per thread on the vectorized path.
+const WIDE: usize = 4;
+
+/// One thread per element or quad, widened from the table.
 #[kernel]
 fn gather(
     #[form(form)] table: Buf<Dyn>,
@@ -16,19 +19,38 @@ fn gather(
     width: u32,
     table_rows: u32,
     #[build] form: &'static dyn Stored,
+    #[build] wide: bool,
 ) {
-    if gid() >= rows * width {
-        return;
+    if wide {
+        let width4 = width / 4;
+        if gid() >= rows * width4 {
+            return;
+        }
+        let row = ids[(gid() / width4) as u64];
+        let mut o = F32x4::zero();
+        if row < table_rows {
+            let col = (gid() % width4) * 4;
+            let v = table.load4(row as u64 * width as u64 + col as u64);
+            o.x = v.x;
+            o.y = v.y;
+            o.z = v.z;
+            o.w = v.w;
+        }
+        out.store4((gid() * 4) as u64, o);
+    } else {
+        if gid() >= rows * width {
+            return;
+        }
+        let row = ids[(gid() / width) as u64];
+        let mut v = 0.0f32;
+        if row < table_rows {
+            v = table[row as u64 * width as u64 + (gid() % width) as u64];
+        }
+        out[gid() as u64] = v;
     }
-    let row = ids[(gid() / width) as u64];
-    let mut v = 0.0f32;
-    if row < table_rows {
-        v = table[row as u64 * width as u64 + (gid() % width) as u64];
-    }
-    out[gid() as u64] = v;
 }
 
-/// One thread per output from a kept table.
+/// One thread per element or quad from a kept table.
 #[kernel]
 fn kept_gather(
     #[form(form)] table: Buf<Dyn>,
@@ -39,25 +61,58 @@ fn kept_gather(
     feat: u32,
     slots: u32,
     #[build] form: &'static dyn Stored,
+    #[build] wide: bool,
 ) {
-    let per_row = keys * feat;
-    if gid() >= rows * per_row {
-        return;
+    if wide {
+        let feat4 = feat / 4;
+        let per_row = keys * feat4;
+        if gid() >= rows * per_row {
+            return;
+        }
+        let r = gid() / per_row;
+        let rem = gid() % per_row;
+        let pos = rem / feat4;
+        let j = (rem % feat4) * 4;
+        let slot = ids[r as u64];
+        let mut o = F32x4::zero();
+        if slot < slots {
+            let v = table.load4((kept_row(slot, pos) * feat + j) as u64);
+            o.x = v.x;
+            o.y = v.y;
+            o.z = v.z;
+            o.w = v.w;
+        }
+        out.store4((gid() * 4) as u64, o);
+    } else {
+        let per_row = keys * feat;
+        if gid() >= rows * per_row {
+            return;
+        }
+        let r = gid() / per_row;
+        let rem = gid() % per_row;
+        let pos = rem / feat;
+        let j = rem % feat;
+        let slot = ids[r as u64];
+        let mut v = 0.0f32;
+        if slot < slots {
+            v = table[(kept_row(slot, pos) * feat + j) as u64];
+        }
+        out[gid() as u64] = v;
     }
-    let r = gid() / per_row;
-    let rem = gid() % per_row;
-    let pos = rem / feat;
-    let j = rem % feat;
-    let slot = ids[r as u64];
-    let mut v = 0.0f32;
-    if slot < slots {
-        v = table[(kept_row(slot, pos) * feat + j) as u64];
-    }
-    out[gid() as u64] = v;
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(gather(self.form), name = self.form.suffixed("gather"), threads = self.rows * self.width, accepts = gather_accepts)]
+#[launch(
+    gather(self.form, self.width.is_multiple_of(WIDE)),
+    name = self.form.suffixed("gather"),
+    threads = if self.width.is_multiple_of(WIDE) {
+        self.rows * (self.width / WIDE)
+    } else {
+        self.rows * self.width
+    },
+    accepts = gather_accepts,
+    source = gather_source,
+)]
 pub struct Gather {
     pub rows: usize,
     pub width: usize,
@@ -71,6 +126,16 @@ fn gather_accepts(k: &Gather, input: usize, form: &dyn Stored) -> bool {
     k.form.taken(input, 0, form)
 }
 
+fn gather_source(k: &Gather) -> Source {
+    let wide = k.width.is_multiple_of(WIDE);
+    let suffix = if wide { "_x4" } else { "" };
+    let entry = match k.form.name() {
+        "f32" => format!("plan_gather{suffix}"),
+        f => format!("plan_gather{suffix}_{f}"),
+    };
+    Source::named(gather_ir(k.form, wide), entry)
+}
+
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "kept_gather",
@@ -79,7 +144,11 @@ fn gather_accepts(k: &Gather, input: usize, form: &dyn Stored) -> bool {
     accepts = kept_accepts,
     source = kept_source,
     launches = kept_launches,
-    shape = Shape::Line(self.rows * self.keys * self.feat),
+    shape = Shape::Line(if self.feat.is_multiple_of(WIDE) {
+        self.rows * self.keys * (self.feat / WIDE)
+    } else {
+        self.rows * self.keys * self.feat
+    }),
 )]
 pub struct KeptGather {
     pub rows: usize,
@@ -96,10 +165,12 @@ fn kept_accepts(k: &KeptGather, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn kept_source(k: &KeptGather) -> Source {
-    let body = kept::attach(kept_gather_ir(k.form), k.kept);
+    let wide = k.feat.is_multiple_of(WIDE);
+    let body = kept::attach(kept_gather_ir(k.form, wide), k.kept);
+    let suffix = if wide { "_x4" } else { "" };
     let entry = match k.form.name() {
-        "f32" => format!("plan_kept_gather_{}", k.kept.name()),
-        f => format!("plan_kept_gather_{}_{f}", k.kept.name()),
+        "f32" => format!("plan_kept_gather{suffix}_{}", k.kept.name()),
+        f => format!("plan_kept_gather{suffix}_{}_{f}", k.kept.name()),
     };
     Source::named(body, entry)
 }

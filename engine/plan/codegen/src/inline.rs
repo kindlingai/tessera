@@ -2,9 +2,11 @@
 
 use crate::ir::{Body, Expr, Helper, Intrinsic, Param, Stmt};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// The prefix of the fields a kernel's returned group declares.
 pub const BUILT: &str = "self";
+const BUILT_PREFIX: &str = "self__";
 
 /// A called kernel's argument: a build value or a tree.
 pub trait Pass<T> {
@@ -115,7 +117,7 @@ impl Inliner {
     fn inline(&mut self, pre: &mut Vec<Stmt>, call: Inline, bound: Option<&str>) -> Option<Expr> {
         self.calls += 1;
         let Inline { callee, args } = call;
-        let body = match callee {
+        let mut body = match callee {
             Callee::Kernel(body) => body,
             Callee::Helper(h) => {
                 let took = h.body.params.len();
@@ -137,8 +139,9 @@ impl Inliner {
             "`{}` returns; a called kernel runs to its end",
             body.entry
         );
-        let mut names = HashMap::new();
-        for (param, arg) in body.params.iter().zip(args) {
+        let suffix = format!("__{}", self.calls);
+        let mut names = Names::default();
+        for (param, arg) in body.params.into_iter().zip(args) {
             match param {
                 // Buffers, group memory, tiles and arrays pass by name.
                 Param::Buffer { name, .. }
@@ -148,44 +151,46 @@ impl Inliner {
                     let Expr::Var(named) = arg else {
                         panic!("`{}` takes `{name}` by name", body.entry);
                     };
-                    names.insert(name.clone(), named);
+                    if name != named {
+                        names.insert(name, Target::Exact(named));
+                    }
                 }
                 // A name the callee never assigns reads as itself.
                 Param::Scalar { name, .. }
-                    if matches!(arg, Expr::Var(_)) && !assigns(&body.stmts, name) =>
+                    if matches!(arg, Expr::Var(_)) && !assigns(&body.stmts, &name) =>
                 {
                     let Expr::Var(named) = arg else {
                         unreachable!()
                     };
-                    names.insert(name.clone(), named);
+                    if name != named {
+                        names.insert(name, Target::Exact(named));
+                    }
                 }
                 Param::Scalar { name, ty } => {
-                    let fresh = self.fresh(name);
+                    let fresh = with_suffix(&name, &suffix);
                     pre.push(Stmt::Let {
                         name: fresh.clone(),
-                        init: Expr::cast(*ty, arg),
+                        init: Expr::cast(ty, arg),
                     });
-                    names.insert(name.clone(), fresh);
+                    names.insert(name, Target::Exact(fresh));
                 }
             }
         }
-        let mut declared = Vec::new();
-        declares(&body.stmts, &mut declared);
-        for name in declared {
-            // A built group's fields take the bound name.
-            let field = name.strip_prefix(&member(BUILT, ""));
-            let fresh = match (bound, field) {
-                (Some(to), Some(field)) => member(to, field),
-                _ => self.fresh(&name),
-            };
-            names.insert(name, fresh);
-        }
-        let renamer = Rename { names, call: None };
-        pre.extend(body.stmts.iter().map(|s| renamer.stmt(s)));
+        bind_declared(&body.stmts, bound, &mut names);
+        let renamer = Rename {
+            names,
+            suffix: &suffix,
+            call: None,
+        };
+        renamer.block(&mut body.stmts);
+        pre.append(&mut body.stmts);
         for h in body.helpers {
             self.helper(h);
         }
-        body.ret.as_ref().map(|e| renamer.expr(e))
+        body.ret.map(|mut e| {
+            renamer.expr(&mut e);
+            e
+        })
     }
 
     fn helper(&mut self, h: Helper) {
@@ -193,9 +198,121 @@ impl Inliner {
             self.helpers.push(h);
         }
     }
+}
 
-    fn fresh(&self, name: &str) -> String {
-        format!("{name}__{}", self.calls)
+fn with_suffix(name: &str, suffix: &str) -> String {
+    let mut out = String::with_capacity(name.len() + suffix.len());
+    out.push_str(name);
+    out.push_str(suffix);
+    out
+}
+
+fn bind_name(name: &str, bound: Option<&str>, names: &mut Names) {
+    // A built group's fields take the bound name.
+    let target = match (bound, name.strip_prefix(BUILT_PREFIX)) {
+        (Some(to), Some(field)) => Target::Exact(member(to, field)),
+        _ => Target::Suffix,
+    };
+    names.insert(name.to_owned(), target);
+}
+
+fn bind_declared(stmts: &[Stmt], bound: Option<&str>, names: &mut Names) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, .. }
+            | Stmt::Array { name, .. }
+            | Stmt::Shared { name, .. }
+            | Stmt::AtomicShared { name, .. }
+            | Stmt::TileAcc { name, .. }
+            | Stmt::TileHeld { name, .. } => bind_name(name, bound, names),
+            Stmt::For { var, body, .. } => {
+                bind_name(var, bound, names);
+                bind_declared(body, bound, names);
+            }
+            Stmt::If { then, els, .. } => {
+                bind_declared(then, bound, names);
+                bind_declared(els, bound, names);
+            }
+            Stmt::TileEach { body, .. } => bind_declared(body, bound, names),
+            _ => {}
+        }
+    }
+}
+
+/// Fast non-cryptographic hasher for short local symbol tables.
+#[derive(Default)]
+struct SymHash(u64);
+
+impl Hasher for SymHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+        self.0 = h;
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<SymHash>>;
+
+enum Target {
+    Exact(String),
+    Suffix,
+}
+
+/// Inline small map, promoting to a hash map when large.
+enum Names {
+    Small(Vec<(String, Target)>),
+    Many(FastMap<String, Target>),
+}
+
+impl Default for Names {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+impl Names {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Small(v) => v.is_empty(),
+            Self::Many(m) => m.is_empty(),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Target> {
+        match self {
+            Self::Small(v) => v.iter().find(|(k, _)| k == key).map(|(_, to)| to),
+            Self::Many(m) => m.get(key),
+        }
+    }
+
+    fn insert(&mut self, key: String, val: Target) {
+        match self {
+            Self::Small(v) => {
+                if let Some((_, slot)) = v.iter_mut().find(|(k, _)| *k == key) {
+                    *slot = val;
+                    return;
+                }
+                if v.len() < 12 {
+                    v.push((key, val));
+                    return;
+                }
+                let mut map = FastMap::with_capacity_and_hasher(32, Default::default());
+                for (k, old) in v.drain(..) {
+                    map.insert(k, old);
+                }
+                map.insert(key, val);
+                *self = Self::Many(map);
+            }
+            Self::Many(m) => {
+                m.insert(key, val);
+            }
+        }
     }
 }
 
@@ -219,157 +336,135 @@ fn assigns(stmts: &[Stmt], name: &str) -> bool {
     })
 }
 
-/// Every name the statements bind, nested ones included.
-fn declares(stmts: &[Stmt], out: &mut Vec<String>) {
-    for s in stmts {
-        match s {
-            Stmt::Let { name, .. }
-            | Stmt::Array { name, .. }
-            | Stmt::Shared { name, .. }
-            | Stmt::AtomicShared { name, .. }
-            | Stmt::TileAcc { name, .. }
-            | Stmt::TileHeld { name, .. } => out.push(name.clone()),
-            Stmt::For { var, body, .. } => {
-                out.push(var.clone());
-                declares(body, out);
-            }
-            Stmt::If { then, els, .. } => {
-                declares(then, out);
-                declares(els, out);
-            }
-            Stmt::TileEach { body, .. } => declares(body, out),
-            _ => {}
-        }
-    }
-}
-
-/// `stmts` with each `intrinsic` call replaced by `with`.
-pub(crate) fn replace(stmts: &[Stmt], intrinsic: Intrinsic, with: Replace<'_>) -> Vec<Stmt> {
-    let names = HashMap::new();
+/// Rewrites each `intrinsic` call in `stmts` with `with` in place.
+pub(crate) fn replace(stmts: &mut [Stmt], intrinsic: Intrinsic, with: Replace<'_>) {
+    let names = Names::default();
     let call = Some((intrinsic, with));
-    Rename { names, call }.block(stmts)
+    Rename {
+        names,
+        suffix: "",
+        call,
+    }
+    .block(stmts);
 }
 
 /// Gives a call's value from its arguments.
 type Replace<'a> = &'a dyn Fn(Vec<Expr>) -> Expr;
 
-/// Rewrites a tree with the callee's names replaced.
+/// Rewrites a tree in place with renamed symbols.
 struct Rename<'a> {
-    names: HashMap<String, String>,
+    names: Names,
+    suffix: &'a str,
     /// Calls of this intrinsic become the function's value.
     call: Option<(Intrinsic, Replace<'a>)>,
 }
 
 impl Rename<'_> {
-    fn name(&self, name: &str) -> String {
-        self.names.get(name).cloned().unwrap_or_else(|| name.into())
-    }
-
-    fn block(&self, stmts: &[Stmt]) -> Vec<Stmt> {
-        stmts.iter().map(|s| self.stmt(s)).collect()
-    }
-
-    fn expr(&self, e: &Expr) -> Expr {
-        let sub = |e: &Expr| Box::new(self.expr(e));
-        match e {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => e.clone(),
-            Expr::Var(name) => Expr::Var(self.name(name)),
-            Expr::Neg(a) => Expr::Neg(sub(a)),
-            Expr::Not(a) => Expr::Not(sub(a)),
-            Expr::Bin(op, a, b) => Expr::Bin(*op, sub(a), sub(b)),
-            Expr::Cast(ty, a) => Expr::Cast(*ty, sub(a)),
-            Expr::Index(base, at) => Expr::Index(sub(base), sub(at)),
-            Expr::Field(base, h) => Expr::Field(sub(base), *h),
-            Expr::Call(i, args) => {
-                let args = args.iter().map(|a| self.expr(a)).collect();
-                match self.call {
-                    Some((to, with)) if to == *i => with(args),
-                    _ => Expr::Call(*i, args),
-                }
+    fn name(&self, name: &mut String) {
+        if self.names.is_empty() {
+            return;
+        }
+        match self.names.get(name) {
+            Some(Target::Exact(to)) => {
+                name.clear();
+                name.push_str(to);
             }
-            Expr::Select(c, a, b) => Expr::Select(sub(c), sub(a), sub(b)),
-            Expr::Fn(name, ty, args) => Expr::Fn(
-                name.clone(),
-                *ty,
-                args.iter().map(|a| self.expr(a)).collect(),
-            ),
+            Some(Target::Suffix) => name.push_str(self.suffix),
+            None => {}
         }
     }
 
-    fn stmt(&self, s: &Stmt) -> Stmt {
+    fn block(&self, stmts: &mut [Stmt]) {
+        for s in stmts {
+            self.stmt(s);
+        }
+    }
+
+    fn expr(&self, e: &mut Expr) {
+        match e {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => {}
+            Expr::Var(name) => self.name(name),
+            Expr::Neg(a) | Expr::Not(a) | Expr::Cast(_, a) | Expr::Field(a, _) => self.expr(a),
+            Expr::Bin(_, a, b) | Expr::Index(a, b) => {
+                self.expr(a);
+                self.expr(b);
+            }
+            Expr::Select(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                self.expr(b);
+            }
+            Expr::Fn(_, _, args) => {
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            Expr::Call(i, args) => {
+                for a in args.iter_mut() {
+                    self.expr(a);
+                }
+                if let Some((to, with)) = self.call
+                    && to == *i
+                {
+                    let taken = std::mem::take(args);
+                    *e = with(taken);
+                }
+            }
+        }
+    }
+
+    fn stmt(&self, s: &mut Stmt) {
         match s {
-            Stmt::Let { name, init } => Stmt::Let {
-                name: self.name(name),
-                init: self.expr(init),
-            },
-            Stmt::Array { name, ty, len } => Stmt::Array {
-                name: self.name(name),
-                ty: *ty,
-                len: *len,
-            },
-            Stmt::Shared { name, ty, len } => Stmt::Shared {
-                name: self.name(name),
-                ty: *ty,
-                len: *len,
-            },
-            Stmt::AtomicShared { name, len } => Stmt::AtomicShared {
-                name: self.name(name),
-                len: *len,
-            },
-            Stmt::AtomicAdd { name, at, value } => Stmt::AtomicAdd {
-                name: self.name(name),
-                at: self.expr(at),
-                value: self.expr(value),
-            },
-            Stmt::Assign { target, op, value } => Stmt::Assign {
-                target: self.expr(target),
-                op: *op,
-                value: self.expr(value),
-            },
+            Stmt::Let { name, init } => {
+                self.name(name);
+                self.expr(init);
+            }
+            Stmt::Array { name, .. }
+            | Stmt::Shared { name, .. }
+            | Stmt::AtomicShared { name, .. }
+            | Stmt::TileAcc { name, .. }
+            | Stmt::TileHeld { name, .. } => self.name(name),
+            Stmt::AtomicAdd { name, at, value } => {
+                self.name(name);
+                self.expr(at);
+                self.expr(value);
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.expr(target);
+                self.expr(value);
+            }
             Stmt::For {
                 var,
                 from,
                 to,
                 step,
-                unroll,
                 body,
-            } => Stmt::For {
-                var: self.name(var),
-                from: self.expr(from),
-                to: self.expr(to),
-                step: self.expr(step),
-                unroll: *unroll,
-                body: self.block(body),
-            },
-            Stmt::If { cond, then, els } => Stmt::If {
-                cond: self.expr(cond),
-                then: self.block(then),
-                els: self.block(els),
-            },
-            Stmt::Return => Stmt::Return,
-            Stmt::Barrier => Stmt::Barrier,
-            Stmt::Expr(e) => Stmt::Expr(self.expr(e)),
-            Stmt::TileAcc { name, rows, cols } => Stmt::TileAcc {
-                name: self.name(name),
-                rows: *rows,
-                cols: *cols,
-            },
-            Stmt::TileHeld { name, rows, depth } => Stmt::TileHeld {
-                name: self.name(name),
-                rows: *rows,
-                depth: *depth,
-            },
+                ..
+            } => {
+                self.name(var);
+                self.expr(from);
+                self.expr(to);
+                self.expr(step);
+                self.block(body);
+            }
+            Stmt::If { cond, then, els } => {
+                self.expr(cond);
+                self.block(then);
+                self.block(els);
+            }
+            Stmt::Return | Stmt::Barrier => {}
+            Stmt::Expr(e) => self.expr(e),
             Stmt::TileHold {
                 held,
                 a,
                 a_at,
                 stride,
-            } => Stmt::TileHold {
-                held: self.name(held),
-                a: self.expr(a),
-                a_at: self.expr(a_at),
-                stride: self.expr(stride),
-            },
+            } => {
+                self.name(held);
+                self.expr(a);
+                self.expr(a_at);
+                self.expr(stride);
+            }
             Stmt::TileBlock {
                 acc,
                 a,
@@ -377,31 +472,26 @@ impl Rename<'_> {
                 b,
                 b_at,
                 stride,
-                depth,
-                parts,
                 apart,
-            } => Stmt::TileBlock {
-                acc: self.name(acc),
-                a: self.expr(a),
-                a_at: self.expr(a_at),
-                b: self.expr(b),
-                b_at: self.expr(b_at),
-                stride: self.expr(stride),
-                depth: *depth,
-                parts: *parts,
-                apart: self.expr(apart),
-            },
-            Stmt::TileEach { acc, body } => Stmt::TileEach {
-                acc: self.name(acc),
-                body: self.block(body),
-            },
-            Stmt::TileZero { acc } => Stmt::TileZero {
-                acc: self.name(acc),
-            },
-            Stmt::TileScale { acc, by } => Stmt::TileScale {
-                acc: self.name(acc),
-                by: self.expr(by),
-            },
+                ..
+            } => {
+                self.name(acc);
+                self.expr(a);
+                self.expr(a_at);
+                self.expr(b);
+                self.expr(b_at);
+                self.expr(stride);
+                self.expr(apart);
+            }
+            Stmt::TileEach { acc, body } => {
+                self.name(acc);
+                self.block(body);
+            }
+            Stmt::TileZero { acc } => self.name(acc),
+            Stmt::TileScale { acc, by } => {
+                self.name(acc);
+                self.expr(by);
+            }
         }
     }
 }

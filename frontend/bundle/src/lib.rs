@@ -24,6 +24,7 @@ pub mod names;
 mod names_test;
 pub mod parts;
 pub mod qwen35;
+mod qwen3_vl;
 pub mod qwen4_exp;
 pub(crate) mod repack;
 #[cfg(test)]
@@ -269,6 +270,114 @@ pub fn pull(
     pull_shared(graph, offer, layers, rules, &|_| None)
 }
 
+/// Send-safe loaded weight before wrapping in a `Tensor`.
+pub(crate) struct Loaded {
+    form: &'static dyn Load,
+    data: RawData,
+}
+
+enum RawData {
+    Floats(Vec<usize>, Vec<f32>),
+    Packed(Vec<u8>),
+    Filed(std::sync::Arc<dyn tessera_engine::Filed>),
+}
+
+type Slot = std::sync::Mutex<Option<Result<Loaded, Failure>>>;
+
+impl Loaded {
+    pub(crate) fn into_weight(self) -> Weight {
+        match self.data {
+            RawData::Floats(shape, v) => Weight::Floats(Tensor::f32(shape, v)),
+            RawData::Packed(b) => Weight::Packed(self.form, b),
+            RawData::Filed(file) => Weight::Filed(self.form, file),
+        }
+    }
+}
+
+/// Reads one claimed weight from `offer`.
+fn load_claim(
+    graph: &Graph,
+    offer: &dyn Offer,
+    slice: &tessera_checkpoint::Slice,
+    c: &names::Claim,
+    at: usize,
+    share: Option<(u32, usize, usize)>,
+) -> Result<Loaded, Failure> {
+    let w = &graph.weights[at];
+    let axis = |e: &tessera_engine::DimExpr| e.value(&graph.dims, &|_| None).map(|n| n as usize);
+    let shape: Option<Vec<usize>> = w.ty.shape.0.iter().map(axis).collect();
+    let form = form(slice.stored, !c.parts.is_empty())?;
+    let packed = matches!(slice.stored, Stored::Form(src) if src.name() != "f32");
+    let data = match (packed, c.rows) {
+        _ if !c.parts.is_empty() => stacked_raw(offer, slice.stored, &c.parts, shape)?,
+        (true, Some(rows)) => RawData::Packed(offer.packed_rows(&c.name, rows)?),
+        (true, None) => match (share, offer.filed(&c.name)) {
+            (Some((ax, first, count)), None) => {
+                RawData::Packed(offer.packed_axis(&c.name, ax, (first, count))?)
+            }
+            (_, Some(file)) => RawData::Filed(file),
+            (None, None) => RawData::Packed(offer.packed(&c.name)?),
+        },
+        (false, _) => floats_raw(offer, slice, c.rows, shape)?,
+    };
+    Ok(Loaded { form, data })
+}
+
+/// Send-safe variant of `pull` for concurrent multi-graph loading.
+pub(crate) fn pull_raw(
+    graph: &Graph,
+    offer: &dyn Offer,
+    layers: u64,
+    rules: &[&[Rule]],
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+) -> Result<(Vec<Loaded>, Pins), Failure> {
+    let slices = offer.slices();
+    let claims = names::resolve(graph, &slices, rules)?;
+    let by_name: std::collections::HashMap<&str, &tessera_checkpoint::Slice> =
+        slices.iter().map(|s| (s.name.as_str(), s)).collect();
+    let count = claims.len();
+    let wanted: Vec<_> = (0..count).map(|i| shares(i as u32)).collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 8)
+        .min(count);
+    let mut loaded = Vec::with_capacity(count);
+    let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(count);
+    if threads <= 1 || count < 8 {
+        for (at, c) in claims.iter().enumerate() {
+            let item = load_claim(graph, offer, by_name[c.name.as_str()], c, at, wanted[at])?;
+            forms.push(item.form);
+            loaded.push(item);
+        }
+        return Ok((loaded, gguf::pins(graph, &forms, layers)));
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Slot> = (0..count).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (claims, by_name, wanted, next, results) =
+                (&claims, &by_name, &wanted, &next, &results);
+            scope.spawn(move || {
+                loop {
+                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if at >= count {
+                        break;
+                    }
+                    let c = &claims[at];
+                    let res = load_claim(graph, offer, by_name[c.name.as_str()], c, at, wanted[at]);
+                    *results[at].lock().expect("weight slot") = Some(res);
+                }
+            });
+        }
+    });
+    for slot in results {
+        let item = slot.into_inner().expect("weight slot").expect("loaded")?;
+        forms.push(item.form);
+        loaded.push(item);
+    }
+    Ok((loaded, gguf::pins(graph, &forms, layers)))
+}
+
 /// As `pull`, reading only each rank's slice when `shares` says.
 pub(crate) fn pull_shared(
     graph: &Graph,
@@ -277,14 +386,9 @@ pub(crate) fn pull_shared(
     rules: &[&[Rule]],
     shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
 ) -> Result<(Vec<Weight>, Pins), Box<dyn Error + Send + Sync>> {
-    let mut weights = Vec::with_capacity(graph.weights.len());
-    let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(graph.weights.len());
-    each(graph, offer, rules, shares, |weight, form| {
-        weights.push(weight);
-        forms.push(form);
-        Ok(())
-    })?;
-    Ok((weights, gguf::pins(graph, &forms, layers)))
+    let (loaded, pins) = pull_raw(graph, offer, layers, rules, shares)?;
+    let weights = loaded.into_iter().map(Loaded::into_weight).collect();
+    Ok((weights, pins))
 }
 
 /// The forms `offer` stores. No weight bytes are read.
@@ -296,9 +400,11 @@ pub fn pins(
 ) -> Result<Pins, Box<dyn Error + Send + Sync>> {
     let slices = offer.slices();
     let claims = names::resolve(graph, &slices, rules)?;
+    let by_name: std::collections::HashMap<&str, &tessera_checkpoint::Slice> =
+        slices.iter().map(|s| (s.name.as_str(), s)).collect();
     let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(claims.len());
     for c in &claims {
-        let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
+        let slice = by_name[c.name.as_str()];
         forms.push(form(slice.stored, !c.parts.is_empty())?);
     }
     Ok(gguf::pins(graph, &forms, layers))
@@ -347,44 +453,31 @@ pub fn each(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let slices = offer.slices();
     let claims = names::resolve(graph, &slices, rules)?;
-    for (at, (c, w)) in claims.iter().zip(&graph.weights).enumerate() {
-        let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
-        let axis =
-            |e: &tessera_engine::DimExpr| e.value(&graph.dims, &|_| None).map(|n| n as usize);
-        let shape: Option<Vec<usize>> = w.ty.shape.0.iter().map(axis).collect();
-        let f = form(slice.stored, !c.parts.is_empty())?;
-        let packed = matches!(slice.stored, Stored::Form(src) if src.name() != "f32");
-        let weight = match (packed, c.rows) {
-            _ if !c.parts.is_empty() => stacked(offer, slice.stored, &c.parts, shape)?,
-            (true, Some(rows)) => Weight::Packed(f, offer.packed_rows(&c.name, rows)?),
-            (true, None) => match (shares(at as u32), offer.filed(&c.name)) {
-                (Some((ax, first, count)), None) => {
-                    Weight::Packed(f, offer.packed_axis(&c.name, ax, (first, count))?)
-                }
-                (_, Some(file)) => Weight::Filed(f, file),
-                (None, None) => Weight::Packed(f, offer.packed(&c.name)?),
-            },
-            (false, _) => floats(offer, slice, c.rows, shape)?,
-        };
-        take(weight, f)?;
+    let by_name: std::collections::HashMap<&str, &tessera_checkpoint::Slice> =
+        slices.iter().map(|s| (s.name.as_str(), s)).collect();
+    for (at, c) in claims.iter().enumerate() {
+        let slice = by_name[c.name.as_str()];
+        let item = load_claim(graph, offer, slice, c, at, shares(at as u32))?;
+        let f = item.form;
+        take(item.into_weight(), f)?;
     }
     Ok(())
 }
 
 /// A set's matrices, one slice each, joined in order.
-fn stacked(
+fn stacked_raw(
     offer: &dyn Offer,
     stored: Stored,
     parts: &[String],
     shape: Option<Vec<usize>>,
-) -> Result<Weight, Box<dyn Error + Send + Sync>> {
+) -> Result<RawData, Box<dyn Error + Send + Sync>> {
     match stored {
         Stored::Form(src) if src.name() != "f32" => {
             let mut all = Vec::new();
             for p in parts {
                 all.extend(offer.packed(p)?);
             }
-            Ok(Weight::Packed(form(stored, true)?, all))
+            Ok(RawData::Packed(all))
         }
         _ => {
             let mut floats = Vec::new();
@@ -392,25 +485,25 @@ fn stacked(
                 floats.extend(offer.floats(p)?);
             }
             let shape = shape.unwrap_or_else(|| vec![floats.len()]);
-            Ok(Weight::Floats(Tensor::f32(shape, floats)))
+            Ok(RawData::Floats(shape, floats))
         }
     }
 }
 
 /// A slice's floats, or its `rows`, in the graph's shape.
-fn floats(
+fn floats_raw(
     offer: &dyn Offer,
     slice: &tessera_checkpoint::Slice,
     rows: Option<(usize, usize)>,
     shape: Option<Vec<usize>>,
-) -> Result<Weight, tessera_checkpoint::Error> {
+) -> Result<RawData, tessera_checkpoint::Error> {
     let mut v = offer.floats(&slice.name)?;
     if let Some((first, count)) = rows {
         let stride = slice.elements() / slice.shape[0];
         v = v[first * stride..(first + count) * stride].to_vec();
     }
     let shape = shape.unwrap_or_else(|| vec![v.len()]);
-    Ok(Weight::Floats(Tensor::f32(shape, v)))
+    Ok(RawData::Floats(shape, v))
 }
 
 /// The architecture and graph sizes `dir/config.json` gives.
@@ -497,7 +590,46 @@ pub fn load_tapped(
     dressed(dir, built, Some(json), ple, overrides)
 }
 
-/// `graph`'s weights held from `ask`'s folder, `rules` first.
+/// Weights streamed one tensor at a time from an `Offer`.
+struct Staged {
+    graph: Graph,
+    offer: Box<dyn Offer>,
+    rules: Vec<Rule>,
+}
+
+impl Stream for Staged {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<(), Failure>,
+    ) -> Result<(), Failure> {
+        numbered(
+            &self.graph,
+            self.offer.as_ref(),
+            &[&self.rules],
+            shares,
+            take,
+        )
+    }
+}
+
+/// Streams `graph`'s weights from `offer` with `rules`.
+pub(crate) fn streamed(
+    graph: Graph,
+    offer: Box<dyn Offer>,
+    layers: u64,
+    rules: Vec<Rule>,
+) -> Result<arch::Built, Box<dyn Error + Send + Sync>> {
+    let pins = pins(&graph, offer.as_ref(), layers, &[&rules])?;
+    let stream = Staged {
+        graph: graph.clone(),
+        offer,
+        rules,
+    };
+    Ok((graph, Weights::Streamed(Box::new(stream)), pins))
+}
+
+/// `graph`'s weights streamed from `ask`'s folder, `rules` first.
 pub(crate) fn held(
     ask: &arch::Ask,
     graph: Graph,
@@ -505,8 +637,9 @@ pub(crate) fn held(
     rules: &[Rule],
 ) -> Result<arch::Built, Box<dyn Error + Send + Sync>> {
     let offer = offer(ask.dir, ask.manifest)?;
-    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[rules, ask.user])?;
-    Ok((graph, Weights::Held(weights), pins))
+    let mut combined = rules.to_vec();
+    combined.extend_from_slice(ask.user);
+    streamed(graph, offer, layers, combined)
 }
 
 /// Builds the weight request used by `load_module`.

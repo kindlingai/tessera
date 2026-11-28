@@ -25,6 +25,7 @@ pub(super) fn mxfp8_pre_len(m: usize, k: usize) -> usize {
     launches = mx8_prep_launches,
     shape = Shape::grid(((self.k / 32).div_ceil(32), self.m), 256),
     load = mx8_prep_load,
+    load_key = tessera_lower::load_key((self.m, self.k, self.min_blocks, self.x_bf16)),
     shared,
     unproven,
 )]
@@ -80,7 +81,7 @@ fn mx8_prep_launches(p: &Mxfp8Prep, step: &Step) -> Vec<Launch> {
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,
     accepts = mx8_mm_accepts,
-    emits = f32_only,
+    emits = mx8_mm_emits,
     needs = mx8_mm_needs(),
     order = Order::PerConfig,
     source = prefill_source_with(
@@ -89,18 +90,27 @@ fn mx8_prep_launches(p: &Mxfp8Prep, step: &Step) -> Vec<Launch> {
         } else {
             "tessera_mm_mxfp8_mx8"
         },
-        self.min_blocks.map(|v| {
-            let def = if self.ks > 1 {
-                "MM_MX8_SK_BLK"
-            } else {
-                "MM_MX8_BLK"
-            };
-            (def, v as usize)
-        }),
+        io_defs(
+            self.min_blocks.map(|v| {
+                let def = if self.ks > 1 {
+                    "MM_MX8_SK_BLK"
+                } else {
+                    "MM_MX8_BLK"
+                };
+                (def, v as usize)
+            }),
+            false,
+            self.y_bf16,
+            self.o_bf16,
+        ),
     ),
     launches = mx8_mm_launches,
     shape = Shape::grid((self.n.div_ceil(128) * self.ks, self.m.div_ceil(128)), 256),
     load = mx8_mm_load,
+    load_key = tessera_lower::load_key((
+        self.m, self.n, self.k, self.ks, self.mode, self.min_blocks, self.form.name(),
+        self.y_bf16, self.o_bf16,
+    )),
     unproven,
 )]
 pub(super) struct Mxfp8Mx8 {
@@ -110,11 +120,17 @@ pub(super) struct Mxfp8Mx8 {
     pub(super) ks: usize,
     pub(super) mode: u32,
     pub(super) min_blocks: Option<u32>,
+    pub(super) y_bf16: bool,
+    pub(super) o_bf16: bool,
     pub(super) form: &'static dyn Stored,
 }
 
 fn mx8_mm_accepts(k: &Mxfp8Mx8, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
+    weight_io_accepts(input, false, k.o_bf16, k.form, form)
+}
+
+fn mx8_mm_emits(k: &Mxfp8Mx8, form: &dyn Stored) -> bool {
+    x_accepts(k.y_bf16, form)
 }
 
 fn mx8_mm_needs() -> Needs {
@@ -132,21 +148,23 @@ fn mx8_mm_needs() -> Needs {
 
 fn mx8_mm_load(k: &Mxfp8Mx8, _: usize) -> Option<Load> {
     let groups = k.n.div_ceil(128) * k.ks * k.m.div_ceil(128);
+    let o_elem = if k.o_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let mut reads = vec![
         k.form.bytes(k.n * k.k) as f64,
         (4 * mxfp8_pre_len(k.m, k.k)) as f64,
     ];
     if matches!(k.mode, 1 | 3 | 4) {
-        reads.push((4 * k.m * k.n) as f64);
+        reads.push((o_elem * k.m * k.n) as f64);
     } else if k.mode == 2 {
-        reads.push((4 * k.n) as f64);
+        reads.push((o_elem * k.n) as f64);
     }
     let mut load = Load {
         threads: groups * 256,
         group: 256,
         trips: k.k as f64 / (128.0 * k.ks as f64),
         reads,
-        written: (4 * k.ks * k.m * k.n) as f64,
+        written: (y_elem * k.ks * k.m * k.n) as f64,
         flight: 1024.0,
         ..Load::default()
     };

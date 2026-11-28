@@ -94,7 +94,7 @@ fn gathered(tree: &Tree, w: T) -> Option<(T, T, usize)> {
     let (mut set, ids) = (gather.args[0], gather.args[1]);
     let mut offset = 0;
     if let Term::Op(Op::View(View::Slice { axis: 1, start, .. })) = &tree.node(set).term {
-        let size = |name| tree.sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n);
+        let size = |name| tree.size(name);
         offset = start.value(&tree.g.dims, &size)? as usize;
         set = tree.node(set).args[0];
     }

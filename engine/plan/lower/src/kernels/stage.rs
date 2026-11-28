@@ -111,6 +111,8 @@ pub fn place(
     weights: &[Option<(Slot, usize)>],
     ring: Ring,
     batches: &mut Batches,
+    // Copies wait for cross-rank steps.
+    turns: bool,
     mut pick: impl FnMut(usize) -> Vec<usize>,
 ) {
     if ring.parts == 0 || ring.slots == 0 {
@@ -156,7 +158,7 @@ pub fn place(
         let step = Stage { bytes, batch }.step(slot, evicted.into_iter().collect());
         let reads = |s: &Step| s.reads.iter().any(|r| same(*r, slot));
         let reader = steps.iter().position(reads).expect("read above");
-        let at = earliest(&steps, &step, reader);
+        let at = earliest(&steps, &step, reader, turns);
         steps.insert(at, step);
         ends += 1;
     }

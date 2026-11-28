@@ -19,14 +19,27 @@ fn scatter(
     width: u32,
     #[build] in_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
+    #[build] wide: bool,
 ) {
-    if gid() >= rows * width {
-        return;
+    if wide {
+        let quads = width / 4;
+        if gid() >= rows * quads {
+            return;
+        }
+        let r = gid() / quads;
+        let j = (gid() % quads) * 4;
+        let dst = kept_row(slots[r as u64], positions[r as u64]) as u64 * width as u64 + j as u64;
+        let v = x.load4(gid() as u64 * 4);
+        out.store4(dst, F32x4::new(v.x, v.y, v.z, v.w));
+    } else {
+        if gid() >= rows * width {
+            return;
+        }
+        let r = gid() / width;
+        let j = gid() % width;
+        let at = kept_row(slots[r as u64], positions[r as u64]) as u64 * width as u64 + j as u64;
+        out[at] = x[gid() as u64];
     }
-    let r = gid() / width;
-    let j = gid() % width;
-    let at = kept_row(slots[r as u64], positions[r as u64]) * width + j;
-    out[at as u64] = x[gid() as u64];
 }
 
 /// `rows` of `width` elements into `slots` of `context` rows.
@@ -50,6 +63,7 @@ pub(crate) struct Scatter {
     pub sparse: bool,
     pub input: &'static dyn Stored,
     pub output: &'static dyn Stored,
+    pub wide: bool,
 }
 
 impl Scatter {
@@ -60,6 +74,11 @@ impl Scatter {
         let all = &node.shape;
         let width: usize = all[2..].iter().product();
         let src = node.args[0];
+        let input = plain(tree.node(src).form);
+        let output = writable(node.form);
+        let wide = width.is_multiple_of(4)
+            && matches!(input.name(), "f32" | "bf16" | "f16" | "fp8")
+            && matches!(output.name(), "f32" | "bf16" | "fp8");
         Some(Scatter {
             rows: tree.elements(src) / width,
             width,
@@ -67,8 +86,9 @@ impl Scatter {
             context,
             kept,
             sparse: tree.is_sparse_kept(index),
-            input: plain(tree.node(src).form),
-            output: writable(node.form),
+            input,
+            output,
+            wide,
         })
     }
 }
@@ -85,10 +105,11 @@ fn scatter_emits(k: &Scatter, form: &dyn Stored) -> bool {
 }
 
 fn scatter_source(k: &Scatter) -> Source {
-    let body = kept::attach(scatter_ir(k.input, k.output), k.kept);
+    let body = kept::attach(scatter_ir(k.input, k.output, k.wide), k.kept);
+    let suffix = if k.wide { "_x4" } else { "" };
     let entry = match (k.input.name(), k.output.name()) {
-        ("f32", "f32") => format!("plan_scatter_{}", k.kept.name()),
-        (a, b) => format!("plan_scatter_{}_{a}_{b}", k.kept.name()),
+        ("f32", "f32") => format!("plan_scatter{suffix}_{}", k.kept.name()),
+        (a, b) => format!("plan_scatter{suffix}_{}_{a}_{b}", k.kept.name()),
     };
     Source::named(body, entry)
 }
@@ -99,6 +120,11 @@ fn scatter_launches(k: &Scatter, step: &Step) -> Vec<Launch> {
     let kept = values.into_iter().map(|v| Arg::count(v as usize));
     let args = [step.read(0), step.read(1), step.read(2), step.out()];
     let table = step.kept_for(k.kept, !k.sparse);
+    let threads = if k.wide {
+        k.rows * (k.width / 4)
+    } else {
+        k.rows * k.width
+    };
     vec![Launch {
         args: args
             .into_iter()
@@ -106,6 +132,6 @@ fn scatter_launches(k: &Scatter, step: &Step) -> Vec<Launch> {
             .chain(sizes)
             .chain(kept)
             .collect(),
-        shape: Shape::Line(k.rows * k.width),
+        shape: Shape::Line(threads),
     }]
 }

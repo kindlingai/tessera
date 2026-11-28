@@ -203,6 +203,7 @@ fn act_values() {
         Act::Softplus,
         Act::Exp,
         Act::Tanh,
+        Act::Gelu,
     ];
     let out = rows(Hidden, vec![-2., 0., 1., 3.], |x| acts.map(|a| x.act(a)));
     close(&out[0], &[0., 0., 1., 3.]);
@@ -217,6 +218,7 @@ fn act_values() {
     let e = std::f32::consts::E;
     close(&out[5], &[0.135_335_28, 1., e, 20.085_537]);
     close(&out[6], &[-0.964_027_6, 0., 0.761_594_2, 0.995_055]);
+    close(&out[7], &[-0.045_500_26, 0., 0.841_344_7, 2.995_950_2]);
 }
 
 #[test]
@@ -265,6 +267,10 @@ fn every_stage_runs() {
                 ports.push(port([Rows], U32));
                 // The second lies past the default log-scale floor.
                 inputs.push(Tensor::u32(vec![2], vec![1, 16383]));
+            }
+            Takes::Axes => {
+                ports.push(port(Shape(vec![Rows.into(), 2u64.into()]), U32));
+                inputs.push(Tensor::u32(vec![2, 2], vec![1, 3, 2, 5]));
             }
             Takes::Bits => {
                 ports.push(port(Shape(vec![Rows.into(), 1u64.into()]), U32));

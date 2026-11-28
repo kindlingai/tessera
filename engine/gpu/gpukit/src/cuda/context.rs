@@ -75,6 +75,7 @@ impl Context {
             group_threads: attr(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as usize,
             compiler: true,
             pdl: false,
+            msl_bfloat: false,
         };
         let version = driver.int("cuDriverGetVersion", |v| unsafe {
             (driver.cu_driver_get_version)(v)

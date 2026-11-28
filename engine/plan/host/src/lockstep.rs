@@ -486,47 +486,136 @@ pub struct Dots {
     pub cols: usize,
 }
 
-/// `rows` of `x` against `BLOCK` rows of `w`, into `out`.
-pub fn dots_form(form: &dyn Load, out: &mut [u8], x: &[u8], w: &[u8], d: &Dots, rows: usize) {
-    let k = d.k;
-    let mut held: Vec<Vec<f32>> = vec![Vec::new(); rows];
-    let mut xr: Vec<&[f32]> = Vec::with_capacity(rows);
-    for (r, h) in held.iter_mut().enumerate() {
-        xr.push(f32_row(x, d.x_at + r * k, k, h));
+use std::cell::RefCell;
+
+/// Precomputed OCP E4M3 to f32 decode table.
+const E4M3_LUT: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = E4M3(i as u8).to_f32();
+        i += 1;
     }
-    let mut kept: [Vec<f32>; BLOCK] = std::array::from_fn(|_| Vec::new());
-    let mut wr: [&[f32]; BLOCK] = [&[]; BLOCK];
-    for (c, h) in kept.iter_mut().enumerate() {
-        let first = d.w_at + c * k;
-        if c >= d.cols {
-            h.resize(k, 0.0);
-            let h: &Vec<f32> = h;
-            wr[c] = h.as_slice();
-            continue;
+    t
+};
+
+/// Widens one little-endian bf16 or f16 pair to `f32`.
+#[inline(always)]
+fn widen_half<const BF16: bool>(pair: [u8; 2]) -> f32 {
+    let raw = u16::from_le_bytes(pair);
+    if BF16 {
+        return f32::from_bits(u32::from(raw) << 16);
+    }
+    let sign = u32::from(raw & 0x8000) << 16;
+    let mag = u32::from(raw & 0x7FFF);
+    let inf = if mag >= 0x7C00 { 0x7F80_0000u32 } else { 0 };
+    f32::from_bits(sign | (mag << 13) | inf) * f32::from_bits(0x7780_0000)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn widen_f16_x4(h: std::arch::aarch64::uint16x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    // SAFETY: aarch64 always supports NEON vector instructions.
+    unsafe {
+        let u = vmovl_u16(h);
+        let sign = vandq_u32(vshlq_n_u32::<16>(u), vdupq_n_u32(0x8000_0000));
+        let mag = vandq_u32(u, vdupq_n_u32(0x7FFF));
+        let inf = vandq_u32(
+            vcgeq_u32(mag, vdupq_n_u32(0x7C00)),
+            vdupq_n_u32(0x7F80_0000),
+        );
+        let bits = vorrq_u32(vorrq_u32(sign, vshlq_n_u32::<13>(mag)), inf);
+        vmulq_f32(
+            vreinterpretq_f32_u32(bits),
+            vdupq_n_f32(f32::from_bits(0x7780_0000)),
+        )
+    }
+}
+
+/// Widens little-endian bf16 or f16 bytes into `dst`.
+#[inline(always)]
+fn widen_halves_row<const BF16: bool>(raw: &[u8], dst: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let (ws, wr) = raw.as_chunks::<16>();
+        let (ds, dr) = dst.as_chunks_mut::<8>();
+        // SAFETY: aarch64 has NEON and chunk bounds match.
+        unsafe {
+            for (wc, dc) in ws.iter().zip(ds) {
+                let halves = vld1q_u16(wc.as_ptr().cast::<u16>());
+                let (lo, hi) = if BF16 {
+                    (
+                        vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(halves))),
+                        vreinterpretq_f32_u32(vshll_high_n_u16::<16>(halves)),
+                    )
+                } else {
+                    (
+                        widen_f16_x4(vget_low_u16(halves)),
+                        widen_f16_x4(vget_high_u16(halves)),
+                    )
+                };
+                vst1q_f32(dc.as_mut_ptr(), lo);
+                vst1q_f32(dc.as_mut_ptr().add(4), hi);
+            }
         }
-        wr[c] = match form.read() {
-            Read::F32 => f32_row(w, first, k, h),
-            Read::Bf16 => {
-                let wide = |i: usize| u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]);
-                h.extend((first..first + k).map(|i| f32::from_bits(u32::from(wide(i)) << 16)));
-                let h: &Vec<f32> = h;
-                h.as_slice()
-            }
-            Read::F16 => {
-                h.extend((first..first + k).map(|i| rd_f16(w, i)));
-                let h: &Vec<f32> = h;
-                h.as_slice()
-            }
-            Read::Fp8 => {
-                h.extend((first..first + k).map(|i| f32::from(E4M3(w[i]))));
-                let h: &Vec<f32> = h;
-                h.as_slice()
-            }
-            other => panic!("no tile of dots over {other:?} rows"),
-        };
+        for (o, &pair) in dr.iter_mut().zip(wr.as_chunks::<2>().0) {
+            *o = widen_half::<BF16>(pair);
+        }
     }
-    let mut acc = vec![[0.0f32; BLOCK]; rows];
-    if !panel_at(Level::best(), &xr, &wr, &mut acc) {
+    #[cfg(not(target_arch = "aarch64"))]
+    for (o, &pair) in dst.iter_mut().zip(raw.as_chunks::<2>().0) {
+        *o = widen_half::<BF16>(pair);
+    }
+}
+
+/// Widens OCP e4m3 bytes into `dst` via the lookup table.
+fn widen_fp8_row(raw: &[u8], dst: &mut [f32]) {
+    for (o, &b) in dst.iter_mut().zip(raw) {
+        *o = E4M3_LUT[b as usize];
+    }
+}
+
+/// Copies `n` little-endian f32 values from `bytes` into `dst`.
+fn copy_f32_row(bytes: &[u8], at: usize, n: usize, dst: &mut [f32]) {
+    let slice = &bytes[at * 4..(at + n) * 4];
+    for (o, &word) in dst.iter_mut().zip(slice.as_chunks::<4>().0) {
+        *o = f32::from_le_bytes(word);
+    }
+}
+
+/// Aligned f32 view of `n` elements, if aligned.
+#[inline(always)]
+fn f32_aligned(bytes: &[u8], at: usize, n: usize) -> Option<&[f32]> {
+    let slice = &bytes[at * 4..(at + n) * 4];
+    // SAFETY: f32 has no invalid bit patterns.
+    let (head, body, _) = unsafe { slice.align_to::<f32>() };
+    (head.is_empty() && body.len() == n).then_some(body)
+}
+
+/// Reusable per-thread scratch buffers for `dots_form`.
+#[derive(Default)]
+struct DotsScratch {
+    w_buf: Vec<f32>,
+    x_buf: Vec<f32>,
+    zeros: Vec<f32>,
+    acc: Vec<[f32; BLOCK]>,
+}
+
+thread_local! {
+    static DOTS_SCRATCH: RefCell<DotsScratch> = RefCell::new(DotsScratch::default());
+}
+
+/// Runs `panel_at` or `block_rows` into `acc` and writes `out`.
+fn run_dots_tile(
+    xr: &[&[f32]],
+    wr: &[&[f32]; BLOCK],
+    acc: &mut [[f32; BLOCK]],
+    out: &mut [u8],
+    d: &Dots,
+) {
+    if !panel_at(Level::best(), xr, wr, acc) {
         // The generic block holds 16 rows by 16 columns.
         for (chunk, lines) in acc.chunks_mut(16).enumerate() {
             let x = &xr[chunk * 16..chunk * 16 + lines.len()];
@@ -536,10 +625,109 @@ pub fn dots_form(form: &dyn Load, out: &mut [u8], x: &[u8], w: &[u8], d: &Dots, 
         }
     }
     for (r, line) in acc.iter().enumerate() {
-        for (c, v) in line.iter().enumerate().take(d.cols) {
-            st_f32(out, d.at + r * d.stride + c, *v);
+        let row_start = (d.at + r * d.stride) * 4;
+        let row_bytes = &mut out[row_start..row_start + d.cols * 4];
+        // SAFETY: f32 has no invalid bit patterns.
+        let (head, body, _) = unsafe { row_bytes.align_to_mut::<f32>() };
+        if head.is_empty() && body.len() == d.cols {
+            body.copy_from_slice(&line[..d.cols]);
+        } else {
+            for (c, v) in line.iter().enumerate().take(d.cols) {
+                st_f32(out, d.at + r * d.stride + c, *v);
+            }
         }
     }
+}
+
+/// `rows` of `x` against `BLOCK` rows of `w`, into `out`.
+pub fn dots_form(form: &dyn Load, out: &mut [u8], x: &[u8], w: &[u8], d: &Dots, rows: usize) {
+    let k = d.k;
+    let read = form.read();
+    DOTS_SCRATCH.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let sc = &mut *sc;
+        if sc.zeros.len() < k {
+            sc.zeros.resize(k, 0.0);
+        }
+        let x_aligned = f32_aligned(x, d.x_at, rows * k).is_some();
+        if !x_aligned {
+            let need = rows * k;
+            if sc.x_buf.len() < need {
+                sc.x_buf.resize(need, 0.0);
+            }
+            for r in 0..rows {
+                copy_f32_row(x, d.x_at + r * k, k, &mut sc.x_buf[r * k..(r + 1) * k]);
+            }
+        }
+        let w_need = match read {
+            Read::F32 => f32_aligned(w, d.w_at, d.cols * k).is_none(),
+            Read::Bf16 | Read::F16 | Read::Fp8 => true,
+            other => panic!("no tile of dots over {other:?} rows"),
+        };
+        if w_need {
+            let need = d.cols * k;
+            if sc.w_buf.len() < need {
+                sc.w_buf.resize(need, 0.0);
+            }
+            match read {
+                Read::F32 => {
+                    for c in 0..d.cols {
+                        copy_f32_row(w, d.w_at + c * k, k, &mut sc.w_buf[c * k..(c + 1) * k]);
+                    }
+                }
+                Read::Bf16 => {
+                    for c in 0..d.cols {
+                        let first = d.w_at + c * k;
+                        let raw = &w[first * 2..(first + k) * 2];
+                        widen_halves_row::<true>(raw, &mut sc.w_buf[c * k..(c + 1) * k]);
+                    }
+                }
+                Read::F16 => {
+                    for c in 0..d.cols {
+                        let first = d.w_at + c * k;
+                        let raw = &w[first * 2..(first + k) * 2];
+                        widen_halves_row::<false>(raw, &mut sc.w_buf[c * k..(c + 1) * k]);
+                    }
+                }
+                Read::Fp8 => {
+                    for c in 0..d.cols {
+                        let first = d.w_at + c * k;
+                        widen_fp8_row(&w[first..first + k], &mut sc.w_buf[c * k..(c + 1) * k]);
+                    }
+                }
+                other => panic!("no tile of dots over {other:?} rows"),
+            }
+        }
+        let zero = &sc.zeros[..k];
+        let mut wr: [&[f32]; BLOCK] = [zero; BLOCK];
+        if w_need {
+            for (c, slot) in wr.iter_mut().enumerate().take(d.cols) {
+                *slot = &sc.w_buf[c * k..(c + 1) * k];
+            }
+        } else {
+            let w_all = f32_aligned(w, d.w_at, d.cols * k).expect("aligned f32");
+            for (c, slot) in wr.iter_mut().enumerate().take(d.cols) {
+                *slot = &w_all[c * k..(c + 1) * k];
+            }
+        }
+        sc.acc.clear();
+        sc.acc.resize(rows, [0.0f32; BLOCK]);
+        let x_all = if x_aligned {
+            f32_aligned(x, d.x_at, rows * k).expect("aligned f32")
+        } else {
+            &sc.x_buf[..rows * k]
+        };
+        if rows <= BLOCK {
+            let mut xr = [&[][..]; BLOCK];
+            for (r, slot) in xr.iter_mut().enumerate().take(rows) {
+                *slot = &x_all[r * k..(r + 1) * k];
+            }
+            run_dots_tile(&xr[..rows], &wr, &mut sc.acc, out, d);
+        } else {
+            let xr: Vec<&[f32]> = (0..rows).map(|r| &x_all[r * k..(r + 1) * k]).collect();
+            run_dots_tile(&xr, &wr, &mut sc.acc, out, d);
+        }
+    });
 }
 
 /// A few rows of `x` by `w`, span by span.
@@ -549,9 +737,15 @@ fn block_rows(x: &[&[f32]], w: &[&[f32]], (col, lines): (usize, &mut [[f32; BLOC
     let mut sums: Block = [[[[[0.0; 16]; 4]; 4]; 4]; 4];
     for start in (0..k).step_by(SPAN) {
         let end = (start + SPAN).min(k);
-        let xs: Vec<&[f32]> = x.iter().map(|r| &r[start..end]).collect();
-        let ws: Vec<&[f32]> = w.iter().map(|r| &r[start..end]).collect();
-        block_at(&xs, x.len(), &ws, &mut sums);
+        let mut xs = [&[][..]; 16];
+        for (dst, src) in xs.iter_mut().zip(x) {
+            *dst = &src[start..end];
+        }
+        let mut ws = [&[][..]; 16];
+        for (dst, src) in ws.iter_mut().zip(w) {
+            *dst = &src[start..end];
+        }
+        block_at(&xs[..x.len()], x.len(), &ws[..w.len()], &mut sums);
     }
     for (r, line) in lines.iter_mut().enumerate() {
         for (cq, quad) in sums[r / 4].iter().enumerate() {
@@ -560,47 +754,75 @@ fn block_rows(x: &[&[f32]], w: &[&[f32]], (col, lines): (usize, &mut [[f32; BLOC
     }
 }
 
-/// `x` against bf16 `w`, widened as it is multiplied.
-#[cfg(not(target_arch = "aarch64"))]
-pub fn dot_bf16(x: &[f32], w: &[u8]) -> f32 {
-    let mut acc = [0.0f32; 8];
+/// Dot of `x` against bf16 or f16 bytes.
+#[inline(always)]
+fn dot_halves<const BF16: bool>(x: &[f32], w: &[u8]) -> f32 {
     let (xs, xr) = x.as_chunks::<8>();
     let (ws, wr) = w.as_chunks::<16>();
-    for (xc, wc) in xs.iter().zip(ws) {
-        for i in 0..8 {
-            let bits = u16::from_le_bytes([wc[2 * i], wc[2 * i + 1]]);
-            acc[i] += xc[i] * f32::from_bits(u32::from(bits) << 16);
+    #[cfg(target_arch = "aarch64")]
+    let mut sum = {
+        use std::arch::aarch64::*;
+        // SAFETY: aarch64 has NEON. Loads stay within the chunks.
+        unsafe {
+            let (mut lo, mut hi) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+            for (xc, wc) in xs.iter().zip(ws) {
+                let halves = vld1q_u16(wc.as_ptr().cast::<u16>());
+                let (a, b) = if BF16 {
+                    (
+                        vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(halves))),
+                        vreinterpretq_f32_u32(vshll_high_n_u16::<16>(halves)),
+                    )
+                } else {
+                    (
+                        widen_f16_x4(vget_low_u16(halves)),
+                        widen_f16_x4(vget_high_u16(halves)),
+                    )
+                };
+                lo = vfmaq_f32(lo, vld1q_f32(xc.as_ptr()), a);
+                hi = vfmaq_f32(hi, vld1q_f32(xc.as_ptr().add(4)), b);
+            }
+            vaddvq_f32(vaddq_f32(lo, hi))
         }
-    }
-    let mut sum = acc.iter().sum::<f32>();
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut sum = {
+        let mut acc = [0.0f32; 8];
+        for (xc, wc) in xs.iter().zip(ws) {
+            for i in 0..8 {
+                acc[i] += xc[i] * widen_half::<BF16>([wc[2 * i], wc[2 * i + 1]]);
+            }
+        }
+        acc.iter().sum::<f32>()
+    };
     for (i, xi) in xr.iter().enumerate() {
-        let bits = u16::from_le_bytes([wr[2 * i], wr[2 * i + 1]]);
-        sum += xi * f32::from_bits(u32::from(bits) << 16);
+        sum += xi * widen_half::<BF16>([wr[2 * i], wr[2 * i + 1]]);
     }
     sum
 }
 
-/// `x` against bf16 `w`: NEON widens eight halves a step.
-#[cfg(target_arch = "aarch64")]
+/// `x` against bf16 `w`, widened as it is multiplied.
 pub fn dot_bf16(x: &[f32], w: &[u8]) -> f32 {
-    use std::arch::aarch64::*;
+    dot_halves::<true>(x, w)
+}
+
+/// `x` against f16 `w`, widened as it is multiplied.
+pub(crate) fn dot_f16(x: &[f32], w: &[u8]) -> f32 {
+    dot_halves::<false>(x, w)
+}
+
+/// `x` against OCP e4m3 `w` via the lookup table.
+pub(crate) fn dot_fp8(x: &[f32], w: &[u8]) -> f32 {
+    let mut acc = [0.0f32; 8];
     let (xs, xr) = x.as_chunks::<8>();
-    let (ws, wr) = w.as_chunks::<16>();
-    // SAFETY: aarch64 has NEON. Loads stay within the chunks.
-    let mut sum = unsafe {
-        let (mut lo, mut hi) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
-        for (xc, wc) in xs.iter().zip(ws) {
-            let halves = vld1q_u16(wc.as_ptr().cast::<u16>());
-            let a = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(halves)));
-            let b = vreinterpretq_f32_u32(vshll_high_n_u16::<16>(halves));
-            lo = vfmaq_f32(lo, vld1q_f32(xc.as_ptr()), a);
-            hi = vfmaq_f32(hi, vld1q_f32(xc.as_ptr().add(4)), b);
+    let (ws, wr) = w.as_chunks::<8>();
+    for (xc, wc) in xs.iter().zip(ws) {
+        for i in 0..8 {
+            acc[i] = xc[i].mul_add(E4M3_LUT[wc[i] as usize], acc[i]);
         }
-        vaddvq_f32(vaddq_f32(lo, hi))
-    };
-    for (i, xi) in xr.iter().enumerate() {
-        let bits = u16::from_le_bytes([wr[2 * i], wr[2 * i + 1]]);
-        sum += xi * f32::from_bits(u32::from(bits) << 16);
+    }
+    let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]) + (acc[4] + acc[5]) + (acc[6] + acc[7]);
+    for (xi, &wb) in xr.iter().zip(wr) {
+        sum += xi * E4M3_LUT[wb as usize];
     }
     sum
 }
@@ -615,6 +837,8 @@ pub fn dot_form(form: &dyn Load, a: &[u8], a_at: usize, b: &[u8], b_at: usize, n
             dot(x, f32_row(b, b_at, n, &mut other))
         }
         Read::Bf16 => dot_bf16(x, &b[b_at * 2..(b_at + n) * 2]),
-        Read::F16 | Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => form.dot(x, b, b_at),
+        Read::F16 => dot_f16(x, &b[b_at * 2..(b_at + n) * 2]),
+        Read::Fp8 => dot_fp8(x, &b[b_at..b_at + n]),
+        Read::U32 | Read::U8 | Read::Decode => form.dot(x, b, b_at),
     }
 }

@@ -7,7 +7,7 @@ use crate::qwen35::{
 };
 use crate::shared::{
     Attend, CalibTaps, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink,
-    part, routed_calib, rows, swiglu_tapped,
+    cat, part, routed_calib, rows, swiglu_tapped,
 };
 use serde_json::json;
 use tessera_trace::DimName::*;
@@ -16,7 +16,7 @@ use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear,
     Mask, Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
 };
-use tessera_trace::{mask_port, pick};
+use tessera_trace::{pick, step_ports_with};
 
 const GDN_HIST: DimName = DimName::named("GdnHist");
 const HC: DimName = DimName::named("Hc");
@@ -182,10 +182,6 @@ impl Config {
 fn grouped_norm(x: &Tensor, gain: &Vector, lead: &[DimExpr], eps: f32) -> Tensor {
     let r = x.rms(eps).reshape(cat(lead, [HC * Hidden]));
     r.add(&r.mul_vector(gain))
-}
-
-fn cat<const N: usize>(lead: &[DimExpr], rest: [DimExpr; N]) -> Vec<DimExpr> {
-    lead.iter().cloned().chain(rest).collect()
 }
 
 /// Low-rank 4-stream hyper-connection with residual injection.
@@ -690,34 +686,12 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     });
     let m = Model::new(dims);
     let w = Qwen4Exp::<R>::declare(&m, c);
-    let row = |role| Port {
-        role,
-        ty: TensorType::new([Rows], DType::U32),
-    };
-    let ple_port = || Port {
+    let ple = c.ple.map(|_| Port {
         role: Role::Ple,
         ty: TensorType::new([Rows, PLE_DIM], DType::F32),
-    };
+    });
     let masked = c.stack.steps == Steps::Masked;
-    let [t, p, s] = [Role::Tokens, Role::Positions, Role::Slots].map(row);
-    let (tokens, positions, slots, ple_in, allowed) = match (c.ple.is_some(), masked) {
-        (true, true) => {
-            let [t, p, s, ple, mask] = m.entry(EntryKind::Step, [t, p, s, ple_port(), mask_port()]);
-            (t, p, s, Some(ple), Some(mask))
-        }
-        (true, false) => {
-            let [t, p, s, ple] = m.entry(EntryKind::Step, [t, p, s, ple_port()]);
-            (t, p, s, Some(ple), None)
-        }
-        (false, true) => {
-            let [t, p, s, mask] = m.entry(EntryKind::Step, [t, p, s, mask_port()]);
-            (t, p, s, None, Some(mask))
-        }
-        (false, false) => {
-            let [t, p, s] = m.entry(EntryKind::Step, [t, p, s]);
-            (t, p, s, None, None)
-        }
-    };
+    let ([tokens, positions, slots], ple_in, allowed) = step_ports_with(&m, masked, ple);
     let ple_state = c.ple.map(|_| {
         m.kept(TensorType::new(
             vec![Seqs.into(), PLE_HIST.into(), HC * Hidden],

@@ -226,8 +226,8 @@ impl Hooks for Engine {
             return Ok(());
         };
         let runner = &mut self.runner;
-        kept.grow_rows_tiered(rows, lanes, &mut |promote, pairs| {
-            Ok(runner.move_kv_pages(promote, pairs)?)
+        kept.grow_rows_tiered(rows, lanes, &mut |kind, pairs| {
+            Ok(runner.move_kv_pages(kind, pairs)?)
         })
     }
 

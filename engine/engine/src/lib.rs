@@ -262,7 +262,8 @@ fn stage_owned(
         .filter(|l| extra.contains(&l.weight))
         .map(|l| l.slot.bytes() as u64)
         .sum();
-    let base_bytes: u64 = runner.plan().buffers.iter().map(|&b| b as u64).sum();
+    // A paged runner's expert cache fills the budget.
+    let base_bytes = runner.base().planned();
     let fits = runner
         .base()
         .budget()

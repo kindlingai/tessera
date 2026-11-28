@@ -118,6 +118,11 @@ pub struct Attend {
 }
 
 impl Attend {
+    /// Whether queries and keys pack variable-length sequences.
+    pub fn packed(&self) -> bool {
+        matches!(self.mask, Mask::Packed { .. })
+    }
+
     /// Expected argument count.
     pub fn arity(&self) -> usize {
         self.listed() + usize::from(self.sinks) + usize::from(self.rel_bias)
@@ -125,7 +130,7 @@ impl Attend {
 
     /// Arguments before any sinks or bias.
     fn listed(&self) -> usize {
-        3 + 2 * usize::from(self.ragged) + usize::from(self.picked)
+        3 + usize::from(self.packed()) + 2 * usize::from(self.ragged) + usize::from(self.picked)
     }
 
     /// Argument index of the listed key ids, if `picked`.
@@ -172,7 +177,7 @@ pub struct Delta {
     pub state: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mask {
     /// Query and key ends align, so queries see earlier keys.
     Causal,
@@ -181,14 +186,18 @@ pub enum Mask {
     Within(u64),
     /// Causal, keys at most this far back.
     Back(u64),
+    /// Per-row `[start, end)` segment bounds, causal or bidirectional.
+    Packed {
+        causal: bool,
+    },
 }
 
 impl Mask {
     /// Keys a query sees before and after. `far` is all.
     pub fn window(self, far: usize) -> (usize, usize) {
         match self {
-            Mask::Causal => (far, 0),
-            Mask::Bidirectional => (far, far),
+            Mask::Causal | Mask::Packed { causal: true } => (far, 0),
+            Mask::Bidirectional | Mask::Packed { causal: false } => (far, far),
             Mask::Within(n) => (n as usize, n as usize),
             Mask::Back(n) => (n as usize, 0),
         }
@@ -196,7 +205,10 @@ impl Mask {
 
     /// Whether query and key ends align.
     pub fn causal(self) -> bool {
-        matches!(self, Mask::Causal | Mask::Back(_))
+        matches!(
+            self,
+            Mask::Causal | Mask::Back(_) | Mask::Packed { causal: true }
+        )
     }
 }
 
@@ -215,6 +227,8 @@ pub enum Pairs {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
+    /// `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    Gelu,
     GeluTanh,
     Silu,
     Sigmoid,
@@ -231,10 +245,21 @@ impl Act {
     /// Whether zero maps to zero.
     pub fn keeps_zero(self) -> bool {
         match self {
-            Act::GeluTanh | Act::Silu | Act::Relu | Act::Tanh | Act::SignedSqrt => true,
+            Act::Gelu | Act::GeluTanh | Act::Silu | Act::Relu | Act::Tanh | Act::SignedSqrt => true,
             Act::Sigmoid | Act::Softplus | Act::Exp => false,
         }
     }
+}
+
+/// Error function via Abramowitz and Stegun 7.1.26.
+pub fn erf(x: f32) -> f32 {
+    let a = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * a);
+    let p = ((((1.061_405_4 * t - 1.453_152) * t + 1.421_413_7) * t - 0.284_496_74) * t
+        + 0.254_829_6)
+        * t;
+    let m = 1.0 - p * (-(a * a)).exp();
+    if x < 0.0 { -m } else { m }
 }
 
 /// Data-dependent picks.

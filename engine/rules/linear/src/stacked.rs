@@ -98,6 +98,10 @@ fn stacked(
     needs = if self.mode == MODE_LANES { Needs::lanes() } else { Needs::default() },
     order = Order::PerConfig,
     load = stacked_load,
+    load_key = tessera_lower::load_key((
+        self.len, self.rows, self.n, self.k, self.block, self.first,
+        self.col_step, self.k_step, self.form.name(), self.mode, self.ahead,
+    )),
 )]
 pub(crate) struct Stacked {
     pub len: usize,
@@ -153,16 +157,16 @@ fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
 }
 
 /// A stored `[b*r, c]` matrix as `[b, r, c]` blocks.
-struct Blocks {
-    leaf: T,
+pub struct Blocks {
+    pub leaf: T,
     /// Rows per block, the first row read, the row width.
-    rows: usize,
-    first: usize,
-    width: usize,
-    swapped: bool,
+    pub rows: usize,
+    pub first: usize,
+    pub width: usize,
+    pub swapped: bool,
 }
 
-fn blocks(tree: &Tree, mut w: T) -> Option<Blocks> {
+pub fn blocks(tree: &Tree, mut w: T) -> Option<Blocks> {
     let term = |t: T| &tree.node(t).term;
     let swapped = matches!(term(w), Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]);
     if swapped {

@@ -45,3 +45,52 @@ fn cpu_row_stages() {
         assert!(off < 1e-4, "{act:?}: off by {off:e}");
     }
 }
+
+/// CPU RMS norm (weighted and plain) matches the interpreter.
+#[test]
+fn cpu_rms_parity() {
+    let settings = Settings {
+        backend: Pick::Cpu,
+        ..tessera_run::testing::host()
+    };
+    for width in [17u64, 64] {
+        let g = tessera_testkit::graphs::residual_norm(&[Dim::bounded(Rows, 8)], width);
+        let sizes = [(Rows, 7)];
+        let mut noise = Noise(19);
+        let stored = weights(&g, &mut noise);
+        let inputs: Vec<Tensor> = g.entries[0]
+            .inputs
+            .iter()
+            .map(|p| tessera_testkit::fill(&g, &p.ty, &sizes, &mut noise).unwrap())
+            .collect();
+        let want = tessera_interp::run(&g, &stored, 0, &inputs).unwrap();
+        let device = Device::guess(&settings).favoring("cpu_rms_norm");
+        let plan = tessera_lower::lower(&g, 0, &sizes, &device).unwrap();
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|s| s.rule == "cpu_rms_norm")
+                .count(),
+            2
+        );
+        let feeds: Vec<_> = inputs.iter().map(Tensor::view).collect();
+        let runners = [
+            tessera_run::open(plan.clone(), &settings).unwrap(),
+            tessera_run::testing::lockstep(plan, &settings).unwrap(),
+        ];
+        for mut runner in runners {
+            for (at, w) in stored.iter().enumerate() {
+                runner.load(at as u32, w.view()).unwrap();
+            }
+            let got = runner.run(&feeds).unwrap().remove(0);
+            let off = got
+                .floats()
+                .unwrap()
+                .iter()
+                .zip(want[0].floats().unwrap())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(off < 1e-4, "width={width}: off by {off:e}");
+        }
+    }
+}

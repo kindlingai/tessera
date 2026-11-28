@@ -511,6 +511,7 @@ fn run_on(
                 Stage::AllReduce => vec![all_reduce(&num, &outs)?; ranks],
                 Stage::ReduceScatter => scatter(&all_reduce(&num, &outs)?, parts),
                 Stage::GatherRows => vec![gather_rows(&outs)?; ranks],
+                Stage::OwnRows => scatter(&outs[0], parts),
                 _ => vec![all_gather(&outs)?; ranks],
             };
             let rest = &row.0[at + 1..];
@@ -677,6 +678,9 @@ impl Context<'_> {
             Op::Input { .. } => Err(Error::Unsupported("another entry's input".into())),
             Op::Weight(i) => weight(&self.weights[*i as usize]),
             Op::Matmul => cpu::matmul(num, args[0], args[1]),
+            Op::Attend(a) if a.packed() => {
+                cpu::attend_packed(num, a, [args[0], args[1], args[2]], args[3])
+            }
             Op::Attend(a) if a.ragged => {
                 let keys = a.ids_arg().map(|i| args[i]);
                 let extra = [a.sinks_arg(), a.rel_bias_arg()].map(|i| i.map(|i| args[i]));

@@ -1,206 +1,23 @@
 //! Hot-cold VRAM cache for stacked trellis expert weights.
 
-use crate::Error;
 use crate::held::Held;
-use crate::lanes::{Source, Staging};
-use crate::promote::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
+use crate::lanes::{Lending, Source, Staging};
 use crate::run::Base;
-use std::collections::{BTreeMap, HashMap};
+use crate::{Backed, Error, HostPool};
+use std::collections::HashMap;
+use tessera_engine_comm::SharedPool;
 use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
+use tessera_kv::Move;
 use tessera_lower::kernels::{Ring, place};
-use tessera_lower::{Loaded, Plan, Slot};
+use tessera_lower::paging::{
+    Decayed, Dense, Forecast, HEAD, Layout, Moves, Paged, Promote, Spec, TABLE, Unknown, aligned,
+    shares,
+};
+use tessera_lower::{Plan, Slot};
 use tessera_mem::Backing;
 
-const HEAD: usize = 16;
-const TABLE: usize = 24;
 const PAGED_FLAG: u32 = 0x8000_0000;
-const ALIGN: usize = 256;
 const RESERVE: u64 = 512 << 20;
-
-fn aligned(bytes: usize) -> usize {
-    bytes.div_ceil(ALIGN) * ALIGN
-}
-
-/// Whether `l` is a pageable stacked trellis weight.
-pub(crate) fn is_pageable(l: &Loaded) -> bool {
-    let name = l.slot.form.name();
-    l.part.is_none()
-        && l.slot.dims == 3
-        && l.slot.shape[0] > 1
-        && name.starts_with("trellis_k")
-        && !name.ends_with("_rot")
-}
-
-/// Bytes reserved in the descriptor buffer for `experts` entries.
-pub(crate) fn desc_bytes(experts: usize) -> usize {
-    aligned(TABLE + experts * 8)
-}
-
-/// Descriptor layout for one paged weight, independent of backend.
-#[derive(Clone, Debug)]
-pub(crate) struct Spec {
-    pub(crate) experts: usize,
-    pub(crate) stride: usize,
-    pub(crate) desc_offset: usize,
-    pub(crate) desc_size: usize,
-}
-
-/// Deterministic layout of paged descriptors and non-paged weight arenas.
-#[derive(Clone, Debug)]
-pub(crate) struct Layout {
-    pub(crate) specs: Vec<Spec>,
-    pub(crate) by_weight: HashMap<u32, usize>,
-    pub(crate) desc_total: usize,
-}
-
-impl Layout {
-    /// Collects all pageable weights in `plan` in weight order.
-    pub(crate) fn build(plan: &Plan) -> Option<Self> {
-        let mut raw: Vec<(u32, usize, usize)> = Vec::new();
-        for l in &plan.weights {
-            if !is_pageable(l) || raw.iter().any(|(w, _, _)| *w == l.weight) {
-                continue;
-            }
-            let experts = l.slot.shape[0] as usize;
-            let total = l.slot.bytes();
-            if total <= HEAD || !(total - HEAD).is_multiple_of(experts) {
-                continue;
-            }
-            let stride = (total - HEAD) / experts;
-            raw.push((l.weight, experts, stride));
-        }
-        if raw.is_empty() {
-            return None;
-        }
-        raw.sort_unstable_by_key(|(w, _, _)| *w);
-        let mut specs = Vec::with_capacity(raw.len());
-        let mut by_weight = HashMap::with_capacity(raw.len());
-        let mut cursor = 0usize;
-        for (weight, experts, stride) in raw {
-            let desc_size = desc_bytes(experts);
-            let idx = specs.len();
-            specs.push(Spec {
-                experts,
-                stride,
-                desc_offset: cursor,
-                desc_size,
-            });
-            by_weight.insert(weight, idx);
-            cursor += desc_size;
-        }
-        Some(Self {
-            specs,
-            by_weight,
-            desc_total: cursor,
-        })
-    }
-
-    /// Moves paged weights of `plan` into a descriptor buffer.
-    pub(crate) fn rewrite(&self, plan: &Plan) -> Plan {
-        let mut buffers = plan.buffers.clone();
-        let mut zones = if plan.zones.is_empty() {
-            vec![0; buffers.len()]
-        } else {
-            plan.zones.clone()
-        };
-        // Keep non-weight buffer indices fixed for caller slots.
-        let mut zone_buf: BTreeMap<u32, u32> = BTreeMap::new();
-        for l in &plan.weights {
-            let z = plan.zone(l.slot.buffer);
-            zone_buf.entry(z).or_insert(l.slot.buffer);
-            buffers[l.slot.buffer as usize] = 0;
-        }
-        let desc_buf = buffers.len() as u32;
-        buffers.push(self.desc_total);
-        zones.push(0);
-        // Pack non-paged weights into each zone's existing weight buffer.
-        let mut non_paged: Vec<(u32, u32, Option<u8>, Slot)> = Vec::new();
-        let mut remap: HashMap<(u32, usize), (u32, usize)> = HashMap::new();
-        for l in &plan.weights {
-            if let Some(&idx) = self.by_weight.get(&l.weight) {
-                let s = &self.specs[idx];
-                remap.insert((l.slot.buffer, l.slot.offset), (desc_buf, s.desc_offset));
-            } else {
-                let zone = plan.zone(l.slot.buffer);
-                non_paged.push((zone, l.weight, l.part, l.slot));
-            }
-        }
-        non_paged.sort_unstable_by_key(|&(z, w, p, s)| (z, w, p, s.buffer, s.offset));
-        let mut cursors: BTreeMap<u32, usize> = BTreeMap::new();
-        for (zone, _, _, slot) in non_paged {
-            if remap.contains_key(&(slot.buffer, slot.offset)) {
-                continue;
-            }
-            let buf = zone_buf[&zone];
-            let cur = cursors.entry(zone).or_insert(0);
-            let off = *cur;
-            *cur += aligned(slot.bytes());
-            remap.insert((slot.buffer, slot.offset), (buf, off));
-        }
-        for (zone, size) in cursors {
-            buffers[zone_buf[&zone] as usize] = size;
-        }
-        let move_slot = |mut s: Slot| {
-            if let Some(&(b, off)) = remap.get(&(s.buffer, s.offset)) {
-                s.buffer = b;
-                s.offset = off;
-            }
-            s
-        };
-        let mut out = plan.clone();
-        out.buffers = buffers;
-        out.zones = zones;
-        for l in &mut out.weights {
-            l.slot = move_slot(l.slot);
-        }
-        for (_, s) in &mut out.kept {
-            *s = move_slot(*s);
-        }
-        out.table = out.table.map(move_slot);
-        out.index_table = out.index_table.map(move_slot);
-        for s in &mut out.inputs {
-            *s = move_slot(*s);
-        }
-        for o in &mut out.outputs {
-            o.slot = move_slot(o.slot);
-        }
-        for step in &mut out.steps {
-            for r in &mut step.reads {
-                *r = move_slot(*r);
-            }
-            step.write = move_slot(step.write);
-            for w in &mut step.also {
-                *w = move_slot(*w);
-            }
-            step.table = step.table.map(move_slot);
-            step.index_table = step.index_table.map(move_slot);
-        }
-        out
-    }
-}
-
-/// VRAM slots per weight within `avail`, and their bytes.
-fn shares(specs: &[Spec], avail: usize) -> (Vec<usize>, usize) {
-    let total: usize = specs.iter().map(|s| s.experts * s.stride).sum();
-    let mut counts = Vec::with_capacity(specs.len());
-    let mut used = 0usize;
-    // Give each paged weight a proportional share of slots.
-    for s in specs {
-        let share =
-            ((avail as u128 * (s.experts * s.stride) as u128) / total.max(1) as u128) as usize;
-        let h = (share / s.stride).min(s.experts);
-        counts.push(h);
-        used += h * s.stride;
-    }
-    // Top up any leftover space with extra slots.
-    for (i, s) in specs.iter().enumerate() {
-        while counts[i] < s.experts && used + s.stride <= avail {
-            counts[i] += 1;
-            used += s.stride;
-        }
-    }
-    (counts, used)
-}
 
 /// Per-weight backing store and VRAM hot slots.
 struct Entry<D: Device> {
@@ -227,6 +44,11 @@ pub(crate) struct Pager<D: Device> {
     /// Swaps whose bytes copy during the next step.
     moves: Moves,
     staging: Staging<D>,
+    /// Per plan id: the size of its expert launches.
+    sizes: HashMap<u64, u64>,
+    /// Whether cross-rank sums share the bus with copies.
+    shared_bus: bool,
+    lending: Lending,
 }
 
 impl<D: Device> Pager<D> {
@@ -265,7 +87,8 @@ impl<D: Device> Pager<D> {
         // Ring and slot counts depend on each other.
         let widest = layout.specs.iter().map(|s| s.stride).max().unwrap_or(0);
         let (mut ring, mut ring_bytes) = (Ring::default(), 0usize);
-        let (mut counts, mut pool_used) = shares(&layout.specs, avail);
+        let sizes: Vec<_> = layout.specs.iter().map(|s| (s.experts, s.stride)).collect();
+        let (mut counts, mut pool_used) = shares(&sizes, avail);
         while forecast.parts() > 0 {
             let cold = |(s, h): (&Spec, &usize)| s.experts - h;
             let slots = layout
@@ -284,7 +107,7 @@ impl<D: Device> Pager<D> {
                 slots,
             };
             ring_bytes = need;
-            (counts, pool_used) = shares(&layout.specs, avail - ring_bytes);
+            (counts, pool_used) = shares(&sizes, avail - ring_bytes);
         }
         let staging = Staging::open(ctx, forecast, ring, widest)?;
         let vram_pool = if pool_used > 0 {
@@ -335,6 +158,9 @@ impl<D: Device> Pager<D> {
             policy: Box::new(Decayed::default()),
             moves: Moves::default(),
             staging,
+            sizes: HashMap::new(),
+            shared_bus: false,
+            lending: Lending::default(),
         }))
     }
 
@@ -353,18 +179,68 @@ impl<D: Device> Pager<D> {
                 ids[idx] = l.weight;
             }
         }
+        // Plans that differ only in context read experts alike.
+        let mut size = 0u64;
+        for step in &out.steps[out.forward()] {
+            let paged = |r: &Slot| {
+                weights
+                    .iter()
+                    .flatten()
+                    .any(|(w, _)| w.buffer == r.buffer && w.offset == r.offset)
+            };
+            if step.reads.iter().any(paged) {
+                size += step.write.len as u64;
+            }
+        }
+        self.sizes.insert(plan.id, size);
         let (entries, staging) = (&self.entries, &mut self.staging);
-        let forecast = &mut staging.forecast;
+        // Every plan gets the steps. Each launch decides to copy.
         let pick = |idx: usize| {
-            let slots = &entries[idx].slot_of;
-            let mut cold = forecast.cold(plan, ids[idx], slots);
-            cold.retain(|&m| slots.get(m).is_some_and(Option::is_none));
-            cold.sort_unstable();
-            cold.dedup();
-            cold
+            let cold = |(m, slot): (usize, &Option<usize>)| slot.is_none().then_some(m);
+            entries[idx]
+                .slot_of
+                .iter()
+                .enumerate()
+                .filter_map(cold)
+                .collect()
         };
-        place(&mut out, &weights, staging.ring, &mut staging.batches, pick);
+        let turns = staging.forecast.turns() && self.shared_bus;
+        place(
+            &mut out,
+            &weights,
+            staging.ring,
+            &mut staging.batches,
+            turns,
+            pick,
+        );
         out
+    }
+
+    /// Frees lent slots in the scratch a plan will write.
+    pub(crate) fn unlend(
+        &mut self,
+        ctx: &D,
+        tail: Option<(u64, usize, usize)>,
+    ) -> Result<(), Error> {
+        let mut lending = std::mem::take(&mut self.lending);
+        let fitted = lending.fit(ctx, tail, |idx| self.source(idx));
+        self.lending = lending;
+        fitted
+    }
+
+    /// Whether copies wait for cross-rank steps.
+    pub(crate) fn turns(&self) -> bool {
+        self.staging.forecast.turns() && self.shared_bus
+    }
+
+    /// Whether `plan`'s launches copy cold experts ahead.
+    pub(crate) fn stages(&self, plan: u64) -> bool {
+        self.staging.forecast.stages(self.kind(plan))
+    }
+
+    /// The forecast's key for `plan`: its expert launch size.
+    fn kind(&self, plan: u64) -> u64 {
+        self.sizes.get(&plan).copied().unwrap_or(plan)
     }
 
     fn source(&self, idx: usize) -> Source<'_> {
@@ -394,8 +270,9 @@ impl<D: Device> Pager<D> {
     }
 
     /// Queues one copy step's work on the active lane.
-    pub(crate) fn stage(&self, ctx: &D, batch: usize) -> Result<(), Error> {
-        self.staging.copy(ctx, batch, |idx| self.source(idx))
+    pub(crate) fn stage(&self, ctx: &D, batch: usize, plan: u64) -> Result<(), Error> {
+        self.staging
+            .copy(ctx, batch, self.kind(plan), |idx| self.source(idx))
     }
 
     pub(crate) fn slot_bytes(&self, weight: u32, part: Option<u8>) -> Option<usize> {
@@ -461,7 +338,91 @@ impl<D: Device> Pager<D> {
         }
         entry.desc_ptr = desc_ptr;
         held.upload(slot, &desc)?;
+        self.lending.forget(|loan| loan.weight == idx);
         Ok(true)
+    }
+
+    /// Gives up hot slots until `plan` fits in `budget`.
+    fn fit(&mut self, ctx: &D, plan: &Plan, budget: u64) -> Result<(), Error> {
+        let need: u64 = plan.buffers.iter().map(|b| *b as u64).sum();
+        let Some(pool) = &self.vram_pool else {
+            return Ok(());
+        };
+        if need + self.vram_bytes <= budget {
+            return Ok(());
+        }
+        let held = pool.size();
+        let fixed = self.vram_bytes - held as u64;
+        let reserve = RESERVE.min(budget / 8);
+        let avail = budget.saturating_sub(need + fixed + reserve) as usize;
+        let sizes: Vec<_> = self
+            .layout
+            .specs
+            .iter()
+            .map(|s| (s.experts, s.stride))
+            .collect();
+        let (counts, used) = shares(&sizes, avail);
+        if used >= held {
+            return Ok(());
+        }
+        // Copies in flight target the old slots.
+        ctx.finish()?;
+        self.moves.land();
+        self.vram_pool = None;
+        let pool = match used > 0 {
+            true => Some(DeviceBuffer::alloc(ctx, used)?),
+            false => None,
+        };
+        let base = pool.as_ref().map_or(0, DeviceBuffer::device_ptr);
+        let mut offset = 0usize;
+        for (entry, count) in self.entries.iter_mut().zip(counts) {
+            let stride = entry.spec.stride;
+            let hot = |(m, slot): (usize, &Option<usize>)| slot.map(|s| (s, m));
+            let mut kept: Vec<(usize, usize)> =
+                entry.slot_of.iter().enumerate().filter_map(hot).collect();
+            kept.sort_unstable();
+            kept.truncate(count);
+            entry.slot_of.fill(None);
+            (entry.vram_offset, entry.resident) = (offset, count);
+            offset += count * stride;
+            for (slot, (_, m)) in kept.into_iter().enumerate() {
+                entry.slot_of[m] = Some(slot);
+            }
+            // An unloaded weight fills its slots when it loads.
+            if entry.desc_ptr == 0 {
+                continue;
+            }
+            let host = entry
+                .host_buf
+                .mapped()
+                .expect("pinned buffer is host-mapped");
+            let mut spans = Vec::with_capacity(count);
+            let mut deltas = Vec::with_capacity(entry.spec.experts * 8);
+            for (m, slot) in entry.slot_of.iter().enumerate() {
+                let at = match slot {
+                    Some(slot) => {
+                        let at = base + (entry.vram_offset + slot * stride) as u64;
+                        spans.push((at, &host[m * stride..][..stride]));
+                        at
+                    }
+                    None => entry.host_buf.device_ptr() + (m * stride) as u64,
+                };
+                deltas.extend(at.wrapping_sub(entry.desc_ptr).to_le_bytes());
+            }
+            ctx.upload_batch(&spans)?;
+            ctx.upload(entry.desc_ptr + TABLE as u64, &deltas)?;
+        }
+        self.vram_pool = pool;
+        self.vram_bytes = fixed + used as u64;
+        self.staging.reaim();
+        self.lending.reset();
+        let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "tessera: expert VRAM cache {:.1} GiB -> {:.1} GiB for a larger plan",
+            gib(held),
+            gib(used)
+        );
+        Ok(())
     }
 
     /// Rewrites staged deltas of experts whose slots changed.
@@ -494,32 +455,51 @@ impl<D: Device> Pager<D> {
         Ok(())
     }
 
-    /// Reports hits and starts the policy's swaps.
-    pub(crate) fn maintain(&mut self, ctx: &D) -> Result<(), Error> {
+    /// Reports hits, starts swaps. True when `plan`'s staging flips.
+    pub(crate) fn maintain(&mut self, ctx: &D, plan: u64) -> Result<bool, Error> {
         let Some(pool_base) = self.vram_pool.as_ref().map(DeviceBuffer::device_ptr) else {
-            return Ok(());
+            return Ok(false);
         };
         self.land(ctx, pool_base)?;
         self.hits_buf.read_bytes(&mut self.raw_hits)?;
         self.hits_buf.zero()?;
         let (words, _) = self.raw_hits.as_chunks::<4>();
         let mut weights = Vec::with_capacity(self.entries.len());
+        let (mut cold, mut read) = (0usize, 0usize);
+        // The policy counts a lent expert as slotted.
+        let mut views: Vec<_> = self.entries.iter().map(|e| e.slot_of.clone()).collect();
+        self.lending.mark(&mut views);
         for (idx, entry) in self.entries.iter().enumerate() {
             let counts = &words[entry.hits_offset..][..entry.spec.experts];
             self.hits.clear();
             self.hits
                 .extend(counts.iter().map(|w| u32::from_le_bytes(*w)));
             self.policy.observe(idx, &self.hits);
+            // A weight with a hit is one the launch read.
+            if self.hits.iter().any(|h| *h > 0) {
+                for (hits, slot) in self.hits.iter().zip(&entry.slot_of) {
+                    cold += usize::from(slot.is_none());
+                    read += usize::from(slot.is_none() && *hits > 0);
+                }
+            }
             weights.push(Paged {
-                slots: &entry.slot_of,
+                slots: &views[idx],
                 stride: entry.spec.stride,
                 ready: entry.resident > 0
                     && entry.resident < entry.spec.experts
                     && entry.desc_ptr != 0,
             });
         }
+        let plan = self.kind(plan);
+        let staged = self.staging.forecast.stages(plan);
+        if cold > 0 {
+            let share = read as f64 / cold as f64;
+            self.staging.forecast.observe(plan, share);
+        }
+        let flipped = self.staging.forecast.stages(plan) != staged;
         let swaps = self.policy.swaps(&weights);
-        let mut moved = Vec::new();
+        let picks = self.policy.fills(&weights);
+        let (mut moved, mut ended) = (Vec::new(), Vec::new());
         // The copies run beside the next step.
         let lane = ctx.active_lane();
         ctx.set_lane(COPY_LANE);
@@ -527,6 +507,8 @@ impl<D: Device> Pager<D> {
             let (cold, hot) = (swap.cold, swap.hot);
             let entry = &mut self.entries[swap.weight];
             let Some(slot) = self.moves.begin(&mut entry.slot_of, &swap) else {
+                // A lent expert gives its slot to a later fill.
+                ended.push((swap.weight, hot));
                 continue;
             };
             let stride = entry.spec.stride;
@@ -557,7 +539,11 @@ impl<D: Device> Pager<D> {
         }
         ctx.set_lane(lane);
         self.retarget(moved);
-        Ok(())
+        let mut lending = std::mem::take(&mut self.lending);
+        let filled = lending.end(ctx, &ended, |idx| self.source(idx));
+        let filled = filled.and_then(|_| lending.fill(ctx, picks, |idx| self.source(idx)));
+        self.lending = lending;
+        filled.map(|_| flipped)
     }
 }
 
@@ -578,9 +564,14 @@ pub(crate) fn prepare<'a, D: Device>(
         };
         *pager = Pager::open(ctx, plan, limit, base.streams, forecast)?;
     }
-    match pager.as_mut() {
-        Some(p) => Ok((std::borrow::Cow::Owned(p.rewrite(plan)), p.vram_bytes())),
-        None => Ok((std::borrow::Cow::Borrowed(plan), 0)),
+    match (pager.as_mut(), base.budget) {
+        (Some(p), Some(limit)) => {
+            p.shared_bus = base.shared_bus;
+            let plan = p.rewrite(plan);
+            p.fit(ctx, &plan, limit)?;
+            Ok((std::borrow::Cow::Owned(plan), p.vram_bytes()))
+        }
+        _ => Ok((std::borrow::Cow::Borrowed(plan), 0)),
     }
 }
 
@@ -593,37 +584,30 @@ pub(crate) struct HostKv<D: Device> {
     page_rows: usize,
     by_index: HashMap<u32, (usize, usize)>,
     by_slot: HashMap<(u32, usize), u64>,
+    /// Whether copies queued on the copy lane may still run.
+    busy: bool,
+    /// The pool the box's ranks share, if any.
+    shared: Option<SharedPool>,
 }
 
 impl<D: Device> Drop for HostKv<D> {
     fn drop(&mut self) {
-        self.ctx.unpin(self.host);
-    }
-}
-
-fn pair_runs(pairs: &[(u32, u32)]) -> Vec<(u32, u32, usize)> {
-    let (mut out, mut i) = (Vec::new(), 0usize);
-    while i < pairs.len() {
-        let ((v0, h0), mut len) = (pairs[i], 1usize);
-        while i + len < pairs.len()
-            && pairs[i + len].0 == v0 + len as u32
-            && pairs[i + len].1 == h0 + len as u32
-        {
-            len += 1;
+        let _ = self.settle();
+        match &self.shared {
+            Some(pool) => self.ctx.unregister(pool.mapping().0),
+            None => self.ctx.unpin(self.host),
         }
-        out.push((v0, h0, len));
-        i += len;
     }
-    out
 }
 
 impl<D: Device> HostKv<D> {
-    /// Pins a host-RAM pool for sparse paged KV tensors.
+    /// Opens a host-RAM pool for sparse paged KV tensors.
     pub(crate) fn open(
         ctx: &'static D,
         plan: &Plan,
         pages: usize,
         page_rows: usize,
+        by: Backed,
     ) -> Option<Self> {
         if pages == 0 || page_rows == 0 || ctx.unified() {
             return None;
@@ -645,7 +629,11 @@ impl<D: Device> HostKv<D> {
         if by_index.is_empty() || total == 0 {
             return None;
         }
-        let (host, dev) = ctx.pin(total).ok()?;
+        let shared = SharedPool::open(by, total, |base, len| ctx.register(base, len).ok());
+        let (host, dev) = match &shared {
+            Some(pool) => pool.at(),
+            None => ctx.pin(total).ok()?,
+        };
         let mut out = Self {
             ctx,
             host,
@@ -654,6 +642,8 @@ impl<D: Device> HostKv<D> {
             page_rows,
             by_index,
             by_slot: HashMap::new(),
+            busy: false,
+            shared,
         };
         out.bind(plan);
         Some(out)
@@ -684,7 +674,7 @@ impl<D: Device> HostKv<D> {
         plan: &Plan,
         pairs: &[(u32, u32)],
     ) -> Option<Vec<(u64, *mut u8, usize)>> {
-        let runs = pair_runs(pairs);
+        let runs = tessera_kv::pair_runs(pairs);
         let mut out = Vec::new();
         for (&(index, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
             let Some(&(off, pbytes)) = self.by_index.get(&index) else {
@@ -728,47 +718,57 @@ impl<D: Device> HostKv<D> {
         Some(out)
     }
 
-    /// Copies `(vram_phys, host_phys)` sparse KV pages from VRAM to host.
-    pub(crate) fn demote(
+    /// Waits for every started copy.
+    fn settle(&mut self) -> Result<(), Error> {
+        if std::mem::take(&mut self.busy) {
+            self.ctx.finish()?;
+        }
+        Ok(())
+    }
+
+    /// Copies `(vram_phys, host_phys)` sparse KV pages as `kind` says.
+    fn copy(
         &mut self,
         held: &Held,
         plan: &Plan,
+        kind: Move,
         pairs: &[(u32, u32)],
     ) -> Result<bool, Error> {
-        if pairs.is_empty() {
-            return Ok(true);
-        }
         let Some(raw) = self.spans(held, plan, pairs) else {
             return Ok(false);
         };
-        let mut spans: Vec<(u64, &mut [u8])> = raw
-            .into_iter()
-            // SAFETY: distinct `host_phys` ranges inside live pinned allocation.
-            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts_mut(ptr, len) }))
-            .collect();
-        self.ctx.download_batch(&mut spans)?;
-        Ok(true)
-    }
-
-    /// Copies `(vram_phys, host_phys)` sparse KV pages from host to VRAM.
-    pub(crate) fn promote(
-        &self,
-        held: &Held,
-        plan: &Plan,
-        pairs: &[(u32, u32)],
-    ) -> Result<bool, Error> {
-        if pairs.is_empty() {
-            return Ok(true);
+        // SAFETY: each span is a distinct range of the pool.
+        let page = |s: &(u64, *mut u8, usize)| unsafe { std::slice::from_raw_parts_mut(s.1, s.2) };
+        // Queued steps may still write the pages that depart.
+        self.busy |= kind == Move::Depart;
+        self.settle()?;
+        let writes = self.shared.as_ref().is_none_or(SharedPool::writes);
+        match kind {
+            Move::Settle => {}
+            Move::Demote | Move::Depart if !writes => {}
+            Move::Promote => {
+                let spans: Vec<(u64, &[u8])> = raw.iter().map(|s| (s.0, &*page(s))).collect();
+                self.ctx.upload_batch(&spans)?;
+            }
+            Move::Demote => {
+                let mut spans: Vec<_> = raw.iter().map(|s| (s.0, page(s))).collect();
+                self.ctx.download_batch(&mut spans)?;
+            }
+            Move::Depart => {
+                self.busy = true;
+                let lane = self.ctx.active_lane();
+                self.ctx.set_lane(COPY_LANE);
+                let queued = raw
+                    .iter()
+                    .try_for_each(|s| self.ctx.queue_download(s.0, page(s)));
+                self.ctx.set_lane(lane);
+                queued?;
+            }
         }
-        let Some(raw) = self.spans(held, plan, pairs) else {
-            return Ok(false);
-        };
-        let spans: Vec<(u64, &[u8])> = raw
-            .into_iter()
-            // SAFETY: valid range inside live pinned allocation.
-            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts(ptr, len) }))
-            .collect();
-        self.ctx.upload_batch(&spans)?;
+        // Readers hold here until rank 0 wrote its batch.
+        if let (Move::Demote | Move::Settle, Some(pool)) = (kind, &mut self.shared) {
+            pool.pass()?;
+        }
         Ok(true)
     }
 }
@@ -801,9 +801,11 @@ impl<D: Device> KvMem<D> {
         plan: &Plan,
         pages: usize,
         page: usize,
-    ) -> bool {
-        self.host = HostKv::open(ctx, plan, pages, page);
-        self.host.is_some()
+        by: Backed,
+    ) -> HostPool {
+        self.host = HostKv::open(ctx, plan, pages, page, by);
+        let shared = |h: &HostKv<D>| HostPool::of(h.shared.as_ref());
+        self.host.as_ref().map_or(HostPool::None, shared)
     }
 
     /// Host pool device pointer for kept `slot`, or zero.
@@ -815,12 +817,11 @@ impl<D: Device> KvMem<D> {
         &mut self,
         held: &Held,
         plan: &Plan,
-        promote: bool,
+        kind: Move,
         pairs: &[(u32, u32)],
     ) -> Result<bool, Error> {
         match &mut self.host {
-            Some(h) if promote => h.promote(held, plan, pairs),
-            Some(h) => h.demote(held, plan, pairs),
+            Some(host) => host.copy(held, plan, kind, pairs),
             None => Ok(false),
         }
     }

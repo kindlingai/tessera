@@ -4,9 +4,72 @@ use crate::file::{Error, Shards};
 use crate::offer::{Offer, Slice, Stored, narrow};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tessera_engine::storage::Form;
 use tessera_engine::{E4M3, Filed, block};
+
+/// Minimum elements before FP8 decoding fans out across threads.
+const PARALLEL_ELEMS: usize = 65_536;
+
+/// Precomputed f32 table for every OCP E4M3 byte value.
+static E4M3_LUT: LazyLock<[f32; 256]> =
+    LazyLock::new(|| std::array::from_fn(|b| f32::from(E4M3(b as u8))));
+
+/// Decodes one FP8 row into f32 using block scales.
+fn decode_fp8_row(lut: &[f32; 256], codes: &[u8], scales: &[f32], bk: usize, dst: &mut [f32]) {
+    for ((out_blk, code_blk), &scale) in dst.chunks_mut(bk).zip(codes.chunks(bk)).zip(scales) {
+        for (o, &c) in out_blk.iter_mut().zip(code_blk) {
+            *o = lut[usize::from(c)] * scale;
+        }
+    }
+}
+
+/// Encodes one FP8 row to BF16 using block scales.
+fn encode_fp8_bf16_row(lut: &[f32; 256], codes: &[u8], scales: &[f32], bk: usize, dst: &mut [u8]) {
+    for ((out_blk, code_blk), &scale) in dst.chunks_mut(bk * 2).zip(codes.chunks(bk)).zip(scales) {
+        for (pair, &c) in out_blk.as_chunks_mut::<2>().0.iter_mut().zip(code_blk) {
+            *pair = narrow(&(lut[usize::from(c)] * scale));
+        }
+    }
+}
+
+/// Loaded FP8 codes and scales for rows.
+struct Fp8Slice {
+    first: usize,
+    count: usize,
+    inp: usize,
+    block: [usize; 2],
+    codes: Vec<u8>,
+    scales: Vec<f32>,
+}
+
+/// Runs `work` over contiguous row strips, in parallel when large.
+fn for_row_strips<T: Send>(
+    dst: &mut [T],
+    row_len: usize,
+    rows: usize,
+    work: impl Fn(usize, &mut [T]) + Sync,
+) {
+    let threads = if rows * row_len >= PARALLEL_ELEMS {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(rows)
+    } else {
+        1
+    };
+    if threads <= 1 {
+        work(0, dst);
+        return;
+    }
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (ti, chunk) in dst.chunks_mut(per * row_len).enumerate() {
+            let start = ti * per;
+            let f = &work;
+            scope.spawn(move || f(start, chunk));
+        }
+    });
+}
 
 /// Quantization layout parsed from `config.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,10 +555,11 @@ impl Quant {
         let tail_elems: usize = shape[1..].iter().product();
         let row_groups = tail_elems / form.block();
         let total_groups = count * row_groups;
-        let mut out = Vec::with_capacity(head_bytes + total_groups * (scale_bytes + code_bytes));
+        let stride = scale_bytes + code_bytes;
+        let mut out = vec![0u8; head_bytes + total_groups * stride];
         if head_bytes == 4 {
             let val = self.read_head(head.as_ref())?;
-            out.extend_from_slice(&val.to_le_bytes());
+            out[..4].copy_from_slice(&val.to_le_bytes());
         }
         if count == 0 || row_groups == 0 {
             return Ok(out);
@@ -512,21 +576,25 @@ impl Quant {
             (first * code_row) as u64,
             Some((count * code_row) as u64),
         )?;
-        for g in 0..total_groups {
+        for (g, dst) in out[head_bytes..].chunks_exact_mut(stride).enumerate() {
             let sb = g * scale_bytes;
             let cb = g * code_bytes;
-            out.extend_from_slice(&scale_raw[sb..sb + scale_bytes]);
-            out.extend_from_slice(&code_raw[cb..cb + code_bytes]);
+            dst[..*scale_bytes].copy_from_slice(&scale_raw[sb..sb + scale_bytes]);
+            dst[*scale_bytes..].copy_from_slice(&code_raw[cb..cb + code_bytes]);
         }
         Ok(out)
     }
 
-    fn decode_fp8(&self, recipe: &Recipe, rows: Option<(usize, usize)>) -> Result<Vec<f32>, Error> {
+    fn load_fp8_parts(
+        &self,
+        recipe: &Recipe,
+        rows: Option<(usize, usize)>,
+    ) -> Result<Fp8Slice, Error> {
         let Recipe::Fp8 {
             shape: [out_rows, inp],
             codes,
             scales,
-            block: [bm, bk],
+            block,
         } = recipe
         else {
             unreachable!("checked fp8 recipe");
@@ -539,36 +607,64 @@ impl Quant {
             )));
         }
         if count == 0 || *inp == 0 {
-            return Ok(Vec::new());
+            return Ok(Fp8Slice {
+                first,
+                count: 0,
+                inp: *inp,
+                block: *block,
+                codes: Vec::new(),
+                scales: Vec::new(),
+            });
         }
         let code_raw =
             self.shards
                 .bytes_at(codes, (first * inp) as u64, Some((count * inp) as u64))?;
         let scale_vals = self.shards.floats(scales)?;
-        let scale_cols = inp.div_ceil(*bk);
-        let mut out = Vec::with_capacity(count * inp);
-        for r in 0..count {
-            let sr = (first + r) / bm * scale_cols;
-            let base = r * inp;
-            for c in 0..*inp {
-                let val = f32::from(E4M3(code_raw[base + c])) * scale_vals[sr + c / bk];
-                out.push(val);
-            }
+        Ok(Fp8Slice {
+            first,
+            count,
+            inp: *inp,
+            block: *block,
+            codes: code_raw,
+            scales: scale_vals,
+        })
+    }
+
+    fn map_fp8_rows<T: Copy + Default + Send>(
+        &self,
+        recipe: &Recipe,
+        rows: Option<(usize, usize)>,
+        elem_stride: usize,
+        row_fn: impl Fn(&[f32; 256], &[u8], &[f32], usize, &mut [T]) + Sync,
+    ) -> Result<Vec<T>, Error> {
+        let slice = self.load_fp8_parts(recipe, rows)?;
+        if slice.count == 0 || slice.inp == 0 {
+            return Ok(Vec::new());
         }
+        let [bm, bk] = slice.block;
+        let lut = &*E4M3_LUT;
+        let scale_cols = slice.inp.div_ceil(bk);
+        let row_len = slice.inp * elem_stride;
+        let mut out = vec![T::default(); slice.count * row_len];
+        for_row_strips(&mut out, row_len, slice.count, |start, chunk| {
+            for (dr, dst_row) in chunk.chunks_exact_mut(row_len).enumerate() {
+                let r = start + dr;
+                let sr = (slice.first + r) / bm * scale_cols;
+                let codes = &slice.codes[r * slice.inp..(r + 1) * slice.inp];
+                row_fn(lut, codes, &slice.scales[sr..sr + scale_cols], bk, dst_row);
+            }
+        });
         Ok(out)
+    }
+
+    fn decode_fp8(&self, recipe: &Recipe, rows: Option<(usize, usize)>) -> Result<Vec<f32>, Error> {
+        self.map_fp8_rows(recipe, rows, 1, decode_fp8_row)
     }
 
     fn assemble(&self, recipe: &Recipe, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
         match recipe {
             Recipe::Block { .. } => self.assemble_block(recipe, rows),
-            Recipe::Fp8 { .. } => {
-                let vals = self.decode_fp8(recipe, rows)?;
-                let mut out = Vec::with_capacity(vals.len() * 2);
-                for v in &vals {
-                    out.extend_from_slice(&narrow(v));
-                }
-                Ok(out)
-            }
+            Recipe::Fp8 { .. } => self.map_fp8_rows(recipe, rows, 2, encode_fp8_bf16_row),
         }
     }
 }

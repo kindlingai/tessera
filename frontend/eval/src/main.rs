@@ -15,7 +15,7 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--allow-weight-streaming] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
-[--embed <texts.json> [--vectors <file>]] [--forward <texts.json>]";
+[--embed <texts.json> [--vectors <file>]] [--embed-bench <list>] [--warmup <n>] [--iters <n>] [--dimensions <n>] [--forward <texts.json>]";
 
 /// A checkpoint's slices, as a manifest for the model tests.
 fn manifest(model: &Path) -> Result<String, Failure> {
@@ -45,6 +45,14 @@ struct Args {
     slices: Option<PathBuf>,
     /// Embed these texts with an exlr8 release, then stop.
     embed: Option<PathBuf>,
+    /// Run synthetic embedding benchmark scenarios, then stop.
+    embed_bench: Option<String>,
+    /// Warmup passes for `--embed-bench`.
+    warmup: usize,
+    /// Timed iterations for `--embed-bench`.
+    iters: usize,
+    /// Optional Matryoshka dimension count for embedding runs.
+    dimensions: Option<usize>,
     /// Where the embeddings go, as little-endian f32.
     vectors: Option<PathBuf>,
     /// Run each text forward through the model, then stop.
@@ -70,6 +78,10 @@ fn args() -> Option<Args> {
         context: 4096,
         slices: None,
         embed: None,
+        embed_bench: None,
+        warmup: 3,
+        iters: 10,
+        dimensions: None,
         vectors: None,
         forward: None,
         require_favored: false,
@@ -112,6 +124,10 @@ fn args() -> Option<Args> {
             "--context" => args.context = value.parse().ok()?,
             "--slices" => args.slices = Some(value.into()),
             "--embed" => args.embed = Some(value.into()),
+            "--embed-bench" => args.embed_bench = Some(value),
+            "--warmup" => args.warmup = value.parse().ok()?,
+            "--iters" => args.iters = value.parse().ok()?,
+            "--dimensions" => args.dimensions = Some(value.parse().ok()?),
             "--vectors" => args.vectors = Some(value.into()),
             "--forward" => args.forward = Some(value.into()),
             _ => return None,
@@ -301,10 +317,16 @@ fn main() -> ExitCode {
             }
         };
     }
-    let report = match &args.embed {
-        Some(texts) => embed::embed(&args.model, texts, args.vectors.as_deref())
-            .map(|s| serde_json::to_string_pretty(&s)),
-        None => match &args.forward {
+    let report = match (&args.embed, &args.embed_bench) {
+        (Some(texts), _) => {
+            embed::embed(&args.model, texts, args.vectors.as_deref(), args.dimensions)
+                .map(|s| serde_json::to_string_pretty(&s))
+        }
+        (None, Some(spec)) => {
+            embed::bench(&args.model, spec, args.warmup, args.iters, args.dimensions)
+                .map(|b| serde_json::to_string_pretty(&b))
+        }
+        (None, None) => match &args.forward {
             Some(texts) => {
                 forward::forward(&args.model, texts).map(|p| serde_json::to_string_pretty(&p))
             }

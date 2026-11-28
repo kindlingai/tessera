@@ -18,6 +18,8 @@ typedef simdgroup_float8x8 tile_held;
 #define TILE_ROW(e) (((lane / 4) & 4) + ((lane / 2) % 4))
 #define TILE_COL(e) ((((lane / 4) & 2) * 2) + ((lane % 2) * 2) + (e))
 #define TILE_VAL(acc, e) ((acc).thread_elements()[e])
+#define TILE_DIRECT 1
+#define TILE_SCALE(acc, e, by) ((acc).thread_elements()[e] *= (by))
 
 ";
 

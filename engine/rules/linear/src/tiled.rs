@@ -479,6 +479,14 @@ tiled_kernel!(
     launches = tiled_launches,
     shape = tiled_shape(self),
     load = tiled_load,
+    load_key = self.product.key_with((
+        self.schedule.block,
+        self.schedule.simds,
+        self.schedule.name,
+        self.schedule.near,
+        self.parts,
+        self.band,
+    )),
     unproven,
 )]
 pub struct Tiled {

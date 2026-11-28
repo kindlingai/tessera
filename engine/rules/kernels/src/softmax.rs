@@ -70,6 +70,7 @@ pub(crate) fn launch_grouped(
     softmax,
     launches = softmax_launches,
     load = Some(per_row(self.rows, self.width, body.trip(), 0.0)),
+    load_key = tessera_lower::load_key((self.rows, self.width, self.threads)),
 )]
 pub struct Softmax {
     pub rows: usize,

@@ -14,6 +14,7 @@ rocm = ["tessera-engine/rocm"]
 guided = ["dep:tessera-grammar", "tessera-grammar/llguidance"]
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 tessera-bundle = { workspace = true }
 tessera-engine = { workspace = true }
 tessera-grammar = { workspace = true, optional = true }

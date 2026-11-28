@@ -279,6 +279,20 @@ const SOFT_TO_BF16: &str = "f_fn u16 f_to_bf16(float x) {
 }
 ";
 
+/// Metal branchless float-to-e4m3 byte conversion, matching OCP e4m3.
+const METAL_TO_E4M3: &str = "f_fn u8 f_to_e4m3(float x) {
+    u32 bits = f_asbits(x);
+    u32 sign = (bits >> 24) & 0x80u;
+    u32 mag = bits & 0x7fffffffu;
+    u32 norm = (mag + 0xc407ffffu + ((mag >> 20) & 1u)) >> 20;
+    u32 sub = f_asbits(fma(f_bits(mag), 512.0f, 8388608.0f)) - 0x4b000000u;
+    u32 code = select(norm, sub, mag < 0x3c800000u);
+    u32 over = select(0x7eu, 0x7fu, mag > 0x7f800000u);
+    code = select(code, over, mag >= 0x43e00000u);
+    return (u8)(sign | code);
+}
+";
+
 /// Store helpers for bf16 and fp8 buffers.
 fn narrow_stores(metal: bool) -> String {
     let (addr, make_u2) = match metal {
@@ -299,7 +313,19 @@ fn narrow_stores(metal: bool) -> String {
 "
     );
     if metal {
-        return format!("{SOFT_TO_BF16}{SOFT_TO_E4M3}{store4_bf16}{soft_store4_e4m3}");
+        let metal_bf16 = format!(
+            "#if __METAL_VERSION__ >= 310
+f_fn u16 f_to_bf16(float x) {{
+    return as_type<u16>((bfloat)x);
+}}
+f_fn void f_store4_bf16(device u16 *p, float4 v) {{
+    *(device bfloat4 *)p = bfloat4(v);
+}}
+#else
+{SOFT_TO_BF16}{store4_bf16}#endif
+"
+        );
+        return format!("{metal_bf16}{METAL_TO_E4M3}{soft_store4_e4m3}");
     }
     let cuda_bf16 = format!(
         "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

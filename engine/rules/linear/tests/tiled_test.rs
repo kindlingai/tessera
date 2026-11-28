@@ -274,9 +274,11 @@ fn tables_pick_schedules() {
             integrated: true,
             memory: 0,
         });
+        // Metal's own bf16 rule would win unfavored.
         let device = Device::guess(&host())
             .on(platform)
-            .pinned(Pins::all(BF16_FORM));
+            .pinned(Pins::all(BF16_FORM))
+            .favoring("tiled");
         let plan = lower(&linear(3072, 3072), 0, &[(Rows, 256)], &device).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         assert_eq!(names, ["tiled_64x64_w32x16_bf16"], "{name}");

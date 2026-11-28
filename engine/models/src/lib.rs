@@ -15,6 +15,7 @@ pub mod mtp;
 pub mod nanogpt;
 pub mod preset;
 pub mod qwen35;
+pub mod qwen3_vl;
 pub mod qwen4_exp;
 mod shared;
 pub mod sprite;

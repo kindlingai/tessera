@@ -441,7 +441,7 @@ fn grid_offer(
 tessera_guest::exports! {
     rules: { NAME => Kind::Moe },
     kernels: { "moe.cu": [ROUTE, FC1, FC2, FC1_TURN, FC1_PF, FC2_PF, FINISH] },
-    files: ["mx8.cuh"],
+    files: ["mx8.cuh", "shared.cuh", "route.cuh"],
     knobs: [
         (NAME, "prefill", 0, 2048),
         (NAME, "slot_cap", 8, 64),

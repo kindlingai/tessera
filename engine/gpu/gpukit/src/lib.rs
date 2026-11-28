@@ -16,6 +16,10 @@ pub mod testing;
 
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod pending;
+#[cfg(test)]
+mod pending_test;
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod api;

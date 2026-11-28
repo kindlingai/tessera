@@ -36,7 +36,7 @@ pub fn ports(m: &Model, kind: EntryKind, rows: DimName) -> [Tensor; 2] {
 }
 
 /// Each pick's mask words, then its packed logit edits.
-pub fn mask_port() -> Port {
+fn mask_port() -> Port {
     let words = DimExpr::Add(Box::new(VocabWords.into()), Box::new(EditWords.into()));
     Port {
         role: Role::Allowed,
@@ -46,16 +46,37 @@ pub fn mask_port() -> Port {
 
 /// A step entry's tokens, positions, slots and optional mask.
 pub fn step_ports(m: &Model, masked: bool) -> ([Tensor; 3], Option<Tensor>) {
+    let (rows, extra, mask) = step_ports_with(m, masked, None);
+    debug_assert!(extra.is_none());
+    (rows, mask)
+}
+
+/// A step entry's rows, optional extra port, optional mask.
+pub fn step_ports_with(
+    m: &Model,
+    masked: bool,
+    extra: Option<Port>,
+) -> ([Tensor; 3], Option<Tensor>, Option<Tensor>) {
     let row = |role| Port {
         role,
         ty: TensorType::new([Rows], DType::U32),
     };
     let [t, p, s] = [Role::Tokens, Role::Positions, Role::Slots].map(row);
-    if !masked {
-        return (m.entry(EntryKind::Step, [t, p, s]), None);
+    match (extra, masked) {
+        (Some(e), true) => {
+            let [t, p, s, e, bits] = m.entry(EntryKind::Step, [t, p, s, e, mask_port()]);
+            ([t, p, s], Some(e), Some(bits))
+        }
+        (Some(e), false) => {
+            let [t, p, s, e] = m.entry(EntryKind::Step, [t, p, s, e]);
+            ([t, p, s], Some(e), None)
+        }
+        (None, true) => {
+            let [t, p, s, bits] = m.entry(EntryKind::Step, [t, p, s, mask_port()]);
+            ([t, p, s], None, Some(bits))
+        }
+        (None, false) => (m.entry(EntryKind::Step, [t, p, s]), None, None),
     }
-    let [t, p, s, bits] = m.entry(EntryKind::Step, [t, p, s, mask_port()]);
-    ([t, p, s], Some(bits))
 }
 
 /// The most token ids one sparse pick chooses from.

@@ -857,7 +857,8 @@ fn mla_narrow_kept() {
             dev.kept = layout;
             let plan = lower(&g, 0, &sizes, &dev).unwrap();
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-            assert!(names.contains(&"listed_attend"), "{names:?}");
+            let narrow = ["listed_attend", "mla_metal"];
+            assert!(names.iter().any(|n| narrow.contains(n)), "{names:?}");
             assert!(!names.contains(&"widen"), "{names:?}");
             assert_eq!(kept_bytes(&plan) * factor, base_bytes);
             let recipe = Recipe {

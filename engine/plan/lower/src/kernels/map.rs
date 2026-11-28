@@ -9,11 +9,11 @@ use crate::sites;
 use crate::sites::After;
 use crate::tree::{T, Tree};
 use std::cmp::Ordering;
-use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
 use tessera_codegen::prelude::*;
 use tessera_codegen::stage::Row;
-use tessera_codegen::{Dialect, hash};
-use tessera_graph::Act;
+use tessera_graph::{Act, DType};
 use tessera_work::Load;
 
 /// Adds `count` f32 operands `a0..` to `body`, at `at`.
@@ -48,6 +48,24 @@ fn map(
     let mut v = x[gid() as u64];
 }
 
+/// One thread per quad. Stages follow, then wide store.
+#[kernel]
+fn map_x4(
+    #[form(x_form)] x: Buf<Dyn>,
+    #[form(out_form)] out: BufMut<Dyn>,
+    len: u32,
+    #[build] x_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) {
+    if gid() >= len / 4 {
+        return;
+    }
+    let base = (gid() * 4) as u64;
+    let vx = x.load4(base);
+    let mut v = 0.0f32;
+    let mut o = F32x4::zero();
+}
+
 /// One elementwise step.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MapStage {
@@ -71,6 +89,7 @@ pub enum MapStage {
     accepts = map_accepts,
     emits = map_emits,
     load = map_load,
+    load_key = map_load_key,
     source = map_source,
     launches = map_launches,
 )]
@@ -79,6 +98,7 @@ pub struct Map(
     pub Vec<Option<usize>>,
     pub Vec<&'static dyn Stored>,
     pub &'static dyn Stored,
+    pub bool,
 );
 
 impl MapStage {
@@ -91,6 +111,7 @@ impl MapStage {
             MapStage::Shift(by) => (Row::Shift, *by),
             MapStage::Min(hi) => (Row::Min, *hi),
             MapStage::Max(lo) => (Row::Max, *lo),
+            MapStage::Act(Act::Gelu) => (Row::Gelu, 0.0),
             MapStage::Act(Act::GeluTanh) => (Row::GeluTanh, 0.0),
             MapStage::Act(Act::Silu) => (Row::Silu, 0.0),
             MapStage::Act(Act::Sigmoid) => (Row::Sigmoid, 0.0),
@@ -112,12 +133,19 @@ impl Map {
             vec![None; count],
             vec![F32_FORM; 1 + count],
             F32_FORM,
+            false,
         )
     }
 
     /// A copy from `from` into `to`.
     pub fn copy(from: &'static dyn Stored, to: &'static dyn Stored) -> Self {
-        Self(Vec::new(), Vec::new(), vec![plain(from)], writable(to))
+        Self(
+            Vec::new(),
+            Vec::new(),
+            vec![plain(from)],
+            writable(to),
+            false,
+        )
     }
 
     /// Scales a `from` input by `by` into f32.
@@ -127,6 +155,7 @@ impl Map {
             Vec::new(),
             vec![plain(from)],
             F32_FORM,
+            false,
         )
     }
 }
@@ -156,6 +185,11 @@ fn act_expr(a: Act) -> Expr {
             let tail = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Exp, vec![neg(most)]));
             let floor = call(Intrinsic::Max, vec![v(), lit(0.0)]);
             Expr::bin(BinOp::Add, floor, call(Intrinsic::Log, vec![tail]))
+        }
+        Act::Gelu => {
+            let scaled = Expr::bin(BinOp::Mul, v(), lit(std::f64::consts::FRAC_1_SQRT_2));
+            let e = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Erf, vec![scaled]));
+            Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, lit(0.5), v()), e)
         }
         Act::GeluTanh => {
             let cube = Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, v(), v()), v());
@@ -265,6 +299,61 @@ fn map_emits(k: &Map, form: &dyn Stored) -> bool {
     k.3.name() == form.name()
 }
 
+/// Hashes elementwise stages into `h` for unmeasured cost caching.
+pub fn hash_stages(stages: &[MapStage], h: &mut impl Hasher) {
+    stages.len().hash(h);
+    for stage in stages {
+        match *stage {
+            MapStage::Add => 0u8.hash(h),
+            MapStage::Mul => 1u8.hash(h),
+            MapStage::Scale(by) => {
+                2u8.hash(h);
+                by.to_bits().hash(h);
+            }
+            MapStage::Shift(by) => {
+                3u8.hash(h);
+                by.to_bits().hash(h);
+            }
+            MapStage::Min(hi) => {
+                4u8.hash(h);
+                hi.to_bits().hash(h);
+            }
+            MapStage::Max(lo) => {
+                5u8.hash(h);
+                lo.to_bits().hash(h);
+            }
+            MapStage::Act(act) => {
+                6u8.hash(h);
+                let tag: u8 = match act {
+                    Act::Gelu => 8,
+                    Act::GeluTanh => 0,
+                    Act::Silu => 1,
+                    Act::Sigmoid => 2,
+                    Act::Relu => 3,
+                    Act::Softplus => 4,
+                    Act::Exp => 5,
+                    Act::Tanh => 6,
+                    Act::SignedSqrt => 7,
+                };
+                tag.hash(h);
+            }
+        }
+    }
+}
+
+fn map_load_key(k: &Map) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_stages(&k.0, &mut h);
+    k.1.hash(&mut h);
+    k.2.len().hash(&mut h);
+    for form in &k.2 {
+        form.name().hash(&mut h);
+    }
+    k.3.name().hash(&mut h);
+    k.4.hash(&mut h);
+    h.finish()
+}
+
 /// One thread per element, each on its own lines.
 fn map_load(k: &Map, len: usize) -> Option<Load> {
     let x_bytes = k.2[0].bytes(len) as f64;
@@ -273,9 +362,15 @@ fn map_load(k: &Map, len: usize) -> Option<Load> {
     let reads = [x_bytes]
         .into_iter()
         .chain(k.1.iter().zip(&k.2[1..]).map(op_bytes));
-    let flight: f64 = k.2.iter().map(|f| f.element_bytes()).sum();
+    let mut flight: f64 = k.2.iter().map(|f| f.element_bytes()).sum();
+    let threads = if k.4 {
+        flight *= 4.0;
+        len / 4
+    } else {
+        len
+    };
     Some(Load {
-        threads: len,
+        threads,
         group: 256,
         trips: 1.0,
         trip: k.tree().trip(),
@@ -288,34 +383,38 @@ fn map_load(k: &Map, len: usize) -> Option<Load> {
 
 fn map_source(k: &Map) -> Source {
     let mut body = k.tree();
-    body.entry = format!("map_{:x}", hash(&body.text().render(Dialect::Cuda)));
+    let tag = if k.4 { "_x4" } else { "" };
+    body.entry = format!("map{tag}_{:x}", body.hash());
     Source::Made(body)
 }
 
-fn map_launches(_: &Map, step: &Step) -> Vec<Launch> {
+fn map_launches(k: &Map, step: &Step) -> Vec<Launch> {
     let len = step.write.len;
     let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
     args.extend([step.out(), Arg::count(len)]);
     vec![Launch {
         args,
-        shape: Shape::Line(len),
+        shape: Shape::Line(if k.4 { len / 4 } else { len }),
     }]
 }
 
 impl Map {
     /// The skeleton with the stages and the store appended.
     fn tree(&self) -> tessera_codegen::ir::Body {
+        if self.4 {
+            return self.wide_tree();
+        }
         let mut body = map_ir(self.2[0], self.3);
         // The operands sit between the input and the output.
         add_operand_forms(&mut body, 1, &self.2[1..]);
         let gid = || Expr::Call(Intrinsic::Gid, Vec::new());
-        let at = || Expr::cast(tessera_codegen::ir::Ty::U64, gid());
+        let at = || Expr::cast(Ty::U64, gid());
         // A repeating operand is read within its span.
         let read = |k: usize| {
             let at = match self.1[k] {
-                Some(1) => Expr::cast(tessera_codegen::ir::Ty::U64, Expr::Int(0)),
+                Some(1) => Expr::cast(Ty::U64, Expr::Int(0)),
                 Some(span) => Expr::cast(
-                    tessera_codegen::ir::Ty::U64,
+                    Ty::U64,
                     Expr::bin(BinOp::Rem, gid(), Expr::Int(span as i64)),
                 ),
                 None => at(),
@@ -330,6 +429,69 @@ impl Map {
         });
         body
     }
+
+    /// Four-wide vectorized map skeleton using `load4` and `store4`.
+    fn wide_tree(&self) -> tessera_codegen::ir::Body {
+        let mut body = map_x4_ir(self.2[0], self.3);
+        add_operand_forms(&mut body, 1, &self.2[1..]);
+        let gid = || Expr::Call(Intrinsic::Gid, Vec::new());
+        for (k, span) in self.1.iter().enumerate() {
+            let init = match *span {
+                Some(1) => Expr::index(
+                    Expr::var(&format!("a{k}")),
+                    Expr::cast(Ty::U64, Expr::Int(0)),
+                ),
+                Some(s) => {
+                    let off = Expr::bin(
+                        BinOp::Rem,
+                        Expr::bin(BinOp::Mul, gid(), Expr::Int(4)),
+                        Expr::Int(s as i64),
+                    );
+                    Expr::Call(
+                        Intrinsic::Load4,
+                        vec![Expr::var(&format!("a{k}")), Expr::cast(Ty::U64, off)],
+                    )
+                }
+                None => Expr::Call(
+                    Intrinsic::Load4,
+                    vec![Expr::var(&format!("a{k}")), Expr::var("base")],
+                ),
+            };
+            body.stmts.push(Stmt::Let {
+                name: format!("op{k}"),
+                init,
+            });
+        }
+        for ch in ['x', 'y', 'z', 'w'] {
+            body.stmts.push(Stmt::Assign {
+                target: Expr::var("v"),
+                op: None,
+                value: Expr::field(Expr::var("vx"), ch),
+            });
+            let read = |k: usize| match self.1[k] {
+                Some(1) => Expr::var(&format!("op{k}")),
+                _ => Expr::field(Expr::var(&format!("op{k}")), ch),
+            };
+            body.stmts.extend(stage_stmts(&self.0, &read));
+            body.stmts.push(Stmt::Assign {
+                target: Expr::field(Expr::var("o"), ch),
+                op: None,
+                value: Expr::var("v"),
+            });
+        }
+        body.stmts.push(Stmt::Expr(Expr::Call(
+            Intrinsic::Store4,
+            vec![Expr::var("out"), Expr::var("base"), Expr::var("o")],
+        )));
+        body
+    }
+}
+
+fn float_form(f: &dyn Stored) -> bool {
+    matches!(
+        f.dtype(),
+        DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8
+    )
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -341,7 +503,18 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     } = tree.site(at)?;
     let forms: Vec<&'static dyn Stored> = reads.iter().map(|r| plain(tree.node(*r).form)).collect();
     let out = writable(tree.node(at).form);
-    Some(vec![Draft::new(Map(stages, spans, forms, out), reads, len)])
+    let wide = len > 0
+        && len.is_multiple_of(4)
+        && forms.iter().all(|f| float_form(*f))
+        && float_form(out)
+        && spans
+            .iter()
+            .all(|s| matches!(s, None | Some(1)) || s.is_some_and(|n| n.is_multiple_of(4)));
+    Some(vec![Draft::new(
+        Map(stages, spans, forms, out, wide),
+        reads,
+        len,
+    )])
 }
 
 crate::rule!("map", propose);

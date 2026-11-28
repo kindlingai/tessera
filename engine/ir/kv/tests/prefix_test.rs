@@ -71,5 +71,29 @@ fn trie_matches_naive() {
                 assert_eq!(index.find(&pool, tag, &q, limit), want);
             }
         }
+        // High-fanout prefix exercises Small->Many edge promotion and lazy pruning.
+        let mut fan = Vec::new();
+        for b in 0u32..16 {
+            let mut h = vec![99u32; grid];
+            h.extend(std::iter::repeat_n(1000 + b, grid * 2));
+            if let Ok(run) = pool.reserve(Tag(u64::from(b % 2)), 4, 4) {
+                pool.retain(run).unwrap();
+                index.keep(run, h.clone(), h.len());
+                fan.push((run, h, b));
+            }
+        }
+        for &(run, _, b) in &fan {
+            if b % 3 == 0 {
+                let _ = pool.release(run);
+            }
+        }
+        for &(run, ref h, b) in &fan {
+            let got = index.find(&pool, Tag(u64::from(b % 2)), h, h.len());
+            if b % 3 != 0 {
+                assert_eq!(got, Some((run, h.len())));
+            } else {
+                assert!(got.is_none_or(|(r, skip)| r != run && skip == grid));
+            }
+        }
     }
 }

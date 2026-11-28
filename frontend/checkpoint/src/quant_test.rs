@@ -217,3 +217,41 @@ fn pairs_quant_forms() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn fp8_parallel_matches_scalar() {
+    // Exceeds PARALLEL_ELEMS with non-multiple block edges.
+    let (rows, cols, bm, bk) = (260usize, 260usize, 128usize, 128usize);
+    let codes: Vec<u8> = (0..rows * cols)
+        .map(|i| ((i * 53 + 17) & 0xff) as u8)
+        .collect();
+    let (sm, sk) = (rows.div_ceil(bm), cols.div_ceil(bk));
+    let scales: Vec<f32> = (0..sm * sk).map(|i| 0.25 + (i % 7) as f32 * 0.25).collect();
+    let scale_bytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let cfg = r#"{"quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}"#;
+    let dir = stage_dir(
+        "fp8_par",
+        Some(cfg),
+        &[
+            spec("w.weight", "F8_E4M3", &[rows, cols], codes.clone()),
+            spec("w.weight_scale_inv", "F32", &[sm, sk], scale_bytes),
+        ],
+    );
+    let offer = crate::open(&dir, None).unwrap();
+    let (c_ref, s_ref) = (codes.as_slice(), scales.as_slice());
+    let want: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            let sr = (r / bm) * sk;
+            (0..cols).map(move |c| f32::from(E4M3(c_ref[r * cols + c])) * s_ref[sr + c / bk])
+        })
+        .collect();
+    let got_f32 = offer.floats("w.weight").unwrap();
+    assert_eq!(got_f32.len(), want.len());
+    for (a, b) in got_f32.iter().zip(&want) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    assert_eq!(offer.packed("w.weight").unwrap(), bf16_bytes(&want));
+    let sub = offer.packed_rows("w.weight", (125, 135)).unwrap();
+    assert_eq!(sub, bf16_bytes(&want[125 * cols..260 * cols]));
+    std::fs::remove_dir_all(dir).unwrap();
+}

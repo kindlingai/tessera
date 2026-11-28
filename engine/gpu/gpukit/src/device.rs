@@ -239,9 +239,27 @@ pub trait Device: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this device supports concurrent encoding with explicit barriers.
+    fn has_barriers(&self) -> bool {
+        false
+    }
+
+    /// Toggles concurrent launch mode on this thread's open encoder.
+    fn set_concurrent(&self, _on: bool) {}
+
+    /// Orders prior concurrent launches before subsequent ones.
+    fn barrier(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Queues `pinned` on the active lane. It must outlive that.
     fn queue_upload(&self, ptr: u64, pinned: &[u8]) -> Result<(), Error> {
         self.upload(ptr, pinned)
+    }
+
+    /// Queues a copy into `pinned` on the active lane.
+    fn queue_download(&self, ptr: u64, pinned: &mut [u8]) -> Result<(), Error> {
+        self.download(ptr, pinned)
     }
 
     /// Whether this thread is recording a device graph now.
@@ -382,6 +400,9 @@ impl<D: Device> DeviceBuffer<D> {
     }
 
     fn host(&self) -> Option<NonNull<u8>> {
+        if D::BACKEND == Backend::Metal && self.ctx.capturing() {
+            return None;
+        }
         self.host.or_else(|| self.ctx.mapped(self.ptr, self.size))
     }
 

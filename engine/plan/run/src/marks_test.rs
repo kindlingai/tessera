@@ -46,3 +46,20 @@ fn gaps_between_marks() {
     assert_eq!((second.from, second.to), (20, 10));
     assert_eq!(marks.lost, 2);
 }
+
+#[test]
+fn unified_budget_full() {
+    use tessera_engine_settings::Memory::{Bytes, Device, Off};
+    let mem = 16u64 << 30;
+    let mut p = tessera_gpukit::Platform {
+        memory: mem,
+        ..Default::default()
+    };
+    let b = |m, p: &_| crate::Base::new(m, p).budget;
+    assert_eq!(b(Device, &p), Some(mem - mem / 10));
+    p.integrated = true;
+    assert_eq!(
+        (b(Device, &p), b(Off, &p), b(Bytes(1), &p)),
+        (Some(mem), None, Some(1))
+    );
+}

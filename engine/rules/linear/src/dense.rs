@@ -19,6 +19,7 @@ pub struct Dense {
     pub bits: u32,
     pub book: u32,
     pub x_bf16: bool,
+    pub y_bf16: bool,
     pub form: &'static dyn Stored,
 }
 
@@ -57,10 +58,12 @@ impl Dense {
         allow_bf16: bool,
     ) -> Result<Self, String> {
         let f32_form = |t: T| tree.node(t).form.name() == "f32";
-        if !f32_form(at) {
-            let name = tree.node(at).form.name();
-            return Err(format!("output form {name} (requires f32)"));
-        }
+        let y_name = tree.node(at).form.name();
+        let y_bf16 = match y_name {
+            "f32" => false,
+            "bf16" if allow_bf16 => true,
+            _ => return Err(format!("output form {y_name} (requires f32)")),
+        };
         let form = tree.node(w).form;
         let Some((bits, book)) = parse_form(form.name()) else {
             return Err(format!("unsupported trellis form {}", form.name()));
@@ -106,6 +109,7 @@ impl Dense {
             bits,
             book,
             x_bf16,
+            y_bf16,
             form,
         })
     }

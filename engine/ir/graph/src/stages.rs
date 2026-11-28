@@ -13,6 +13,8 @@ pub enum Takes {
     RowWeight,
     /// Integer positions that lead the rows.
     Positions,
+    /// Integer coordinates per position, with a trailing axis count.
+    Axes,
     /// A `u32` mask word per 32 entries, then edits.
     Bits,
 }
@@ -37,6 +39,8 @@ pub enum Place {
     Scatter,
     /// Each rank's own rows become replicated.
     Join,
+    /// Replicated rows become each rank's own rows.
+    Own,
 }
 
 /// A check on a stage's parameters.
@@ -177,6 +181,18 @@ macro_rules! stages {
                 check: Positive(theta, "rope base"),
                 blocks: 2,
             }
+            /// Multi-axis rotary positions. Operand holds coordinates per position.
+            Mrope {
+                theta: f32 = 10000.0,
+                /// Pairs per axis, zero-padded to three axes.
+                sections: [u32; 3] = [2, 2, 0],
+                /// Interleaved uses global frequencies. Contiguous resets per axis.
+                interleaved: bool = false,
+            } => "rope" {
+                operand: Axes,
+                check: Positive(theta, "mrope base"),
+                blocks: 2,
+            }
             Act(a: Act = Act::Silu) as act => Map { place: Nonlinear(a.keeps_zero()) }
             /// Sine of each element. Fold it away before lowering.
             Sin as sin => Fold { place: Replicated }
@@ -190,6 +206,8 @@ macro_rules! stages {
             ReduceScatter => Crossing { reduces: true, place: Scatter }
             /// Joins each rank's own rows, in rank order.
             GatherRows => Crossing { reduces: true, place: Join }
+            /// Keeps each rank's own rows without communication.
+            OwnRows => Crossing { place: Own }
             /// Entries past the position in the argument become -inf.
             Causal as causal => "causal" { operand: Positions, whole: true }
             /// Masks entries to -inf, then applies packed edits.

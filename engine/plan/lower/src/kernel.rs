@@ -3,7 +3,9 @@
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::extent::Extent;
 use crate::plan::Step;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 use tessera_engine_settings::Backend;
@@ -14,6 +16,13 @@ use tessera_work::Load;
 
 /// Seconds per unit of work for an unmeasured kernel.
 pub const UNPROVEN: f64 = 1e-9;
+
+/// Hashes explicit `load()` inputs into a cache key.
+pub fn load_key(inputs: impl Hash) -> u64 {
+    let mut h = DefaultHasher::new();
+    inputs.hash(&mut h);
+    h.finish()
+}
 
 /// One kernel with its sizes. Any crate may add one.
 pub trait Kernel: fmt::Debug + Send + Sync {
@@ -48,6 +57,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     }
     /// Its work and traffic when writing `len` elements.
     fn load(&self, _: usize) -> Option<Load> {
+        None
+    }
+    /// Key over `load()` inputs, allowing unmeasured estimate caching.
+    fn load_key(&self) -> Option<u64> {
         None
     }
     /// Whether it writes over its first input.
@@ -186,9 +199,23 @@ pub struct Needs {
     pub bf16_tile: bool,
     /// Block-scaled mxfp8 tiles with f32 sums.
     pub mxfp8_tile: bool,
+    /// Metal MSL 3.1 bfloat matrix tiles.
+    pub msl_bfloat: bool,
 }
 
 impl Needs {
+    /// Hand-written Metal text in 32-lane SIMD groups.
+    pub fn metal(group_threads: usize, group_bytes: usize) -> Self {
+        Needs {
+            lanes: 32,
+            group_bytes,
+            group_threads,
+            compiler: true,
+            lacks: &[Backend::Cuda, Backend::Rocm],
+            ..Needs::default()
+        }
+    }
+
     /// A SIMD group per row, in groups of 256 threads.
     pub fn lanes() -> Self {
         Needs {
@@ -218,6 +245,7 @@ impl Needs {
             && (!self.tile || platform.tile().is_some())
             && (!self.bf16_tile || platform.bf16_tile().is_some())
             && (!self.mxfp8_tile || platform.mxfp8_tile().is_some())
+            && (!self.msl_bfloat || limits.msl_bfloat)
     }
 
     /// First unmet hardware requirement for `platform`, if any.
@@ -230,6 +258,9 @@ impl Needs {
         }
         if self.compiler && !limits.compiler {
             return Some("requires kernel compiler".into());
+        }
+        if self.msl_bfloat && !limits.msl_bfloat {
+            return Some("requires MSL 3.1 bfloat tiles".into());
         }
         if self.mxfp8_tile && platform.mxfp8_tile().is_none() {
             return Some("requires mxfp8 tensor tiles".into());

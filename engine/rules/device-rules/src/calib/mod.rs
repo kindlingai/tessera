@@ -183,7 +183,7 @@ fn gemm_source(k: &PickedBf16) -> Source {
     order = Order::PerConfig,
     source = fixed_cuda("calib_sort_hist"),
     launches = hist_launches,
-    load = hist_load,
+    load = hist_load, load_key = tessera_lower::load_key((self.rows, self.count, self.sort_blocks)),
     unproven,
 )]
 struct SortHist {
@@ -257,7 +257,7 @@ fn hist_launches(k: &SortHist, step: &Step) -> Vec<Launch> {
     order = Order::PerConfig,
     source = fixed_cuda("calib_sort_prefix"),
     launches = prefix_launches,
-    load = prefix_load,
+    load = prefix_load, load_key = tessera_lower::load_key((self.count, self.max_tiles, self.sort_blocks)),
     unproven,
 )]
 struct SortPrefix {
@@ -317,7 +317,7 @@ fn prefix_launches(k: &SortPrefix, step: &Step) -> Vec<Launch> {
     order = Order::PerConfig,
     source = fixed_cuda("calib_sort_scatter"),
     launches = scatter_launches,
-    load = scatter_load,
+    load = scatter_load, load_key = tessera_lower::load_key((self.rows, self.count, self.sort_blocks)),
     unproven,
 )]
 struct SortScatter {
@@ -381,7 +381,7 @@ fn gemm_entry(out_f32: bool, fused: bool) -> &'static str {
     order = Order::PerConfig,
     source = gemm_source(self),
     launches = gemm_launches,
-    load = gemm_load,
+    load = gemm_load, load_key = tessera_lower::load_key(((self.rows, self.n, self.k, self.count, self.stride, self.offset, self.repeat), (self.max_tiles, self.sort_blocks, self.min_blocks, self.group_m, self.fused), self.out_form.name())),
     unproven,
 )]
 struct PickedBf16 {

@@ -24,24 +24,27 @@ pub(crate) use layout::EDITION;
 pub const CUDA_LACKS: &[tessera_lower::Backend] =
     &[tessera_lower::Backend::Metal, tessera_lower::Backend::Rocm];
 
+/// Non-ROCm backends skipped by ROCm-only rules.
+pub const ROCM_LACKS: &[tessera_lower::Backend] =
+    &[tessera_lower::Backend::Metal, tessera_lower::Backend::Cuda];
 #[doc(hidden)]
 pub use tessera_lower as __lower;
 
-/// Registers a CUDA rule, from a `check` or a proposer.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! cuda_rule {
-    ($name:literal, $propose:path, why = $why:path) => {
-        $crate::__lower::rule!($name, $propose, why = $why, lacks = $crate::CUDA_LACKS);
+macro_rules! device_rule {
+    ($lacks:path, $name:literal, $propose:path, why = $why:path) => {
+        $crate::__lower::rule!($name, $propose, why = $why, lacks = $lacks);
     };
-    ($name:literal, $propose:path) => {
+    ($lacks:path, $name:literal, $propose:path) => {
         const _: () = {
             fn why(_: &$crate::__lower::Tree, _: $crate::__lower::T) -> Option<String> {
                 None
             }
-            $crate::cuda_rule!($name, $propose, why = why);
+            $crate::device_rule!($lacks, $name, $propose, why = why);
         };
     };
-    ($name:literal, check = $check:path) => {
+    ($lacks:path, $name:literal, check = $check:path) => {
         const _: () = {
             use $crate::__lower::{Draft, T, Tree};
             fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -50,8 +53,24 @@ macro_rules! cuda_rule {
             fn why(tree: &Tree, at: T) -> Option<String> {
                 $check(tree, at)?.err()
             }
-            $crate::cuda_rule!($name, propose, why = why);
+            $crate::device_rule!($lacks, $name, propose, why = why);
         };
+    };
+}
+
+/// Registers a CUDA rule, from a `check` or a proposer.
+#[macro_export]
+macro_rules! cuda_rule {
+    ($($tt:tt)*) => {
+        $crate::device_rule!($crate::CUDA_LACKS, $($tt)*);
+    };
+}
+
+/// Registers a ROCm rule, from a `check` or a proposer.
+#[macro_export]
+macro_rules! rocm_rule {
+    ($($tt:tt)*) => {
+        $crate::device_rule!($crate::ROCM_LACKS, $($tt)*);
     };
 }
 

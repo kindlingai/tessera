@@ -97,6 +97,10 @@ pub struct Device {
     #[serde(skip)]
     #[partial_eq(skip)]
     memo: RefCell<Memo>,
+    /// Unmeasured chip-model estimates, without source hashing.
+    #[serde(skip)]
+    #[partial_eq(skip)]
+    model_memo: RefCell<ModelMemo>,
 }
 
 type FixedKey = (usize, usize, [(usize, usize); Backend::ALL.len()]);
@@ -143,6 +147,9 @@ fn sample(step: &Step, seconds: f64) -> Sample {
 
 /// Seconds by zone, name, entry, source, sizes, work, coldness.
 type Memo = HashMap<(ZoneKind, &'static str, Arc<str>, u64, Vec<usize>, u64, bool), f64>;
+
+/// Unmeasured chip-model estimates by zone, name, key, sizes, len, work.
+type ModelMemo = HashMap<(ZoneKind, &'static str, u64, Vec<usize>, usize, u64), Option<f64>>;
 
 /// Each generation is handed out once per process.
 static GENERATIONS: AtomicU64 = AtomicU64::new(1);
@@ -201,6 +208,7 @@ impl Default for Device {
             config: None,
             generation: 0,
             memo: RefCell::default(),
+            model_memo: RefCell::default(),
         }
     }
 }
@@ -321,6 +329,7 @@ impl Device {
     fn changed(mut self) -> Self {
         self.generation = fresh();
         self.memo.get_mut().clear();
+        self.model_memo.get_mut().clear();
         self
     }
 
@@ -506,6 +515,30 @@ impl Device {
             return f64::INFINITY;
         }
         let work = k.work(len);
+        // A host zone beside a GPU has its own samples.
+        let own = kind == self.cluster.kind(0);
+        let timed = if own { &self.timed } else { &self.host };
+        let chip = self.model.as_ref().filter(|_| own);
+        let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
+        // Without samples, cache chip-model estimates only for keyed kernels.
+        if !timed.has(k.name()) {
+            let Some(chip) = chip else {
+                return FIXED + k.guess() * work;
+            };
+            let est = if let Some(load_key) = k.load_key() {
+                let key = (kind, k.name(), load_key, k.sizes(), len, work.to_bits());
+                if let Some(&hit) = self.model_memo.borrow().get(&key) {
+                    hit
+                } else {
+                    let est = k.load(len).map(|l| chip.estimate(&l).seconds);
+                    self.model_memo.borrow_mut().insert(key, est);
+                    est
+                }
+            } else {
+                k.load(len).map(|l| chip.estimate(&l).seconds)
+            };
+            return est.unwrap_or(FIXED + k.guess() * work);
+        }
         let (entry, source) = identity();
         let key = (
             kind,
@@ -519,13 +552,8 @@ impl Device {
         if let Some(seconds) = self.memo.borrow().get(&key) {
             return *seconds;
         }
-        // A host zone beside a GPU has its own samples.
-        let own = kind == self.cluster.kind(0);
-        let timed = if own { &self.timed } else { &self.host };
         let near = timed.estimate(k.name(), Some(source), &key.4, work, cold);
-        // With no sample of this kernel, the chip model speaks.
-        let chip = self.model.as_ref().filter(|_| own);
-        let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
+        // With no matching sample, the chip model speaks.
         let seconds = near.or_else(modelled).unwrap_or(FIXED + k.guess() * work);
         self.memo.borrow_mut().insert(key, seconds);
         seconds
@@ -596,6 +624,7 @@ impl Device {
     pub fn fit<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
         self.generation = fresh();
         self.memo.get_mut().clear();
+        self.model_memo.get_mut().clear();
         let timed = samples
             .into_iter()
             .map(|(s, seconds)| (s.kernel.name(), sample(s, seconds)));
@@ -606,6 +635,7 @@ impl Device {
     pub fn fit_cold<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
         self.generation = fresh();
         self.memo.get_mut().clear();
+        self.model_memo.get_mut().clear();
         let timed = samples
             .into_iter()
             .map(|(s, seconds)| (s.kernel.name(), sample(s, seconds)));

@@ -490,6 +490,11 @@ impl<D> Sum for P2p<D>
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
+    // Peer GPUs read each other over the host's PCIe.
+    fn shares_bus(&self) -> bool {
+        true
+    }
+
     fn sum(
         &mut self,
         from: u64,

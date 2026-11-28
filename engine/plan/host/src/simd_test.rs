@@ -45,3 +45,29 @@ fn levels_match_sums() {
         }
     }
 }
+
+/// Every NEON/AVX row-group remainder matches plain sums.
+#[test]
+fn panel_row_counts_match() {
+    let len = 301;
+    let row = |seed: usize| -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * seed + 5) % 11) as f32 * 0.5 - 2.5)
+            .collect()
+    };
+    let w_rows: Vec<Vec<f32>> = (1..=WIDE).map(row).collect();
+    let w: Vec<&[f32]> = w_rows.iter().map(Vec::as_slice).collect();
+    for m in [5usize, 6, 7, 8, 9, 10, 13] {
+        let x_rows: Vec<Vec<f32>> = (100..100 + m).map(row).collect();
+        let x: Vec<&[f32]> = x_rows.iter().map(Vec::as_slice).collect();
+        let mut acc = vec![[0.0f32; WIDE]; m];
+        if panel_at(Level::best(), &x, &w, &mut acc) {
+            for r in 0..m {
+                for c in 0..WIDE {
+                    let want: f32 = x[r].iter().zip(w[c]).map(|(a, b)| a * b).sum();
+                    assert_eq!(acc[r][c], want, "m={m} r={r} c={c}");
+                }
+            }
+        }
+    }
+}

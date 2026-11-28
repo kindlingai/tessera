@@ -26,6 +26,7 @@ knob!("thin", "max_rows", 1, 64);
     launches = thin_launches,
     shape = Shape::Line(self.product.n),
     load = thin_load,
+    load_key = self.product.key_with(self.rows_cap),
     unproven,
 )]
 pub(crate) struct Thin {

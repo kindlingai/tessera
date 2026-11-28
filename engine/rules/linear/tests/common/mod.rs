@@ -2,20 +2,12 @@
 
 use std::collections::HashMap;
 use tessera_codegen::ir::Param;
-use tessera_graph::DimName::{Ffn, Hidden, Rows};
+use tessera_graph::DimName::Rows;
 use tessera_interp::Tensor;
 use tessera_lower::{Plan, Source, Terms};
 use tessera_testkit::Noise;
-use tessera_trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, TensorType, Weights};
-
-#[derive(Weights)]
-struct Layer {
-    #[shape(Hidden, Ffn)]
-    w: Linear,
-}
-
-/// A graph's work on its input and the product.
-pub type Finish = fn(&tessera_trace::Tensor, tessera_trace::Tensor) -> tessera_trace::Tensor;
+pub use tessera_testkit::graphs::Finish;
+use tessera_trace::{Dim, Graph};
 
 /// `k` inputs to `n` outputs, over any number of rows.
 pub fn linear(k: u64, n: u64) -> Graph {
@@ -24,13 +16,7 @@ pub fn linear(k: u64, n: u64) -> Graph {
 
 /// The same, with stages after the matmul.
 pub fn finished(k: u64, n: u64, finish: Finish) -> Graph {
-    let rows = Dim::bounded(Rows, 640);
-    let m = Model::new(vec![rows, Dim::fixed(Hidden, k), Dim::fixed(Ffn, n)]);
-    let w: Layer = tessera_trace::declare(&m);
-    let ty = TensorType::new([Rows, Hidden], DType::F32);
-    let role = Role::Logits;
-    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
-    m.finish([(Role::Logits, &finish(&x, x.matmul(&w.w)))])
+    tessera_testkit::graphs::linear_then(&[Dim::bounded(Rows, 640)], [k, n], finish)
 }
 
 pub fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {

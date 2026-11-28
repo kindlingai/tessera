@@ -1,12 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A file tests may write, under the workspace's target directory.
 pub fn scratch(file: &str) -> PathBuf {
-    let dir = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../target/scratch"
-    ));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("workspace root");
+    let dir = root.join("target").join("scratch");
     std::fs::create_dir_all(&dir).expect("a target directory");
     dir.join(file)
 }

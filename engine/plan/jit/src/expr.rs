@@ -78,7 +78,8 @@ impl Lowerer<'_, '_> {
             Expr::Float(_) => Ty::F32,
             Expr::Bool(_) => Ty::Bool,
             Expr::Var(name) => match self.kind(name)? {
-                Kind::Lanes(ty, _) | Kind::One(ty, _) => ty,
+                Kind::Lanes(ty, _) | Kind::Reg(ty, _) | Kind::One(ty, _) => ty,
+                Kind::Reg4(_) => Ty::F32x4,
                 Kind::Buffer { .. } => Ty::Bytes,
                 _ => return Err(format!("`{name}` is not a value")),
             },
@@ -90,7 +91,7 @@ impl Lowerer<'_, '_> {
             Expr::Cast(ty, _) => *ty,
             Expr::Index(base, _) => match &**base {
                 Expr::Var(name) => match self.kind(name)? {
-                    Kind::Array(ty, ..) | Kind::Shared(ty, ..) => ty,
+                    Kind::Array(ty, ..) | Kind::LocalArray(ty, _) | Kind::Shared(ty, ..) => ty,
                     Kind::Buffer { form, .. } => element(form),
                     _ => Ty::F32,
                 },
@@ -150,6 +151,76 @@ impl Lowerer<'_, '_> {
         self.expr_as(at, Ty::U64, t)?.scalar()
     }
 
+    /// Rounds `v` to bf16 bits in an `i32`.
+    pub(crate) fn f32_to_bf16(&mut self, v: Value) -> Value {
+        let bits = self.b.ins().bitcast(types::I32, MemFlagsData::new(), v);
+        let abs = self.b.ins().band_imm_u(bits, 0x7fff_ffff);
+        let is_nan = self
+            .b
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThan, abs, 0x7f80_0000);
+        let hi = self.b.ins().ushr_imm_u(bits, 16);
+        let lsb = self.b.ins().band_imm_u(hi, 1);
+        let bias = self.b.ins().iadd_imm_u(lsb, 0x7fff);
+        let rounded = self.b.ins().iadd(bits, bias);
+        let rounded = self.b.ins().ushr_imm_u(rounded, 16);
+        let sign = self.b.ins().band_imm_u(hi, 0x8000);
+        let qnan = self.b.ins().bor_imm_u(sign, 0x7fc0);
+        self.b.ins().select(is_nan, qnan, rounded)
+    }
+
+    /// Loads one bf16 at `addr + off` and widens to `f32`.
+    fn load_bf16_at(&mut self, addr: Value, off: i32) -> Value {
+        let raw = self
+            .b
+            .ins()
+            .uload16(types::I32, MemFlagsData::new(), addr, off);
+        let bits = self.b.ins().ishl_imm_u(raw, 16);
+        self.b.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+    }
+
+    /// Element `at` of a buffer, read through its form.
+    fn read_at(&mut self, form: &'static dyn Load, [ptr, len, at]: [Value; 3]) -> Res<Value> {
+        let rd = match form.read() {
+            // Reads in range skip the helper and its checks.
+            Read::F32 | Read::U32 => {
+                let (rd, ty) = match form.read() {
+                    Read::F32 => ("rd_f32", types::F32),
+                    _ => ("rd_u32", types::I32),
+                };
+                let [fits, addr] = self.guarded([ptr, len, at], 4);
+                let load = |s: &mut Self| Some(s.b.ins().load(ty, MemFlagsData::new(), addr, 0));
+                let check = |s: &mut Self| s.call(rd, &[ptr, len, at]);
+                return Ok(self.either(fits, load, check, Some(ty)).expect("a value"));
+            }
+            Read::Bf16 => {
+                let [fits, addr] = self.guarded([ptr, len, at], 2);
+                let load = |s: &mut Self| Some(s.load_bf16_at(addr, 0));
+                let check = |s: &mut Self| s.call("rd_bf16", &[ptr, len, at]);
+                return Ok(self
+                    .either(fits, load, check, Some(types::F32))
+                    .expect("a value"));
+            }
+            Read::U8 => {
+                let [fits, addr] = self.guarded([ptr, len, at], 1);
+                let load =
+                    |s: &mut Self| Some(s.b.ins().uload8(types::I32, MemFlagsData::new(), addr, 0));
+                let check = |s: &mut Self| s.call("rd_u8", &[ptr, len, at]);
+                return Ok(self
+                    .either(fits, load, check, Some(types::I32))
+                    .expect("a value"));
+            }
+            Read::F16 => "rd_f16",
+            Read::Fp8 => "rd_fp8",
+            Read::Decode => {
+                let form = self.registered(form)?;
+                let v = self.call("rd_form", &[form, ptr, len, at]);
+                return Ok(v.expect("a value"));
+            }
+        };
+        Ok(self.call(rd, &[ptr, len, at]).expect("a value"))
+    }
+
     /// Element `at` of the buffer `name`, read through its form.
     fn read(&mut self, name: &str, at: &Expr, t: Value) -> Res<Value> {
         let Kind::Buffer {
@@ -163,29 +234,7 @@ impl Lowerer<'_, '_> {
         };
         let idx = self.index(at, t)?;
         let at = self.b.ins().iadd(skip, idx);
-        let rd = match form.read() {
-            // Reads in range skip the helper and its checks.
-            Read::F32 | Read::U32 => {
-                let (rd, ty) = match form.read() {
-                    Read::F32 => ("rd_f32", types::F32),
-                    _ => ("rd_u32", types::I32),
-                };
-                let [fits, addr] = self.guarded([ptr, len, at], 4);
-                let load = |s: &mut Self| Some(s.b.ins().load(ty, MemFlagsData::new(), addr, 0));
-                let check = |s: &mut Self| s.call(rd, &[ptr, len, at]);
-                return Ok(self.either(fits, load, check, Some(ty)).expect("a value"));
-            }
-            Read::Bf16 => "rd_bf16",
-            Read::F16 => "rd_f16",
-            Read::Fp8 => "rd_fp8",
-            Read::U8 => "rd_u8",
-            Read::Decode => {
-                let form = self.registered(form)?;
-                let v = self.call("rd_form", &[form, ptr, len, at]);
-                return Ok(v.expect("a value"));
-            }
-        };
-        Ok(self.call(rd, &[ptr, len, at]).expect("a value"))
+        self.read_at(form, [ptr, len, at])
     }
 
     /// `tanh(x)` as a rational polynomial, within 3e-7 of f32 `tanh`.
@@ -226,6 +275,8 @@ impl Lowerer<'_, '_> {
             Expr::Bool(b) => Ok(Val::S(self.iconst(types::I8, i64::from(*b)))),
             Expr::Var(name) => match self.kind(name)? {
                 Kind::Lanes(ty, slot) => Ok(self.load_lane(slot, ty, t)),
+                Kind::Reg(_, var) => Ok(Val::S(self.b.use_var(var))),
+                Kind::Reg4(vars) => Ok(Val::V(vars.map(|v| self.b.use_var(v)))),
                 Kind::One(_, v) => Ok(Val::S(v)),
                 _ => Err(format!("`{name}` is not a value")),
             },
@@ -259,6 +310,11 @@ impl Lowerer<'_, '_> {
                     }
                     Kind::Array(ty, slot, len) => {
                         let addr = self.array_at(slot, ty, len, t, at)?;
+                        Ok(self.load_at(addr, ty))
+                    }
+                    Kind::LocalArray(ty, slot) => {
+                        let idx = self.index(at, t)?;
+                        let addr = self.at(slot, idx, elem_size(ty));
                         Ok(self.load_at(addr, ty))
                     }
                     _ => Err(format!("`{name}` is not indexed")),
@@ -428,12 +484,25 @@ impl Lowerer<'_, '_> {
                 let x = self.floats(args, t)?[0];
                 Val::S(self.tanh(x))
             }
+            Intrinsic::Erf => math(self, "erf")?,
             Intrinsic::Log => math(self, "log")?,
             Intrinsic::Cos => math(self, "cos")?,
             Intrinsic::Sin => math(self, "sin")?,
-            Intrinsic::Max => math(self, "max")?,
+            Intrinsic::Max => {
+                let a = self.floats(args, t)?;
+                let (x, y) = (a[0], a[1]);
+                let x_nan = self.b.ins().fcmp(FloatCC::Unordered, x, x);
+                let y_nan = self.b.ins().fcmp(FloatCC::Unordered, y, y);
+                let m = self.b.ins().fmax(x, y);
+                let m = self.b.ins().select(y_nan, x, m);
+                Val::S(self.b.ins().select(x_nan, y, m))
+            }
             Intrinsic::Pow => math(self, "pow")?,
-            Intrinsic::Clamp => math(self, "clamp")?,
+            Intrinsic::Clamp => {
+                let a = self.floats(args, t)?;
+                let lo = self.b.ins().fmax(a[0], a[1]);
+                Val::S(self.b.ins().fmin(lo, a[2]))
+            }
             Intrinsic::RoundF16 => math(self, "round_f16")?,
             Intrinsic::RoundE4M3 => math(self, "round_e4m3")?,
             Intrinsic::Rsqrt => {
@@ -454,12 +523,59 @@ impl Lowerer<'_, '_> {
                 let Expr::Var(name) = &args[0] else {
                     return Err("a load names its buffer".into());
                 };
-                let mut out = [t; 4];
-                for (k, slot) in out.iter_mut().enumerate() {
-                    let at = Expr::bin(BinOp::Add, args[1].clone(), Expr::Int(k as i64));
-                    *slot = self.read(name, &at, t)?;
+                let Kind::Buffer {
+                    form,
+                    ptr,
+                    len,
+                    skip,
+                } = self.kind(name)?
+                else {
+                    return Err(format!("`{name}` is not a buffer"));
+                };
+                let idx = self.index(&args[1], t)?;
+                let at = self.b.ins().iadd(skip, idx);
+                match form.read() {
+                    Read::F32 | Read::Bf16 => {
+                        let is_f32 = form.read() == Read::F32;
+                        let stride = if is_f32 { 4 } else { 2 };
+                        let rd = if is_f32 { "rd_f32" } else { "rd_bf16" };
+                        let [fits, addr] = self.guarded_span([ptr, len, at], stride, stride * 4);
+                        let vals = self.either_many(
+                            fits,
+                            |s| {
+                                (0..4i32)
+                                    .map(|k| match is_f32 {
+                                        true => s.b.ins().load(
+                                            types::F32,
+                                            MemFlagsData::new(),
+                                            addr,
+                                            k * 4,
+                                        ),
+                                        false => s.load_bf16_at(addr, k * 2),
+                                    })
+                                    .collect()
+                            },
+                            |s| {
+                                (0..4i64)
+                                    .map(|k| {
+                                        let pos = s.b.ins().iadd_imm_u(at, k);
+                                        s.call(rd, &[ptr, len, pos]).expect("a float")
+                                    })
+                                    .collect()
+                            },
+                            &[types::F32; 4],
+                        );
+                        Val::V([vals[0], vals[1], vals[2], vals[3]])
+                    }
+                    _ => {
+                        let mut out = [t; 4];
+                        for (k, slot) in out.iter_mut().enumerate() {
+                            let pos = self.b.ins().iadd_imm_u(at, k as i64);
+                            *slot = self.read_at(form, [ptr, len, pos])?;
+                        }
+                        Val::V(out)
+                    }
                 }
-                Val::V(out)
             }
             Intrinsic::Store4 => {
                 let Expr::Var(name) = &args[0] else {
@@ -474,19 +590,55 @@ impl Lowerer<'_, '_> {
                 else {
                     return Err(format!("`{name}` is not a buffer"));
                 };
-                let st = match form.read() {
-                    Read::F32 => "st_f32",
-                    Read::Bf16 => "st_bf16",
-                    Read::Fp8 => "st_fp8",
-                    other => return Err(format!("cannot store4 into {other:?}")),
-                };
                 let idx = self.index(&args[1], t)?;
                 let at = self.b.ins().iadd(skip, idx);
                 let v = self.expr_as(&args[2], Ty::F32x4, t)?.wide()?;
-                for (k, part) in v.into_iter().enumerate() {
-                    let k = self.iconst(self.ptr, k as i64);
-                    let at = self.b.ins().iadd(at, k);
-                    self.call(st, &[ptr, len, at, part]);
+                match form.read() {
+                    Read::F32 | Read::Bf16 => {
+                        let is_f32 = form.read() == Read::F32;
+                        let stride = if is_f32 { 4 } else { 2 };
+                        let st = if is_f32 { "st_f32" } else { "st_bf16" };
+                        let [fits, addr] = self.guarded_span([ptr, len, at], stride, stride * 4);
+                        self.either(
+                            fits,
+                            |s| {
+                                for (k, &part) in v.iter().enumerate() {
+                                    if is_f32 {
+                                        s.b.ins().store(
+                                            MemFlagsData::new(),
+                                            part,
+                                            addr,
+                                            (k * 4) as i32,
+                                        );
+                                    } else {
+                                        let bits = s.f32_to_bf16(part);
+                                        s.b.ins().istore16(
+                                            MemFlagsData::new(),
+                                            bits,
+                                            addr,
+                                            (k * 2) as i32,
+                                        );
+                                    }
+                                }
+                                None
+                            },
+                            |s| {
+                                for (k, &part) in v.iter().enumerate() {
+                                    let pos = s.b.ins().iadd_imm_u(at, k as i64);
+                                    s.call(st, &[ptr, len, pos, part]);
+                                }
+                                None
+                            },
+                            None,
+                        );
+                    }
+                    Read::Fp8 => {
+                        for (k, part) in v.into_iter().enumerate() {
+                            let pos = self.b.ins().iadd_imm_u(at, k as i64);
+                            self.call("st_fp8", &[ptr, len, pos, part]);
+                        }
+                    }
+                    other => return Err(format!("cannot store4 into {other:?}")),
                 }
                 Val::S(self.iconst(types::I8, 0))
             }
@@ -508,8 +660,21 @@ impl Lowerer<'_, '_> {
                 };
                 let idx = self.index(&args[1], t)?;
                 let at = self.b.ins().iadd(skip, idx);
-                let f = if i == Intrinsic::Word { "word" } else { "half" };
-                Val::S(self.call(f, &[ptr, len, at]).expect("a word"))
+                let is_word = i == Intrinsic::Word;
+                let span = if is_word { 4 } else { 2 };
+                let f = if is_word { "word" } else { "half" };
+                let [fits, addr] = self.guarded_span([ptr, len, at], 1, span);
+                let load = |s: &mut Self| {
+                    Some(match is_word {
+                        true => s.b.ins().load(types::I32, MemFlagsData::new(), addr, 0),
+                        false => s.b.ins().uload16(types::I32, MemFlagsData::new(), addr, 0),
+                    })
+                };
+                let check = |s: &mut Self| s.call(f, &[ptr, len, at]);
+                Val::S(
+                    self.either(fits, load, check, Some(types::I32))
+                        .expect("a word"),
+                )
             }
             Intrinsic::Bits | Intrinsic::Signed => {
                 let v = self.u32s(args, t)?;
@@ -732,7 +897,18 @@ impl Lowerer<'_, '_> {
             }
             Intrinsic::Bf16Pair => {
                 let v = self.floats(args, t)?;
-                Val::S(self.call("bf16_pair", &[v[0], v[1]]).expect("a word"))
+                let mut round = |x: Value| {
+                    let b = self.b.ins().bitcast(types::I32, MemFlagsData::new(), x);
+                    let shifted = self.b.ins().ushr_imm_u(b, 16);
+                    let lsb = self.b.ins().band_imm_u(shifted, 1);
+                    let bias = self.b.ins().iadd_imm_u(lsb, 0x7fff);
+                    let sum = self.b.ins().iadd(b, bias);
+                    self.b.ins().band_imm_u(sum, 0xffff_0000)
+                };
+                let hi = round(v[0]);
+                let lo = round(v[1]);
+                let lo = self.b.ins().ushr_imm_u(lo, 16);
+                Val::S(self.b.ins().bor(hi, lo))
             }
             Intrinsic::F16 | Intrinsic::E4M3 | Intrinsic::E2M1 => {
                 let v = self.u32s(args, t)?;

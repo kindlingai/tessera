@@ -8,10 +8,13 @@
 <tr><td><a href="device">device/</a></td><td>tessera-device</td><td>Device headers, import scanner, host proxy and launcher for recipe kernels</td></tr>
 <tr><td><a href="device-grid">device-grid/</a></td><td>tessera-device-grid</td><td>Persistent-grid collectives and the resident whole-step decoder</td></tr>
 <tr><td><a href="device-linear">device-linear/</a></td><td>tessera-device-linear</td><td>Device CUDA linear matmul, trellis MMA, and decode GEMV rules</td></tr>
-<tr><td><a href="device-rules">device-rules/</a></td><td>tessera-device-rules</td><td>Device CUDA rules for attention, MoE and calibration</td></tr>
+<tr><td><a href="device-rules">device-rules/</a></td><td>tessera-device-rules</td><td>Device CUDA rules for attention and calibration</td></tr>
 <tr><td><a href="guest">guest/</a></td><td>tessera-guest</td><td>The recipe module ABI: memory hand-off and the table format</td></tr>
 <tr><td><a href="kernels">kernels/</a></td><td>tessera-kernels</td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td><a href="linear">linear/</a></td><td>tessera-linear</td><td>Generated matmul kernels, registered as lowering rules</td></tr>
+<tr><td><a href="metal-attention">metal-attention/</a></td><td>tessera-metal-attention</td><td>Metal attention, indexer and DeltaNet kernels, registered as lowering rules</td></tr>
+<tr><td><a href="metal-kernels">metal-kernels/</a></td><td>tessera-metal-kernels</td><td>Metal argmax, batched matmul and convolution kernels, registered as lowering rules</td></tr>
+<tr><td><a href="metal-linear">metal-linear/</a></td><td>tessera-metal-linear</td><td>Metal matmul, trellis and stacked kernels, registered as lowering rules</td></tr>
 <tr><td><a href="rules">rules/</a></td><td>tessera-rules</td><td>Links every lowering rule crate</td></tr>
 <tr><td><a href="wasm">wasm/</a></td><td>tessera-wasm</td><td>Lowering rules a sandboxed wasm module proposes, over JSON</td></tr>
 </table>

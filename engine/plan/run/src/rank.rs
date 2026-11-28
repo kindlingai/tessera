@@ -1,7 +1,7 @@
 //! One process's rank of a plan, over a transport.
 
 use crate::open;
-use crate::{Base, Error, Run};
+use crate::{Backed, Base, Error, HostPool, Run};
 use std::ops::Range;
 use std::time::Instant;
 use tessera_codegen::Precision;
@@ -11,6 +11,7 @@ use tessera_gpukit::Platform;
 use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
+use tessera_kv::Move;
 use tessera_lower::kernels::{AllGather, AllReduce, GatherRows, ReduceScatter, crosses};
 use tessera_lower::{Launching, Plan, Step};
 use tessera_mem::{DType, Tensor};
@@ -64,6 +65,10 @@ pub trait Sum {
     }
     /// Whether launches capture into a device graph.
     fn capturable(&self) -> bool {
+        false
+    }
+    /// Whether its traffic shares the host bus with host copies.
+    fn shares_bus(&self) -> bool {
         false
     }
     /// Stops a running grid before context-syncing device calls.
@@ -626,15 +631,15 @@ impl<T: Transport> Run for Rank<T> {
         self.runner.run_mut().upload_kept_pages(p, g, src)
     }
 
-    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+    fn open_host_kv(&mut self, pages: usize, page: usize, by: Backed) -> Result<HostPool, Error> {
         if let Some(grid) = &mut self.grid {
             let _ = grid.pause();
         }
-        self.runner.run_mut().open_host_kv(pages, page)
+        self.runner.run_mut().open_host_kv(pages, page, by)
     }
 
-    fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
-        self.runner.run_mut().move_kv_pages(promote, pairs)
+    fn move_kv_pages(&mut self, kind: Move, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        self.runner.run_mut().move_kv_pages(kind, pairs)
     }
 
     /// Runs these steps. Sums wait for every rank.

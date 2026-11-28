@@ -112,6 +112,7 @@ impl Context {
             group_threads: 1024,
             compiler: true,
             pdl: false,
+            msl_bfloat: false,
         }
     }
 

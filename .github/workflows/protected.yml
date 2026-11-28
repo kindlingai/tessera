@@ -4,7 +4,7 @@ name: Protected files
 # so a PR cannot change its own checks. It never runs PR code.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, edited, unlabeled, ready_for_review]
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review]
 
 permissions:
   actions: write
@@ -18,8 +18,13 @@ concurrency:
 jobs:
   human-review:
     # A draft waits. The ready_for_review event starts the run CI's success needs.
-    if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    # Of added labels, only a held-* label changes the result.
+    if: >-
+      github.event.pull_request.draft != true &&
+      (github.event.action != 'labeled' || startsWith(github.event.label.name, 'held-'))
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
@@ -32,14 +37,14 @@ jobs:
           BIG_PR_LINES: 5000
         run: |
           # README.md changes inside the generated crate table skip review.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
-            | tools/scripts/review-paths.sh \
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" > "$RUNNER_TEMP/files"
+          tools/scripts/review-paths.sh < "$RUNNER_TEMP/files" \
             | tools/scripts/protected.sh > "$RUNNER_TEMP/hits"
-          tools/scripts/big-pr.sh >> "$RUNNER_TEMP/hits"
+          tools/scripts/big-pr.sh < "$RUNNER_TEMP/files" >> "$RUNNER_TEMP/hits"
           cat "$RUNNER_TEMP/hits"
           tools/scripts/protected-label.sh < "$RUNNER_TEMP/hits"
       - name: Rerun CI's success job
         # A finished success job read the old label or setting.
-        if: contains(fromJSON('["edited", "unlabeled"]'), github.event.action)
+        if: contains(fromJSON('["edited", "labeled", "unlabeled"]'), github.event.action)
         run: tools/scripts/rerun-success.sh "$SHA"
       - run: tools/scripts/pr-gate.sh

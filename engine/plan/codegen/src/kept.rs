@@ -71,13 +71,13 @@ pub fn attach(mut body: Body, layout: &'static dyn Layout) -> Body {
         let [slot, position] = <[Expr; 2]>::try_from(args).expect("kept_row takes two");
         layout.row(slot, position)
     };
-    body.stmts = inline::replace(&body.stmts, Intrinsic::KeptRow, &row);
+    inline::replace(&mut body.stmts, Intrinsic::KeptRow, &row);
     if layout.page().is_some() {
         let buffer = |p: &Param| matches!(p, Param::Buffer { .. });
         let last = body.params.iter().rposition(buffer);
         let table = Param::Buffer {
             name: TABLE.into(),
-            form: crate::form::of(tessera_graph::DType::U32),
+            form: crate::form::U32_FORM,
             writes: false,
         };
         body.params.insert(last.map_or(0, |at| at + 1), table);

@@ -1,6 +1,5 @@
 //! Replays a plan on any GPU over the device traits.
 
-use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
 use crate::kernels::{self, Kernels};
@@ -11,6 +10,7 @@ use crate::paged::{KvMem, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
+use crate::{Backed, Error, HostPool};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -18,12 +18,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
-use tessera_gpukit::backend::OnGpu;
+use tessera_gpukit::backend::{Backend, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
+use tessera_lower::hazard::Waves;
 use tessera_lower::kernels::crosses;
-use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
+use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, Step};
 use tessera_mem::{Buffer, DType};
 
 mod replan;
@@ -284,9 +285,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     /// Whether `steps` can record into one device graph.
     pub(crate) fn can_record(&self, steps: &Range<usize>) -> bool {
-        // A recorded graph cannot hold a grid that waits.
+        // Skip Metal graphs when profiling or paging.
+        let metal_skip =
+            D::BACKEND == Backend::Metal && (self.base.profile.is_some() || self.pager.is_some());
         self.launching.graphs
             && self.ctx.graphs()
+            && !metal_skip
             && !self.resident[steps.clone()].contains(&true)
             && self.base.plan.id != 0
     }
@@ -296,8 +300,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         if wait
             && end == self.base.plan.steps.len()
             && let Some(pager) = &mut self.pager
+            // Recorded graphs hold the old choice to copy.
+            && pager.maintain(self.ctx, self.base.plan.id)?
         {
-            pager.maintain(self.ctx)?;
+            self.drop_graphs();
         }
         Ok(())
     }
@@ -501,30 +507,46 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         mut sums: Option<&mut (dyn Sum + 'static)>,
         stamped: bool,
     ) -> Result<(), Capture> {
-        let order = marks::slots(&self.base.plan, steps.clone());
+        let mut order = marks::slots(&self.base.plan, steps.clone());
+        // An unstaged plan runs without its copy steps.
+        let stages = |p: &Pager<D>| p.stages(self.base.plan.id);
+        if !self.pager.as_ref().is_some_and(stages) {
+            order.retain(|(_, i, _)| i.is_some());
+        }
+        let ordered: Vec<&Step> = order.iter().map(|(.., s)| *s).collect();
+        let turns = self.pager.as_ref().is_some_and(Pager::turns);
         let sync = match self.ctx.has_lanes() {
-            true => LaneSync::plan(order.iter().map(|(.., s)| *s)),
+            true => LaneSync::plan(ordered.iter().copied(), turns),
             false => LaneSync::default(),
         };
+        let mut waves = Waves::new(&self.base.plan, self.ctx.has_barriers() && !sync.active);
         let stamps = stamped.then_some(self.stamps.as_ref()).flatten();
         let len = steps.len();
         if let Some(st) = stamps {
             st.emit(self.ctx, len, marks::BEGIN)?;
         }
         sync.begin(self.ctx)?;
+        if waves.active() {
+            self.ctx.set_concurrent(true);
+        }
+        let bar = |ok: bool| if ok { self.ctx.barrier() } else { Ok(()) };
         let run = (|| -> Result<(), Capture> {
             for (at, &(rel, i, step)) in order.iter().enumerate() {
                 sync.before(self.ctx, at, step.lane)?;
                 let Some(i) = i else {
+                    bar(waves.before(&ordered, at, true))?;
                     self.stage(step, stamps.map(|st| (st, rel)))?;
+                    bar(waves.reset(at + 1))?;
                     sync.after(self.ctx, at, step.lane)?;
                     continue;
                 };
-                if sync.active
-                    && let Some(st) = stamps
-                {
+                if let Some(st) = stamps.filter(|_| sync.active) {
                     st.emit(self.ctx, rel, marks::LANE_BEGIN)?;
                 }
+                let sp = crosses(step.kernel.name())
+                    || step.kernel.staged().is_some()
+                    || self.resident[i];
+                bar(waves.before(&ordered, at, sp))?;
                 if crosses(step.kernel.name())
                     && let Some(grid) = sums.as_deref_mut()
                 {
@@ -533,10 +555,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                         return Err(Capture::Split(i));
                     }
                 } else {
-                    for launch in self.base.launches(i)? {
-                        self.launch(i, &launch)?;
+                    for (k, launch) in self.base.launches(i)?.iter().enumerate() {
+                        bar(k > 0 && waves.reset(at))?;
+                        self.launch(i, launch)?;
                     }
                 }
+                bar(sp && waves.reset(at + 1))?;
                 if let Some(st) = stamps {
                     let mode = match (sync.active, rel + 1 == len) {
                         (true, _) => marks::LANE_END,
@@ -548,17 +572,20 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 sync.after(self.ctx, at, step.lane)?;
             }
             sync.finish(self.ctx)?;
-            if sync.active
-                && let Some(st) = stamps
-            {
+            if let Some(st) = stamps.filter(|_| sync.active) {
                 st.emit(self.ctx, len, marks::END)?;
             }
             Ok(())
         })();
+        let end = waves.active().then(|| {
+            let b = self.ctx.barrier();
+            self.ctx.set_concurrent(false);
+            b
+        });
         if sync.active {
             self.ctx.set_lane(0);
         }
-        run
+        run.and_then(|()| end.transpose().map(|_| ()).map_err(Capture::from))
     }
 }
 
@@ -768,17 +795,18 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         b.held.upload_pages(ctx, st, &b.plan, p, g, src)
     }
 
-    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+    fn open_host_kv(&mut self, pages: usize, page: usize, by: Backed) -> Result<HostPool, Error> {
         self.check_ready()?;
-        let ok = self.kv.open_host(self.ctx, &self.base.plan, pages, page);
+        let plan = &self.base.plan;
+        let ok = self.kv.open_host(self.ctx, plan, pages, page, by);
         self.clear_graphs()?;
         Ok(ok)
     }
 
-    fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+    fn move_kv_pages(&mut self, kind: tessera_kv::Move, p: &[(u32, u32)]) -> Result<bool, Error> {
         self.check_ready()?;
         self.kv
-            .move_pages(&self.base.held, &self.base.plan, promote, pairs)
+            .move_pages(&self.base.held, &self.base.plan, kind, p)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

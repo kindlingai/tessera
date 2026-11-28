@@ -5,6 +5,11 @@ use crate::tensor::Error;
 use tessera_graph::{Act, Attend, Delta, Mask, Numerics, Pairs, Stage};
 use tessera_mem::Tensor;
 
+/// Exact GELU using `erf(x / sqrt(2))`.
+fn gelu_exact(x: f32) -> f32 {
+    0.5 * x * (1.0 + tessera_graph::erf(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
 /// The tanh approximation the GPU kernels use.
 fn gelu(x: f32) -> f32 {
     const COEF: f32 = 0.797_884_6;
@@ -28,6 +33,7 @@ fn signed_sqrt(x: f32) -> f32 {
 
 fn act(a: Act, x: f32) -> f32 {
     match a {
+        Act::Gelu => gelu_exact(x),
         Act::GeluTanh => gelu(x),
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Sigmoid => 1.0 / (1.0 + (-x).exp()),
@@ -53,6 +59,55 @@ fn turn(row: &mut [f32], pos: usize, theta: f32, pairs: Pairs, turned: usize) {
             Pairs::Halves => (j, j + half),
         };
         let (sin, cos) = angle(pos, j, row.len(), theta).sin_cos();
+        (row[a], row[b]) = (row[a] * cos - row[b] * sin, row[a] * sin + row[b] * cos);
+    }
+}
+
+/// Multi-axis rotary angle for pair `j`.
+fn mrope_angle(
+    coords: &[usize],
+    j: usize,
+    width: usize,
+    theta: f32,
+    sections: [u32; 3],
+    interleaved: bool,
+) -> f32 {
+    let (s0, s1, s2) = (
+        sections[0] as usize,
+        sections[1] as usize,
+        sections[2] as usize,
+    );
+    let (axis, local, denom) = if interleaved {
+        let axis = if j % 3 == 1 && j < s1 * 3 {
+            1
+        } else if j % 3 == 2 && j < s2 * 3 {
+            2
+        } else {
+            0
+        };
+        (axis, j, width)
+    } else if j < s0 {
+        (0, j, 2 * s0)
+    } else if j < s0 + s1 {
+        (1, j - s0, 2 * s1)
+    } else {
+        (2, j - s0 - s1, 2 * s2)
+    };
+    coords[axis] as f32 * theta.powf(-((2 * local) as f32) / denom as f32)
+}
+
+/// Rotates halves of `row` using multi-axis coordinates.
+fn turn_mrope(
+    row: &mut [f32],
+    coords: &[usize],
+    theta: f32,
+    sections: [u32; 3],
+    interleaved: bool,
+) {
+    let half = row.len() / 2;
+    for j in 0..half {
+        let (sin, cos) = mrope_angle(coords, j, row.len(), theta, sections, interleaved).sin_cos();
+        let (a, b) = (j, j + half);
         (row[a], row[b]) = (row[a] * cos - row[b] * sin, row[a] * sin + row[b] * cos);
     }
 }
@@ -532,6 +587,56 @@ pub(crate) fn attend_rows(
     Ok(Tensor::f32(vec![rows, heads, dv], out))
 }
 
+/// Packed rows `[Rows, Heads, D]` with `[start, end)` segment bounds.
+pub(crate) fn attend_packed(
+    n: &Numerics,
+    a: &Attend,
+    [q, k, v]: [&Tensor; 3],
+    bounds: &Tensor,
+) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let [rows, heads, d] = q.shape[..] else {
+        return Err(Error::Mismatch(
+            "packed attention wants rank 3 queries".into(),
+        ));
+    };
+    let (kv_heads, dv) = (k.shape[1], v.shape[2]);
+    let group = heads / kv_heads;
+    let qs = q.floats()?;
+    let (ks, vs) = (k.floats()?, v.floats()?);
+    let bounds = bounds.indices()?;
+    let kv = Keys {
+        acc,
+        scale: a.scale,
+        k: ks,
+        v: vs,
+    };
+    let causal = a.mask.causal();
+    let mut out = vec![0.0; rows * heads * dv];
+    let mut p = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let start = bounds[r * 2].min(rows);
+        let end = bounds[r * 2 + 1].min(rows);
+        let to = if causal { end.min(r + 1) } else { end };
+        if to <= start {
+            continue;
+        }
+        for h in 0..heads {
+            let row = r * heads + h;
+            let kv_at = |j: usize| (j * kv_heads + h / group, 0.0);
+            let o = &mut out[row * dv..(row + 1) * dv];
+            kv.row(
+                &qs[row * d..(row + 1) * d],
+                (start..to).map(kv_at),
+                None,
+                &mut p,
+                o,
+            );
+        }
+    }
+    Ok(Tensor::f32(vec![rows, heads, dv], out))
+}
+
 pub(crate) fn stage(
     n: &Numerics,
     s: &Stage,
@@ -596,7 +701,11 @@ pub(crate) fn stage(
         Stage::Cos => out.iter_mut().for_each(|v| *v = v.cos()),
         Stage::Softmax => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
         // One rank holds the whole value already.
-        Stage::AllReduce | Stage::AllGather | Stage::ReduceScatter | Stage::GatherRows => {}
+        Stage::AllReduce
+        | Stage::AllGather
+        | Stage::ReduceScatter
+        | Stage::GatherRows
+        | Stage::OwnRows => {}
         Stage::Rope {
             theta,
             pairs,
@@ -609,6 +718,22 @@ pub(crate) fn stage(
             for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
                 for row in block.chunks_mut(width) {
                     turn(row, pos, *theta, *pairs, turned);
+                }
+            }
+        }
+        Stage::Mrope {
+            theta,
+            sections,
+            interleaved,
+        } => {
+            let op = operand()?;
+            let axes = *op.shape.last().unwrap_or(&1);
+            let at = op.indices()?;
+            let positions = at.len() / axes.max(1);
+            let span = out.len() / positions.max(1);
+            for (block, coords) in out.chunks_mut(span.max(1)).zip(at.chunks(axes.max(1))) {
+                for row in block.chunks_mut(width) {
+                    turn_mrope(row, coords, *theta, *sections, *interleaved);
                 }
             }
         }

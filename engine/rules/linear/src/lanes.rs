@@ -87,6 +87,7 @@ fn linear<const WIDE: u32>(
     launches = lanes_launches,
     shape = Shape::Line(self.product.n * LANES),
     load = lanes_load,
+    load_key = self.product.key_with((self.rows_cap, self.ahead)),
     unproven,
 )]
 pub(crate) struct Lanes {

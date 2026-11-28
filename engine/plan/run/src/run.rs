@@ -1,8 +1,8 @@
 //! Work every backend's plan runner does.
 
-use crate::Error;
 use crate::held::Held;
 use crate::profile::Profile;
+use crate::{Backed, Error, HostPool};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
@@ -12,6 +12,7 @@ use tessera_codegen::Precision;
 use tessera_engine_settings::{Memory, Reads};
 use tessera_gpukit::Platform;
 use tessera_graph::DimName;
+use tessera_kv::Move;
 use tessera_lower::form::{F32_FORM, Load};
 use tessera_lower::{
     Arg, Extent, Filed, Launch, Launching, Loaded, Plan, Shape, Share, Slot, Weight,
@@ -29,10 +30,14 @@ pub struct Base {
     launches: Vec<OnceLock<Vec<Launch>>>,
     /// The most bytes a plan may use. `None` checks nothing.
     pub(crate) budget: Option<u64>,
+    /// Bytes the runner holds beside the plan's buffers.
+    pub(crate) beside: u64,
     /// Whether weights past the budget may page from the host.
     pub(crate) streams: bool,
     /// Cold experts copy to VRAM ahead of their reader.
     pub(crate) stages: bool,
+    /// Set once a sum transport shares the host bus.
+    pub(crate) shared_bus: bool,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
     pub(crate) reads: Reads,
@@ -43,11 +48,12 @@ pub struct Base {
 impl Base {
     /// Empty, with the plan budget `memory` gives on `platform`.
     pub(crate) fn new(memory: Memory, platform: &Platform) -> Self {
-        // A tenth of the device stays spare.
+        // Discrete GPUs keep a tenth spare.
         let budget = match memory {
             Memory::Off => None,
             Memory::Bytes(bytes) => Some(bytes),
             Memory::Device if platform.memory == 0 => None,
+            Memory::Device if platform.integrated => Some(platform.memory),
             Memory::Device => Some(platform.memory - platform.memory / 10),
         };
         Self {
@@ -66,6 +72,12 @@ impl Base {
     /// Memory budget in bytes, if bounded.
     pub fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// Budget bytes in use: the plan and the expert cache.
+    pub fn planned(&self) -> u64 {
+        let buffers: u64 = self.plan.buffers.iter().map(|b| *b as u64).sum();
+        buffers + self.beside
     }
 
     /// Whether `weight` has a staged whole slot.
@@ -263,13 +275,13 @@ pub trait Run {
         Ok(true)
     }
 
-    /// Opens a pinned device-mapped host KV pool of `pages`.
-    fn open_host_kv(&mut self, _pages: usize, _page: usize) -> Result<bool, Error> {
-        Ok(false)
+    /// Opens a device-mapped host KV pool of `pages`.
+    fn open_host_kv(&mut self, _n: usize, _page: usize, _by: Backed) -> Result<HostPool, Error> {
+        Ok(HostPool::None)
     }
 
-    /// Promotes or demotes `(vram_phys, host_phys)` sparse KV page pairs.
-    fn move_kv_pages(&mut self, _promote: bool, _pairs: &[(u32, u32)]) -> Result<bool, Error> {
+    /// Moves `(vram_phys, host_phys)` sparse KV page pairs as `kind` says.
+    fn move_kv_pages(&mut self, _kind: Move, _pairs: &[(u32, u32)]) -> Result<bool, Error> {
         Ok(false)
     }
 

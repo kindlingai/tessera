@@ -4,11 +4,13 @@ mod attend;
 mod conv;
 mod cpu;
 mod delta;
-mod flash;
-mod indexer;
+pub mod flash;
+mod flash_rows;
+pub mod indexer;
 mod join_rope;
 mod kv_prep;
-mod listed;
+pub mod listed;
+mod packed;
 mod slots;
 
 use tessera_lower::form::Load as Stored;

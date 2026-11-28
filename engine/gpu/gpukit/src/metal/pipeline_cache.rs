@@ -5,22 +5,25 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunction,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary,
     MTLPipelineOption,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
-/// Every pipeline compiled so far, by its label.
+/// Every pipeline and library compiled so far, shared process-wide.
 #[derive(Default)]
 pub(crate) struct Pipelines {
     /// Keyed by label. The label must encode the full specialization.
     compiled: Mutex<HashMap<String, Pipeline>>,
+    /// Compiled Metal libraries keyed by expanded source text.
+    libraries: Mutex<HashMap<String, Library>>,
 }
 
-// SAFETY: pipelines are immutable, and the map is locked.
+// SAFETY: pipelines and libraries are immutable, and maps are locked.
 unsafe impl Send for Pipelines {}
 unsafe impl Sync for Pipelines {}
 
@@ -30,6 +33,29 @@ impl Pipelines {
     /// The process-wide set.
     pub(crate) fn shared() -> Arc<Self> {
         Arc::clone(GLOBAL.get_or_init(Default::default))
+    }
+
+    pub(crate) fn get(&self, label: &str) -> Option<Pipeline> {
+        self.compiled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(label)
+            .cloned()
+    }
+
+    pub(crate) fn get_library(&self, source: &str) -> Option<Library> {
+        self.libraries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(source)
+            .cloned()
+    }
+
+    pub(crate) fn insert_library(&self, source: String, library: Library) {
+        self.libraries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(source, library);
     }
 
     pub(crate) fn compile_compute(

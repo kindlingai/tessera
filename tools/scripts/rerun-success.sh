@@ -5,6 +5,13 @@
 # finished may have read the old state. GitHub reruns a job only in
 # a finished run, so wait for the run, then rerun.
 # Needs GH_TOKEN and GITHUB_REPOSITORY.
+# The SHAs do not depend on each other, and one may wait for its run,
+# so each SHA runs in its own process. GitHub allows a client 100
+# requests at once.
+if [ $# -gt 1 ]; then
+    printf '%s\n' "$@" | xargs -n 1 -P 100 "$0"
+    exit
+fi
 tmp=$(mktemp -d)
 status=0
 for sha in "$@"; do

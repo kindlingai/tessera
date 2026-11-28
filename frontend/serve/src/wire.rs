@@ -3,13 +3,17 @@
 use crate::Model;
 use crate::http::Response;
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{self, DeserializeOwned, IgnoredAny, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_engine::{Penalties, Sampling};
-use tessera_tasks::api::{Format, ToolChoice as TaskToolChoice};
+use tessera_tasks::api::{
+    EmbedInput, EmbedMessage, EmbedOptions, EmbedPart, Format, ToolChoice as TaskToolChoice,
+};
 use tessera_tasks::scopes::{Boost, Sequence, Thinking};
+use tessera_tasks::vision::decode_uri;
 
 /// Why a request was refused, in OpenAI's error format.
 #[derive(Debug)]
@@ -101,32 +105,34 @@ pub(crate) fn object(body: &[u8]) -> Result<Map<String, Value>, Refusal> {
     serde_json::from_slice(body).map_err(|e| refuse(400, e.to_string(), None))
 }
 
+/// Validates that `got`, if set, names `model`.
+fn check_model(model: &Model, got: Option<&Value>) -> Result<(), Refusal> {
+    match got {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(m)) if *m == model.info.name => Ok(()),
+        Some(m) => {
+            let m = m.as_str().map_or_else(|| m.to_string(), str::to_string);
+            Err(refuse(
+                404,
+                format!("The model `{m}` does not exist."),
+                Some("model"),
+            ))
+        }
+    }
+}
+
 /// The body, for this model only.
 pub(crate) fn parse<T: DeserializeOwned + Bagged>(
     model: &Model,
     body: &[u8],
 ) -> Result<T, Refusal> {
     let body = object(body)?;
-    match body.get("model") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(m)) if *m == model.info.name => {}
-        Some(m) => {
-            let m = m.as_str().map_or_else(|| m.to_string(), str::to_string);
-            let message = format!("The model `{m}` does not exist.");
-            return Err(refuse(404, message, Some("model")));
-        }
-    }
+    check_model(model, body.get("model"))?;
     fields(model, body)
 }
 
-/// The body's fields. Unknown fields warn, or refuse if strict.
-pub(crate) fn fields<T: DeserializeOwned + Bagged>(
-    model: &Model,
-    body: Map<String, Value>,
-) -> Result<T, Refusal> {
-    let parsed: T = serde_json::from_value(Value::Object(body))
-        .map_err(|e| refuse(400, e.to_string(), None))?;
-    let (top, nested) = parsed.bags();
+/// Validates unknown fields in `top` and `nested` against `model.strict`.
+pub(crate) fn check_bag(model: &Model, top: &Bag, nested: Vec<String>) -> Result<(), Refusal> {
     let mut unknown = Vec::new();
     for (key, value) in top {
         match neutral(key, value) {
@@ -143,10 +149,24 @@ pub(crate) fn fields<T: DeserializeOwned + Bagged>(
     }
     unknown.extend(nested);
     match (unknown.first(), model.strict) {
-        (None, _) => {}
-        (Some(first), true) => return Err(bad(format!("`{first}` is not supported"), first)),
-        (Some(_), false) => eprintln!("tessera-serve: ignored fields: {}", unknown.join(", ")),
+        (None, _) => Ok(()),
+        (Some(first), true) => Err(bad(format!("`{first}` is not supported"), first)),
+        (Some(_), false) => {
+            eprintln!("tessera-serve: ignored fields: {}", unknown.join(", "));
+            Ok(())
+        }
     }
+}
+
+/// The body's fields. Unknown fields warn, or refuse if strict.
+pub(crate) fn fields<T: DeserializeOwned + Bagged>(
+    model: &Model,
+    body: Map<String, Value>,
+) -> Result<T, Refusal> {
+    let parsed: T = serde_json::from_value(Value::Object(body))
+        .map_err(|e| refuse(400, e.to_string(), None))?;
+    let (top, nested) = parsed.bags();
+    check_bag(model, top, nested)?;
     Ok(parsed)
 }
 
@@ -720,4 +740,255 @@ impl Bagged for Images {
 }
 
 single!(Detokenize, tokens: Vec<u32>);
-single!(Embeddings, input: Strings);
+
+macro_rules! map_visit {
+    ($ty:ident, $expect:literal, { $($key:literal => $field:ident),+ $(,)? }, |$r:ident, $k:ident, $m:ident| $unk:expr $(, $req:ident: $name:literal)*) => {
+        impl<'de> Deserialize<'de> for $ty<'de> {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Visit;
+                impl<'de> Visitor<'de> for Visit {
+                    type Value = $ty<'de>;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str($expect)
+                    }
+                    fn visit_map<A: de::MapAccess<'de>>(self, mut $m: A) -> Result<Self::Value, A::Error> {
+                        let mut $r = $ty::default();
+                        while let Some($k) = $m.next_key::<Cow<'de, str>>()? {
+                            match $k.as_ref() {
+                                $($key => $r.$field = $m.next_value()?,)+
+                                _ => $unk,
+                            }
+                        }
+                        $(if $r.$req.is_none() { return Err(de::Error::missing_field($name)); })*
+                        Ok($r)
+                    }
+                }
+                d.deserialize_map(Visit)
+            }
+        }
+    };
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbedInputWire {
+    Text(String),
+    Texts(Vec<String>),
+    Ids(Vec<u32>),
+    IdLists(Vec<Vec<u32>>),
+}
+
+#[derive(Default)]
+struct ImageUrl<'a> {
+    url: Option<Cow<'a, str>>,
+    extra: Vec<String>,
+}
+
+map_visit!(ImageUrl, "an image_url object", { "url" => url }, |r, k, m| {
+    let _: IgnoredAny = m.next_value()?;
+    r.extra.push(k.into_owned());
+}, url: "url");
+
+#[derive(Default)]
+struct EmbedPartWire<'a> {
+    kind: Option<Cow<'a, str>>,
+    text: Option<Cow<'a, str>>,
+    image_url: Option<ImageUrl<'a>>,
+    image: Option<Cow<'a, str>>,
+    extra: Vec<String>,
+}
+
+map_visit!(
+    EmbedPartWire,
+    "a message content part",
+    { "type" => kind, "text" => text, "image_url" => image_url, "image" => image },
+    |r, k, m| {
+        let _: IgnoredAny = m.next_value()?;
+        r.extra.push(k.into_owned());
+    },
+    kind: "type"
+);
+
+enum EmbedContent<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<EmbedPartWire<'a>>),
+}
+
+impl<'de> Deserialize<'de> for EmbedContent<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> Visitor<'de> for Visit {
+            type Value = EmbedContent<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or content parts")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(EmbedContent::Text(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(EmbedContent::Text(Cow::Owned(v.to_owned())))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut parts = Vec::new();
+                while let Some(part) = seq.next_element()? {
+                    parts.push(part);
+                }
+                Ok(EmbedContent::Parts(parts))
+            }
+        }
+        d.deserialize_any(Visit)
+    }
+}
+
+#[derive(Default)]
+struct EmbedMsgWire<'a> {
+    role: Option<Cow<'a, str>>,
+    content: Option<EmbedContent<'a>>,
+    extra: Vec<String>,
+}
+
+map_visit!(
+    EmbedMsgWire,
+    "a message object",
+    { "role" => role, "content" => content },
+    |r, k, m| {
+        let _: IgnoredAny = m.next_value()?;
+        r.extra.push(k.into_owned());
+    },
+    role: "role",
+    content: "content"
+);
+
+#[derive(Default)]
+struct EmbedRequest<'a> {
+    model: Option<Value>,
+    input: Option<EmbedInputWire>,
+    messages: Option<Vec<EmbedMsgWire<'a>>>,
+    dimensions: Option<usize>,
+    encoding_format: Option<Cow<'a, str>>,
+    normalize: Option<bool>,
+    add_generation_prompt: Option<bool>,
+    extra: Bag,
+}
+
+map_visit!(
+    EmbedRequest,
+    "an embeddings request object",
+    {
+        "model" => model,
+        "input" => input,
+        "messages" => messages,
+        "dimensions" => dimensions,
+        "encoding_format" => encoding_format,
+        "normalize" => normalize,
+        "add_generation_prompt" => add_generation_prompt,
+    },
+    |r, k, m| { r.extra.insert(k.into_owned(), m.next_value()?); }
+);
+
+/// Parses and validates `/v1/embeddings` in one zero-copy pass.
+pub(crate) fn parse_embeddings(
+    model: &Model,
+    body: &[u8],
+) -> Result<(Vec<EmbedInput>, EmbedOptions, bool), Refusal> {
+    let req: EmbedRequest<'_> =
+        serde_json::from_slice(body).map_err(|e| refuse(400, e.to_string(), None))?;
+    check_model(model, req.model.as_ref())?;
+    let mut nested = Vec::new();
+    for (i, msg) in req.messages.iter().flatten().enumerate() {
+        nested.extend(msg.extra.iter().map(|k| format!("messages[{i}].{k}")));
+        if let Some(EmbedContent::Parts(parts)) = &msg.content {
+            for (j, part) in parts.iter().enumerate() {
+                let p = format!("messages[{i}].content[{j}]");
+                nested.extend(part.extra.iter().map(|k| format!("{p}.{k}")));
+                for k in part.image_url.iter().flat_map(|u| &u.extra) {
+                    nested.push(format!("{p}.image_url.{k}"));
+                }
+            }
+        }
+    }
+    check_bag(model, &req.extra, nested)?;
+    let as_base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(_) => {
+            return Err(bad(
+                "`encoding_format` must be \"float\" or \"base64\"",
+                "encoding_format",
+            ));
+        }
+    };
+    if req.dimensions == Some(0) {
+        return Err(bad("`dimensions` must be positive", "dimensions"));
+    }
+    let options = EmbedOptions {
+        dimensions: req.dimensions,
+        normalize: req.normalize.unwrap_or(true),
+    };
+    if let Some(input) = req.input {
+        let items = match input {
+            EmbedInputWire::Text(s) => vec![EmbedInput::Text(s)],
+            EmbedInputWire::Texts(v) if !v.is_empty() => {
+                v.into_iter().map(EmbedInput::Text).collect()
+            }
+            EmbedInputWire::Ids(ids) if !ids.is_empty() => vec![EmbedInput::Tokens(ids)],
+            EmbedInputWire::IdLists(ls) if !ls.is_empty() && ls.iter().all(|x| !x.is_empty()) => {
+                ls.into_iter().map(EmbedInput::Tokens).collect()
+            }
+            _ => return Err(bad("`input` must not be empty", "input")),
+        };
+        return Ok((items, options, as_base64));
+    }
+    let msgs = req
+        .messages
+        .ok_or_else(|| bad("`input` or `messages` is required", "input"))?;
+    if msgs.is_empty() {
+        return Err(bad("`messages` must not be empty", "messages"));
+    }
+    let mut out = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        let parts = match msg.content.unwrap() {
+            EmbedContent::Text(t) => vec![EmbedPart::Text(t.into_owned())],
+            EmbedContent::Parts(ps) => {
+                let mut list = Vec::with_capacity(ps.len());
+                for p in ps {
+                    let kind = p.kind.unwrap();
+                    let part = match kind.as_ref() {
+                        "text" => EmbedPart::Text(
+                            p.text
+                                .ok_or_else(|| bad("missing `text` field", "messages"))?
+                                .into_owned(),
+                        ),
+                        "image_url" | "image" => {
+                            let uri = match kind.as_ref() {
+                                "image_url" => p.image_url.and_then(|u| u.url),
+                                _ => p.image,
+                            }
+                            .ok_or_else(|| bad("missing image payload", "messages"))?;
+                            let raw =
+                                decode_uri(&uri).map_err(|e| bad(e.to_string(), "messages"))?;
+                            EmbedPart::Image(raw)
+                        }
+                        other => {
+                            return Err(bad(
+                                format!("unsupported content part type `{other}`"),
+                                "messages",
+                            ));
+                        }
+                    };
+                    list.push(part);
+                }
+                list
+            }
+        };
+        out.push(EmbedMessage {
+            role: msg.role.unwrap().into_owned(),
+            parts,
+        });
+    }
+    let item = EmbedInput::Messages {
+        messages: out,
+        add_generation_prompt: req.add_generation_prompt.unwrap_or(true),
+    };
+    Ok((vec![item], options, as_base64))
+}

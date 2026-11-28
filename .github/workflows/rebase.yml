@@ -32,7 +32,9 @@ env:
 jobs:
   plan:
     # Lists the pull requests whose rebase needs only list joins.
-    runs-on: ubuntu-latest
+    # An orble runner for this org's branches. A fork's event runs on
+    # a hosted runner instead. ubuntu-slim has no Rust toolchain.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-latest' }}
     permissions:
       contents: read
       issues: write
