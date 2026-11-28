@@ -22,7 +22,7 @@ fn join(
 ) {
     if wide {
         let left4 = left / 4;
-        let width4 = (left + right) / 4;
+        let width4 = left4 + right / 4;
         let row = gid() / width4;
         let col4 = gid() % width4;
         if row >= rows {
@@ -36,16 +36,16 @@ fn join(
             out.store4(gid() as u64 * 4u64, F32x4::new(v.x, v.y, v.z, v.w));
         }
     } else {
-        let width = left + right;
-        let row = gid() / width;
-        let col = gid() % width;
-        if row >= rows {
+        let width = left as u64 + right as u64;
+        let row = gid() as u64 / width;
+        let col = gid() as u64 % width;
+        if row >= rows as u64 {
             return;
         }
-        let v = if col < left {
-            a[row as u64 * left as u64 + col as u64]
+        let v = if col < left as u64 {
+            a[row * left as u64 + col]
         } else {
-            b[row as u64 * right as u64 + (col - left) as u64]
+            b[row * right as u64 + (col - left as u64)]
         };
         out[gid() as u64] = v;
     }

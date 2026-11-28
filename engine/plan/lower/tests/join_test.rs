@@ -42,11 +42,26 @@ fn offsets_widen() {
 
     let scalar = render_metal(65_535, 65_535, 32_769);
     assert!(
-        scalar.contains("(u64)row * (u64)left") && scalar.contains("(u64)row * (u64)right"),
+        scalar.contains("(u64)left + (u64)right"),
+        "expected widened scalar width:\n{scalar}"
+    );
+    assert!(
+        scalar.contains("row * (u64)left") && scalar.contains("row * (u64)right"),
         "expected widened scalar row offsets:\n{scalar}"
     );
     assert!(
         !scalar.contains("(row * left)") && !scalar.contains("(row * right)"),
         "found u32-wrapping scalar offset:\n{scalar}"
+    );
+
+    // left + right == 2^32 wraps u32 if summed before / 4.
+    let huge = render_metal(2_147_483_648, 2_147_483_648, 1);
+    assert!(
+        huge.contains("left4 + (right / 4)"),
+        "expected pre-divided width4:\n{huge}"
+    );
+    assert!(
+        !huge.contains("(left + right)"),
+        "found u32-wrapping row width:\n{huge}"
     );
 }
