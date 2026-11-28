@@ -23,6 +23,9 @@ fn join(
     if wide {
         let left4 = left / 4;
         let width4 = left4 + right / 4;
+        if width4 == 0 {
+            return;
+        }
         let row = gid() / width4;
         let col4 = gid() % width4;
         if row >= rows {
@@ -37,6 +40,9 @@ fn join(
         }
     } else {
         let width = left as u64 + right as u64;
+        if width == 0 {
+            return;
+        }
         let row = gid() as u64 / width;
         let col = gid() as u64 % width;
         if row >= rows as u64 {
@@ -107,12 +113,10 @@ impl Join {
         let Some(stride) = self.thread_stride() else {
             return false;
         };
-        stride > 0
-            && self
-                .rows
-                .most()
-                .checked_mul(stride)
-                .is_some_and(|threads| threads <= max)
+        self.rows
+            .most()
+            .checked_mul(stride)
+            .is_some_and(|threads| threads <= max)
     }
 }
 

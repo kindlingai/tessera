@@ -72,6 +72,7 @@ fn offsets_widen() {
 
 #[test]
 fn bounds_check() {
+    assert!(make_join(0, 0, 2).fits());
     assert!(make_join(65_536, 65_536, 32_769).fits());
     assert!(make_join(2_147_483_648, 2_147_483_648, 1).fits());
     assert!(make_join(65_535, 65_535, 32_768).fits());
