@@ -3,9 +3,11 @@
 
 using namespace tessera;
 
-#if defined(TESSERA_CUDA)
+#if defined(TESSERA_CUDA) || defined(TESSERA_HIP)
 
-#if !defined(DTR_FORCE_FP16) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(TESSERA_HIP)
+constexpr u32 DTR_TILE = 512u;
+#elif !defined(DTR_FORCE_FP16) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define DTR_MX8 1
 constexpr u32 DTR_TILE = trellis::MX8_TILE;
 #else
@@ -17,7 +19,16 @@ constexpr u32 DTR_STRIDE = 8u * DTR_TILE;
 
 static __device__ __forceinline__ void pf_store_frag(u32* tile, u32 row, u32 lane, bool valid,
                                                      const float v[4]) {
-#if DTR_MX8
+#if defined(TESSERA_HIP)
+    typedef _Float16 f16x4 __attribute__((ext_vector_type(4)));
+    _Float16(*sh)[8][16] = reinterpret_cast<_Float16(*)[8][16]>(tile);
+    u32 u = lane >> 2u, kk = (lane & 3u) << 2u;
+    *reinterpret_cast<f16x4*>(&sh[u][row][kk]) =
+        valid ? (f16x4){static_cast<_Float16>(v[0]), static_cast<_Float16>(v[1]),
+                        static_cast<_Float16>(v[2]), static_cast<_Float16>(v[3])}
+              : (f16x4){static_cast<_Float16>(0.0f), static_cast<_Float16>(0.0f),
+                        static_cast<_Float16>(0.0f), static_cast<_Float16>(0.0f)};
+#elif DTR_MX8
     (void)valid;
     trellis::store_bfrag_mx8(tile, row, lane, v);
 #else
@@ -31,9 +42,16 @@ static __device__ __forceinline__ void pf_store_frag(u32* tile, u32 row, u32 lan
 
 static __device__ __forceinline__ void pf_write_v4(float* out, const u32* src, u64 slot_off,
                                                    u64 blk_off, u32 ti, u32 idx) {
+#if defined(TESSERA_HIP)
+    u32 su = idx >> 4u, sq = idx & 15u;
+    u16* dst = reinterpret_cast<u16*>(out) + (slot_off + blk_off) * 2ull + u64(su) * 1024u +
+               u64(ti) * 128u;
+    reinterpret_cast<uint4*>(dst)[sq] = reinterpret_cast<const uint4*>(src)[idx];
+#else
     uint4* dst =
         reinterpret_cast<uint4*>(reinterpret_cast<u32*>(out) + slot_off + blk_off + ti * DTR_TILE);
     dst[idx] = reinterpret_cast<const uint4*>(src)[idx];
+#endif
 }
 
 static __device__ __forceinline__ void pf_load4(const u8* p, u32 col, bool bf16, float v[4]) {
@@ -51,7 +69,11 @@ static __device__ __forceinline__ void pf_load4(const u8* p, u32 col, bool bf16,
 static __device__ __forceinline__ float pf_warp_sum(float v) {
 #pragma unroll
     for (u32 off = 16u; off > 0u; off >>= 1u) {
+#if defined(TESSERA_HIP)
+        v += __shfl_xor(v, static_cast<int>(off));
+#else
         v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+#endif
     }
     return v;
 }

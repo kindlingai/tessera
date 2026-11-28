@@ -1,8 +1,10 @@
 //! Fused CUDA/ROCm trellis prep (norm + multi-output) and direct xpre chains.
 
 use super::gemv::{CudaTrellisRed, cuda_pre_ks, dense_pick, match_cuda_site};
+use super::rocm_trellis::rocm_pre_ks;
 use super::{
     BLOCK, THREADS, TrellisPreMma, TrellisPrep, dtr_blocks, dtr_needs, dtr_pre_tile, f32_only,
+    rocm_needs, rocm_source,
 };
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
@@ -18,7 +20,15 @@ fn prep_fuse_raw() -> &'static str {
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prep_fuse.kernel", PREP_FUSE))
 }
 
-fn prep_fuse_source(mx8: bool) -> Source {
+fn prep_fuse_rocm() -> &'static str {
+    static ROCM: OnceLock<&'static str> = OnceLock::new();
+    ROCM.get_or_init(|| flatten_for(Backend::Rocm, "prep_fuse.kernel", PREP_FUSE))
+}
+
+fn prep_fuse_source(mx8: bool, rocm: bool) -> Source {
+    if rocm {
+        return rocm_source(prep_fuse_rocm(), "dtr_prep_fused");
+    }
     let defs = (!mx8).then_some(("DTR_FORCE_FP16", 1));
     tessera_device::cuda_source_with(prep_fuse_raw(), "dtr_prep_fused", defs)
 }
@@ -28,13 +38,19 @@ fn pre_len(m: usize, k: usize) -> usize {
 }
 
 fn prep_fused_name(p: &TrellisPrepFused) -> &'static str {
-    match (p.flags & 32 != 0, p.flags & 16 != 0, p.count) {
-        (true, true, _) => "trellis_prep_ln",
-        (true, false, 1) => "trellis_prep_rms",
-        (true, false, 2) => "trellis_prep_rms2",
-        (true, false, _) => "trellis_prep_rms3",
-        (false, _, 2) => "trellis_prep_pair",
-        (false, _, _) => "trellis_prep_multi",
+    match (p.rocm, p.flags & 32 != 0, p.flags & 16 != 0, p.count) {
+        (true, true, true, _) => "rocm_trellis_prep_ln",
+        (true, true, false, 1) => "rocm_trellis_prep_rms",
+        (true, true, false, 2) => "rocm_trellis_prep_rms2",
+        (true, true, false, _) => "rocm_trellis_prep_rms3",
+        (true, false, _, 2) => "rocm_trellis_prep_pair",
+        (true, false, _, _) => "rocm_trellis_prep_multi",
+        (false, true, true, _) => "trellis_prep_ln",
+        (false, true, false, 1) => "trellis_prep_rms",
+        (false, true, false, 2) => "trellis_prep_rms2",
+        (false, true, false, _) => "trellis_prep_rms3",
+        (false, false, _, 2) => "trellis_prep_pair",
+        (false, false, _, _) => "trellis_prep_multi",
     }
 }
 
@@ -46,9 +62,9 @@ fn prep_fused_name(p: &TrellisPrepFused) -> &'static str {
     work = self.m * self.k * self.count,
     accepts = prep_fused_accepts,
     emits = f32_only,
-    needs = dtr_needs(4096),
+    needs = if self.rocm { rocm_needs(4096, THREADS, true) } else { dtr_needs(4096) },
     order = Order::PerConfig,
-    source = prep_fuse_source(self.mx8),
+    source = prep_fuse_source(self.mx8, self.rocm),
     launches = prep_fused_launches,
     load = prep_fused_load,
     shared,
@@ -61,6 +77,7 @@ struct TrellisPrepFused {
     eps: f32,
     flags: u32,
     mx8: bool,
+    rocm: bool,
 }
 
 fn prep_fused_accepts(p: &TrellisPrepFused, input: usize, form: &dyn Stored) -> bool {
@@ -253,6 +270,7 @@ fn build_fused_prep(
     m: usize,
     k: usize,
     mx8: bool,
+    rocm: bool,
 ) -> Draft {
     let mut flags = 64u32;
     let mut reads = Vec::with_capacity(3 + suhs.len());
@@ -291,6 +309,7 @@ fn build_fused_prep(
         eps,
         flags,
         mx8,
+        rocm,
     };
     Draft::new(kernel, reads, suhs.len() * pre_len(m, k))
 }
@@ -307,6 +326,7 @@ fn shared_prep_plan(
     m: usize,
     k: usize,
     mx8: bool,
+    rocm: bool,
     absorb_norm: bool,
 ) -> Option<(Draft, Vec<T>)> {
     if tree.outputs.iter().any(|(o, _)| *o == h) || tree.appends(h) {
@@ -378,18 +398,21 @@ fn shared_prep_plan(
     if norm.is_none() && suhs.len() < 2 {
         return None;
     }
-    let draft = build_fused_prep(tree, h, norm, &suhs, m, k, mx8);
+    let draft = build_fused_prep(tree, h, norm, &suhs, m, k, mx8, rocm);
     Some((draft, suhs))
 }
 
-fn plain_prep_draft(tree: &Tree, d: Dense, mx8: bool) -> Draft {
+fn plain_prep_draft(tree: &Tree, d: Dense, mx8: bool, rocm: bool) -> Draft {
     let suh = d.turn.map(|[u, _]| u);
     let reads = [d.x].into_iter().chain(suh).map(Read::Node);
     let prep = TrellisPrep {
         m: d.m,
         k: d.k,
-        min_blocks: dtr_blocks(tree, d.turned(), "prep_min_blocks"),
+        min_blocks: (!rocm)
+            .then(|| dtr_blocks(tree, d.turned(), "prep_min_blocks"))
+            .flatten(),
         turned: d.turned(),
+        rocm,
         mx8,
         x_bf16: d.x_bf16,
     };
@@ -409,17 +432,22 @@ fn append_trellis_drafts(
     epi: (u32, Option<Read>, Option<Read>),
     rot_out: Option<T>,
     mx8: bool,
+    rocm: bool,
 ) -> usize {
     let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
     let (mode, other, bias2) = epi;
     let svh = d.turn.map(|[_, v]| Read::Node(v));
-    let ks = if d.bits == 4 && d.book == 0 && turned {
-        cuda_pre_ks(tree, &d)
-    } else {
-        1
+    let ks = match (d.bits == 4 && d.book == 0 && turned, rocm) {
+        (false, _) => 1,
+        (true, true) => rocm_pre_ks(m, n, k),
+        (true, false) => cuda_pre_ks(tree, &d),
     };
-    let tile = dtr_pre_tile(tree, turned, m, n);
-    let blk = |knob| dtr_blocks(tree, turned, knob);
+    let tile = if rocm {
+        super::rocm_trellis::pre_tile(m, n)
+    } else {
+        dtr_pre_tile(tree, turned, m, n)
+    };
+    let blk = |knob| (!rocm).then(|| dtr_blocks(tree, turned, knob)).flatten();
     let min_blocks = match (tile, d.bits, d.book, turned) {
         (128, 4, 0, true) => blk("t16_min_blocks"),
         (64, 4, 0, true) => blk("t8_min_blocks"),
@@ -445,16 +473,17 @@ fn append_trellis_drafts(
             bits: d.bits,
             book: d.book,
             turned,
+            rocm,
             y_bf16: false,
             form: d.form,
-            mx8,
+            mx8: !rocm && mx8,
             mode: slot_bits,
             rot_out: false,
         };
         drafts.push(Draft::new(mma, [xpre, Read::Node(d.w)], ks * m * n));
         let r_mode = mode
             | if rot_out.is_some() {
-                32 | if mx8 { 256 } else { 0 }
+                32 | if !rocm && mx8 { 256 } else { 0 }
             } else {
                 0
             };
@@ -464,6 +493,7 @@ fn append_trellis_drafts(
             ks,
             turned,
             mode: r_mode,
+            rocm,
             y_bf16,
         };
         let r_reads = [Read::Draft(mma_idx)]
@@ -493,9 +523,10 @@ fn append_trellis_drafts(
         bits: d.bits,
         book: d.book,
         turned,
+        rocm,
         y_bf16,
         form: d.form,
-        mx8,
+        mx8: !rocm && mx8,
         mode: mode | slot_bits,
         rot_out: rot_out.is_some(),
     };
@@ -509,6 +540,7 @@ fn try_fuse_chain(
     d: Dense,
     epi: (u32, Option<T>, Option<T>),
     mx8: bool,
+    rocm: bool,
 ) -> Option<Vec<Draft>> {
     let [d_suh, _] = d.turn?;
     if d.x_bf16 || tree.root(d.x) || tree.compute_at(d.x) != tree.compute_at(at) {
@@ -533,19 +565,19 @@ fn try_fuse_chain(
         && let Some([up_suh, _]) = up.turn
     {
         let (prep_d, up_slot, gate_slot) =
-            if let Some((pd, suhs)) = shared_prep_plan(tree, d.x, p.x, p.m, p.k, mx8, true) {
+            if let Some((pd, suhs)) = shared_prep_plan(tree, d.x, p.x, p.m, p.k, mx8, rocm, true) {
                 let us = suhs.iter().position(|&s| s == up_suh)? as u32;
                 let gs = suhs.iter().position(|&s| s == p_suh)? as u32;
                 (pd, us, gs)
             } else if up_suh == p_suh {
-                (plain_prep_draft(tree, up, mx8), 0, 0)
+                (plain_prep_draft(tree, up, mx8, rocm), 0, 0)
             } else {
                 let mut suhs = vec![up_suh, p_suh];
                 suhs.sort_by_key(|t| t.0);
                 let us = suhs.iter().position(|&s| s == up_suh)? as u32;
                 let gs = suhs.iter().position(|&s| s == p_suh)? as u32;
                 (
-                    build_fused_prep(tree, p.x, None, &suhs, p.m, p.k, mx8),
+                    build_fused_prep(tree, p.x, None, &suhs, p.m, p.k, mx8, rocm),
                     us,
                     gs,
                 )
@@ -560,6 +592,7 @@ fn try_fuse_chain(
             (0, None, None),
             None,
             mx8,
+            rocm,
         );
         let xpre_down = append_trellis_drafts(
             &mut drafts,
@@ -570,6 +603,7 @@ fn try_fuse_chain(
             (p_mode, Some(Read::Draft(up_idx)), None),
             Some(d_suh),
             mx8,
+            rocm,
         );
         append_trellis_drafts(
             &mut drafts,
@@ -580,16 +614,17 @@ fn try_fuse_chain(
             (d_mode, d_other.map(Read::Node), d_bias2.map(Read::Node)),
             None,
             mx8,
+            rocm,
         );
         return Some(drafts);
     }
     let (prep_d, p_slot) = if let Some((pd, suhs)) =
-        shared_prep_plan(tree, d.x, p.x, p.m, p.k, mx8, !tree.root(p.x))
+        shared_prep_plan(tree, d.x, p.x, p.m, p.k, mx8, rocm, !tree.root(p.x))
     {
         let ps = suhs.iter().position(|&s| s == p_suh)? as u32;
         (pd, ps)
     } else {
-        (plain_prep_draft(tree, p, mx8), 0)
+        (plain_prep_draft(tree, p, mx8, rocm), 0)
     };
     drafts.push(prep_d);
     let xpre_next = append_trellis_drafts(
@@ -601,6 +636,7 @@ fn try_fuse_chain(
         (p_mode, p_other.map(Read::Node), None),
         Some(d_suh),
         mx8,
+        rocm,
     );
     append_trellis_drafts(
         &mut drafts,
@@ -611,6 +647,7 @@ fn try_fuse_chain(
         (d_mode, d_other.map(Read::Node), d_bias2.map(Read::Node)),
         None,
         mx8,
+        rocm,
     );
     Some(drafts)
 }
@@ -623,20 +660,24 @@ pub(super) fn plan_trellis_pre(
     tree: &Tree,
     at: T,
     d: Dense,
-    epi: (u32, Option<T>, Option<T>),
+    mode: u32,
+    other: Option<T>,
+    bias2: Option<T>,
     mx8: bool,
+    rocm: bool,
 ) -> Vec<Draft> {
-    if let Some(fused) = try_fuse_chain(tree, at, d, epi, mx8) {
+    if let Some(fused) = try_fuse_chain(tree, at, d, (mode, other, bias2), mx8, rocm) {
         return fused;
     }
     let (prep_d, slot) = if let Some([my_suh, _]) = d.turn
         && !d.x_bf16
-        && let Some((pd, suhs)) = shared_prep_plan(tree, at, d.x, d.m, d.k, mx8, !tree.root(d.x))
+        && let Some((pd, suhs)) =
+            shared_prep_plan(tree, at, d.x, d.m, d.k, mx8, rocm, !tree.root(d.x))
         && let Some(pos) = suhs.iter().position(|&s| s == my_suh)
     {
         (pd, pos as u32)
     } else {
-        (plain_prep_draft(tree, d, mx8), 0)
+        (plain_prep_draft(tree, d, mx8, rocm), 0)
     };
     let mut drafts = vec![prep_d];
     append_trellis_drafts(
@@ -645,9 +686,10 @@ pub(super) fn plan_trellis_pre(
         d,
         Read::Draft(0),
         slot,
-        (epi.0, epi.1.map(Read::Node), epi.2.map(Read::Node)),
+        (mode, other.map(Read::Node), bias2.map(Read::Node)),
         None,
         mx8,
+        rocm,
     );
     drafts
 }

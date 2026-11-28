@@ -184,9 +184,9 @@ pub(super) fn check_prep_fuse_cases(
                 "kind={kind} m={m}: unfused norm in {names:?}"
             );
             assert!(
-                names
-                    .iter()
-                    .all(|&n| { n != "trellis_prep_f16" && n != "trellis_prep" }),
+                names.iter().all(|&n| {
+                    n != "trellis_prep_f16" && n != "trellis_prep" && n != "rocm_trellis_prep"
+                }),
                 "kind={kind} m={m}: unfused prep in {names:?}"
             );
         }

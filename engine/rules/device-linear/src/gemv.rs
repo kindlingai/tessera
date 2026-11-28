@@ -4,7 +4,7 @@ use super::mm::{MmDims, match_mm_add, match_mm_site};
 use super::{
     BLOCK, THREADS, TrellisMma, TrellisReduce, WARPS, cuda_needs, cuda_source_with, dtr_blocks,
     dtr_needs, dtr_pre_tile, dtr_rule, dtr_tile, io_defs, prefill_defs, prefill_source_with,
-    reduce_load_for, trip, weight_x_accepts, x_accepts,
+    reduce_load_for, rocm_needs, rocm_source, trip, weight_x_accepts, x_accepts,
 };
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_linear::Dense;
@@ -511,21 +511,30 @@ pub(super) fn why_gemv(tree: &Tree, at: T) -> Option<String> {
 /// Split-K trellis reduction with output rotation and epilogue.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "trellis_reduce_epi",
+    name = if self.rocm { "rocm_trellis_reduce_epi" } else { "trellis_reduce_epi" },
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = cred_accepts,
     emits = cred_emits,
-    needs = dtr_needs(if (self.mode & 32) != 0 { 2048 } else { 0 }),
+    needs = if self.rocm {
+        rocm_needs(if (self.mode & 32) != 0 { 2048 } else { 0 }, THREADS, false)
+    } else {
+        dtr_needs(if (self.mode & 32) != 0 { 2048 } else { 0 })
+    },
     order = Order::PerConfig,
-    source = prefill_source_with(
-        "dtr_reduce_epi",
-        io_defs(prefill_defs("dtr_reduce_epi", (self.mode & 256) != 0), false, self.y_bf16, false),
-    ),
+    source = if self.rocm {
+        rocm_source(
+            super::rocm_trellis::rocm_trellis_source(),
+            "rocm_dtr_reduce_epi",
+        )
+    } else {
+        let base = prefill_defs("dtr_reduce_epi", (self.mode & 256) != 0);
+        prefill_source_with("dtr_reduce_epi", io_defs(base, false, self.y_bf16, false))
+    },
     launches = cred_launches,
     load = cred_load,
     load_key = tessera_lower::load_key((
-        self.m, self.n, self.ks, self.turned, self.mode, self.y_bf16,
+        self.m, self.n, self.ks, self.turned, self.mode, self.rocm, self.y_bf16,
     )),
     unproven,
 )]
@@ -535,6 +544,7 @@ pub(super) struct CudaTrellisRed {
     pub(super) ks: usize,
     pub(super) turned: bool,
     pub(super) mode: u32,
+    pub(super) rocm: bool,
     pub(super) y_bf16: bool,
 }
 
@@ -656,15 +666,20 @@ pub(super) fn dense_pick(tree: &Tree, at: T) -> Option<Dense> {
     Dense::find(tree, at, BLOCK)?.ok()
 }
 
-fn small_drafts(tree: &Tree, d: &Dense) -> Result<Vec<Draft>, String> {
+fn small_drafts(tree: &Tree, d: &Dense, rocm: bool) -> Result<Vec<Draft>, String> {
     let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
-    let tile = match tree.knobs.get(dtr_rule(turned), "tile_rows") {
-        Some(v @ (8 | 16 | 32)) => v,
-        Some(v) => return Err(format!("tile_rows={v} (requires 8, 16, or 32)")),
-        None => dtr_tile(m),
+    let (ks, tile) = if rocm {
+        let ks = super::rocm_trellis::dtr_ks_for(m, n, k, 4, [80, 40]);
+        (ks, super::rocm_trellis::small_tile(m))
+    } else {
+        let tile = match tree.knobs.get(dtr_rule(turned), "tile_rows") {
+            Some(v @ (8 | 16 | 32)) => v,
+            Some(v) => return Err(format!("tile_rows={v} (requires 8, 16, or 32)")),
+            None => dtr_tile(m),
+        };
+        (cuda_small_ks(tree, d), tile)
     };
-    let ks = cuda_small_ks(tree, d);
-    let blocks = |knob| dtr_blocks(tree, turned, knob);
+    let blocks = |knob| (!rocm).then(|| dtr_blocks(tree, turned, knob)).flatten();
     let mma = TrellisMma {
         m,
         n,
@@ -675,6 +690,7 @@ fn small_drafts(tree: &Tree, d: &Dense) -> Result<Vec<Draft>, String> {
         bits: d.bits,
         book: d.book,
         turned,
+        rocm,
         y_bf16: ks == 1 && d.y_bf16,
         form: d.form,
         x_bf16: d.x_bf16,
@@ -685,29 +701,33 @@ fn small_drafts(tree: &Tree, d: &Dense) -> Result<Vec<Draft>, String> {
         ks,
         min_blocks: blocks("reduce_min_blocks"),
         turned,
+        rocm,
         y_bf16: d.y_bf16,
     };
     Ok(d.drafts(mma, ks, red))
 }
 
-pub(super) fn eval_trellis_for(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
+pub(super) fn eval_trellis_for(
+    tree: &Tree,
+    at: T,
+    rocm: bool,
+) -> Option<Result<Vec<Draft>, String>> {
     let (d, mode, other, bias2) = match match_cuda_site(tree, at, dense_pick) {
         Some(hit) => hit,
-        None => match Dense::find_with(tree, at, BLOCK, true)? {
+        None => match Dense::find_with(tree, at, BLOCK, !rocm)? {
             Ok(d) => (d, 0, None, None),
             Err(e) => return Some(Err(e)),
         },
     };
-    let pre_min_rows = tree.knobs.get(dtr_rule(d.turned()), "prefill_min_rows");
+    let pre_min_rows = match rocm {
+        true => None,
+        false => tree.knobs.get(dtr_rule(d.turned()), "prefill_min_rows"),
+    };
     if d.m < pre_min_rows.unwrap_or(33) {
-        return (mode == 0).then(|| small_drafts(tree, &d));
+        return (mode == 0).then(|| small_drafts(tree, &d, rocm));
     }
-    let mx8 = tree.compute_at(at) == Compute::Bf16;
+    let mx8 = !rocm && tree.compute_at(at) == Compute::Bf16;
     Some(Ok(super::cuda_fuse::plan_trellis_pre(
-        tree,
-        at,
-        d,
-        (mode, other, bias2),
-        mx8,
+        tree, at, d, mode, other, bias2, mx8, rocm,
     )))
 }

@@ -8,6 +8,10 @@ mod device_test;
 mod gemv;
 pub(crate) mod mm;
 mod moe;
+mod rocm_mm;
+#[cfg(test)]
+mod rocm_test;
+mod rocm_trellis;
 mod stacked;
 mod stacked_fused;
 #[cfg(test)]
@@ -15,11 +19,13 @@ mod stacked_test;
 
 use gemv::{propose_gemv, why_gemv};
 use stacked::check_stacked;
-pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
+pub(crate) use tessera_device::{CUDA_LACKS, ROCM_LACKS, cuda_rule, f32_only, rocm_rule};
 use tessera_graph::Order;
 use tessera_linear::launch_args;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Tree};
+use tessera_lower::{
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Tree,
+};
 
 const KERNEL: &str = include_str!("linear.cu");
 const TRELLIS: &str = include_str!("trellis.cu");
@@ -152,6 +158,25 @@ pub(crate) fn dtr_needs(bytes: usize) -> Needs {
     }
 }
 
+pub(crate) fn rocm_source(text: &'static str, entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", "", text]),
+        entry,
+    }
+}
+
+pub(crate) fn rocm_needs(group_bytes: usize, group_threads: usize, tile: bool) -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes,
+        group_threads,
+        compiler: true,
+        tile,
+        lacks: ROCM_LACKS,
+        ..Needs::default()
+    }
+}
+
 /// Defines that trim the prefill module for one entry.
 pub(crate) fn prefill_defs(entry: &str, mx8: bool) -> Vec<(&'static str, usize)> {
     let mut defs = Vec::new();
@@ -171,15 +196,32 @@ pub(crate) fn prefill_defs(entry: &str, mx8: bool) -> Vec<(&'static str, usize)>
 }
 
 fn trellis_mma_name(t: &TrellisMma) -> &'static str {
-    t.form.suffixed(if t.turned {
-        "trellis_turned"
-    } else {
-        "trellis_mma"
-    })
+    let base = match (t.rocm, t.turned) {
+        (true, true) => "rocm_trellis_turned",
+        (true, false) => "rocm_trellis_mma",
+        (false, true) => "trellis_turned",
+        (false, false) => "trellis_mma",
+    };
+    t.form.suffixed(base)
 }
 
-fn mma_needs(_: &TrellisMma) -> Needs {
-    dtr_needs(DTR_SMEM)
+fn mma_needs(t: &TrellisMma) -> Needs {
+    if t.rocm {
+        rocm_trellis::small_needs(t.m)
+    } else {
+        dtr_needs(DTR_SMEM)
+    }
+}
+
+fn mma_source(t: &TrellisMma) -> Source {
+    if t.rocm {
+        rocm_source(
+            rocm_trellis::rocm_trellis_source(),
+            rocm_trellis::small_entry(t),
+        )
+    } else {
+        dtr_source(t)
+    }
 }
 
 macro_rules! define_trellis_kernel {
@@ -211,7 +253,7 @@ macro_rules! define_trellis_kernel {
             load = $load,
             load_key = tessera_lower::load_key((
                 (self.m, self.n, self.k, self.ks, self.tile, self.min_blocks),
-                (self.bits, self.book, self.turned, self.form.name(), self.y_bf16),
+                (self.bits, self.book, self.turned, self.rocm, self.form.name(), self.y_bf16),
                 ($(self.$field,)*),
             )),
             unproven,
@@ -226,6 +268,7 @@ macro_rules! define_trellis_kernel {
             pub(crate) bits: u32,
             pub(crate) book: u32,
             pub(crate) turned: bool,
+            pub(crate) rocm: bool,
             pub(crate) y_bf16: bool,
             pub(crate) form: &'static dyn Stored,
             $(pub(crate) $field: $fty,)*
@@ -244,7 +287,7 @@ define_trellis_kernel! {
         accepts: mma_accepts,
         emits: mma_emits,
         needs: mma_needs,
-        source: dtr_source,
+        source: mma_source,
         launches: mma_launches,
         load: mma_load,
         extra: {
@@ -314,26 +357,30 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
 /// Deterministic split-K reduction and optional output rotation.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "trellis_reduce",
+    name = if self.rocm { "rocm_trellis_reduce" } else { "trellis_reduce" },
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = reduce_accepts,
     emits = reduce_emits,
-    needs = dtr_needs(0),
+    needs = if self.rocm { rocm_needs(0, THREADS, false) } else { dtr_needs(0) },
     order = Order::PerConfig,
-    source = trellis_source_with(
-        "dtr_reduce",
-        io_defs(
-            self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
-            false,
-            self.y_bf16,
-            false,
-        ),
-    ),
+    source = if self.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_reduce")
+    } else {
+        trellis_source_with(
+            "dtr_reduce",
+            io_defs(
+                self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
+                false,
+                self.y_bf16,
+                false,
+            ),
+        )
+    },
     launches = reduce_launches,
     load = reduce_load,
     load_key = tessera_lower::load_key((
-        self.m, self.n, self.ks, self.min_blocks, self.turned, self.y_bf16,
+        self.m, self.n, self.ks, self.min_blocks, self.turned, self.rocm, self.y_bf16,
     )),
     unproven,
 )]
@@ -343,6 +390,7 @@ pub(crate) struct TrellisReduce {
     pub(crate) ks: usize,
     pub(crate) min_blocks: Option<u32>,
     pub(crate) turned: bool,
+    pub(crate) rocm: bool,
     pub(crate) y_bf16: bool,
 }
 
@@ -443,26 +491,35 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
 /// Rotates and quantizes dense inputs once per 64x128 block.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = if self.mx8 { "trellis_prep" } else { "trellis_prep_f16" },
+    name = if self.rocm {
+        "rocm_trellis_prep"
+    } else if self.mx8 {
+        "trellis_prep"
+    } else {
+        "trellis_prep_f16"
+    },
     sizes = [self.m, self.k],
     work = self.m * self.k,
     accepts = prep_accepts,
     emits = f32_only,
-    needs = dtr_needs(DTR_SMEM),
+    needs = if self.rocm {
+        rocm_needs(16 * 1024, THREADS, true)
+    } else {
+        dtr_needs(DTR_SMEM)
+    },
     order = Order::PerConfig,
-    source = prefill_source_with(
-        "dtr_prep",
-        x_defs(
-            prefill_defs("dtr_prep", self.mx8)
-                .into_iter()
-                .chain(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize))),
-            self.x_bf16,
-        ),
-    ),
+    source = if self.rocm {
+        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_prep")
+    } else {
+        let base = prefill_defs("dtr_prep", self.mx8)
+            .into_iter()
+            .chain(self.min_blocks.map(|v| ("DTR_PREP_BLK", v as usize)));
+        prefill_source_with("dtr_prep", x_defs(base, self.x_bf16))
+    },
     launches = prep_launches,
     load = prep_load,
     load_key = tessera_lower::load_key((
-        self.m, self.k, self.min_blocks, self.turned, self.mx8, self.x_bf16,
+        self.m, self.k, self.min_blocks, self.turned, self.rocm, self.mx8, self.x_bf16,
     )),
     shared,
     unproven,
@@ -472,6 +529,7 @@ pub(crate) struct TrellisPrep {
     pub(crate) k: usize,
     pub(crate) min_blocks: Option<u32>,
     pub(crate) turned: bool,
+    pub(crate) rocm: bool,
     pub(crate) mx8: bool,
     pub(crate) x_bf16: bool,
 }
@@ -519,17 +577,34 @@ fn prep_launches(p: &TrellisPrep, step: &Step) -> Vec<Launch> {
 }
 
 fn trellis_pre_name(t: &TrellisPreMma) -> &'static str {
-    let base = match (t.turned, t.mx8) {
-        (true, true) => "trellis_turned_pf",
-        (false, true) => "trellis_mma_pf",
-        (true, false) => "trellis_turned_f16",
-        (false, false) => "trellis_mma_f16",
+    let base = match (t.rocm, t.turned, t.mx8) {
+        (true, true, _) => "rocm_trellis_pf",
+        (true, false, _) => "rocm_trellis_plain_pf",
+        (false, true, true) => "trellis_turned_pf",
+        (false, false, true) => "trellis_mma_pf",
+        (false, true, false) => "trellis_turned_f16",
+        (false, false, false) => "trellis_mma_f16",
     };
     t.form.suffixed(base)
 }
 
 fn pre_mma_needs(t: &TrellisPreMma) -> Needs {
-    dtr_needs(if t.mx8 { 33_792 } else { 49_152 })
+    if t.rocm {
+        rocm_trellis::pre_needs(t.m, t.n)
+    } else {
+        dtr_needs(if t.mx8 { 33_792 } else { 49_152 })
+    }
+}
+
+fn pre_mma_source(t: &TrellisPreMma) -> Source {
+    if t.rocm {
+        rocm_source(
+            rocm_trellis::rocm_trellis_source(),
+            rocm_trellis::pre_entry(t),
+        )
+    } else {
+        dtr_pre_source(t)
+    }
 }
 
 define_trellis_kernel! {
@@ -539,7 +614,7 @@ define_trellis_kernel! {
         accepts: pre_mma_accepts,
         emits: pre_mma_emits,
         needs: pre_mma_needs,
-        source: dtr_pre_source,
+        source: pre_mma_source,
         launches: pre_mma_launches,
         load: pre_mma_load,
         extra: {
@@ -563,7 +638,7 @@ fn pre_mma_load(t: &TrellisPreMma, _: usize) -> Option<Load> {
         (true, 1) => &[t.n],
         _ => &[],
     };
-    let x_elem = if t.mx8 { 1 } else { 2 };
+    let x_elem = if !t.rocm && t.mx8 { 1 } else { 2 };
     let mut load = trellis_mma_load(
         t.form,
         [t.m, t.n, t.k, t.ks],
@@ -624,7 +699,7 @@ fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
 
 /// Rotated or plain dense trellis matmul.
 fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    gemv::eval_trellis_for(tree, at)
+    gemv::eval_trellis_for(tree, at, false)
 }
 
 /// One thread's trip. Bf16 widens with one integer op.

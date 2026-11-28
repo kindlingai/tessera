@@ -467,37 +467,42 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
 /// Deterministic split-K reduction and matmul epilogue.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "fast_mm_reduce",
+    name = if self.rocm { "rocm_mm_reduce" } else { "fast_mm_reduce" },
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = mm_red_accepts,
     emits = mm_red_emits,
-    needs = mm_red_needs(),
+    needs = mm_red_needs(self.rocm),
     order = Order::PerConfig,
-    source = cuda_source_with(
-        "tessera_mm_reduce",
-        io_defs(
-            self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
-            false,
-            self.y_bf16,
-            self.o_bf16,
-        ),
-    ),
+    source = if self.rocm {
+        super::rocm_source(super::rocm_mm::rocm_linear_source(), "rocm_mm_reduce")
+    } else {
+        cuda_source_with(
+            "tessera_mm_reduce",
+            io_defs(
+                self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
+                false,
+                self.y_bf16,
+                self.o_bf16,
+            ),
+        )
+    },
     launches = mm_red_launches,
     load = mm_red_load,
     load_key = tessera_lower::load_key((
-        self.m, self.n, self.ks, self.mode, self.min_blocks, self.y_bf16, self.o_bf16,
+        self.m, self.n, self.ks, self.mode, self.rocm, self.min_blocks, self.y_bf16, self.o_bf16,
     )),
     unproven,
 )]
-struct FastMmReduce {
-    m: usize,
-    n: usize,
-    ks: usize,
-    mode: u32,
-    min_blocks: Option<u32>,
-    y_bf16: bool,
-    o_bf16: bool,
+pub(super) struct FastMmReduce {
+    pub(super) m: usize,
+    pub(super) n: usize,
+    pub(super) ks: usize,
+    pub(super) mode: u32,
+    pub(super) rocm: bool,
+    pub(super) min_blocks: Option<u32>,
+    pub(super) y_bf16: bool,
+    pub(super) o_bf16: bool,
 }
 
 fn mm_red_accepts(r: &FastMmReduce, input: usize, form: &dyn Stored) -> bool {
@@ -512,7 +517,10 @@ fn mm_red_emits(r: &FastMmReduce, form: &dyn Stored) -> bool {
     x_accepts(r.y_bf16, form)
 }
 
-fn mm_red_needs() -> Needs {
+fn mm_red_needs(rocm: bool) -> Needs {
+    if rocm {
+        return super::rocm_needs(0, 256, false);
+    }
     Needs {
         lanes: 32,
         group_bytes: 0,
@@ -582,6 +590,39 @@ pub(super) struct MmSite {
     pub(super) form: &'static dyn Stored,
 }
 
+pub(super) fn mm_draft<K: Kernel + 'static>(
+    mm: K,
+    [m, n]: [usize; 2],
+    [x, w]: [T; 2],
+    ks: usize,
+    mode: u32,
+    [other, bias2]: [Option<T>; 2],
+    rocm: bool,
+) -> Vec<Draft> {
+    if ks > 1 {
+        let red = FastMmReduce {
+            m,
+            n,
+            ks,
+            mode,
+            rocm,
+            min_blocks: None,
+            y_bf16: false,
+            o_bf16: false,
+        };
+        let red_reads = [Read::Draft(0)]
+            .into_iter()
+            .chain(other.map(Read::Node))
+            .chain(bias2.map(Read::Node));
+        return vec![
+            Draft::new(mm, [x, w], ks * m * n),
+            Draft::new(red, red_reads, m * n),
+        ];
+    }
+    let reads = [x, w].into_iter().chain(other).chain(bias2);
+    vec![Draft::new(mm, reads, m * n)]
+}
+
 impl MmSite {
     pub(super) fn reduce_draft(
         &self,
@@ -595,6 +636,7 @@ impl MmSite {
             n: self.n,
             ks: self.ks,
             mode,
+            rocm: false,
             min_blocks: self.reduce_min_blocks,
             y_bf16: self.io[1],
             o_bf16: self.io[2],
