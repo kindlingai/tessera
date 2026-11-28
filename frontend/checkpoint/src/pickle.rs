@@ -2,6 +2,7 @@
 
 use crate::Error;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// The largest pickle, in bytes.
 pub(crate) const MAX_PICKLE: usize = 64 << 20;
@@ -100,15 +101,19 @@ pub struct View {
 impl View {
     /// One past the last element the view reads.
     pub fn end(&self) -> Option<u64> {
-        let mut last = self.offset;
-        for (&n, &s) in self.shape.iter().zip(&self.stride) {
-            if n == 0 {
-                return Some(self.offset);
-            }
-            last = last.checked_add((n as u64 - 1).checked_mul(s)?)?;
-        }
-        last.checked_add(1)
+        view_end(self.offset, &self.shape, &self.stride)
     }
+}
+
+fn view_end(offset: u64, shape: &[usize], stride: &[u64]) -> Option<u64> {
+    let mut last = offset;
+    for (&n, &s) in shape.iter().zip(stride) {
+        if n == 0 {
+            return Some(offset);
+        }
+        last = last.checked_add((n as u64 - 1).checked_mul(s)?)?;
+    }
+    last.checked_add(1)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,16 +131,97 @@ pub enum Value {
     Tensor(View),
 }
 
+#[derive(Clone, Copy)]
+struct RawStorage<'a> {
+    key: &'a str,
+    dtype: DType,
+    count: u64,
+}
+
+impl RawStorage<'_> {
+    fn into_storage(self) -> Storage {
+        Storage {
+            key: self.key.to_owned(),
+            dtype: self.dtype,
+            count: self.count,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RawView<'a> {
+    storage: RawStorage<'a>,
+    offset: u64,
+    shape: Vec<usize>,
+    stride: Vec<u64>,
+}
+
+impl RawView<'_> {
+    fn into_view(self) -> View {
+        View {
+            storage: self.storage.into_storage(),
+            offset: self.offset,
+            shape: self.shape,
+            stride: self.stride,
+        }
+    }
+}
+
+/// Internal value keeping strings borrowed and views shared.
+#[derive(Clone)]
+enum Val<'a> {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(&'a str),
+    Dims(u8, [u32; 4]),
+    List(Vec<Val<'a>>),
+    Tuple(Vec<Val<'a>>),
+    Dict(Vec<(Val<'a>, Val<'a>)>),
+    Global(Global),
+    Storage(RawStorage<'a>),
+    Tensor(Rc<RawView<'a>>),
+}
+
+impl Val<'_> {
+    fn into_value(self) -> Value {
+        match self {
+            Val::None => Value::None,
+            Val::Bool(b) => Value::Bool(b),
+            Val::Int(n) => Value::Int(n),
+            Val::Float(x) => Value::Float(x),
+            Val::Text(s) => Value::Str(s.to_owned()),
+            Val::Dims(n, a) => Value::Tuple(
+                a[..n as usize]
+                    .iter()
+                    .map(|&v| Value::Int(v as i64))
+                    .collect(),
+            ),
+            Val::List(xs) => Value::List(xs.into_iter().map(Val::into_value).collect()),
+            Val::Tuple(xs) => Value::Tuple(xs.into_iter().map(Val::into_value).collect()),
+            Val::Dict(xs) => Value::Dict(
+                xs.into_iter()
+                    .map(|(k, v)| (k.into_value(), v.into_value()))
+                    .collect(),
+            ),
+            Val::Global(g) => Value::Global(g),
+            Val::Storage(s) => Value::Storage(s.into_storage()),
+            Val::Tensor(v) => Value::Tensor(Rc::unwrap_or_clone(v).into_view()),
+        }
+    }
+}
+
 /// A value with its nesting depth and node count.
 #[derive(Clone)]
-struct Slot {
-    v: Value,
+struct Slot<'a> {
+    v: Val<'a>,
     depth: u32,
     size: u64,
 }
 
-impl Slot {
-    fn leaf(v: Value) -> Self {
+impl<'a> Slot<'a> {
+    fn leaf(v: Val<'a>) -> Self {
         Slot {
             v,
             depth: 0,
@@ -145,36 +231,85 @@ impl Slot {
 
     /// Takes `child`'s depth and size into this container.
     fn grow(&mut self, depth: u32, size: u64) -> Result<(), Error> {
-        self.depth = self.depth.max(depth + 1);
-        self.size = self.size.saturating_add(size);
-        if self.depth > MAX_DEPTH {
-            return Err(bad("values nest too deep"));
-        }
-        Ok(())
+        grow_meta(&mut self.depth, &mut self.size, depth, size)
     }
 }
 
-fn tuple(items: Vec<Slot>) -> Result<Slot, Error> {
-    let mut slot = Slot::leaf(Value::None);
-    let mut values = Vec::with_capacity(items.len());
-    for item in items {
-        slot.grow(item.depth, item.size)?;
-        values.push(item.v);
+fn grow_meta(dst_depth: &mut u32, dst_size: &mut u64, depth: u32, size: u64) -> Result<(), Error> {
+    *dst_depth = (*dst_depth).max(depth + 1);
+    *dst_size = dst_size.saturating_add(size);
+    if *dst_depth > MAX_DEPTH {
+        return Err(bad("values nest too deep"));
     }
-    slot.v = Value::Tuple(values);
-    Ok(slot)
+    Ok(())
+}
+
+/// Dense vector memo with sparse fallback for arbitrary keys.
+struct Memo<'a> {
+    dense: Vec<Option<Slot<'a>>>,
+    sparse: HashMap<u32, Slot<'a>>,
+    count: usize,
+}
+
+impl<'a> Memo<'a> {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            dense: Vec::with_capacity(cap),
+            sparse: HashMap::new(),
+            count: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn clear(&mut self) {
+        self.dense.clear();
+        self.sparse.clear();
+        self.count = 0;
+    }
+
+    fn insert(&mut self, key: u32, slot: Slot<'a>) {
+        let idx = key as usize;
+        if idx < self.dense.len() {
+            if self.dense[idx].replace(slot).is_none() {
+                self.count += 1;
+            }
+            return;
+        }
+        if idx <= self.dense.len().saturating_add(64) {
+            self.dense.resize_with(idx, || None);
+            self.dense.push(Some(slot));
+            self.count += 1;
+            return;
+        }
+        if self.sparse.insert(key, slot).is_none() {
+            self.count += 1;
+        }
+    }
+
+    fn get(&self, key: u32) -> Option<&Slot<'a>> {
+        let idx = key as usize;
+        if idx < self.dense.len() {
+            self.dense[idx].as_ref()
+        } else {
+            self.sparse.get(&key)
+        }
+    }
 }
 
 struct Machine<'a> {
     bytes: &'a [u8],
     at: usize,
-    stack: Vec<Slot>,
+    stack: Vec<Slot<'a>>,
     marks: Vec<usize>,
-    memo: HashMap<u32, Slot>,
+    memo: Memo<'a>,
     copied: u64,
 }
 
 impl<'a> Machine<'a> {
+    #[inline(always)]
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
         let end = end.ok_or_else(|| bad("ends early"))?;
@@ -183,6 +318,7 @@ impl<'a> Machine<'a> {
         Ok(out)
     }
 
+    #[inline(always)]
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         Ok(self.take(N)?.try_into().expect("N bytes"))
     }
@@ -195,12 +331,14 @@ impl<'a> Machine<'a> {
         std::str::from_utf8(line).map_err(bad)
     }
 
-    fn text(&mut self, n: usize) -> Result<Value, Error> {
+    #[inline(always)]
+    fn text(&mut self, n: usize) -> Result<Val<'a>, Error> {
         let s = std::str::from_utf8(self.take(n)?).map_err(bad)?;
-        Ok(Value::Str(s.into()))
+        Ok(Val::Text(s))
     }
 
-    fn pop(&mut self) -> Result<Slot, Error> {
+    #[inline(always)]
+    fn pop(&mut self) -> Result<Slot<'a>, Error> {
         let floor = self.marks.last().copied().unwrap_or(0);
         if self.stack.len() <= floor {
             return Err(bad("the stack runs empty"));
@@ -208,19 +346,63 @@ impl<'a> Machine<'a> {
         Ok(self.stack.pop().expect("checked"))
     }
 
-    fn top(&mut self) -> Result<&mut Slot, Error> {
+    fn top(&mut self) -> Result<&mut Slot<'a>, Error> {
         self.stack
             .last_mut()
             .ok_or_else(|| bad("the stack runs empty"))
     }
 
-    fn since_mark(&mut self) -> Result<Vec<Slot>, Error> {
-        let mark = self.marks.pop().ok_or_else(|| bad("no mark"))?;
-        Ok(self.stack.split_off(mark))
+    fn pop_mark(&mut self) -> Result<usize, Error> {
+        self.marks.pop().ok_or_else(|| bad("no mark"))
     }
 
-    fn push(&mut self, v: Value) {
+    #[inline(always)]
+    fn push(&mut self, v: Val<'a>) {
         self.stack.push(Slot::leaf(v));
+    }
+
+    fn tuple_from(&mut self, start: usize) -> Result<(), Error> {
+        let count = self.stack.len() - start;
+        if (1..=4).contains(&count) {
+            let mut dims = [0u32; 4];
+            let mut all_dims = true;
+            for (i, item) in self.stack[start..].iter().enumerate() {
+                match item.v {
+                    Val::Int(n) if (0..=u32::MAX as i64).contains(&n) => dims[i] = n as u32,
+                    _ => {
+                        all_dims = false;
+                        break;
+                    }
+                }
+            }
+            if all_dims {
+                self.stack.truncate(start);
+                self.stack.push(Slot {
+                    v: Val::Dims(count as u8, dims),
+                    depth: 1,
+                    size: 1 + count as u64,
+                });
+                return Ok(());
+            }
+        }
+        let mut slot = Slot::leaf(Val::None);
+        let mut values = Vec::with_capacity(count);
+        for item in self.stack.drain(start..) {
+            slot.grow(item.depth, item.size)?;
+            values.push(item.v);
+        }
+        slot.v = Val::Tuple(values);
+        self.stack.push(slot);
+        Ok(())
+    }
+
+    fn tuple_n(&mut self, n: usize) -> Result<(), Error> {
+        let floor = self.marks.last().copied().unwrap_or(0);
+        if self.stack.len() < floor + n {
+            return Err(bad("the stack runs empty"));
+        }
+        let start = self.stack.len() - n;
+        self.tuple_from(start)
     }
 
     fn put(&mut self, key: u32) -> Result<(), Error> {
@@ -232,7 +414,7 @@ impl<'a> Machine<'a> {
     fn get(&mut self, key: u32) -> Result<(), Error> {
         let slot = self
             .memo
-            .get(&key)
+            .get(key)
             .ok_or_else(|| bad("a memo key is unset"))?;
         self.copied = self.copied.saturating_add(slot.size);
         if self.copied > MAX_COPIED {
@@ -250,77 +432,188 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// Adds `items` to the list on top.
-    fn append(&mut self, items: Vec<Slot>) -> Result<(), Error> {
+    /// Adds one item to the list on top.
+    fn append_one(&mut self, item: Slot<'a>) -> Result<(), Error> {
         let list = self.top()?;
-        for item in items {
-            list.grow(item.depth, item.size)?;
-            let Value::List(values) = &mut list.v else {
-                return Err(refused("appending to a non-list"));
-            };
+        list.grow(item.depth, item.size)?;
+        let Val::List(values) = &mut list.v else {
+            return Err(refused("appending to a non-list"));
+        };
+        values.push(item.v);
+        Ok(())
+    }
+
+    /// Adds stack items from `mark` to the list below it.
+    fn append_mark(&mut self, mark: usize) -> Result<(), Error> {
+        if mark == 0 {
+            return Err(bad("the stack runs empty"));
+        }
+        let count = self.stack.len() - mark;
+        if count == 0 {
+            return Ok(());
+        }
+        let mut list = std::mem::replace(&mut self.stack[mark - 1], Slot::leaf(Val::None));
+        let mut depth = list.depth;
+        let mut size = list.size;
+        let Val::List(values) = &mut list.v else {
+            return Err(refused("appending to a non-list"));
+        };
+        values.reserve(count);
+        for item in self.stack.drain(mark..) {
+            grow_meta(&mut depth, &mut size, item.depth, item.size)?;
             values.push(item.v);
+        }
+        list.depth = depth;
+        list.size = size;
+        self.stack[mark - 1] = list;
+        Ok(())
+    }
+
+    /// Adds one key, value pair to the dict on top.
+    fn set_one(&mut self, k: Slot<'a>, v: Slot<'a>) -> Result<(), Error> {
+        let dict = self.top()?;
+        dict.grow(k.depth.max(v.depth), k.size.saturating_add(v.size))?;
+        let Val::Dict(pairs) = &mut dict.v else {
+            return Err(refused("setting items on a non-dict"));
+        };
+        pairs.push((k.v, v.v));
+        Ok(())
+    }
+
+    /// Adds pairs from `mark` into the dict below.
+    fn set_mark(&mut self, mark: usize) -> Result<(), Error> {
+        let count = self.stack.len() - mark;
+        if !count.is_multiple_of(2) {
+            return Err(bad("a key has no value"));
+        }
+        if mark == 0 {
+            return Err(bad("the stack runs empty"));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let mut dict = std::mem::replace(&mut self.stack[mark - 1], Slot::leaf(Val::None));
+        let mut depth = dict.depth;
+        let mut size = dict.size;
+        let Val::Dict(pairs) = &mut dict.v else {
+            return Err(refused("setting items on a non-dict"));
+        };
+        pairs.reserve(count / 2);
+        let mut items = self.stack.drain(mark..);
+        while let (Some(k), Some(v)) = (items.next(), items.next()) {
+            grow_meta(
+                &mut depth,
+                &mut size,
+                k.depth.max(v.depth),
+                k.size.saturating_add(v.size),
+            )?;
+            pairs.push((k.v, v.v));
+        }
+        drop(items);
+        dict.depth = depth;
+        dict.size = size;
+        self.stack[mark - 1] = dict;
+        Ok(())
+    }
+
+    /// Checks items from `mark` against the depth limit.
+    fn check_tuple_depth(&self, mark: usize) -> Result<(), Error> {
+        for item in &self.stack[mark..] {
+            if item.depth >= MAX_DEPTH {
+                return Err(bad("values nest too deep"));
+            }
         }
         Ok(())
     }
 
-    /// Adds key, value pairs to the dict on top.
-    fn set(&mut self, items: Vec<Slot>) -> Result<(), Error> {
-        if !items.len().is_multiple_of(2) {
-            return Err(bad("a key has no value"));
-        }
-        let dict = self.top()?;
-        let mut items = items.into_iter();
-        while let (Some(k), Some(v)) = (items.next(), items.next()) {
-            dict.grow(k.depth.max(v.depth), k.size.saturating_add(v.size))?;
-            let Value::Dict(pairs) = &mut dict.v else {
-                return Err(refused("setting items on a non-dict"));
-            };
-            pairs.push((k.v, v.v));
-        }
+    fn call_global(&mut self, call: Val<'a>, args: &[Val<'a>]) -> Result<(), Error> {
+        let Val::Global(g) = call else {
+            return Err(refused("a call on a non-global"));
+        };
+        let out = match g {
+            Global::OrderedDict if args.is_empty() => Val::Dict(Vec::new()),
+            Global::Tensor if (6..=7).contains(&args.len()) => {
+                Val::Tensor(Rc::new(rebuild(&args[0], &args[1], &args[2], &args[3])?))
+            }
+            Global::Parameter if args.len() == 3 && matches!(args[0], Val::Tensor(_)) => {
+                args[0].clone()
+            }
+            g => return Err(refused(format_args!("{g:?} with these arguments"))),
+        };
+        self.push(out);
         Ok(())
     }
 
     fn reduce(&mut self) -> Result<(), Error> {
         let args = self.pop()?;
         let call = self.pop()?;
-        let (Value::Global(g), Value::Tuple(args)) = (call.v, args.v) else {
+        match args.v {
+            Val::Tuple(args) => self.call_global(call.v, &args),
+            Val::Dims(..) => {
+                let Val::Global(g) = call.v else {
+                    return Err(refused("a call on a non-global"));
+                };
+                Err(refused(format_args!("{g:?} with these arguments")))
+            }
+            _ => Err(refused("a call on a non-global")),
+        }
+    }
+
+    /// Fuses `TUPLE` + `REDUCE` directly from `stack[mark..]`.
+    fn reduce_mark(&mut self, mark: usize) -> Result<(), Error> {
+        self.check_tuple_depth(mark)?;
+        let floor = self.marks.last().copied().unwrap_or(0);
+        if mark <= floor {
+            return Err(bad("the stack runs empty"));
+        }
+        let Val::Global(g) = self.stack[mark - 1].v else {
             return Err(refused("a call on a non-global"));
         };
-        let out = match (g, args.as_slice()) {
-            (Global::OrderedDict, []) => Value::Dict(Vec::new()),
-            (Global::Tensor, [s, offset, shape, stride, _, _, ..]) if args.len() <= 7 => {
-                Value::Tensor(rebuild(s, offset, shape, stride)?)
+        let n = self.stack.len() - mark;
+        let out = match g {
+            Global::OrderedDict if n == 0 => Val::Dict(Vec::new()),
+            Global::Tensor if (6..=7).contains(&n) => Val::Tensor(Rc::new(rebuild(
+                &self.stack[mark].v,
+                &self.stack[mark + 1].v,
+                &self.stack[mark + 2].v,
+                &self.stack[mark + 3].v,
+            )?)),
+            Global::Parameter if n == 3 && matches!(self.stack[mark].v, Val::Tensor(_)) => {
+                std::mem::replace(&mut self.stack[mark].v, Val::None)
             }
-            (Global::Parameter, [t @ Value::Tensor(_), _, _]) => t.clone(),
-            (g, _) => return Err(refused(format_args!("{g:?} with these arguments"))),
+            g => return Err(refused(format_args!("{g:?} with these arguments"))),
         };
+        self.stack.truncate(mark - 1);
         self.push(out);
         Ok(())
     }
 
     fn persistent(&mut self) -> Result<(), Error> {
-        let Value::Tuple(pid) = self.pop()?.v else {
+        let Val::Tuple(pid) = self.pop()?.v else {
             return Err(bad("a persistent id is not a tuple"));
         };
-        let [
-            Value::Str(tag),
-            Value::Global(Global::Storage(dtype)),
-            Value::Str(key),
-            _,
-            count,
-        ] = pid.as_slice()
-        else {
+        if pid.len() != 5 {
             return Err(refused("this persistent id"));
-        };
-        let plain = key.bytes().all(|b| b.is_ascii_alphanumeric());
-        if tag != "storage" || key.is_empty() || !plain {
-            return Err(refused(format_args!("storage key {key:?}")));
         }
-        self.push(Value::Storage(Storage {
-            key: key.clone(),
-            dtype: *dtype,
-            count: count_of(count)?,
-        }));
+        let storage = parse_storage(&pid[0], &pid[1], &pid[2], &pid[4])?;
+        self.push(Val::Storage(storage));
+        Ok(())
+    }
+
+    /// Fuses `TUPLE` + `BINPERSID` directly from `stack[mark..]`.
+    fn persistent_mark(&mut self, mark: usize) -> Result<(), Error> {
+        self.check_tuple_depth(mark)?;
+        if self.stack.len() - mark != 5 {
+            return Err(refused("this persistent id"));
+        }
+        let storage = parse_storage(
+            &self.stack[mark].v,
+            &self.stack[mark + 1].v,
+            &self.stack[mark + 2].v,
+            &self.stack[mark + 4].v,
+        )?;
+        self.stack.truncate(mark);
+        self.push(Val::Storage(storage));
         Ok(())
     }
 
@@ -343,7 +636,8 @@ impl<'a> Machine<'a> {
                 if !self.stack.is_empty() || !self.marks.is_empty() {
                     return Err(bad("values remain at the end"));
                 }
-                return Ok(Some(top.v));
+                self.memo.clear();
+                return Ok(Some(top.v.into_value()));
             }
             b'(' => {
                 if self.marks.len() as u32 >= MAX_DEPTH {
@@ -351,24 +645,27 @@ impl<'a> Machine<'a> {
                 }
                 self.marks.push(self.stack.len());
             }
-            b'}' => self.push(Value::Dict(Vec::new())),
-            b']' => self.push(Value::List(Vec::new())),
-            b')' => self.push(Value::Tuple(Vec::new())),
-            b'N' => self.push(Value::None),
-            0x88 => self.push(Value::Bool(true)),
-            0x89 => self.push(Value::Bool(false)),
+            b'}' => self.push(Val::Dict(Vec::new())),
+            b']' => self.push(Val::List(Vec::new())),
+            b')' => self.push(Val::Tuple(Vec::new())),
+            b'N' => self.push(Val::None),
+            0x88 => self.push(Val::Bool(true)),
+            0x89 => self.push(Val::Bool(false)),
             b't' => {
-                let items = self.since_mark()?;
-                self.stack.push(tuple(items)?);
-            }
-            0x85..=0x87 => {
-                let mut items = Vec::new();
-                for _ in 0..op - 0x84 {
-                    items.push(self.pop()?);
+                let mark = self.pop_mark()?;
+                match self.bytes.get(self.at).copied() {
+                    Some(b'Q') => {
+                        self.at += 1;
+                        self.persistent_mark(mark)?;
+                    }
+                    Some(b'R') => {
+                        self.at += 1;
+                        self.reduce_mark(mark)?;
+                    }
+                    _ => self.tuple_from(mark)?,
                 }
-                items.reverse();
-                self.stack.push(tuple(items)?);
             }
+            0x85..=0x87 => self.tuple_n((op - 0x84) as usize)?,
             b'q' | b'h' => {
                 let key = self.fixed::<1>()?[0] as u32;
                 self.memo_op(op, key)?;
@@ -380,24 +677,24 @@ impl<'a> Machine<'a> {
             0x94 => self.put(self.memo.len() as u32)?,
             b'K' => {
                 let n = self.fixed::<1>()?[0] as i64;
-                self.push(Value::Int(n));
+                self.push(Val::Int(n));
             }
             b'M' => {
                 let n = u16::from_le_bytes(self.fixed()?) as i64;
-                self.push(Value::Int(n));
+                self.push(Val::Int(n));
             }
             b'J' => {
                 let n = i32::from_le_bytes(self.fixed()?) as i64;
-                self.push(Value::Int(n));
+                self.push(Val::Int(n));
             }
             0x8a => {
                 let [n] = self.fixed()?;
                 let int = long(self.take(n as usize)?)?;
-                self.push(Value::Int(int));
+                self.push(Val::Int(int));
             }
             b'G' => {
                 let x = f64::from_be_bytes(self.fixed()?);
-                self.push(Value::Float(x));
+                self.push(Val::Float(x));
             }
             b'X' => {
                 let n = u32::from_le_bytes(self.fixed()?) as usize;
@@ -411,37 +708,37 @@ impl<'a> Machine<'a> {
             }
             b'a' => {
                 let item = self.pop()?;
-                self.append(vec![item])?;
+                self.append_one(item)?;
             }
             b'e' => {
-                let items = self.since_mark()?;
-                self.append(items)?;
+                let mark = self.pop_mark()?;
+                self.append_mark(mark)?;
             }
             b's' => {
                 let v = self.pop()?;
                 let k = self.pop()?;
-                self.set(vec![k, v])?;
+                self.set_one(k, v)?;
             }
             b'u' => {
-                let items = self.since_mark()?;
-                self.set(items)?;
+                let mark = self.pop_mark()?;
+                self.set_mark(mark)?;
             }
             b'c' => {
                 let module = self.line()?;
                 let name = self.line()?;
-                self.push(Value::Global(global(module, name)?));
+                self.push(Val::Global(global(module, name)?));
             }
             0x93 => {
-                let (Value::Str(name), Value::Str(module)) = (self.pop()?.v, self.pop()?.v) else {
+                let (Val::Text(name), Val::Text(module)) = (self.pop()?.v, self.pop()?.v) else {
                     return Err(bad("a stack global names non-strings"));
                 };
-                self.push(Value::Global(global(&module, &name)?));
+                self.push(Val::Global(global(module, name)?));
             }
             b'R' => self.reduce()?,
             b'Q' => self.persistent()?,
             b'b' => {
                 self.pop()?;
-                if !matches!(self.top()?.v, Value::Dict(_)) {
+                if !matches!(self.top()?.v, Val::Dict(_)) {
                     return Err(refused("BUILD on an object"));
                 }
             }
@@ -466,40 +763,69 @@ fn long(bytes: &[u8]) -> Result<i64, Error> {
     Ok(i64::from_le_bytes(wide))
 }
 
-fn count_of(v: &Value) -> Result<u64, Error> {
+fn count_of(v: &Val<'_>) -> Result<u64, Error> {
     match v {
-        Value::Int(n) if *n >= 0 => Ok(*n as u64),
+        Val::Int(n) if *n >= 0 => Ok(*n as u64),
         _ => Err(bad("a size is not a whole number")),
     }
 }
 
-fn counts(v: &Value) -> Result<Vec<u64>, Error> {
-    let Value::Tuple(items) = v else {
-        return Err(bad("a shape is not a tuple"));
-    };
-    if items.len() > MAX_RANK {
-        return Err(bad("a tensor has too many axes"));
+fn tuple_counts<T>(v: &Val<'_>, cast: impl Fn(u64) -> T) -> Result<Vec<T>, Error> {
+    match v {
+        Val::Dims(n, a) => Ok(a[..*n as usize].iter().map(|&x| cast(x as u64)).collect()),
+        Val::Tuple(items) => {
+            if items.len() > MAX_RANK {
+                return Err(bad("a tensor has too many axes"));
+            }
+            items.iter().map(|i| Ok(cast(count_of(i)?))).collect()
+        }
+        _ => Err(bad("a shape is not a tuple")),
     }
-    items.iter().map(count_of).collect()
 }
 
-fn rebuild(storage: &Value, offset: &Value, shape: &Value, stride: &Value) -> Result<View, Error> {
-    let Value::Storage(storage) = storage else {
+fn parse_storage<'a>(
+    tag: &Val<'a>,
+    dtype: &Val<'a>,
+    key: &Val<'a>,
+    count: &Val<'a>,
+) -> Result<RawStorage<'a>, Error> {
+    let (Val::Text(tag), Val::Global(Global::Storage(dtype)), Val::Text(key)) = (tag, dtype, key)
+    else {
+        return Err(refused("this persistent id"));
+    };
+    let plain = key.bytes().all(|b| b.is_ascii_alphanumeric());
+    if *tag != "storage" || key.is_empty() || !plain {
+        return Err(refused(format_args!("storage key {key:?}")));
+    }
+    Ok(RawStorage {
+        key,
+        dtype: *dtype,
+        count: count_of(count)?,
+    })
+}
+
+fn rebuild<'a>(
+    storage: &Val<'a>,
+    offset: &Val<'a>,
+    shape: &Val<'a>,
+    stride: &Val<'a>,
+) -> Result<RawView<'a>, Error> {
+    let Val::Storage(storage) = *storage else {
         return Err(bad("a tensor has no storage"));
     };
-    let shape = counts(shape)?;
-    let stride = counts(stride)?;
+    let shape = tuple_counts(shape, |n| n as usize)?;
+    let stride = tuple_counts(stride, |n| n)?;
     if shape.len() != stride.len() {
         return Err(bad("shape and stride differ in rank"));
     }
-    let view = View {
-        storage: storage.clone(),
-        offset: count_of(offset)?,
-        shape: shape.iter().map(|&n| n as usize).collect(),
-        stride,
-    };
-    match view.end() {
-        Some(end) if end <= storage.count => Ok(view),
+    let offset = count_of(offset)?;
+    match view_end(offset, &shape, &stride) {
+        Some(end) if end <= storage.count => Ok(RawView {
+            storage,
+            offset,
+            shape,
+            stride,
+        }),
         _ => Err(bad(format_args!(
             "a view runs past storage {}",
             storage.key
@@ -515,9 +841,9 @@ pub fn parse(bytes: &[u8]) -> Result<Value, Error> {
     let mut m = Machine {
         bytes,
         at: 0,
-        stack: Vec::new(),
-        marks: Vec::new(),
-        memo: HashMap::new(),
+        stack: Vec::with_capacity(64),
+        marks: Vec::with_capacity(16),
+        memo: Memo::with_capacity(bytes.len() / 32),
         copied: 0,
     };
     loop {

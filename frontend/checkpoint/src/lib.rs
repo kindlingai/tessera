@@ -25,6 +25,8 @@ mod offer;
 #[cfg(test)]
 mod offer_test;
 mod pickle;
+#[cfg(test)]
+mod pickle_test;
 mod quant;
 #[cfg(test)]
 mod quant_test;
