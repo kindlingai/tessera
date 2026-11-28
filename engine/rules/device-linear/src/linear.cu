@@ -1,7 +1,6 @@
 #include <tessera/1/core>
 #include <tessera/1/trellis>
-
-using namespace tessera;
+#include "common.cuh"
 
 #ifndef TM_WARPS
 #define TM_WARPS 8u
@@ -115,40 +114,16 @@ static __device__ __forceinline__ float fg_dot8_bf16(const trellis::x_t* x, cons
     return fg_warp_sum(acc);
 }
 
-static __device__ __forceinline__ u32 fg_bf16x2(float lo, float hi) {
-    u32 out;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
-    return out;
-}
-
-static __device__ __forceinline__ void fg_mma_bf16(float d[4], const u32 a[4], const u32 b[2]) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-static __device__ __forceinline__ float fg_silu(float v) {
-    return v / (1.0f + expf(-v));
-}
-
-static __device__ __forceinline__ float fg_epilogue(float v, const trellis::o_t* other, u64 off,
-                                                    u32 col, u32 mode) {
-    if (mode == 1u) return v + trellis::load_o(other, off);
-    if (mode == 2u) return v + trellis::load_o(other, col);
-    if (mode == 3u) return fg_silu(v) * trellis::load_o(other, off);
-    if (mode == 4u) return v * trellis::load_o(other, off);
-    if (mode == 5u) return fg_silu(v);
-    return v;
-}
-
 static __device__ __forceinline__ float2 fg_epilogue2(float v0, float v1, const trellis::o_t* other,
                                                       u64 off, u32 col, u32 mode) {
     if (mode == 0u) return make_float2(v0, v1);
-    if (mode == 5u) return make_float2(fg_silu(v0), fg_silu(v1));
-    float2 b = trellis::load_o2(other + (mode == 2u ? u64(col) : off));
+    if (mode == 5u) return make_float2(dl_silu(v0), dl_silu(v1));
+    bool is_bias = (mode == 2u || mode == 6u || mode == 7u);
+    float2 b = trellis::load_o2(other + (is_bias ? u64(col) : off));
     if (mode == 1u || mode == 2u) return make_float2(v0 + b.x, v1 + b.y);
-    if (mode == 3u) return make_float2(fg_silu(v0) * b.x, fg_silu(v1) * b.y);
+    if (mode == 3u) return make_float2(dl_silu(v0) * b.x, dl_silu(v1) * b.y);
+    if (mode == 6u) return make_float2(dl_gelu_tanh(v0 + b.x), dl_gelu_tanh(v1 + b.y));
+    if (mode == 7u) return make_float2(dl_gelu(v0 + b.x), dl_gelu(v1 + b.y));
     return make_float2(v0 * b.x, v1 * b.y);
 }
 
@@ -204,24 +179,12 @@ static __device__ __forceinline__ void fg_bf16_mm(const trellis::x_t* x, const u
 #pragma unroll
             for (u32 dr = 0u; dr < 16u; dr += 8u) {
                 u32 r = xr + dr;
-                if (r0 + r < m) {
-                    const trellis::x_t* xp = x + u64(r0 + r) * x_rs + k0 + (s << 6) + xc;
+                const trellis::x_t* xp = x + u64(r0 + r) * x_rs + k0 + (s << 6) + xc;
 #if defined(X_BF16)
-                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = *reinterpret_cast<const uint2*>(xp);
+                dl_stage_bf16_x4(xp, r0 + r < m, &sm.sxh[s][r][xw]);
 #else
-                    float4 xv = *reinterpret_cast<const float4*>(xp);
-                    u32 h0 = fg_bf16x2(xv.x, xv.y), h1 = fg_bf16x2(xv.z, xv.w);
-                    u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16), xv.y - __uint_as_float(h0 & 0xFFFF0000u));
-                    u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16), xv.w - __uint_as_float(h1 & 0xFFFF0000u));
-                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(h0, h1);
-                    *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(l0, l1);
+                dl_stage_bf16_x4(xp, r0 + r < m, &sm.sxh[s][r][xw], &sm.sxl[s][r][xw]);
 #endif
-                } else {
-                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(0u, 0u);
-#if !defined(X_BF16)
-                    *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(0u, 0u);
-#endif
-                }
             }
         }
         *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2]) = cur0;
@@ -237,11 +200,11 @@ static __device__ __forceinline__ void fg_bf16_mm(const trellis::x_t* x, const u
             u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off], sm.sxh[kp][g][off + 4u],
                          sm.sxh[kp][g + 8u][off + 4u]};
             u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
-            fg_mma_bf16(acc, ah, b);
+            dl_mma_bf16(acc, ah, b);
 #if !defined(X_BF16)
             u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off], sm.sxl[kp][g][off + 4u],
                          sm.sxl[kp][g + 8u][off + 4u]};
-            fg_mma_bf16(acc, al, b);
+            dl_mma_bf16(acc, al, b);
 #endif
         }
         prim::block_sync();
@@ -403,11 +366,8 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const trellis::x_t* x, const 
         if (r0 + tr < m) {
             float v = sm.red[0][tr][col] + sm.red[1][tr][col] + sm.red[2][tr][col] +
                       sm.red[3][tr][col];
-            if constexpr (SPLIT) trellis::store_y(out, (u64(p) * m + (r0 + tr)) * n + n0 + col, v);
-            else {
-                u64 off = u64(r0 + tr) * n + n0 + col;
-                trellis::store_y(out, off, fg_epilogue(v, other, off, n0 + col, mode));
-            }
+            u64 off = u64(SPLIT ? (p * m + r0 + tr) : (r0 + tr)) * n + n0 + col;
+            trellis::store_y(out, off, SPLIT ? v : dl_epilogue<false>(v, other, off, n0 + col, mode));
         }
     }
 }
@@ -502,13 +462,13 @@ static __device__ __forceinline__ void fg_mxfp8_r64(const trellis::x_t* x, const
         u32 row0 = r0 + m_base + (ti << 3) + (t << 1);
         if (row0 < m) {
             u64 off0 = u64(SPLIT ? (p * m + row0) : row0) * n;
-            if (col0 < n) trellis::store_y(out, off0 + col0, SPLIT ? acc[ti][0] : fg_epilogue(acc[ti][0], other, off0 + col0, col0, mode));
-            if (col1 < n) trellis::store_y(out, off0 + col1, SPLIT ? acc[ti][2] : fg_epilogue(acc[ti][2], other, off0 + col1, col1, mode));
+            if (col0 < n) trellis::store_y(out, off0 + col0, SPLIT ? acc[ti][0] : dl_epilogue(acc[ti][0], other, off0 + col0, col0, mode));
+            if (col1 < n) trellis::store_y(out, off0 + col1, SPLIT ? acc[ti][2] : dl_epilogue(acc[ti][2], other, off0 + col1, col1, mode));
         }
         if (row0 + 1u < m) {
             u64 off1 = u64(SPLIT ? (p * m + row0 + 1u) : (row0 + 1u)) * n;
-            if (col0 < n) trellis::store_y(out, off1 + col0, SPLIT ? acc[ti][1] : fg_epilogue(acc[ti][1], other, off1 + col0, col0, mode));
-            if (col1 < n) trellis::store_y(out, off1 + col1, SPLIT ? acc[ti][3] : fg_epilogue(acc[ti][3], other, off1 + col1, col1, mode));
+            if (col0 < n) trellis::store_y(out, off1 + col0, SPLIT ? acc[ti][1] : dl_epilogue(acc[ti][1], other, off1 + col0, col0, mode));
+            if (col1 < n) trellis::store_y(out, off1 + col1, SPLIT ? acc[ti][3] : dl_epilogue(acc[ti][3], other, off1 + col1, col1, mode));
         }
     }
 }
@@ -539,8 +499,8 @@ extern "C" __global__ __launch_bounds__(128, MM_MX_R16_SK_BLK) void tessera_mm_m
 
 // Sums split-K partials in order and applies matmul epilogue.
 extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
-    const float* part, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 ks,
-    u32 mode) {
+    const float* part, const trellis::o_t* other, const u8* bias_p, trellis::y_t* out, u32 m,
+    u32 n, u32 ks, u32 mode) {
     u64 idx = u64(blockIdx.x) * 256u + threadIdx.x;
     u64 mn = u64(m) * n;
     if (idx >= mn) return;
@@ -548,7 +508,7 @@ extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
     for (u32 p = 0u; p < ks; p++) {
         v += part[u64(p) * mn + idx];
     }
-    trellis::store_y(out, idx, fg_epilogue(v, other, idx, u32(idx % n), mode));
+    trellis::store_y(out, idx, dl_epilogue(v, other, idx, u32(idx % n), mode, bias_p));
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
@@ -560,7 +520,7 @@ extern "C" __global__ __launch_bounds__(128, MM_MX_R16_BLK) void tessera_mm_mxfp
 }
 
 static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, float b) {
-    if (mode == 1u) return fg_silu(s * a);
+    if (mode == 1u) return dl_silu(s * a);
     if (mode == 2u) return (1.0f / (1.0f + expf(-(s * a)))) * b;
     return s;
 }
@@ -666,129 +626,109 @@ extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_
     }
 }
 
-// Streaming chunk-tiled MXFP8 decode GEMV, one warp per output.
-extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_mxfp8(
-    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
+// Streaming chunk-tiled MXFP8 or 2-row INT4_G32 decode GEMV.
+template <bool INT4>
+__device__ __forceinline__ void fg_gemv_blk(const trellis::x_t* x, const u8* w, trellis::y_t* out,
+                                            u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
-    __shared__ __align__(16) u32 sm_buf[TM_WARPS][268];
+    __shared__ __align__(16) u32 sm_buf[TM_WARPS][INT4 ? 296 : 268];
     u32 warp = threadIdx.x >> 5;
     u32 lane = threadIdx.x & 31u;
-    u32 row = blockIdx.x * TM_WARPS + warp;
-    bool live = row < n;
+    u32 row0 = (blockIdx.x * TM_WARPS + warp) << (INT4 ? 1u : 0u);
     u32 chunks = k >> 10;
-    u64 row_off = u64(row) * (k >> 5) * 33ull;
-    u32* sm_u32 = sm_buf[warp];
-    u8* sm_u8 = reinterpret_cast<u8*>(sm_u32);
-    float acc = 0.0f;
-    uint4 cur0, cur1, cur2;
-    if (live && chunks > 0u) {
-        const u8* p = w + row_off;
-        cur0 = fg_ld_nc4(p + (lane << 4));
-        cur1 = fg_ld_nc4(p + 512u + (lane << 4));
-        if (lane < 2u) cur2 = fg_ld_nc4(p + 1024u + (lane << 4));
-    }
-    for (u32 ch = 0u; ch < chunks; ch++) {
-        fg_stage_chunk(x_h, x, ch << 10);
-        if (live) {
-            *reinterpret_cast<uint4*>(sm_u32 + (lane << 2)) = cur0;
-            *reinterpret_cast<uint4*>(sm_u32 + 128u + (lane << 2)) = cur1;
-            if (lane < 2u) *reinterpret_cast<uint4*>(sm_u32 + 256u + (lane << 2)) = cur2;
-            __syncwarp();
-            if (ch + 1u < chunks) {
-                const u8* np = w + row_off + u64(ch + 1u) * 1056ull;
-                cur0 = fg_ld_nc4(np + (lane << 4));
-                cur1 = fg_ld_nc4(np + 512u + (lane << 4));
-                if (lane < 2u) cur2 = fg_ld_nc4(np + 1024u + (lane << 4));
-            }
-#pragma unroll
-            for (u32 step = 0u; step < 8u; step++) {
-                u32 b_off = ((step << 2) + (lane >> 3)) * 33u;
-                u32 eb = sm_u8[b_off];
-                float sc = __uint_as_float(eb == 0u ? 0x00400000u : (eb << 23));
-                u32 qw = fg_unaligned_u32(sm_u32, b_off + 1u + ((lane & 7u) << 2));
-                u32 h0, h1;
-                u16 q0 = static_cast<u16>(qw);
-                u16 q1 = static_cast<u16>(qw >> 16);
-                asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h0) : "h"(q0));
-                asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h1) : "h"(q1));
-                uint2 xq = *reinterpret_cast<const uint2*>(x_h + (((step << 7) + (lane << 2)) >> 1));
-                acc = fmaf(sc, fg_dot4(h0, h1, xq), acc);
-            }
-        }
-        prim::block_sync();
-    }
-    if (live) {
-        float s = fg_warp_sum(acc);
-        if (lane == 0u) trellis::store_y(out, row, s);
-    }
-}
-
-// Streaming chunk-tiled 2-row INT4_G32 decode GEMV.
-extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_int4(
-    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
-    __shared__ __align__(16) u32 x_h[512];
-    __shared__ __align__(16) u32 sm_buf[TM_WARPS][296];
-    u32 warp = threadIdx.x >> 5;
-    u32 lane = threadIdx.x & 31u;
-    u32 row0 = (blockIdx.x * TM_WARPS + warp) << 1;
-    bool live = row0 + 1u < n;
-    u32 chunks = k >> 10;
-    u64 row_bytes = u64(k >> 5) * 18ull;
+    bool live = INT4 ? (row0 + 1u < n) : (row0 < n);
+    u64 row_bytes = u64(k >> 5) * (INT4 ? 18ull : 33ull);
     const u8* w0 = w + u64(row0) * row_bytes;
     const u8* w1 = w0 + row_bytes;
     u32* sm_u32 = sm_buf[warp];
     u8* sm_u8 = reinterpret_cast<u8*>(sm_u32);
     float acc0 = 0.0f, acc1 = 0.0f;
     uint4 cur0, cur1, cur2;
-    if (live && chunks > 0u) {
-        cur0 = fg_ld_nc4(w0 + (lane << 4));
-        cur1 = fg_ld_nc4(w1 + (lane << 4));
-        if (lane < 4u) cur2 = fg_ld_nc4(w0 + 512u + (lane << 4));
-        else if (lane < 8u) cur2 = fg_ld_nc4(w1 + 512u + ((lane - 4u) << 4));
-    }
+    auto prefetch = [&](u32 ch) {
+        if constexpr (!INT4) {
+            const u8* p = w0 + u64(ch) * 1056ull;
+            cur0 = fg_ld_nc4(p + (lane << 4));
+            cur1 = fg_ld_nc4(p + 512u + (lane << 4));
+            if (lane < 2u) cur2 = fg_ld_nc4(p + 1024u + (lane << 4));
+        } else {
+            u64 off = u64(ch) * 576ull;
+            cur0 = fg_ld_nc4(w0 + off + (lane << 4));
+            cur1 = fg_ld_nc4(w1 + off + (lane << 4));
+            if (lane < 4u) cur2 = fg_ld_nc4(w0 + off + 512u + (lane << 4));
+            else if (lane < 8u) cur2 = fg_ld_nc4(w1 + off + 512u + ((lane - 4u) << 4));
+        }
+    };
+    if (live && chunks > 0u) prefetch(0u);
     for (u32 ch = 0u; ch < chunks; ch++) {
         fg_stage_chunk(x_h, x, ch << 10);
         if (live) {
-            *reinterpret_cast<uint4*>(sm_u32 + (lane << 2)) = cur0;
-            *reinterpret_cast<uint4*>(sm_u32 + 144u + (lane << 2)) = cur1;
-            if (lane < 4u) *reinterpret_cast<uint4*>(sm_u32 + 128u + (lane << 2)) = cur2;
-            else if (lane < 8u) *reinterpret_cast<uint4*>(sm_u32 + 272u + ((lane - 4u) << 2)) = cur2;
-            __syncwarp();
-            if (ch + 1u < chunks) {
-                u64 off = u64(ch + 1u) * 576ull;
-                cur0 = fg_ld_nc4(w0 + off + (lane << 4));
-                cur1 = fg_ld_nc4(w1 + off + (lane << 4));
-                if (lane < 4u) cur2 = fg_ld_nc4(w0 + off + 512u + (lane << 4));
-                else if (lane < 8u) cur2 = fg_ld_nc4(w1 + off + 512u + ((lane - 4u) << 4));
+            if constexpr (!INT4) {
+                *reinterpret_cast<uint4*>(sm_u32 + (lane << 2)) = cur0;
+                *reinterpret_cast<uint4*>(sm_u32 + 128u + (lane << 2)) = cur1;
+                if (lane < 2u) *reinterpret_cast<uint4*>(sm_u32 + 256u + (lane << 2)) = cur2;
+            } else {
+                *reinterpret_cast<uint4*>(sm_u32 + (lane << 2)) = cur0;
+                *reinterpret_cast<uint4*>(sm_u32 + 144u + (lane << 2)) = cur1;
+                if (lane < 4u) *reinterpret_cast<uint4*>(sm_u32 + 128u + (lane << 2)) = cur2;
+                else if (lane < 8u)
+                    *reinterpret_cast<uint4*>(sm_u32 + 272u + ((lane - 4u) << 2)) = cur2;
             }
+            __syncwarp();
+            if (ch + 1u < chunks) prefetch(ch + 1u);
 #pragma unroll
             for (u32 step = 0u; step < 8u; step++) {
-                u32 b0 = ((step << 2) + (lane >> 3)) * 18u;
-                u32 b1 = 576u + b0;
-                u32 q_off = 2u + ((lane & 7u) << 1);
-                float sc0 = trellis::f16_to_f32(*reinterpret_cast<const u16*>(sm_u8 + b0));
-                float sc1 = trellis::f16_to_f32(*reinterpret_cast<const u16*>(sm_u8 + b1));
-                u32 q0 = *reinterpret_cast<const u16*>(sm_u8 + b0 + q_off);
-                u32 q1 = *reinterpret_cast<const u16*>(sm_u8 + b1 + q_off);
                 uint2 xq = *reinterpret_cast<const uint2*>(x_h + (((step << 7) + (lane << 2)) >> 1));
-                u32 a0, a1, b0h, b1h;
-                asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(a0) : "r"(0x64006400u | (q0 & 0x0Fu) | ((q0 & 0xF0u) << 12)), "r"(0x64086408u));
-                asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(a1) : "r"(0x64006400u | ((q0 >> 8) & 0x0Fu) | (((q0 >> 8) & 0xF0u) << 12)), "r"(0x64086408u));
-                asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(b0h) : "r"(0x64006400u | (q1 & 0x0Fu) | ((q1 & 0xF0u) << 12)), "r"(0x64086408u));
-                asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(b1h) : "r"(0x64006400u | ((q1 >> 8) & 0x0Fu) | (((q1 >> 8) & 0xF0u) << 12)), "r"(0x64086408u));
-                acc0 = fmaf(sc0, fg_dot4(a0, a1, xq), acc0);
-                acc1 = fmaf(sc1, fg_dot4(b0h, b1h, xq), acc1);
+                if constexpr (!INT4) {
+                    u32 b_off = ((step << 2) + (lane >> 3)) * 33u;
+                    u32 eb = sm_u8[b_off];
+                    float sc = __uint_as_float(eb == 0u ? 0x00400000u : (eb << 23));
+                    u32 qw = fg_unaligned_u32(sm_u32, b_off + 1u + ((lane & 7u) << 2));
+                    u32 h0, h1;
+                    u16 q0 = static_cast<u16>(qw), q1 = static_cast<u16>(qw >> 16);
+                    asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h0) : "h"(q0));
+                    asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h1) : "h"(q1));
+                    acc0 = fmaf(sc, fg_dot4(h0, h1, xq), acc0);
+                } else {
+                    u32 b0 = ((step << 2) + (lane >> 3)) * 18u, b1 = 576u + b0;
+                    u32 q_off = 2u + ((lane & 7u) << 1);
+                    float sc0 = trellis::f16_to_f32(*reinterpret_cast<const u16*>(sm_u8 + b0));
+                    float sc1 = trellis::f16_to_f32(*reinterpret_cast<const u16*>(sm_u8 + b1));
+                    u32 q0 = *reinterpret_cast<const u16*>(sm_u8 + b0 + q_off);
+                    u32 q1 = *reinterpret_cast<const u16*>(sm_u8 + b1 + q_off);
+                    u32 a0, a1, b0h, b1h;
+                    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(a0) : "r"(0x64006400u | (q0 & 0x0Fu) | ((q0 & 0xF0u) << 12)), "r"(0x64086408u));
+                    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(a1) : "r"(0x64006400u | ((q0 >> 8) & 0x0Fu) | (((q0 >> 8) & 0xF0u) << 12)), "r"(0x64086408u));
+                    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(b0h) : "r"(0x64006400u | (q1 & 0x0Fu) | ((q1 & 0xF0u) << 12)), "r"(0x64086408u));
+                    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(b1h) : "r"(0x64006400u | ((q1 >> 8) & 0x0Fu) | (((q1 >> 8) & 0xF0u) << 12)), "r"(0x64086408u));
+                    acc0 = fmaf(sc0, fg_dot4(a0, a1, xq), acc0);
+                    acc1 = fmaf(sc1, fg_dot4(b0h, b1h, xq), acc1);
+                }
             }
         }
         prim::block_sync();
     }
     if (live) {
-        float s0 = fg_warp_sum(acc0), s1 = fg_warp_sum(acc1);
-        if (lane == 0u) {
-            trellis::store_y(out, row0, s0);
-            trellis::store_y(out, row0 + 1u, s1);
+        float s0 = fg_warp_sum(acc0);
+        if constexpr (!INT4) {
+            if (lane == 0u) trellis::store_y(out, row0, s0);
+        } else {
+            float s1 = fg_warp_sum(acc1);
+            if (lane == 0u) {
+                trellis::store_y(out, row0, s0);
+                trellis::store_y(out, row0 + 1u, s1);
+            }
         }
     }
+}
+
+extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_mxfp8(
+    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
+    fg_gemv_blk<false>(x, w, out, n, k);
+}
+
+extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_int4(
+    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
+    fg_gemv_blk<true>(x, w, out, n, k);
 }
 
 #endif

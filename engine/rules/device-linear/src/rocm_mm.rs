@@ -2,18 +2,39 @@
 
 use super::epi::{
     MatmulBase, MmDims, check_mm_base, epi_accepts, gemv_launch, gemv_load_for, gemv_propose,
-    has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads,
+    has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads, rocm_o_bf16,
 };
 use super::mm::mm_draft;
-use super::{THREADS, WARPS, f32_only, rocm_needs, rocm_rule, rocm_source, weight_x_accepts};
+use super::{ROCM_LACKS, THREADS, WARPS, f32_only, rocm_rule, weight_x_accepts};
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
 use tessera_graph::{Op, Order};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Ops, Shape, Step, T, Term, Tree};
+use tessera_lower::{
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Term, Tree,
+};
 
 const ROCM_LINEAR: &str = include_str!("rocm_linear.cu");
 const MM_THREADS: usize = 128;
+
+pub(crate) fn rocm_source(text: &'static str, entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", "", text]),
+        entry,
+    }
+}
+
+pub(crate) fn rocm_needs(group_bytes: usize, group_threads: usize, tile: bool) -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes,
+        group_threads,
+        compiler: true,
+        tile,
+        lacks: ROCM_LACKS,
+        ..Needs::default()
+    }
+}
 
 pub(crate) fn rocm_linear_source() -> &'static str {
     static ROCM: OnceLock<&'static str> = OnceLock::new();
@@ -331,7 +352,7 @@ fn mm_grid(kind: RocmMmForm, m: usize, n: usize, ks: usize) -> (usize, usize) {
 
 fn mm_accepts(k: &RocmMm, input: usize, form: &dyn Stored) -> bool {
     if k.ks == 1 && input >= 2 {
-        return epi_accepts(k.mode, input, 2, form);
+        return epi_accepts(k.mode, input, 2, rocm_o_bf16(k.mode), form);
     }
     weight_x_accepts(input, false, k.form, form)
 }
@@ -341,7 +362,7 @@ fn mm_load(k: &RocmMm, _: usize) -> Option<Load> {
     let threads = mm_threads(k.kind, k.m, k.n);
     let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (4 * k.m * k.k) as f64];
     if k.ks == 1 {
-        push_epi_reads(&mut reads, k.mode, k.m, k.n);
+        push_epi_reads(&mut reads, k.mode, rocm_o_bf16(k.mode), k.m, k.n);
     }
     let mut load = Load {
         threads: across * down * threads,
@@ -478,8 +499,8 @@ fn mm_site(tree: &Tree, mat: T) -> Option<RocmSite> {
 }
 
 pub(crate) fn propose_rocm_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (site, mode, other, bias2) = match_epi_site(tree, at, mm_site)?;
-    Some(site.draft(mode, other, bias2))
+    let (site, epi) = match_epi_site(tree, at, mm_site)?;
+    Some(site.draft(epi.mode, epi.other, epi.bias2))
 }
 
 fn why_mm(tree: &Tree, at: T) -> Option<String> {
