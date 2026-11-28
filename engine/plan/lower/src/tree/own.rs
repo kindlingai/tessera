@@ -91,7 +91,7 @@ pub(crate) fn own_extents(
 }
 
 /// Slices `slot` on axis 0, pushing through rank-1 row gathers.
-fn slice_axis0(
+pub(crate) fn slice_axis0(
     tree: &mut Tree<'_>,
     slot: T,
     first: usize,

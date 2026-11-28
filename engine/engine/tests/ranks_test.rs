@@ -236,10 +236,14 @@ fn own_attn_glm53() {
         assert_eq!(row_ar, 0, "unexpected row all_reduce");
         assert!(g.nodes.iter().any(|n| is(n, Stage::ReduceScatter)));
         assert!(g.nodes.iter().any(|n| is(n, Stage::GatherRows)));
+        assert!(g.nodes.iter().any(|n| is(n, Stage::OwnRows)));
         for r in g.regions.iter().filter(|r| r.kind == Composite::Attention) {
             let span = &g.nodes[r.start.0 as usize..r.end.0 as usize];
             assert!(!span.iter().any(|n| is(n, Stage::ReduceScatter)));
             assert!(!span.iter().any(|n| is(n, Stage::AllReduce)));
+            for n in span.iter().filter(|n| matches!(n.op, Op::Attend(_))) {
+                assert_eq!(n.ty.placement, tessera_graph::Placement::Owned { axis: 0 });
+            }
         }
     }
 }

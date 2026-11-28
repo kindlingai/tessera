@@ -186,6 +186,11 @@ fn place(
             "needs owned rows",
             Placement::Replicated,
         ),
+        Place::Own => (
+            p == Placement::Replicated && x.rank() >= 2,
+            "needs replicated rows",
+            Placement::Owned { axis: 0 },
+        ),
         _ => (true, "", p),
     };
     need(ok, ErrorKind::Placement, || {
@@ -201,7 +206,7 @@ fn place(
         Place::Nonlinear(keeps_zero) => {
             nonlinear(p != Placement::Partial && (p != Placement::Routed || keeps_zero))
         }
-        Place::Reduce | Place::Gather | Place::Scatter | Place::Join => Ok(crossed),
+        Place::Reduce | Place::Gather | Place::Scatter | Place::Join | Place::Own => Ok(crossed),
     }
 }
 

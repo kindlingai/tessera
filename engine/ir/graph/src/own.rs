@@ -13,6 +13,10 @@ fn gather_op() -> Op {
     Op::Row(Row(vec![Stage::GatherRows]))
 }
 
+fn own_op() -> Op {
+    Op::Row(Row(vec![Stage::OwnRows]))
+}
+
 fn owned(g: &Graph, id: NodeId) -> bool {
     g.node(id).ty.placement == Placement::Owned { axis: 0 }
 }
@@ -245,6 +249,63 @@ fn enter_regions(g: &mut Graph, at: usize, wire: Option<DType>, owned_attn: &[bo
     true
 }
 
+/// Slices a replicated row input before owned attention.
+fn enter_owned_attn(g: &mut Graph, at: usize, owned_attn: &[bool]) -> bool {
+    let mut found = None;
+    for (ri, r) in g.regions.iter().enumerate() {
+        if r.start.0 as usize != at || !owned_attn[ri] {
+            continue;
+        }
+        if r.inputs.iter().any(|&i| owned(g, i)) {
+            continue;
+        }
+        if let Some(&from) = r.inputs.iter().find(|&&i| {
+            let ty = &g.node(i).ty;
+            ty.placement == Placement::Replicated
+                && ty.dtype.is_float()
+                && ty.rank() == 2
+                && weight_of(g, i).is_none()
+                && !matches!(
+                    ty.shape.0[0],
+                    DimExpr::Const(_) | DimExpr::Dim(DimName::Picks)
+                )
+        }) {
+            found = Some(from);
+            break;
+        }
+    }
+    let Some(from) = found else {
+        return false;
+    };
+    let node = Node {
+        op: own_op(),
+        args: vec![from],
+        ty: g.node(from).ty.clone(),
+        numerics: None,
+    };
+    let new = NodeId(at as u32);
+    open(g, new, node);
+    for r in &mut g.regions {
+        if r.end.0 == new.0 + 1 && r.start < new {
+            r.end = new;
+        }
+    }
+    let first = at + 1;
+    for n in &mut g.nodes[first..] {
+        n.args
+            .iter_mut()
+            .filter(|a| **a == from)
+            .for_each(|a| *a = new);
+    }
+    for ri in 0..g.regions.len() {
+        let (start, end) = (g.regions[ri].start, g.regions[ri].end);
+        if end.0 as usize > first {
+            g.regions[ri].inputs = g.reads(start, end);
+        }
+    }
+    true
+}
+
 /// Sums over rows scatter. Readers of all rows gather.
 pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
     own_rows_with(g, false)
@@ -291,7 +352,9 @@ fn own_rows_with(g: &Graph, attn: bool) -> Result<Graph, VerifyError> {
     }
     let mut at = 0;
     while at < out.nodes.len() {
-        if enter_regions(&mut out, at, wire, &owned_attn) {
+        if enter_regions(&mut out, at, wire, &owned_attn)
+            || enter_owned_attn(&mut out, at, &owned_attn)
+        {
             continue;
         }
         let retyped = retype_node(&mut out, at);

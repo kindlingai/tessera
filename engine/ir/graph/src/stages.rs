@@ -37,6 +37,8 @@ pub enum Place {
     Scatter,
     /// Each rank's own rows become replicated.
     Join,
+    /// Replicated rows become each rank's own rows.
+    Own,
 }
 
 /// A check on a stage's parameters.
@@ -190,6 +192,8 @@ macro_rules! stages {
             ReduceScatter => Crossing { reduces: true, place: Scatter }
             /// Joins each rank's own rows, in rank order.
             GatherRows => Crossing { reduces: true, place: Join }
+            /// Keeps each rank's own rows without communication.
+            OwnRows => Crossing { place: Own }
             /// Entries past the position in the argument become -inf.
             Causal as causal => "causal" { operand: Positions, whole: true }
             /// Masks entries to -inf, then applies packed edits.

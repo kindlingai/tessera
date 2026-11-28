@@ -512,6 +512,15 @@ impl<'a> Tree<'a> {
                     );
                     let last = stages.len().saturating_sub(1);
                     for (idx, stage) in stages.into_iter().enumerate() {
+                        if matches!(stage, Stage::OwnRows) {
+                            crossed = true;
+                            let whole = tree.node(cur).shape[0];
+                            let (first, count) = parts.rows(whole, rank as usize);
+                            if count != whole || first != 0 {
+                                cur = own::slice_axis0(&mut tree, cur, first, count, &mut sliced);
+                            }
+                            continue;
+                        }
                         if crossing(stage) {
                             crossed = true;
                         }

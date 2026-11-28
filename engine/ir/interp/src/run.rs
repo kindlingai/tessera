@@ -511,6 +511,7 @@ fn run_on(
                 Stage::AllReduce => vec![all_reduce(&num, &outs)?; ranks],
                 Stage::ReduceScatter => scatter(&all_reduce(&num, &outs)?, parts),
                 Stage::GatherRows => vec![gather_rows(&outs)?; ranks],
+                Stage::OwnRows => scatter(&outs[0], parts),
                 _ => vec![all_gather(&outs)?; ranks],
             };
             let rest = &row.0[at + 1..];
