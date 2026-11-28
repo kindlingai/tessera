@@ -1,0 +1,86 @@
+# Throwaway: CI's lint and style jobs on an orble runner.
+name: orble lint probe
+on:
+  pull_request: null
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  CI_IMAGE: ghcr.io/${{ github.repository }}-ci
+jobs:
+  lint:
+    runs-on: orble-1
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.99.1
+      with:
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: lint
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - run: cargo fmt --all --check
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-machete@0.9.2
+    - run: cargo machete
+    - id: gate
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+      run: 'mkdir -p "$RUNNER_TEMP/checks"
+
+        tools/scripts/lint-gate.sh "$RUNNER_TEMP/checks/lint.json" > "$RUNNER_TEMP/review"
+
+        tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/review"
+
+        '
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: checks-lint
+        path: ${{ runner.temp }}/checks/lint.json
+  style:
+    runs-on: orble-1
+    permissions:
+      contents: read
+      actions: write
+    env:
+      PULL: ${{ github.event_name == 'pull_request' }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.head.sha }}
+      STYLE: tools/scripts/stickler.sh style
+    steps:
+    - if: env.PULL == 'true'
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.HEAD }}
+        fetch-depth: 0
+    - if: env.PULL == 'true'
+      id: pin
+      run: echo "stickler=$(sed -n 's/^stickler\.version = "\(.*\)"$/\1/p' lint.toml)" >> "$GITHUB_OUTPUT"
+    - if: env.PULL == 'true'
+      id: spacy
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/spacy
+        key: spacy-stickler-${{ steps.pin.outputs.stickler }}
+    - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
+      run: $STYLE fetch "$RUNNER_TEMP/spacy"
+    - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/spacy
+        key: spacy-stickler-${{ steps.pin.outputs.stickler }}
+    - if: env.PULL == 'true'
+      run: 'mkdir -p "$RUNNER_TEMP/checks" && $STYLE diff "$RUNNER_TEMP/spacy" "$BASE" "$HEAD" "$RUNNER_TEMP/checks/style.json"
+
+        '
+    - if: always() && env.PULL == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: checks-style
+        path: ${{ runner.temp }}/checks/style.json
