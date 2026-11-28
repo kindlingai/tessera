@@ -641,14 +641,15 @@ jobs:
           filter: blob:none
       # Skips come only from `changes`, so it must pass itself. A job
       # left without a hosted runner counts as skipped, so a runner
-      # outage does not remove a merge queue entry.
+      # outage does not remove a merge queue entry. On main a newer push
+      # cancels the run, so a cancel there is not a failure.
       - env:
           GH_TOKEN: ${{ github.token }}
           CHANGES: ${{ needs.changes.result }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          EVENT: ${{ github.event_name }}
         run: |
           echo "changes: $CHANGES, job results: $RESULTS"
-          [ "$CHANGES" = success ] || exit 1
           for r in $RESULTS; do
             case "$r" in
             success | skipped) ;;
@@ -657,6 +658,11 @@ jobs:
             *) exit 1 ;;
             esac
           done
+          if [ -n "$cancelled" ] && [ "$EVENT" = push ]; then
+            echo "Jobs were cancelled on main, usually by a newer push."
+            exit 0
+          fi
+          [ "$CHANGES" = success ] || exit 1
           [ -z "$cancelled" ] || tools/scripts/runner-missing.sh
       # Protected files and fork settings: see protected.yml.
       - if: github.event_name == 'pull_request'
