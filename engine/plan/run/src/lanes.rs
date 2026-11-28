@@ -168,6 +168,8 @@ impl LaneSync {
         for &ev in &self.joins {
             ctx.wait_lane(0, ev)?;
         }
+        // Later launches, such as the end stamp, join lane 0.
+        ctx.set_lane(0);
         Ok(())
     }
 }
