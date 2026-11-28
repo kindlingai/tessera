@@ -140,4 +140,17 @@ fn lookahead_closer_parity() {
             assert_eq!((content.as_str(), calls), ("\n All done.", want.clone()));
         }
     }
+    // Competing longer alternation branch must not be bypassed mid-stream.
+    let alt_cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think>\\s*</analysis>|</think>(?!-literal)","content":"text"}}}}"#;
+    let ap = ResponseParser::from_config(alt_cfg).unwrap().unwrap();
+    let alt_whole = ap.parse("<think>plan</think> </analysis>answer", true, false);
+    let alt_stream = parse_stream(&ap, &["<think>plan</think> ", "</analysis>answer"]);
+    assert_eq!(
+        (alt_whole.reasoning.as_str(), alt_whole.content.as_str()),
+        ("plan", "answer")
+    );
+    assert_eq!(
+        (alt_stream.0.as_str(), alt_stream.1.as_str()),
+        ("plan", "answer")
+    );
 }

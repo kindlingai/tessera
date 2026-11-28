@@ -303,41 +303,55 @@ fn forced_tool_choice() {
     assert!(!sse.contains("never mind") && !sse.contains("\"stop\"") && sse.contains("\"error\""));
 }
 
-fn check_think_usage(pat: &str, first: &str) {
-    let cfg = format!(
-        r#"{{"response_template":{{"fields":{{"reasoning_content":{{"open":"<think>","close_pattern":"{pat}","content":"text"}}}}}}}}"#
-    );
+fn check_think_case(
+    pat: &str,
+    pieces: &[&str],
+    want_reason: &str,
+    want_content: &str,
+    want_tokens: u64,
+) {
+    let cfg = json!({"response_template": {"fields": {
+        "reasoning_content": {"open": "<think>", "close_pattern": pat, "content": "text"},
+    }}})
+    .to_string();
     let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
     let mock = Arc::new(MockGenerator {
-        pieces: vec![
-            first.into(),
-            "The ".into(),
-            "answer ".into(),
-            "is ".into(),
-            "42.".into(),
-            String::new(),
-        ],
+        pieces: pieces.iter().map(|s| (*s).into()).collect(),
         ..MockGenerator::default()
     });
     let slot = loaded_with(&mock, true, Some(parser));
     let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
     let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
     assert_eq!(status, 200);
-    assert_eq!(got["choices"][0]["message"]["reasoning_content"], "plan");
-    let want_content = format!(
-        "{}The answer is 42.",
-        first.trim_start_matches("<think>plan</think>")
+    assert_eq!(
+        got["choices"][0]["message"]["reasoning_content"],
+        want_reason
     );
     assert_eq!(got["choices"][0]["message"]["content"], want_content);
     assert_eq!(
         got["usage"]["completion_tokens_details"]["reasoning_tokens"],
-        1
+        want_tokens
     );
     body["stream"] = json!(true);
     body["stream_options"] = json!({"include_usage": true});
     let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
     assert_eq!(s_status, 200);
-    assert!(sse.contains("\"reasoning_tokens\":1"), "sse: {sse}");
+    let mut content = String::new();
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    assert_eq!(content, want_content);
+    assert!(
+        sse.contains(&format!("\"reasoning_tokens\":{want_tokens}")),
+        "sse: {sse}"
+    );
 }
 
 fn check_lookahead_tools() {
@@ -404,14 +418,60 @@ fn check_lookahead_tools() {
     assert!(sse.contains("All done."));
 }
 
+fn check_think_cases() {
+    check_think_case(
+        "</think>(?!-literal)",
+        &["<think>plan</think> ", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        " The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>(?!-literal)",
+        &["<think>plan</think>", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        "The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>(?!.*-literal)",
+        &["<think>plan</think> ", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        " The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>\\s*</analysis>|</think>(?!-literal)",
+        &["<think>plan</think> ", "</analysis>answer"],
+        "plan",
+        "answer",
+        2,
+    );
+    check_think_case(
+        "</think>",
+        &["<think>plan", "", "é", " more</think>answer", ""],
+        "plané more",
+        "answer",
+        4,
+    );
+    check_think_case(
+        "</think>(?!.*-literal)",
+        &[
+            "<think>one</think> <think>two",
+            " three",
+            " four",
+            " five</think>",
+            "answer",
+            "",
+        ],
+        "onetwo three four five",
+        " answer",
+        4,
+    );
+}
+
 #[test]
 fn lookahead_closer_usage() {
-    for (pat, first) in [
-        ("</think>(?!-literal)", "<think>plan</think> "),
-        ("</think>(?!-literal)", "<think>plan</think>"),
-        ("</think>(?!.*-literal)", "<think>plan</think> "),
-    ] {
-        check_think_usage(pat, first);
-    }
+    check_think_cases();
     check_lookahead_tools();
 }

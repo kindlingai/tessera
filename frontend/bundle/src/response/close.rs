@@ -407,7 +407,7 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
             }
             b'[' if !in_class => in_class = true,
             b']' if in_class => in_class = false,
-            b'$' if !in_class => return (StreamRule::DeferEof, needs_context),
+            b'$' | b'|' if !in_class => return (StreamRule::DeferEof, needs_context),
             b'(' if !in_class && i + 2 < bytes.len() && bytes[i + 1] == b'?' => {
                 let Some(end) = matching_paren(pat, i) else {
                     return (StreamRule::DeferEof, needs_context);
@@ -448,57 +448,53 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
     (rule, needs_context)
 }
 
-/// Extracts literal guards from trailing `(?!...)` closer branches.
+/// Extracts literal guards from a single trailing `(?!...)` closer.
 fn parse_neg_guards(pat: &str) -> Option<Vec<String>> {
+    let branches = split_alt(strip_group(pat));
+    if branches.len() != 1 {
+        return None;
+    }
+    let b = strip_group(branches[0]);
     let mut guards = Vec::new();
-    for branch in split_alt(strip_group(pat)) {
-        let b = strip_group(branch);
-        if let Some(inner) = strip_lookahead(b) {
-            if unescape_lit(inner)?.is_empty() {
-                return None;
-            }
-            continue;
-        }
-        let bytes = b.as_bytes();
-        let mut i = 0;
-        let mut in_class = false;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => {
-                    if !in_class
-                        && i + 1 < bytes.len()
-                        && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
-                    {
-                        return None;
-                    }
-                    i += 2;
-                    continue;
+    let bytes = b.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if !in_class
+                    && i + 1 < bytes.len()
+                    && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
+                {
+                    return None;
                 }
-                b'[' if !in_class => in_class = true,
-                b']' if in_class => in_class = false,
-                b'$' if !in_class => return None,
-                b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
-                    let end = matching_paren(b, i)?;
-                    if i + 2 < bytes.len() && bytes[i + 2] == b'!' && end + 1 == b.len() {
-                        for alt in split_alt(strip_group(&b[i + 3..end])) {
-                            let lit = unescape_lit(strip_group(alt))?;
-                            if lit.is_empty() {
-                                return None;
-                            }
-                            guards.push(lit);
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'$' | b'|' if !in_class => return None,
+            b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
+                let end = matching_paren(b, i)?;
+                if i + 2 < bytes.len() && bytes[i + 2] == b'!' && end + 1 == b.len() {
+                    for alt in split_alt(strip_group(&b[i + 3..end])) {
+                        let lit = unescape_lit(strip_group(alt))?;
+                        if lit.is_empty() {
+                            return None;
                         }
-                        break;
+                        guards.push(lit);
                     }
-                    if !(i + 2 < bytes.len() && bytes[i + 2] == b':') {
-                        return None;
-                    }
-                    i += 3;
-                    continue;
+                    break;
                 }
-                _ => {}
+                if !(i + 2 < bytes.len() && bytes[i + 2] == b':') {
+                    return None;
+                }
+                i += 3;
+                continue;
             }
-            i += 1;
+            _ => {}
         }
+        i += 1;
     }
     (!guards.is_empty()).then_some(guards)
 }

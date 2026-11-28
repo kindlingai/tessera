@@ -746,7 +746,9 @@ fn feed_stream(
     events: &mut Vec<ResponseEvent>,
     reasoning: &mut usize,
 ) {
-    stream.push(text, events);
+    if !done || !text.is_empty() {
+        stream.push(text, events);
+    }
     if done {
         stream.finish(events);
     }

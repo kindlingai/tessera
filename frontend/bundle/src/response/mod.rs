@@ -393,9 +393,7 @@ impl ResponseParser {
             lead: false,
             tool: ToolState::Start,
             reasoning_tokens: 0,
-            think_starts: Vec::new(),
-            piece_counted: false,
-            piece_pending: false,
+            spans: Vec::new(),
         }
     }
 
@@ -457,6 +455,13 @@ enum Hit {
     Close,
 }
 
+#[derive(Clone, Copy)]
+struct TokenSpan {
+    start: usize,
+    end: usize,
+    counted: bool,
+}
+
 /// Incremental state machine for one assistant reply.
 pub struct ResponseStream<'a> {
     parser: &'a ResponseParser,
@@ -473,12 +478,8 @@ pub struct ResponseStream<'a> {
     tool: ToolState,
     /// Confirmed reasoning tokens pushed so far.
     reasoning_tokens: usize,
-    /// Start offsets in `buf` of buffered thinking tokens.
-    think_starts: Vec<usize>,
-    /// Whether the active `push` already incremented `reasoning_tokens`.
-    piece_counted: bool,
-    /// Whether `think_starts.last()` belongs to the active `push`.
-    piece_pending: bool,
+    /// Buffered token byte ranges in `buf`.
+    spans: Vec<TokenSpan>,
 }
 
 impl<'a> ResponseStream<'a> {
@@ -494,33 +495,41 @@ impl<'a> ResponseStream<'a> {
 
     /// Feeds raw decoded text and appends completed events.
     pub fn push(&mut self, piece: &str, out: &mut Vec<ResponseEvent>) {
-        if self.mode == Mode::Closed || piece.is_empty() {
+        if self.mode == Mode::Closed {
             return;
         }
-        self.piece_counted = false;
-        self.piece_pending = false;
-        if self.mode == Mode::Thinking {
-            self.think_starts.push(self.buf.len());
-            self.piece_pending = true;
+        if piece.is_empty() {
+            if self.mode == Mode::Thinking {
+                let at = self.buf.len();
+                self.spans.push(TokenSpan {
+                    start: at,
+                    end: at,
+                    counted: false,
+                });
+            }
+            return;
         }
+        let start = self.buf.len();
         self.buf.push_str(piece);
+        self.spans.push(TokenSpan {
+            start,
+            end: self.buf.len(),
+            counted: false,
+        });
         self.drain(out, false);
-        self.piece_pending = false;
     }
 
     /// Flushes remaining buffered text when generation ends.
     pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
         if self.mode == Mode::Closed {
             self.buf.clear();
-            self.drop_think_marks();
+            self.spans.clear();
             return;
         }
-        self.piece_counted = false;
-        self.piece_pending = false;
         self.drain(out, true);
         if self.mode == Mode::Closed {
             self.buf.clear();
-            self.drop_think_marks();
+            self.spans.clear();
             return;
         }
         if self.mode == Mode::ToolCall
@@ -528,79 +537,84 @@ impl<'a> ResponseStream<'a> {
             && (self.tool.started() || !self.buf.is_empty())
         {
             let rest = std::mem::take(&mut self.buf);
+            self.spans.clear();
             self.tool.finish(spec, &rest, out);
             return;
         }
         if self.buf.is_empty() {
-            self.drop_think_marks();
+            if self.mode == Mode::Thinking && !self.opening {
+                self.count_all_spans();
+            } else {
+                self.spans.clear();
+            }
             return;
         }
         let mut rest = std::mem::take(&mut self.buf);
         if std::mem::take(&mut self.opening) {
             match self.opener_len(&rest) {
                 Some(cut) => {
-                    self.count_think_before(cut);
+                    self.shift_spans(cut, true);
                     drop(rest.drain(..cut));
                 }
                 None => {
-                    self.drop_think_marks();
+                    self.spans.clear();
                     self.mode = Mode::Text;
                 }
             }
             if rest.is_empty() {
-                self.drop_think_marks();
+                self.spans.clear();
                 return;
             }
         }
         match self.mode {
             Mode::Thinking => {
-                self.finish_think_at(usize::MAX);
+                self.count_all_spans();
                 out.push(ResponseEvent::Reasoning(rest));
             }
             Mode::Text | Mode::ToolCall | Mode::Calls => {
-                self.drop_think_marks();
+                self.spans.clear();
                 out.push(ResponseEvent::Content(rest));
             }
             Mode::Closed => {}
         }
     }
 
-    fn count_think_before(&mut self, cut: usize) {
+    fn drain_buf(&mut self, cut: usize, reasoning: bool) {
+        if cut == 0 {
+            return;
+        }
+        self.buf.drain(..cut);
+        self.shift_spans(cut, reasoning);
+    }
+
+    fn shift_spans(&mut self, cut: usize, reasoning: bool) {
+        if cut == 0 {
+            return;
+        }
         let mut kept = 0;
-        let len = self.think_starts.len();
-        for i in 0..len {
-            let pos = self.think_starts[i];
-            if pos < cut {
+        for i in 0..self.spans.len() {
+            let mut span = self.spans[i];
+            if reasoning && !span.counted && span.start < cut {
+                span.counted = true;
                 self.reasoning_tokens += 1;
-                if self.piece_pending && i + 1 == len {
-                    self.piece_counted = true;
-                    self.piece_pending = false;
-                }
-            } else {
-                self.think_starts[kept] = pos - cut;
+            }
+            if span.end > cut {
+                span.start = span.start.saturating_sub(cut);
+                span.end -= cut;
+                self.spans[kept] = span;
                 kept += 1;
             }
         }
-        self.think_starts.truncate(kept);
+        self.spans.truncate(kept);
     }
 
-    fn finish_think_at(&mut self, close_end: usize) {
-        let len = self.think_starts.len();
-        for (i, &pos) in self.think_starts.iter().enumerate() {
-            if pos < close_end {
+    fn count_all_spans(&mut self) {
+        for span in &self.spans {
+            if !span.counted {
                 self.reasoning_tokens += 1;
-                if self.piece_pending && i + 1 == len {
-                    self.piece_counted = true;
-                }
             }
         }
-        self.think_starts.clear();
-        self.piece_pending = false;
-    }
-
-    fn drop_think_marks(&mut self) {
-        self.think_starts.clear();
-        self.piece_pending = false;
+        self.spans.clear();
     }
 
     fn drain(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) {
@@ -621,7 +635,7 @@ impl<'a> ResponseStream<'a> {
     fn step_text(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         if self.lead {
             let kept = self.buf.trim_start_matches('\n').len();
-            self.buf.drain(..self.buf.len() - kept);
+            self.drain_buf(self.buf.len() - kept, false);
             if self.buf.is_empty() {
                 return false;
             }
@@ -638,22 +652,14 @@ impl<'a> ResponseStream<'a> {
         {
             if at > 0 {
                 out.push(ResponseEvent::Content(self.buf[..at].to_string()));
+                self.drain_buf(at, false);
             }
-            self.buf.drain(..at + skip);
+            self.drain_buf(skip, matches!(hit, Hit::Thinking));
             self.mode = match hit {
                 Hit::Thinking => {
                     let thinking = self.parser.thinking.as_ref();
                     self.opening =
                         thinking.is_some_and(|t| matches!(t.open, Opener::Pattern { .. }));
-                    if !self.piece_counted {
-                        if self.opening {
-                            self.think_starts.push(0);
-                            self.piece_pending = true;
-                        } else {
-                            self.reasoning_tokens += 1;
-                            self.piece_counted = true;
-                        }
-                    }
                     Mode::Thinking
                 }
                 Hit::ToolCall => Mode::ToolCall,
@@ -663,6 +669,7 @@ impl<'a> ResponseStream<'a> {
                 }
                 Hit::Close => {
                     self.buf.clear();
+                    self.spans.clear();
                     Mode::Closed
                 }
             };
@@ -685,7 +692,7 @@ impl<'a> ResponseStream<'a> {
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Content(self.buf[..emit].to_string()));
-            self.buf.drain(..emit);
+            self.drain_buf(emit, false);
         }
         false
     }
@@ -701,14 +708,12 @@ impl<'a> ResponseStream<'a> {
             match (self.opener_len(&self.buf), close) {
                 // Text after the match shows that the opener is complete.
                 (Some(cut), _) if cut < self.buf.len() || eof => {
-                    self.count_think_before(cut);
-                    self.buf.drain(..cut);
+                    self.drain_buf(cut, true);
                     self.opening = false;
                 }
                 (None, Some((at, len))) => {
-                    self.drop_think_marks();
                     out.push(ResponseEvent::Content(self.buf[..at + len].to_string()));
-                    self.buf.drain(..at + len);
+                    self.drain_buf(at + len, false);
                     self.opening = false;
                     self.mode = Mode::Text;
                     return true;
@@ -717,11 +722,10 @@ impl<'a> ResponseStream<'a> {
             }
         }
         if let Some((at, len)) = spec.close.find_for(&self.buf, eof) {
-            self.finish_think_at(at + len);
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
             }
-            self.buf.drain(..at + len);
+            self.drain_buf(at + len, true);
             self.mode = Mode::Text;
             self.lead = true;
             return true;
@@ -732,9 +736,8 @@ impl<'a> ResponseStream<'a> {
         let keep = spec.close.tail_hold(&self.buf);
         let emit = self.buf.len() - keep;
         if emit > 0 {
-            self.count_think_before(emit);
             out.push(ResponseEvent::Reasoning(self.buf[..emit].to_string()));
-            self.buf.drain(..emit);
+            self.drain_buf(emit, true);
         }
         false
     }
@@ -744,7 +747,10 @@ impl<'a> ResponseStream<'a> {
             self.mode = Mode::Text;
             return true;
         };
-        match self.tool.step(spec, &mut self.buf, out, eof) {
+        let before = self.buf.len();
+        let outcome = self.tool.step(spec, &mut self.buf, out, eof);
+        self.shift_spans(before - self.buf.len(), false);
+        match outcome {
             StepOutcome::Wait => false,
             StepOutcome::Continue => true,
             StepOutcome::Done => {
@@ -770,11 +776,11 @@ impl<'a> ResponseStream<'a> {
             .and_then(|[_, c]| Some((self.buf.find(c.as_str())?, c.len())));
         match (open, close) {
             (Some(at), c) if c.is_none_or(|(end, _)| at < end) => {
-                self.buf.drain(..at);
+                self.drain_buf(at, false);
                 self.mode = Mode::ToolCall;
             }
             (_, Some((at, len))) => {
-                self.buf.drain(..at + len);
+                self.drain_buf(at + len, false);
                 self.calls = false;
                 self.mode = Mode::Text;
             }
