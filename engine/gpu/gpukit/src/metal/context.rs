@@ -5,6 +5,7 @@ use crate::device::{Caches, Device};
 use crate::launch::{Bound, KernelArgs, Launch};
 use crate::metal::expand::expand;
 use crate::metal::pipeline_cache::Pipelines;
+use crate::pending::{Pending, PendingOps};
 use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 use objc2::msg_send;
@@ -55,27 +56,49 @@ impl Allocs {
     }
 }
 
-/// Launches encoded since the last `finish`.
-struct Pending {
-    /// The context whose queue holds it.
-    owner: usize,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-    concurrent: bool,
-    dirty: bool,
+type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type CompEnc = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
+type MetalPending = Pending<CmdBuf, CompEnc>;
+
+struct MetalOps<'a> {
+    queue: &'a ProtocolObject<dyn MTLCommandQueue>,
 }
 
-impl Pending {
-    /// Commits and waits. Returns the GPU's own seconds.
-    fn finish(self) -> f64 {
+impl PendingOps for MetalOps<'_> {
+    type Cmd = CmdBuf;
+    type Enc = CompEnc;
+
+    fn new_cmd(&mut self) -> Result<CmdBuf, Error> {
         autoreleasepool(|_| {
-            self.enc.endEncoding();
-            self.cmd.commit();
-            self.cmd.waitUntilCompleted();
+            self.queue
+                .commandBuffer()
+                .ok_or(Error::Gpu("command buffer"))
+        })
+    }
+
+    fn open_enc(&mut self, cmd: &CmdBuf, concurrent: bool) -> Result<CompEnc, Error> {
+        let kind = match concurrent {
+            true => MTLDispatchType::Concurrent,
+            false => MTLDispatchType::Serial,
+        };
+        autoreleasepool(|_| {
+            cmd.computeCommandEncoderWithDispatchType(kind)
+                .ok_or(Error::Gpu("encoder"))
+        })
+    }
+
+    fn end_enc(&mut self, enc: CompEnc) {
+        autoreleasepool(|_| enc.endEncoding());
+    }
+
+    fn commit(&mut self, cmd: CmdBuf) -> f64 {
+        autoreleasepool(|_| {
+            cmd.commit();
+            cmd.waitUntilCompleted();
             // The GPU's own clock leaves out the scheduling wait.
-            let cmd = &*self.cmd;
+            let raw = &*cmd;
             let (start, end): (f64, f64) =
-                unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+                unsafe { (msg_send![raw, GPUStartTime], msg_send![raw, GPUEndTime]) };
             end - start
         })
     }
@@ -83,7 +106,7 @@ impl Pending {
 
 thread_local! {
     /// This thread's open command buffer. Encoders are not shared.
-    static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Option<MetalPending>> = const { RefCell::new(None) };
     /// Whether this thread encodes launches concurrently with explicit barriers.
     static CONCURRENT: Cell<bool> = const { Cell::new(false) };
 }
@@ -230,69 +253,24 @@ impl Context {
         Arc::as_ptr(&self.0) as usize
     }
 
-    fn open_encoder(
-        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
-        concurrent: bool,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
-        let kind = match concurrent {
-            true => MTLDispatchType::Concurrent,
-            false => MTLDispatchType::Serial,
-        };
-        cmd.computeCommandEncoderWithDispatchType(kind)
-            .ok_or(Error::Gpu("encoder"))
+    fn ops(&self) -> MetalOps<'_> {
+        MetalOps {
+            queue: &self.0.queue,
+        }
     }
 
     /// This thread's open encoder, or a new command buffer's.
-    fn encoder(
-        &self,
-        pending: &mut Option<Pending>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
+    fn encoder(&self, pending: &mut Option<MetalPending>) -> Result<CompEnc, Error> {
         let want = CONCURRENT.with(Cell::get);
-        match pending {
-            Some(p) if p.owner == self.id() && p.concurrent == want => return Ok(p.enc.clone()),
-            Some(p) if p.owner == self.id() => {
-                let enc = autoreleasepool(|_| {
-                    p.enc.endEncoding();
-                    Self::open_encoder(&p.cmd, want)
-                })?;
-                p.enc = enc;
-                p.concurrent = want;
-                p.dirty = false;
-                return Ok(p.enc.clone());
-            }
-            // Another context's work ends before this one's starts.
-            Some(_) => drop(pending.take().map(Pending::finish)),
-            None => {}
-        }
-        let (cmd, enc) = autoreleasepool(|_| {
-            let cmd = self
-                .0
-                .queue
-                .commandBuffer()
-                .ok_or(Error::Gpu("command buffer"))?;
-            let enc = Self::open_encoder(&cmd, want)?;
-            Ok::<_, Error>((cmd, enc))
-        })?;
-        let owner = self.id();
-        let made = pending.insert(Pending {
-            owner,
-            cmd,
-            enc,
-            concurrent: want,
-            dirty: false,
-        });
-        Ok(made.enc.clone())
+        Pending::acquire(pending, self.id(), want, &mut self.ops())
     }
 
     fn fence_concurrent(&self) {
         PENDING.with(|p| {
             if let Some(pending) = p.borrow_mut().as_mut()
                 && pending.owner == self.id()
-                && pending.concurrent
-                && pending.dirty
             {
-                pending.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-                pending.dirty = false;
+                pending.fence(|enc| enc.memoryBarrierWithScope(MTLBarrierScope::Buffers));
             }
         });
     }
@@ -470,7 +448,8 @@ impl Device for Context {
                 _ => None,
             }
         });
-        Ok(taken.map(Pending::finish))
+        let mut ops = self.ops();
+        Ok(taken.map(|p| p.finish(&mut ops)))
     }
 
     fn has_barriers(&self) -> bool {
