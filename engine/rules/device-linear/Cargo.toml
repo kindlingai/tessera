@@ -6,6 +6,11 @@ license.workspace = true
 publish.workspace = true
 description = "Device CUDA linear matmul, trellis MMA, and decode GEMV rules"
 
+[features]
+default = []
+cuda = ["tessera-device/cuda"]
+rocm = ["tessera-device/rocm"]
+
 [dependencies]
 tessera-device = { workspace = true }
 tessera-graph = { workspace = true }
@@ -14,5 +19,8 @@ tessera-mem = { workspace = true }
 tessera-lower = { workspace = true }
 
 [dev-dependencies]
+tessera-gpukit = { workspace = true }
+tessera-interp = { workspace = true }
 tessera-kernels = { workspace = true }
+tessera-run = { workspace = true }
 tessera-testkit = { workspace = true }

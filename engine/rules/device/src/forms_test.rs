@@ -62,16 +62,29 @@ impl OnGpu for Hand {
     }
 }
 
-/// Every state: kernel text and hand CUDA match the host.
+/// Every state: kernel text and hand GPU match the host.
 #[test]
 fn trellis_states_match() {
-    let options = Options::plain(Backend::Cuda);
-    let text = flatten("trellis_states.cu", HAND, &|_| None, &options)
-        .expect("flattens")
-        .text;
+    let cuda_text = flatten(
+        "trellis_states.cu",
+        HAND,
+        &|_| None,
+        &Options::plain(Backend::Cuda),
+    )
+    .expect("flattens cuda")
+    .text;
+    let rocm_text = flatten(
+        "trellis_states.kernel",
+        HAND,
+        &|_| None,
+        &Options::plain(Backend::Rocm),
+    )
+    .expect("flattens rocm")
+    .text;
     tessera_gpukit::testing::require_gpu();
     let hand = match picked() {
-        Some(Backend::Cuda) => dispatch(Some(Backend::Cuda), Hand(text)).ok(),
+        Some(Backend::Cuda) => dispatch(Some(Backend::Cuda), Hand(cuda_text)).ok(),
+        Some(Backend::Rocm) => dispatch(Some(Backend::Rocm), Hand(rocm_text)).ok(),
         _ => None,
     };
     let half = |w: u32, high: bool| f32::from(F16((w >> (16 * u32::from(high))) as u16));
