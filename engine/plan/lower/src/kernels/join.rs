@@ -56,11 +56,7 @@ fn join(
 #[launch(
     join(self.a_form, self.b_form, self.out_form, self.wide()),
     crate = crate,
-    threads = if self.wide() {
-        self.rows.times((self.left + self.right) / 4)
-    } else {
-        self.rows.times(self.left + self.right)
-    },
+    threads = self.rows.times(self.thread_stride().unwrap_or(0)),
     sizes = [self.left, self.right],
     accepts = join_accepts,
     emits = join_emits,
@@ -92,6 +88,31 @@ impl Join {
             && float_form(self.out_form)
             && self.left.is_multiple_of(4)
             && self.right.is_multiple_of(4)
+    }
+
+    fn thread_stride(&self) -> Option<usize> {
+        if self.wide() {
+            (self.left / 4).checked_add(self.right / 4)
+        } else {
+            self.left.checked_add(self.right)
+        }
+    }
+
+    /// Whether widths, rows, and total threads fit in `u32`.
+    pub fn fits(&self) -> bool {
+        let max = u32::MAX as usize;
+        if self.left > max || self.right > max || self.rows.most() > max {
+            return false;
+        }
+        let Some(stride) = self.thread_stride() else {
+            return false;
+        };
+        stride > 0
+            && self
+                .rows
+                .most()
+                .checked_mul(stride)
+                .is_some_and(|threads| threads <= max)
     }
 }
 

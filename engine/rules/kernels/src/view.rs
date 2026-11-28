@@ -423,6 +423,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             b_form: plain(tree.node(y).form),
             out_form,
         };
+        if !join.fits() {
+            return None;
+        }
         return Some(vec![Draft::new(join, [x, y], len)]);
     }
     // Fuse a single-reader slice followed by a permute.

@@ -689,3 +689,51 @@ fn lane_clip_matches() {
         }
     }
 }
+
+#[test]
+fn join_bounds() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_graph::TensorType;
+    use tessera_lower::Shape;
+    use tessera_trace::Port;
+    let metal = Platform {
+        backend: "metal".into(),
+        arch: "apple9".into(),
+        name: "Apple M4 Pro".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let dev = Device::guess(&host()).on(metal);
+    let build = |rows: u64, width: u64| {
+        let m = Model::new(vec![Dim::bounded(Rows, rows), Dim::fixed(Hidden, width)]);
+        let port = || Port {
+            role: Role::Logits,
+            ty: TensorType::new([Rows, Hidden], DType::F32),
+        };
+        let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
+        m.finish([(Role::Logits, &x.concat(&y))])
+    };
+    for (rows, width, want_threads) in [
+        (1u64, 2_147_483_648u64, 1_073_741_824usize),
+        (32_769, 65_536, 1_073_774_592),
+    ] {
+        let plan = lower(&build(rows, width), 0, &[(Rows, rows)], &dev).unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| s.kernel.name() == "join")
+            .unwrap();
+        let launch = &step.launches()[0];
+        assert_eq!(launch.shape, Shape::Line(want_threads));
+        assert!(want_threads <= u32::MAX as usize);
+        assert_eq!(launch.args[3].u32(), Some(width as u32));
+        assert_eq!(launch.args[4].u32(), Some(width as u32));
+        assert_eq!(launch.args[5].u32(), Some(rows as u32));
+        assert_eq!(want_threads * 4, step.write.len);
+    }
+    for (rows, width) in [(1u64, 4_294_967_296u64), (32_769, 65_535)] {
+        assert!(
+            lower(&build(rows, width), 0, &[(Rows, rows)], &dev).is_err(),
+            "expected join to reject {rows}x({width}+{width})"
+        );
+    }
+}

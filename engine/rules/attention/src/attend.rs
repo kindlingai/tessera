@@ -437,6 +437,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         b_form: sizes.v_form,
         out_form: F32_FORM,
     };
+    if !join.fits() {
+        return None;
+    }
     let joined = 2 * sizes.seqs * sizes.keys.most() * side;
     Some(vec![
         scaled,
