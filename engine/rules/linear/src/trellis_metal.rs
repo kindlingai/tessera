@@ -14,14 +14,16 @@ use tessera_mem::trellis::{parse_form, parse_mix_form};
 const BLOCK: usize = 128;
 const THREADS: usize = 256;
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("trellis_metal.metal");
+const SOURCE: &str = concat!(
+    include_str!("trellis_metal.metal"),
+    "\n",
+    include_str!("trellis_metal_picked.metal")
+);
 const DEC_SMEM: usize = 4 * 128 * 4;
 const PF16_SMEM: usize = (16 * 132 + 8 * 16 * 20) * 4;
 const PF32_SMEM: usize = (32 * 132 + 8 * 16 * 20) * 4;
 const MAX_GROUP_EXPERTS: usize = 1024;
 const GROUP_SMEM: usize = 2 * (MAX_GROUP_EXPERTS + 1) * 4;
-const PF16_PICK_SMEM: usize = PF16_SMEM + 16 * 4;
-const PF32_PICK_SMEM: usize = PF32_SMEM + 32 * 4;
 const GUESS: f64 = 2.0e-11;
 
 knob!("trellis_metal", "splits", 1, 16);
@@ -361,11 +363,11 @@ fn picked_launches(p: &PickedTrellisMetal, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-/// Groups routed row indices by expert id on Metal.
+/// Groups routed row indices by expert into work tiles.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "picked_metal_group",
-    sizes = [self.rows, self.count],
+    sizes = [self.rows, self.count, self.bm],
     work = self.rows + self.count,
     guess = GUESS,
     accepts = pick_group_accepts,
@@ -380,6 +382,7 @@ struct MetalPickGroup {
     rows: usize,
     count: usize,
     first: usize,
+    bm: usize,
 }
 
 fn pick_group_accepts(_: &MetalPickGroup, _: usize, form: &dyn Stored) -> bool {
@@ -397,8 +400,13 @@ fn pick_group_needs() -> Needs {
     }
 }
 
+fn max_pick_tiles(rows: usize, count: usize, bm: usize) -> usize {
+    rows / bm + count + 1
+}
+
 fn pick_group_load(g: &MetalPickGroup, _: usize) -> Option<Load> {
-    let meta_bytes = (4 * (2 * (g.count + 1) + g.rows)) as f64;
+    let tiles = max_pick_tiles(g.rows, g.count, g.bm);
+    let meta_bytes = (4 * (1 + 3 * tiles + g.rows)) as f64;
     Some(Load {
         threads: THREADS,
         group: THREADS,
@@ -423,6 +431,7 @@ fn pick_group_launches(g: &MetalPickGroup, step: &Step) -> Vec<Launch> {
         Arg::count(g.rows),
         Arg::count(g.count),
         Arg::count(g.first),
+        Arg::count(g.bm),
     ];
     vec![Launch { args, shape }]
 }
@@ -446,7 +455,7 @@ struct PickedTrellisPfMetal {
     site: Coded,
     bits: u32,
     book: u32,
-    wide: bool,
+    bm: usize,
 }
 
 fn picked_pf_accepts(p: &PickedTrellisPfMetal, input: usize, form: &dyn Stored) -> bool {
@@ -456,25 +465,36 @@ fn picked_pf_accepts(p: &PickedTrellisPfMetal, input: usize, form: &dyn Stored) 
     }
 }
 
+fn picked_pf_fast(p: &PickedTrellisPfMetal) -> bool {
+    p.bits == 0 && p.book == 2 && p.site.turned
+}
+
 fn picked_pf_entry(p: &PickedTrellisPfMetal) -> &'static str {
-    let fast = p.bits == 0 && p.book == 2 && p.site.turned;
-    match (fast, p.wide) {
-        (true, false) => "tm_pickmix_pf16_pmcgx_t",
-        (true, true) => "tm_pickmix_pf32_pmcgx_t",
-        (false, false) => "tm_pick_pf16_gen",
-        (false, true) => "tm_pick_pf32_gen",
+    match (picked_pf_fast(p), p.bm) {
+        (true, 16) => "tm_pickmix_pf16_pmcgx_t",
+        (true, _) => "tm_pickmix_pf32_pmcgx_t",
+        (false, 16) => "tm_pick_pf16_gen",
+        (false, _) => "tm_pick_pf32_gen",
     }
 }
 
-fn picked_pf_smem(wide: bool) -> usize {
-    if wide { PF32_PICK_SMEM } else { PF16_PICK_SMEM }
+fn picked_pf_smem(p: &PickedTrellisPfMetal) -> usize {
+    if picked_pf_fast(p) {
+        (p.bm * 128 + 4 * 16 * 32) * 2 + p.bm * 4
+    } else {
+        (p.bm * 132 + 8 * 16 * 20) * 4 + p.bm * 4
+    }
+}
+
+fn picked_pf_threads(p: &PickedTrellisPfMetal) -> usize {
+    if picked_pf_fast(p) { 128 } else { THREADS }
 }
 
 fn picked_pf_needs(p: &PickedTrellisPfMetal) -> Needs {
     Needs {
         lanes: 32,
-        group_bytes: picked_pf_smem(p.wide),
-        group_threads: THREADS,
+        group_bytes: picked_pf_smem(p),
+        group_threads: picked_pf_threads(p),
         tile: true,
         compiler: true,
         lacks: LACKS,
@@ -484,14 +504,14 @@ fn picked_pf_needs(p: &PickedTrellisPfMetal) -> Needs {
 
 fn picked_pf_load(p: &PickedTrellisPfMetal, _: usize) -> Option<Load> {
     let s = p.site;
-    let bm = if p.wide { 32 } else { 16 };
-    let passes = s.rows.div_ceil(s.count.max(1)).div_ceil(bm);
-    let groups = (s.n / BLOCK) * (s.count + 1);
+    let tiles = max_pick_tiles(s.rows, s.count, p.bm);
+    let passes = s.rows.div_ceil(s.count.max(1)).div_ceil(p.bm);
+    let groups = (s.n / BLOCK) * tiles;
     let out = s.rows * s.n;
     let mut reads = vec![
         s.form.bytes(s.count * passes * s.n * s.k) as f64,
         (4 * (s.rows / s.repeat) * s.k) as f64,
-        (4 * (2 * (s.count + 1) + s.rows)) as f64,
+        (4 * (1 + 3 * tiles + s.rows)) as f64,
     ];
     if s.turned {
         reads.extend([(4 * s.count * s.k) as f64, (4 * s.count * s.n) as f64]);
@@ -502,13 +522,13 @@ fn picked_pf_load(p: &PickedTrellisPfMetal, _: usize) -> Option<Load> {
         _ => {}
     }
     Some(Load {
-        threads: groups * THREADS,
-        group: THREADS,
-        trips: (passes * (s.k / BLOCK)) as f64,
+        threads: groups * picked_pf_threads(p),
+        group: picked_pf_threads(p),
+        trips: (s.k / BLOCK) as f64,
         reads,
         written: (4 * out) as f64,
         flight: 1024.0,
-        group_bytes: picked_pf_smem(p.wide) as f64,
+        group_bytes: picked_pf_smem(p) as f64,
         ..Load::default()
     })
 }
@@ -516,8 +536,8 @@ fn picked_pf_load(p: &PickedTrellisPfMetal, _: usize) -> Option<Load> {
 fn picked_pf_launches(p: &PickedTrellisPfMetal, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: p.site.n / BLOCK,
-        down: p.site.count + 1,
-        threads: THREADS,
+        down: max_pick_tiles(p.site.rows, p.site.count, p.bm),
+        threads: picked_pf_threads(p),
     };
     let args = p.site.args(step, p.bits, p.book);
     vec![Launch { args, shape }]
@@ -533,17 +553,20 @@ fn propose_picked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let mixed = parse_mix_form(name).map(|book| (0, book));
     let (bits, book) = parse_form(name).or(mixed)?;
     if site.count <= MAX_GROUP_EXPERTS && site.rows >= 64 && site.rows >= site.count * 2 {
-        let meta_len = 2 * (site.count + 1) + site.rows;
+        let bm = if site.rows > site.count * 16 { 32 } else { 16 };
+        let tiles = max_pick_tiles(site.rows, site.count, bm);
+        let meta_len = 1 + 3 * tiles + site.rows;
         let group = MetalPickGroup {
             rows: site.rows,
             count: site.count,
             first: site.first,
+            bm,
         };
         let pf = PickedTrellisPfMetal {
             site,
             bits,
             book,
-            wide: site.rows > site.count * 16,
+            bm,
         };
         let mut pf_reads: Vec<Read> = reads.iter().copied().map(Read::Node).collect();
         pf_reads[2] = Read::Draft(0);

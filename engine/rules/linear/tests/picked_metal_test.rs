@@ -178,6 +178,10 @@ fn prefill_takes_mma() {
     assert_eq!(entries(&pf16), ["tm_pick_group", "tm_pickmix_pf16_pmcgx_t"]);
     let pf32 = plan_rows(&picked(true, false), "trellis_mix_pmcgx", 80, apple());
     assert_eq!(entries(&pf32), ["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"]);
+    let wide = plan_rows(&picked(true, false), "trellis_mix_pmcgx", 256, apple());
+    assert_eq!(entries(&wide), ["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"]);
+    let needs = wide.steps[1].kernel.needs();
+    assert_eq!((needs.group_threads, needs.group_bytes), (128, 12416));
     let plain = plan_rows(&picked(false, false), "trellis_k3_pmcgx", 80, apple());
     assert_eq!(entries(&plain), ["tm_pick_group", "tm_pick_pf32_gen"]);
 }
@@ -254,6 +258,14 @@ fn metal_picked_matches_cpu() {
                 2,
                 2,
                 40,
+                vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
+            ),
+            (
+                true,
+                true,
+                1,
+                2,
+                128,
                 vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
             ),
             (
