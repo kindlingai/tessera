@@ -214,6 +214,61 @@ impl Closers {
     }
 }
 
+/// Selected tag boundary action against a block closer.
+pub(super) struct TagHit {
+    pub at: usize,
+    pub drain: usize,
+    pub done: bool,
+    pub trim: bool,
+}
+
+/// Resolves value and block closer hits without consuming overlap.
+pub(super) fn pick_tag_hit(
+    val_hit: Option<(usize, usize)>,
+    blk_hit: Option<(usize, usize)>,
+    safe_end: usize,
+    eof: bool,
+) -> Option<TagHit> {
+    if let Some((at, len)) = val_hit {
+        let end = at + len;
+        if blk_hit.is_none_or(|(b, _)| end <= b) && (eof || blk_hit.is_some() || end <= safe_end) {
+            return Some(TagHit {
+                at,
+                drain: end,
+                done: false,
+                trim: true,
+            });
+        }
+    }
+    let (b_at, b_len) = blk_hit?;
+    let (at, trim) = match val_hit {
+        Some((v_at, _)) if v_at <= b_at => (v_at, true),
+        _ => (b_at, false),
+    };
+    Some(TagHit {
+        at,
+        drain: b_at + b_len,
+        done: true,
+        trim,
+    })
+}
+
+/// Caps safe emission before any held value closer match.
+pub(super) fn cap_tag_emit(
+    buf: &str,
+    emit: usize,
+    val_hit: Option<(usize, usize)>,
+    trim_nl: bool,
+) -> usize {
+    let Some((mut cap, _)) = val_hit else {
+        return emit;
+    };
+    if trim_nl && cap > 0 && buf.as_bytes()[cap - 1] == b'\n' {
+        cap -= 1;
+    }
+    emit.min(cap)
+}
+
 /// Next tag capture bounded inside `body_len`.
 pub(super) fn next_tag<'a>(
     regex: &Regex,

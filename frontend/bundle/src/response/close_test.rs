@@ -320,6 +320,64 @@ fn check_r10_buffered_tags() {
     for i in 0..=sample.len() {
         check_parity(&zp, &[&sample[..i], &sample[i..]]);
     }
+    check_r11_overlap_tags();
+}
+
+fn check_r11_overlap_tags() {
+    // Overlapping value and block closers keep calls and text intact.
+    let overlap_cases: &[(&str, &str, &[&str])] = &[
+        (
+            r"</parameter></function></tool_call>",
+            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|(?=<parameter=)|(?=</function>))",
+            &[
+                "<tool_call><function=ping><parameter=x>1</parameter>",
+                "</function></tool_call> next <tool_call><function=ping><parameter=x>2</parameter>",
+                "</function></tool_call> All done.",
+            ],
+        ),
+        (
+            r"</function></tool_call>",
+            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|</function>)",
+            &[
+                "<tool_call><function=ping><parameter=x>1</function>",
+                "</tool_call> next <tool_call><function=ping><parameter=x>2</function>",
+                "</tool_call> All done.",
+            ],
+        ),
+        (
+            r"</function></tool_call>",
+            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function>",
+            &[
+                "<tool_call><function=ping><parameter=x>1</parameter></function>",
+                "</tool_call> next <tool_call><function=ping><parameter=x>2</parameter></function>",
+                "</tool_call> All done.",
+            ],
+        ),
+    ];
+    for (close_pat, tag_pat, pieces) in overlap_cases {
+        check_xml_tool_calls(tag_pat, pieces, &[close_pat], " next  All done.");
+    }
+    // Streamed string value with trailing newline handles overlapping block closer.
+    let nl_cfg = xml_tool_cfg(
+        r"</parameter></function></tool_call>",
+        r"<parameter=(?P<key>[^>]+)>\n?(?P<value>.*?)\n?</parameter>",
+    );
+    let np = ResponseParser::from_config(&nl_cfg).unwrap().unwrap();
+    let nl_pieces = [
+        "<tool_call><function=ping><parameter=msg>\nhello\n</parameter>",
+        "</function></tool_call> next <tool_call><function=ping><parameter=msg>\nbye\n</parameter>",
+        "</function></tool_call> All done.",
+    ];
+    let want_nl = vec![
+        ("ping".to_string(), json!({"msg": "hello"})),
+        ("ping".to_string(), json!({"msg": "bye"})),
+    ];
+    let (_, content, calls) = parse_stream(&np, &nl_pieces);
+    assert_eq!((content.as_str(), calls), (" next  All done.", want_nl));
+    let nl_joined = nl_pieces.concat();
+    for i in 0..=nl_joined.len() {
+        check_parity(&np, &[&nl_joined[..i], &nl_joined[i..]]);
+    }
 }
 
 fn xml_tool_cfg(close_pat: &str, tag_pat: &str) -> String {
@@ -334,6 +392,10 @@ fn xml_tool_cfg(close_pat: &str, tag_pat: &str) -> String {
 }
 
 fn check_xml_tool_closers(tag_pat: &str, pieces: &[&str], pats: &[&str]) {
+    check_xml_tool_calls(tag_pat, pieces, pats, "\n All done.");
+}
+
+fn check_xml_tool_calls(tag_pat: &str, pieces: &[&str], pats: &[&str], want_content: &str) {
     let joined = pieces.concat();
     let want = vec![
         ("ping".to_string(), json!({"x": 1})),
@@ -348,12 +410,9 @@ fn check_xml_tool_closers(tag_pat: &str, pieces: &[&str], pats: &[&str]) {
             .into_iter()
             .map(|tc| (tc.function.name, tc.function.arguments))
             .collect();
-        assert_eq!(
-            (whole.content.as_str(), got),
-            ("\n All done.", want.clone())
-        );
+        assert_eq!((whole.content.as_str(), got), (want_content, want.clone()));
         let (_, content, calls) = parse_stream(&tp, pieces);
-        assert_eq!((content.as_str(), calls), ("\n All done.", want.clone()));
+        assert_eq!((content.as_str(), calls), (want_content, want.clone()));
         for i in 0..=joined.len() {
             check_parity(&tp, &[&joined[..i], &joined[i..]]);
         }

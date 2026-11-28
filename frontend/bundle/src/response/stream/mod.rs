@@ -7,8 +7,8 @@ pub(super) mod stream_test;
 pub(super) use json::parse_json;
 
 use super::close::{
-    Closer, Closers, find_closers, find_closers_for, matching_paren, parse_literal_closers,
-    unescape_lit,
+    Closer, Closers, cap_tag_emit, find_closers, find_closers_for, matching_paren,
+    parse_literal_closers, pick_tag_hit, unescape_lit,
 };
 use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
 use json::{RelaxedState, finish_relaxed, step_relaxed};
@@ -351,8 +351,8 @@ impl ToolState {
                 let close = spec.close.find_for(buf, eof);
                 match (key_at, close) {
                     (Some(at), c)
-                        if c.is_none_or(|(end, _)| at < end)
-                            && (eof || c.is_some() || at < safe_end) =>
+                        if c.is_none_or(|(end, _)| at + delims.key_open.len() <= end)
+                            && (eof || c.is_some() || at + delims.key_open.len() <= safe_end) =>
                     {
                         buf.drain(..at + delims.key_open.len());
                         *phase = TagPhase::ReadKey { first };
@@ -365,8 +365,11 @@ impl ToolState {
                         StepOutcome::Done
                     }
                     _ => {
-                        let keep = tail_hold(buf, &[delims.key_open.as_str()])
+                        let mut keep = tail_hold(buf, &[delims.key_open.as_str()])
                             .max(spec.close.tail_hold(buf));
+                        if let Some(at) = key_at {
+                            keep = keep.max(buf.len() - at);
+                        }
                         buf.drain(..buf.len() - keep);
                         StepOutcome::Wait
                     }
@@ -376,8 +379,8 @@ impl ToolState {
                 let first = *first;
                 let close = spec.close.find_for(buf, eof);
                 if let Some(at) = buf.find(delims.key_close.as_str())
-                    && close.is_none_or(|(end, _)| at < end)
-                    && (eof || close.is_some() || at < safe_end)
+                    && close.is_none_or(|(end, _)| at + delims.key_close.len() <= end)
+                    && (eof || close.is_some() || at + delims.key_close.len() <= safe_end)
                 {
                     let key = buf[..at].to_string();
                     buf.drain(..at + delims.key_close.len());
@@ -395,8 +398,8 @@ impl ToolState {
             TagPhase::SeekValOpen { first, key } => {
                 let close = spec.close.find_for(buf, eof);
                 if let Some(at) = buf.find(delims.val_open.as_str())
-                    && close.is_none_or(|(end, _)| at < end)
-                    && (eof || close.is_some() || at < safe_end)
+                    && close.is_none_or(|(end, _)| at + delims.val_open.len() <= end)
+                    && (eof || close.is_some() || at + delims.val_open.len() <= safe_end)
                 {
                     let first = *first;
                     let key = std::mem::take(key);
@@ -431,38 +434,29 @@ impl ToolState {
             TagPhase::DetectVal { first, key, held } => {
                 let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
-                if let Some((at, len)) = val_hit
-                    && blk_hit.is_none_or(|(b, _)| at <= b)
-                    && (eof || blk_hit.is_some() || at < safe_end)
-                {
-                    held.push_str(&buf[..at]);
-                    buf.drain(..at + len);
-                    if delims.trim_trail_nl && held.ends_with('\n') {
+                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, eof) {
+                    held.push_str(&buf[..hit.at]);
+                    buf.drain(..hit.drain);
+                    if hit.trim && delims.trim_trail_nl && held.ends_with('\n') {
                         held.pop();
                     }
                     let prefix = if *first { "" } else { "," };
+                    let suffix = if hit.done { "}" } else { "" };
                     let encoded = encode_tag_value(held);
                     out.push(ResponseEvent::ToolCallArgs(format!(
-                        "{prefix}{}:{encoded}",
+                        "{prefix}{}:{encoded}{suffix}",
                         json_str(key)
                     )));
+                    if hit.done {
+                        out.push(ResponseEvent::ToolCallEnd);
+                        return StepOutcome::Done;
+                    }
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = blk_hit {
-                    held.push_str(&buf[..at]);
-                    buf.drain(..at + len);
-                    let prefix = if *first { "" } else { "," };
-                    let encoded = encode_tag_value(held);
-                    out.push(ResponseEvent::ToolCallArgs(format!(
-                        "{prefix}{}:{encoded}}}",
-                        json_str(key)
-                    )));
-                    out.push(ResponseEvent::ToolCallEnd);
-                    return StepOutcome::Done;
-                }
                 let val_needles = delims.val_needles();
-                let emit = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
+                let raw = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
+                let emit = cap_tag_emit(buf, raw, val_hit, delims.trim_trail_nl);
                 if emit > 0 {
                     held.push_str(&buf[..emit]);
                     buf.drain(..emit);
@@ -482,29 +476,25 @@ impl ToolState {
             TagPhase::StreamString => {
                 let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
-                if let Some((at, len)) = val_hit
-                    && blk_hit.is_none_or(|(b, _)| at <= b)
-                    && (eof || blk_hit.is_some() || at < safe_end)
-                {
-                    let mut chunk = &buf[..at];
-                    if delims.trim_trail_nl {
+                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, eof) {
+                    let mut chunk = &buf[..hit.at];
+                    if hit.trim && delims.trim_trail_nl {
                         chunk = chunk.strip_suffix('\n').unwrap_or(chunk);
                     }
                     let escaped = json_escape_inner(chunk);
-                    buf.drain(..at + len);
-                    out.push(ResponseEvent::ToolCallArgs(format!("{escaped}\"")));
+                    let suffix = if hit.done { "\"}" } else { "\"" };
+                    buf.drain(..hit.drain);
+                    out.push(ResponseEvent::ToolCallArgs(format!("{escaped}{suffix}")));
+                    if hit.done {
+                        out.push(ResponseEvent::ToolCallEnd);
+                        return StepOutcome::Done;
+                    }
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = blk_hit {
-                    let escaped = json_escape_inner(&buf[..at]);
-                    buf.drain(..at + len);
-                    out.push(ResponseEvent::ToolCallArgs(format!("{escaped}\"}}")));
-                    out.push(ResponseEvent::ToolCallEnd);
-                    return StepOutcome::Done;
-                }
                 let val_needles = delims.val_needles();
-                let emit = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
+                let raw = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
+                let emit = cap_tag_emit(buf, raw, val_hit, delims.trim_trail_nl);
                 if emit > 0 {
                     let escaped = json_escape_inner(&buf[..emit]);
                     buf.drain(..emit);
