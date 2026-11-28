@@ -59,6 +59,107 @@ fn half(dtype: DType) -> Option<&'static dyn Form> {
     }
 }
 
+/// Whether a view is contiguous in row-major order.
+fn is_contiguous(view: &View) -> bool {
+    if view.shape.len() != view.stride.len() {
+        return false;
+    }
+    let mut step = 1u64;
+    for (&dim, &stride) in view.shape.iter().zip(&view.stride).rev() {
+        if dim > 1 {
+            if stride != step {
+                return false;
+            }
+            let Some(next) = step.checked_mul(dim as u64) else {
+                return false;
+            };
+            step = next;
+        }
+    }
+    true
+}
+
+/// Widens contiguous bytes of `dtype` into f32 values.
+fn widen_contiguous(dtype: DType, bytes: &[u8]) -> Vec<f32> {
+    match dtype {
+        DType::F64 => bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
+            .collect(),
+        DType::F32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect(),
+        DType::F16 => F16::floats(bytes),
+        DType::Bf16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
+            .collect(),
+        DType::I64 => bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c) as f32)
+            .collect(),
+        DType::I32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32)
+            .collect(),
+        DType::I16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c) as f32)
+            .collect(),
+        DType::I8 => bytes.iter().map(|&b| b as i8 as f32).collect(),
+        DType::U8 | DType::Bool => bytes.iter().map(|&b| f32::from(b)).collect(),
+    }
+}
+
+/// Reads little-endian f32 values directly from `file`.
+#[cfg(all(unix, target_endian = "little"))]
+fn read_f32_direct(file: &fs::File, at: u64, count: usize, size: u64) -> Result<Vec<f32>, Error> {
+    use std::os::unix::fs::FileExt;
+    let len = (count as u64)
+        .checked_mul(4)
+        .ok_or_else(|| bad("byte length overflow"))?;
+    if at.checked_add(len).is_none_or(|end| end > size) {
+        return Err(bad("a range runs past the end"));
+    }
+    let mut out = vec![0.0f32; count];
+    // SAFETY: `out` is initialized memory valid for byte writes.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), count * 4) };
+    file.read_exact_at(bytes, at)?;
+    Ok(out)
+}
+
+/// Visits strided element offsets in row-major order.
+fn visit_strided(view: &View, first: u64, count: usize, mut take: impl FnMut(usize)) {
+    let mut index = vec![0usize; view.shape.len()];
+    for _ in 0..count {
+        let mut at = view.offset - first;
+        for (&i, &s) in index.iter().zip(&view.stride) {
+            at += i as u64 * s;
+        }
+        take(at as usize);
+        for axis in (0..index.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < view.shape[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+}
+
 /// One element at the start of `b`, as f32.
 fn widen(dtype: DType, b: &[u8]) -> f32 {
     let two = || u16::from_le_bytes([b[0], b[1]]);
@@ -128,32 +229,29 @@ impl Torch {
             .views
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
+        let count: usize = view.shape.iter().product();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let width = view.storage.dtype.width();
         let end = view.end().ok_or_else(|| bad("a view overflows"))?;
         let first = view.offset.min(end);
-        let bytes = zip::read_at(
-            &self.file,
-            entry.start + first * width,
-            (end - first) * width,
-            self.size,
-        )?;
-        let count: usize = view.shape.iter().product();
-        let mut out = Vec::with_capacity(count);
-        let mut index = vec![0usize; view.shape.len()];
-        for _ in 0..count {
-            let mut at = view.offset - first;
-            for (&i, &s) in index.iter().zip(&view.stride) {
-                at += i as u64 * s;
+        let byte_start = entry.start + first * width;
+        let byte_len = (end - first) * width;
+        if is_contiguous(view) {
+            #[cfg(all(unix, target_endian = "little"))]
+            if view.storage.dtype == DType::F32 {
+                return read_f32_direct(&self.file, byte_start, count, self.size);
             }
-            out.push(widen(view.storage.dtype, &bytes[(at * width) as usize..]));
-            for axis in (0..index.len()).rev() {
-                index[axis] += 1;
-                if index[axis] < view.shape[axis] {
-                    break;
-                }
-                index[axis] = 0;
-            }
+            let bytes = zip::read_at(&self.file, byte_start, byte_len, self.size)?;
+            return Ok(widen_contiguous(view.storage.dtype, &bytes));
         }
+        let bytes = zip::read_at(&self.file, byte_start, byte_len, self.size)?;
+        let mut out = Vec::with_capacity(count);
+        let elem_w = width as usize;
+        visit_strided(view, first, count, |at| {
+            out.push(widen(view.storage.dtype, &bytes[at * elem_w..]));
+        });
         Ok(out)
     }
 }
@@ -174,18 +272,34 @@ impl Offer for Torch {
     }
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
-        let (view, _) = self
+        let (view, entry) = self
             .views
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
-        match half(view.storage.dtype) {
-            Some(form) => Ok(form.pack(&self.floats(name)?)),
-            None => Err(Error::DType(format!("{name} holds floats, not a form"))),
+        if half(view.storage.dtype).is_none() {
+            return Err(Error::DType(format!("{name} holds floats, not a form")));
         }
+        let count: usize = view.shape.iter().product();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let end = view.end().ok_or_else(|| bad("a view overflows"))?;
+        let first = view.offset.min(end);
+        let byte_start = entry.start + first * 2;
+        let byte_len = (end - first) * 2;
+        if is_contiguous(view) {
+            return zip::read_at(&self.file, byte_start, byte_len, self.size);
+        }
+        let bytes = zip::read_at(&self.file, byte_start, byte_len, self.size)?;
+        let mut out = Vec::with_capacity(count * 2);
+        visit_strided(view, first, count, |at| {
+            out.extend_from_slice(&bytes[at * 2..at * 2 + 2]);
+        });
+        Ok(out)
     }
 
     fn packed_rows(&self, name: &str, (first, count): (usize, usize)) -> Result<Vec<u8>, Error> {
-        let (view, _) = self
+        let (view, entry) = self
             .views
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
@@ -193,10 +307,20 @@ impl Offer for Torch {
             return Err(Error::DType(format!("{name} cannot be read in rows")));
         }
         let rows = *view.shape.first().unwrap_or(&0);
-        if rows == 0 {
+        if rows == 0 || count == 0 {
             return Ok(Vec::new());
         }
-        let stride = 2 * view.shape.iter().product::<usize>() / rows;
+        if first.checked_add(count).is_none_or(|end| end > rows) {
+            return Err(bad("row slice runs past the end"));
+        }
+        let row_elems: usize = view.shape[1..].iter().product();
+        if is_contiguous(view) {
+            let _ = view.end().ok_or_else(|| bad("a view overflows"))?;
+            let off = entry.start + (view.offset + (first * row_elems) as u64) * 2;
+            let len = (count * row_elems) as u64 * 2;
+            return zip::read_at(&self.file, off, len, self.size);
+        }
+        let stride = 2 * row_elems;
         let all = self.packed(name)?;
         Ok(all[first * stride..(first + count) * stride].to_vec())
     }

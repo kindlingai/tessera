@@ -9,29 +9,37 @@ fn text(s: &str) -> Vec<u8> {
     out
 }
 
-fn ints(values: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'('];
-    for &v in values {
-        out.extend([b'K', v]);
-    }
-    out.push(b't');
-    out
-}
-
-/// `{"w": tensor}` over a float storage of `count` elements.
-fn pickle(count: u8, shape: &[u8], stride: &[u8]) -> Vec<u8> {
+/// `{"w": tensor}` over a `storage` of `count` elements from `offset`.
+fn pickle_as(storage: &str, count: u32, offset: u32, shape: &[u32], stride: &[u32]) -> Vec<u8> {
+    let int = |p: &mut Vec<u8>, v: u32| {
+        p.push(b'J');
+        p.extend(v.to_le_bytes());
+    };
+    let tup = |p: &mut Vec<u8>, vals: &[u32]| {
+        p.push(b'(');
+        vals.iter().for_each(|&v| int(p, v));
+        p.push(b't');
+    };
     let mut p = b"\x80\x02}".to_vec();
     p.extend(text("w"));
     p.extend(b"ctorch._utils\n_rebuild_tensor_v2\n((");
     p.extend(text("storage"));
-    p.extend(b"ctorch\nFloatStorage\n");
+    p.extend(format!("ctorch\n{storage}\n").as_bytes());
     p.extend(text("0"));
     p.extend(text("cpu"));
-    p.extend([b'K', count, b't', b'Q', b'K', 0]);
-    p.extend(ints(shape));
-    p.extend(ints(stride));
+    int(&mut p, count);
+    p.extend(b"tQ");
+    int(&mut p, offset);
+    tup(&mut p, shape);
+    tup(&mut p, stride);
     p.extend(b"\x89ccollections\nOrderedDict\n)RtRs.");
     p
+}
+
+fn pickle(count: u8, shape: &[u8], stride: &[u8]) -> Vec<u8> {
+    let s: Vec<u32> = shape.iter().map(|&v| u32::from(v)).collect();
+    let st: Vec<u32> = stride.iter().map(|&v| u32::from(v)).collect();
+    pickle_as("FloatStorage", u32::from(count), 0, &s, &st)
 }
 
 /// A stored zip of `files`, as `torch.save` lays one out.
@@ -134,4 +142,62 @@ fn clip_matches_safetensors() {
         &torch,
         &File::open(&dir.join("clip/model.safetensors")).unwrap(),
     );
+}
+
+#[test]
+fn reads_contiguous_and_strided() {
+    use tessera_engine::{Bf16, F16};
+    let vals: Vec<f32> = (0..18).map(|i| i as f32 * 0.5 - 4.0).collect();
+    let bf16: Vec<u8> = vals
+        .iter()
+        .flat_map(|&v| Bf16::from(v).0.to_le_bytes())
+        .collect();
+    let open = |name, st, meta: (u32, u32, &[u32], &[u32]), body: Vec<u8>| {
+        let pkl = pickle_as(st, meta.0, meta.1, meta.2, meta.3);
+        Torch::open(&archive(name, &[("data.pkl", pkl), ("data/0", body)])).unwrap()
+    };
+    let t = open(
+        "c_bf16",
+        "BFloat16Storage",
+        (18, 2, &[4, 4], &[4, 1]),
+        bf16.clone(),
+    );
+    let want: Vec<f32> = vals[2..18]
+        .iter()
+        .map(|&v| f32::from(Bf16::from(v)))
+        .collect();
+    assert_eq!(t.floats("w").unwrap(), want);
+    assert_eq!(t.packed("w").unwrap(), &bf16[4..36]);
+    assert_eq!(t.packed_rows("w", (1, 2)).unwrap(), &bf16[12..28]);
+    assert!(t.packed_rows("w", (0, 0)).unwrap().is_empty());
+    assert!(matches!(t.packed_rows("w", (3, 2)), Err(Error::Format(_))));
+
+    let s = open(
+        "s_bf16",
+        "BFloat16Storage",
+        (6, 0, &[3, 2], &[1, 3]),
+        bf16[..12].to_vec(),
+    );
+    let ord: Vec<u8> = [0, 3, 1, 4, 2, 5]
+        .iter()
+        .flat_map(|&i| bf16[i * 2..i * 2 + 2].iter().copied())
+        .collect();
+    assert_eq!(s.packed("w").unwrap(), ord);
+    assert_eq!(s.packed_rows("w", (1, 2)).unwrap(), &ord[4..12]);
+
+    let all_f16: Vec<u8> = (0u16..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+    let m = (65_536, 0, &[1, 256, 256][..], &[99_999, 256, 1][..]);
+    let f = open("all_f16", "HalfStorage", m, all_f16.clone());
+    assert_eq!(f.packed("w").unwrap(), all_f16);
+    for (bits, got) in f.floats("w").unwrap().into_iter().enumerate() {
+        let w = f32::from(F16(bits as u16));
+        assert!(if w.is_nan() {
+            got.is_nan()
+        } else {
+            got.to_bits() == w.to_bits()
+        });
+    }
+    let f32b: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let f32t = open("c_f32", "FloatStorage", (18, 2, &[4, 4], &[4, 1]), f32b);
+    assert_eq!(f32t.floats("w").unwrap(), vals[2..18]);
 }
