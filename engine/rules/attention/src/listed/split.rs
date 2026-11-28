@@ -70,6 +70,8 @@ fn listed_merge(
     }
     let mut denom = 0.0f32;
     let mut sum = 0.0f32;
+    // A dead part that saw keys holds a NaN.
+    let mut hole = 0.0f32;
     let stride = (width + 2) as u64;
     let at = list as u64 * splits as u64 * stride;
     // Only parts that saw keys carry a sum.
@@ -77,6 +79,8 @@ fn listed_merge(
         let p = at + s as u64 * stride;
         if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, parts[p]);
+        } else {
+            hole += parts[p];
         }
     }
     if sink_mode > 0 && sinks[sink_at as u64].to_bits() != 0xff80_0000 {
@@ -91,7 +95,7 @@ fn listed_merge(
     let inv = if (denom.to_bits() & 0x7fff_ffff) != 0 {
         1.0 / denom
     } else {
-        0.0
+        hole
     };
     // Each part's scaled mean joins by its share.
     for s in 0..splits {

@@ -707,6 +707,34 @@ fn barred_value_shows() {
     }
 }
 
+/// Odd sinks and barred rows end alike on every plan.
+#[test]
+fn endpoints_align() {
+    let (ni, pi, na) = (f32::NEG_INFINITY, f32::INFINITY, f32::NAN);
+    // Per head: NaN, 0 or 1. Head 7 follows interp.
+    let ends = [na, na, na, 0.0, na, na, 1.0];
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [8, 1, width, 1, 256]);
+        let fill = |inputs: &mut [Tensor], start: usize, n: usize| {
+            inputs[5] = Tensor::f32(vec![8], vec![pi, ni, na, 0.0, ni, 0.0, ni, 0.0]);
+            let mut bias = vec![0.0f32; n * 8 * 256];
+            for r in 0..n {
+                // Heads 1 to 3 bar each key.
+                bias[(r * 8 + 1) * 256..(r * 8 + 4) * 256].fill(ni);
+                bias[(r * 8 + 4) * 256 + start + r] = pi;
+                bias[(r * 8 + 5) * 256 + start + r] = na;
+            }
+            inputs[6] = Tensor::f32(vec![n, 8, 256], bias);
+        };
+        across(c, fill, |got, on| {
+            for (h, end) in ends.iter().enumerate() {
+                let head = &got[h * width..(h + 1) * width];
+                assert!(alike(head, &vec![*end; width], 2e-2), "{on}: head {h}");
+            }
+        });
+    }
+}
+
 /// Runs on a Metal GPU alone: bf16 rounds each operand.
 #[test]
 fn sunk_metal_matches() {

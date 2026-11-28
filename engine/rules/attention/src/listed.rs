@@ -108,6 +108,7 @@ fn listed_attend(
     }
     let mut peak = f32::NEG_INFINITY;
     let mut total = 0.0f32;
+    let mut hits = 0u32;
     let mut start = if from_list == 0 { from } else { 0 };
     if splits > 1 {
         start += (gid() / threads % splits) * warps;
@@ -156,6 +157,7 @@ fn listed_attend(
             if rel_win > 0 && j <= position && position - j < rel_win {
                 score += rel_bias[list as u64 * rel_win as u64 + (position - j) as u64];
             }
+            hits = 1;
             // A -inf score weighs zero, yet its values still count.
             let dropped = score.to_bits() == 0xff80_0000;
             let seen = (total.to_bits() & 0x7fff_ffff) != 0;
@@ -186,7 +188,10 @@ fn listed_attend(
     let mut l_s = shared::<f32>(warps);
     let mut o_s = shared::<f32>(warps * width);
     if l == 0 {
-        m_s[warp] = peak;
+        // A dead warp that saw keys leaves a NaN.
+        let dead = (total.to_bits() & 0x7fff_ffff) == 0;
+        let mark = if hits > 0 { peak * total } else { 0.0 };
+        m_s[warp] = if dead { mark } else { peak };
         l_s[warp] = total;
     }
     for s in (0..quads).unroll(MAX_QUADS) {
@@ -209,9 +214,12 @@ fn listed_attend(
         sink = sinks[list as u64];
     }
     let mut best = sink;
+    let mut hole = 0.0f32;
     for w in 0..warps {
         if (l_s[w].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, m_s[w]);
+        } else {
+            hole += m_s[w];
         }
     }
     let mut denom = 0.0f32;
@@ -223,17 +231,18 @@ fn listed_attend(
             denom += l_s[w] * exp(m_s[w] - best);
         }
     }
-    let inv = if (denom.to_bits() & 0x7fff_ffff) != 0 {
-        1.0 / denom
-    } else {
-        0.0
-    };
+    let empty = (denom.to_bits() & 0x7fff_ffff) == 0;
+    // Zero weight over seen keys gives NaN, once merged.
+    let mut inv = if empty { hole } else { 1.0 / denom };
     if splits > 1 {
         // A part keeps its peak, sum and scaled mean.
         q_at = (gid() / threads) as u64 * (width + 2) as u64 + 2;
         if lid() == 0 {
-            out[q_at - 2] = best;
+            out[q_at - 2] = if empty { hole } else { best };
             out[q_at - 1] = denom;
+        }
+        if empty {
+            inv = 0.0;
         }
     }
     for d in (lid()..width).by(threads) {

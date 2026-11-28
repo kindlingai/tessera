@@ -92,25 +92,36 @@ fn fold_sinks(
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
         let q = hd.q0 + simd * ROWS + i;
+        let row = simd * ROWS + i;
         let mut h = 1.0f32;
         let mut denom = 1.0f32;
+        let mut sink = f32::NEG_INFINITY;
         if sink_mode > 0 && q < hd.queries {
             let list = q * hd.heads + hd.head;
             let at = if sink_mode == 1 { hd.head } else { list };
-            let sink = sinks[at as u64];
-            let sum = st.state[(ROWS + i) as usize];
-            // A NaN sink reaches rows with zero weight too.
-            let odd = (sink.to_bits() & 0x7fff_ffff) > 0x7f80_0000;
-            if sink.to_bits() != 0xff80_0000 && (sum > 0.0 || odd) {
-                let peak = st.state[i as usize];
-                let d = (peak - sink) + log(sum);
-                if d >= 0.0 {
-                    denom = 1.0 + exp(-d);
-                } else {
-                    h = exp(0.5 * d);
-                    denom = h * h + 1.0;
-                }
+            sink = sinks[at as u64];
+        }
+        let sb = sink.to_bits();
+        let off = sb == 0xff80_0000;
+        let peak = st.state[i as usize];
+        let sum = st.state[(ROWS + i) as usize];
+        let barred = q < hd.queries && st.to_s[row] > st.from_s[row];
+        if !off && (sb & 0x7f80_0000) == 0x7f80_0000 {
+            // A +inf or NaN sink makes each row NaN.
+            h = exp(sink) - sink;
+            denom = h;
+        } else if !off && sum > 0.0 {
+            let d = (peak - sink) + log(sum);
+            if d >= 0.0 {
+                denom = 1.0 + exp(-d);
+            } else {
+                h = exp(0.5 * d);
+                denom = h * h + 1.0;
             }
+        } else if off && barred && (sum.to_bits() & 0x7fff_ffff) == 0 {
+            // Seen keys of zero weight and no sink: NaN.
+            h = peak * sum;
+            denom = h;
         }
         st.state[(ROWS + i) as usize] = denom * 0.25;
         if lane() == 0 {
