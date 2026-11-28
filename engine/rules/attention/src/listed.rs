@@ -156,26 +156,29 @@ fn listed_attend(
             if rel_win > 0 && j <= position && position - j < rel_win {
                 score += rel_bias[list as u64 * rel_win as u64 + (position - j) as u64];
             }
-            let next = max(peak, score);
-            let seen = (total.to_bits() & 0x7fff_ffff) != 0;
-            let prev = if seen { total * exp(peak - next) } else { 0.0 };
-            let wt = exp(score - next);
-            let sum_l = prev + wt;
-            let live = (sum_l.to_bits() & 0x7fff_ffff) != 0;
-            let old_s = if live { prev / sum_l } else { 0.0 };
-            let new_s = if live { wt / sum_l } else { 0.0 };
-            peak = next;
-            total = sum_l;
-            for s in (0..quads).unroll(MAX_QUADS) {
-                let d = s * (LANES as u32 * WIDE) + l * WIDE;
-                let b = (s * WIDE) as usize;
-                if d < width {
-                    let vv = v.load4(k_at + d as u64);
-                    // A quarter-scaled running mean cannot overflow.
-                    acc[b] = acc[b] * old_s + new_s * (vv.x * 0.25);
-                    acc[b + 1] = acc[b + 1] * old_s + new_s * (vv.y * 0.25);
-                    acc[b + 2] = acc[b + 2] * old_s + new_s * (vv.z * 0.25);
-                    acc[b + 3] = acc[b + 3] * old_s + new_s * (vv.w * 0.25);
+            // Skip -inf scores so only active keys update the softmax.
+            if score.to_bits() != 0xff80_0000 {
+                let seen = (total.to_bits() & 0x7fff_ffff) != 0;
+                let next = if seen { max(peak, score) } else { score };
+                let prev = if seen { total * exp(peak - next) } else { 0.0 };
+                let wt = exp(score - next);
+                let sum_l = prev + wt;
+                let live = (sum_l.to_bits() & 0x7fff_ffff) != 0;
+                let old_s = if live { prev / sum_l } else { 0.0 };
+                let new_s = if live { wt / sum_l } else { 0.0 };
+                peak = next;
+                total = sum_l;
+                for s in (0..quads).unroll(MAX_QUADS) {
+                    let d = s * (LANES as u32 * WIDE) + l * WIDE;
+                    let b = (s * WIDE) as usize;
+                    if d < width {
+                        let vv = v.load4(k_at + d as u64);
+                        // A quarter-scaled running mean cannot overflow.
+                        acc[b] = acc[b] * old_s + new_s * (vv.x * 0.25);
+                        acc[b + 1] = acc[b + 1] * old_s + new_s * (vv.y * 0.25);
+                        acc[b + 2] = acc[b + 2] * old_s + new_s * (vv.z * 0.25);
+                        acc[b + 3] = acc[b + 3] * old_s + new_s * (vv.w * 0.25);
+                    }
                 }
             }
         }

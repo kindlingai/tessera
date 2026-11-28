@@ -551,43 +551,90 @@ fn odd_keys_propagate() {
     }
 }
 
+/// Prefills 255 zero-score keys, then checks one decode row.
+fn decoded(
+    c: Case,
+    rule: &'static str,
+    fill: impl Fn(&mut [Tensor], usize, usize),
+    check: impl Fn(&[f32], &[f32], &str),
+) {
+    let g = graph(c);
+    for settings in runs() {
+        let dev = Device::guess(&settings).favoring(rule);
+        if dev.platform.backend != "host" && dev.platform.backend != "metal" {
+            continue;
+        }
+        let (mut store, mut runner) = (Store::default(), None);
+        for (start, n) in [(0usize, 128usize), (128, 127), (255, 1)] {
+            let run = [(0u32, start as u32, n as u32)];
+            let mut inputs = flat(c, n, 1.0, f32::NEG_INFINITY, 0.0);
+            inputs[4] = Tensor::u32(vec![n], (start as u32..(start + n) as u32).collect());
+            fill(&mut inputs, start, n);
+            let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+            let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+            let took = kernels(&plan).contains(&rule);
+            let got = advance(&mut runner, plan, |p| open(p, &settings).unwrap(), &inputs);
+            if n == 1 {
+                let on = format!("{rule} on {}", dev.platform.backend);
+                assert!(took, "{on}: not taken");
+                check(got.floats().unwrap(), want[0].floats().unwrap(), &on);
+            }
+        }
+    }
+}
+
 /// Split parts of huge opposite values merge to zero.
 #[test]
 fn split_cancels_large() {
     let c = case(Mask::Causal, [2, 1, 64, 1, 0]);
-    let g = graph(c);
-    for settings in runs() {
-        let dev = Device::guess(&settings).favoring(SPLIT);
-        if dev.platform.backend != "host" && dev.platform.backend != "metal" {
-            continue;
-        }
-        for big in [f32::from_bits(0x7d80_0000), f32::MAX] {
-            let (mut store, mut runner) = (Store::default(), None);
-            for (start, n) in [(0usize, 128usize), (128, 127), (255, 1)] {
-                let run = [(0u32, start as u32, n as u32)];
-                let mut inputs = feeds(c, &run, &mut Noise(57));
-                inputs[0] = Tensor::f32(vec![n, 2, 64], vec![0.0; n * 128]);
-                inputs[1] = Tensor::f32(vec![n, 1, 64], vec![0.0; n * 64]);
-                // Eight keys of one sign, then eight of the other.
-                let sign = |t: usize| if (t / 8).is_multiple_of(2) { big } else { -big };
-                let vs = (start..start + n).flat_map(|t| vec![sign(t); 64]);
-                inputs[2] = Tensor::f32(vec![n, 1, 64], vs.collect());
-                inputs[5] = Tensor::f32(vec![2], vec![f32::NEG_INFINITY; 2]);
-                let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
-                let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
-                let split = kernels(&plan).contains(&SPLIT);
-                let got = advance(&mut runner, plan, |p| open(p, &settings).unwrap(), &inputs);
-                if n == 1 {
-                    let on = format!("{big:e} on {}", dev.platform.backend);
-                    assert!(split, "{on}: not split");
-                    let got = got.floats().unwrap();
-                    assert!(got.iter().all(|v| v.abs() < 1e-4), "{on}: {:?}", got[0]);
-                    let want = want[0].floats().unwrap()[0];
-                    // The interpreter loses the largest values to rounding.
-                    assert!(want == 0.0 || big == f32::MAX, "{on}: interp {want}");
-                }
+    for big in [f32::from_bits(0x7d80_0000), f32::MAX] {
+        // Eight keys of one sign, then eight of the other.
+        let sign = |t: usize| if (t / 8).is_multiple_of(2) { big } else { -big };
+        let fill = |inputs: &mut [Tensor], start: usize, n: usize| {
+            let vs = (start..start + n).flat_map(|t| vec![sign(t); 64]);
+            inputs[2] = Tensor::f32(vec![n, 1, 64], vs.collect());
+        };
+        decoded(c, SPLIT, fill, |got, want, on| {
+            assert!(got.iter().all(|v| v.abs() < 1e-4), "{on}: {:?}", got[0]);
+            // The interpreter loses the largest values to rounding.
+            assert!(want[0] == 0.0 || big == f32::MAX, "{on}: interp {want:?}");
+        });
+    }
+}
+
+/// Drops keys whose relative bias is -inf.
+#[test]
+fn barred_key_drops() {
+    let c = case(Mask::Causal, [2, 1, 64, 1, 256]);
+    for rule in [SPLIT, "listed_attend"] {
+        let fill = |inputs: &mut [Tensor], _: usize, n: usize| {
+            let mut bias = vec![0.0f32; n * 2 * 256];
+            if n == 1 {
+                bias[255] = f32::NEG_INFINITY;
+                bias[511] = f32::NEG_INFINITY;
             }
-        }
+            inputs[6] = Tensor::f32(vec![n, 2, 256], bias);
+        };
+        decoded(c, rule, fill, |got, want, on| {
+            let off = max_abs_diff(got, want);
+            let one = got.iter().all(|v| (v - 1.0).abs() < 1e-4);
+            assert!(one && off < 1e-4, "{on}: got {:?}, off {off:e}", got[0]);
+        });
+    }
+}
+
+/// The largest query component times zero keys stays zero.
+#[test]
+fn huge_query_stays_finite() {
+    let n = 64usize;
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+        let mut inputs = flat(c, n, 1.0, -30.0, 0.0);
+        let mut q = vec![0.0f32; n * 2 * width];
+        q[5 * 2 * width] = f32::MAX;
+        inputs[0] = Tensor::f32(vec![n, 2, width], q);
+        let expected = vec![1.0f32; n * 2 * width];
+        near(c, n, &inputs, &expected, &format!("w={width}"));
     }
 }
 

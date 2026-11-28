@@ -22,7 +22,14 @@ static inline bool fs_finite(float v) {
 // Rounds four floats to bf16 bits, ties to even.
 static inline ushort4 fs_bf16(float4 v) {
     uint4 b = as_type<uint4>(v);
-    return ushort4((b + uint4(0x7FFFu) + ((b >> uint4(16u)) & uint4(1u))) >> uint4(16u));
+    uint4 mag = b & uint4(0x7FFFFFFFu);
+    uint4 rounded = b + uint4(0x7FFFu) + ((b >> uint4(16u)) & uint4(1u));
+    // A finite value past the bf16 range stays finite.
+    uint4 top = (b & uint4(0x80000000u)) | uint4(0x7F7F0000u);
+    uint4 kept = select(rounded, top, (mag - uint4(0x7F7F0001u)) < uint4(0xFFFFu));
+    // Each NaN stays a quiet NaN.
+    uint4 bits = select(kept, uint4(0x7FC00000u), mag > uint4(0x7F800000u));
+    return ushort4(bits >> uint4(16u));
 }
 
 static inline void fs_put4(threadgroup ushort *at, ushort4 v) {
