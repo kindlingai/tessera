@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
-use tessera_gpukit::backend::OnGpu;
+use tessera_gpukit::backend::{Backend, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
@@ -285,9 +285,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     /// Whether `steps` can record into one device graph.
     pub(crate) fn can_record(&self, steps: &Range<usize>) -> bool {
-        // A recorded graph cannot hold a grid that waits.
+        // Skip Metal graphs when profiling or paging.
+        let metal_skip =
+            D::BACKEND == Backend::Metal && (self.base.profile.is_some() || self.pager.is_some());
         self.launching.graphs
             && self.ctx.graphs()
+            && !metal_skip
             && !self.resident[steps.clone()].contains(&true)
             && self.base.plan.id != 0
     }
