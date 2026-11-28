@@ -297,8 +297,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         if wait
             && end == self.base.plan.steps.len()
             && let Some(pager) = &mut self.pager
+            // Recorded graphs hold the old choice to copy.
+            && pager.maintain(self.ctx, self.base.plan.id)?
         {
-            pager.maintain(self.ctx)?;
+            self.drop_graphs();
         }
         Ok(())
     }
@@ -502,7 +504,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         mut sums: Option<&mut (dyn Sum + 'static)>,
         stamped: bool,
     ) -> Result<(), Capture> {
-        let order = marks::slots(&self.base.plan, steps.clone());
+        let mut order = marks::slots(&self.base.plan, steps.clone());
+        // An unstaged plan runs without its copy steps.
+        let stages = |p: &Pager<D>| p.stages(self.base.plan.id);
+        if !self.pager.as_ref().is_some_and(stages) {
+            order.retain(|(_, i, _)| i.is_some());
+        }
         let ordered: Vec<&Step> = order.iter().map(|(.., s)| *s).collect();
         let sync = match self.ctx.has_lanes() {
             true => LaneSync::plan(ordered.iter().copied()),

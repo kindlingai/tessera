@@ -389,6 +389,7 @@ impl<D: Device> Staging<D> {
         &self,
         ctx: &D,
         id: usize,
+        plan: u64,
         source: impl Fn(usize) -> Source<'a>,
     ) -> Result<(), Error> {
         let (Some(batch), Some(pool)) = (self.batches.list().get(id), &self.pool) else {
@@ -398,8 +399,8 @@ impl<D: Device> Staging<D> {
             let weight = self.batches.list()[evicts].weight;
             self.flip(ctx, evicts, true, source(weight))?;
         }
-        // Unaimed experts stay cold, which reads the same bytes.
-        if !matches!(self.deltas.get(id), Some(Some(_))) {
+        // Unaimed and unstaged experts stay cold, with the same bytes.
+        if !matches!(self.deltas.get(id), Some(Some(_))) || !self.forecast.stages(plan) {
             return Ok(());
         }
         let s = source(batch.weight);

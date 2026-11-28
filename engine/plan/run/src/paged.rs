@@ -229,6 +229,8 @@ pub(crate) struct Pager<D: Device> {
     /// Swaps whose bytes copy during the next step.
     moves: Moves,
     staging: Staging<D>,
+    /// Per plan id: the size of its expert launches.
+    sizes: HashMap<u64, u64>,
 }
 
 impl<D: Device> Pager<D> {
@@ -337,6 +339,7 @@ impl<D: Device> Pager<D> {
             policy: Box::new(Decayed::default()),
             moves: Moves::default(),
             staging,
+            sizes: HashMap::new(),
         }))
     }
 
@@ -355,18 +358,43 @@ impl<D: Device> Pager<D> {
                 ids[idx] = l.weight;
             }
         }
+        // Plans that differ only in context read experts alike.
+        let mut size = 0u64;
+        for step in &out.steps[out.forward()] {
+            let paged = |r: &Slot| {
+                weights
+                    .iter()
+                    .flatten()
+                    .any(|(w, _)| w.buffer == r.buffer && w.offset == r.offset)
+            };
+            if step.reads.iter().any(paged) {
+                size += step.write.len as u64;
+            }
+        }
+        self.sizes.insert(plan.id, size);
         let (entries, staging) = (&self.entries, &mut self.staging);
-        let forecast = &mut staging.forecast;
+        // Every plan gets the steps. Each launch decides to copy.
         let pick = |idx: usize| {
-            let slots = &entries[idx].slot_of;
-            let mut cold = forecast.cold(plan, ids[idx], slots);
-            cold.retain(|&m| slots.get(m).is_some_and(Option::is_none));
-            cold.sort_unstable();
-            cold.dedup();
-            cold
+            let cold = |(m, slot): (usize, &Option<usize>)| slot.is_none().then_some(m);
+            entries[idx]
+                .slot_of
+                .iter()
+                .enumerate()
+                .filter_map(cold)
+                .collect()
         };
         place(&mut out, &weights, staging.ring, &mut staging.batches, pick);
         out
+    }
+
+    /// Whether `plan`'s launches copy cold experts ahead.
+    pub(crate) fn stages(&self, plan: u64) -> bool {
+        self.staging.forecast.stages(self.kind(plan))
+    }
+
+    /// The forecast's key for `plan`: its expert launch size.
+    fn kind(&self, plan: u64) -> u64 {
+        self.sizes.get(&plan).copied().unwrap_or(plan)
     }
 
     fn source(&self, idx: usize) -> Source<'_> {
@@ -396,8 +424,9 @@ impl<D: Device> Pager<D> {
     }
 
     /// Queues one copy step's work on the active lane.
-    pub(crate) fn stage(&self, ctx: &D, batch: usize) -> Result<(), Error> {
-        self.staging.copy(ctx, batch, |idx| self.source(idx))
+    pub(crate) fn stage(&self, ctx: &D, batch: usize, plan: u64) -> Result<(), Error> {
+        self.staging
+            .copy(ctx, batch, self.kind(plan), |idx| self.source(idx))
     }
 
     pub(crate) fn slot_bytes(&self, weight: u32, part: Option<u8>) -> Option<usize> {
@@ -572,22 +601,30 @@ impl<D: Device> Pager<D> {
         Ok(())
     }
 
-    /// Reports hits and starts the policy's swaps.
-    pub(crate) fn maintain(&mut self, ctx: &D) -> Result<(), Error> {
+    /// Reports hits, starts swaps. True when `plan`'s staging flips.
+    pub(crate) fn maintain(&mut self, ctx: &D, plan: u64) -> Result<bool, Error> {
         let Some(pool_base) = self.vram_pool.as_ref().map(DeviceBuffer::device_ptr) else {
-            return Ok(());
+            return Ok(false);
         };
         self.land(ctx, pool_base)?;
         self.hits_buf.read_bytes(&mut self.raw_hits)?;
         self.hits_buf.zero()?;
         let (words, _) = self.raw_hits.as_chunks::<4>();
         let mut weights = Vec::with_capacity(self.entries.len());
+        let (mut cold, mut read) = (0usize, 0usize);
         for (idx, entry) in self.entries.iter().enumerate() {
             let counts = &words[entry.hits_offset..][..entry.spec.experts];
             self.hits.clear();
             self.hits
                 .extend(counts.iter().map(|w| u32::from_le_bytes(*w)));
             self.policy.observe(idx, &self.hits);
+            // A weight with a hit is one the launch read.
+            if self.hits.iter().any(|h| *h > 0) {
+                for (hits, slot) in self.hits.iter().zip(&entry.slot_of) {
+                    cold += usize::from(slot.is_none());
+                    read += usize::from(slot.is_none() && *hits > 0);
+                }
+            }
             weights.push(Paged {
                 slots: &entry.slot_of,
                 stride: entry.spec.stride,
@@ -596,6 +633,13 @@ impl<D: Device> Pager<D> {
                     && entry.desc_ptr != 0,
             });
         }
+        let plan = self.kind(plan);
+        let staged = self.staging.forecast.stages(plan);
+        if cold > 0 {
+            let share = read as f64 / cold as f64;
+            self.staging.forecast.observe(plan, share);
+        }
+        let flipped = self.staging.forecast.stages(plan) != staged;
         let swaps = self.policy.swaps(&weights);
         let mut moved = Vec::new();
         // The copies run beside the next step.
@@ -635,7 +679,7 @@ impl<D: Device> Pager<D> {
         }
         ctx.set_lane(lane);
         self.retarget(moved);
-        Ok(())
+        Ok(flipped)
     }
 }
 

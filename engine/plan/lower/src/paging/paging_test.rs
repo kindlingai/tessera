@@ -1,6 +1,4 @@
-use crate::kernels::Map;
 use crate::paging::{Decayed, Dense, Forecast, Moves, Moving, Paged, Promote, Swap};
-use crate::{KernelRef, Loaded, Plan, Slot, Step};
 
 #[test]
 fn decayed_swaps_expert() {
@@ -26,46 +24,21 @@ fn decayed_swaps_expert() {
     assert_eq!(policy.swaps(&paged(true)), []);
 }
 
-/// One step picks `picks` rows of four experts.
-fn picking(picks: usize) -> Plan {
-    let weight = Slot {
-        dims: 3,
-        shape: [4, 8, 16, 0],
-        ..Slot::floats(0, 4 * 8 * 16)
-    };
-    let step = Step {
-        kernel: KernelRef::new(Map::plain(Vec::new())),
-        rule: "test",
-        site: None,
-        reads: vec![weight],
-        write: Slot::floats(1, picks * 8),
-        also: Vec::new(),
-        covers: Vec::new(),
-        zone: 0,
-        lane: 0,
-        table: None,
-        index_table: None,
-    };
-    let loaded = Loaded {
-        weight: 7,
-        slot: weight,
-        share: None,
-        part: None,
-    };
-    Plan {
-        steps: vec![step],
-        weights: vec![loaded],
-        ..Plan::default()
-    }
-}
-
 #[test]
 fn dense_stages_reads() {
     let mut forecast = Dense::default();
-    let slots = [Some(0), None, Some(1), None];
-    assert_eq!(forecast.cold(&picking(1000), 7, &slots), [1, 3]);
-    assert!(forecast.cold(&picking(2), 7, &slots).is_empty());
-    assert!(forecast.cold(&picking(1000), 8, &slots).is_empty());
+    assert!(!forecast.stages(7));
+    // A prefill plan reads every cold expert.
+    forecast.observe(7, 1.0);
+    assert!(forecast.stages(7));
+    // A decode plan reads few, and stays unstaged.
+    forecast.observe(8, 0.2);
+    assert!(!forecast.stages(8));
+    // One light launch keeps a staged plan staged.
+    forecast.observe(7, 0.3);
+    assert!(forecast.stages(7));
+    forecast.observe(7, 0.0);
+    assert!(!forecast.stages(7));
 }
 
 #[test]

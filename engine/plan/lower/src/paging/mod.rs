@@ -1,6 +1,6 @@
 //! Which paged experts hold a VRAM slot.
 
-use crate::plan::Plan;
+use std::collections::HashMap;
 
 #[cfg(test)]
 mod paging_test;
@@ -149,12 +149,14 @@ impl Promote for Decayed {
     }
 }
 
-/// Names the cold experts a plan will read.
+/// Decides which plans stage their cold experts.
 pub trait Forecast: Send {
     /// Ring parts it needs. None stages nothing.
     fn parts(&self) -> usize;
-    /// Cold experts of `weight` that `plan` reads, likeliest first.
-    fn cold(&mut self, plan: &Plan, weight: u32, slots: &[Option<usize>]) -> Vec<usize>;
+    /// One launch of `plan` read `share` of its cold experts.
+    fn observe(&mut self, plan: u64, share: f64);
+    /// Whether `plan`'s launches copy cold experts ahead.
+    fn stages(&self, plan: u64) -> bool;
 }
 
 /// Predicts nothing, so every cold read streams from host.
@@ -165,45 +167,36 @@ impl Forecast for Unknown {
         0
     }
 
-    fn cold(&mut self, _: &Plan, _: u32, _: &[Option<usize>]) -> Vec<usize> {
-        Vec::new()
+    fn observe(&mut self, _: u64, _: f64) {}
+
+    fn stages(&self, _: u64) -> bool {
+        false
     }
 }
 
-/// Stages every cold expert a launch almost surely reads.
+/// Stages a plan whose launches read most cold experts.
 pub struct Dense {
-    /// The least chance of a read that stages an expert.
+    /// The read share that starts staging a plan.
     pub sure: f64,
+    /// A staged plan stops below this read share.
+    pub idle: f64,
+    /// Share of the old estimate kept per launch.
+    pub decay: f64,
     /// Weights staged ahead of the one in use.
     pub parts: usize,
+    /// Per plan: its read share, and whether it stages.
+    seen: HashMap<u64, (f64, bool)>,
 }
 
 impl Default for Dense {
     fn default() -> Self {
         Self {
-            sure: 0.99,
+            sure: 0.9,
+            idle: 0.5,
+            decay: 0.5,
             parts: 4,
+            seen: HashMap::new(),
         }
-    }
-}
-
-impl Dense {
-    /// Expert rows the plan's steps pick from `weight`.
-    fn picks(plan: &Plan, weight: u32) -> usize {
-        let loaded = |l: &&crate::plan::Loaded| l.weight == weight && l.part.is_none();
-        let Some(slot) = plan.weights.iter().find(loaded).map(|l| l.slot) else {
-            return 0;
-        };
-        // A reader writes one output row per pick.
-        let out = slot.shape[1] as usize;
-        let mut picks = 0;
-        for step in &plan.steps[plan.forward()] {
-            let reads = |r: &crate::plan::Slot| r.buffer == slot.buffer && r.offset == slot.offset;
-            if out > 0 && step.reads.iter().any(reads) && step.write.len.is_multiple_of(out) {
-                picks = picks.max(step.write.len / out);
-            }
-        }
-        picks
     }
 }
 
@@ -212,14 +205,17 @@ impl Forecast for Dense {
         self.parts
     }
 
-    fn cold(&mut self, plan: &Plan, weight: u32, slots: &[Option<usize>]) -> Vec<usize> {
-        // Picks spread evenly until hit counts say otherwise.
-        let miss = 1.0 - 1.0 / slots.len().max(1) as f64;
-        let read = 1.0 - miss.powf(Self::picks(plan, weight) as f64);
-        if read < self.sure {
-            return Vec::new();
-        }
-        let cold = |(m, slot): (usize, &Option<usize>)| slot.is_none().then_some(m);
-        slots.iter().enumerate().filter_map(cold).collect()
+    fn observe(&mut self, plan: u64, share: f64) {
+        let (read, stages) = self.seen.entry(plan).or_insert((share, false));
+        *read = *read * self.decay + share * (1.0 - self.decay);
+        // Two bounds keep a plan from flipping each launch.
+        *stages = match *stages {
+            true => *read > self.idle,
+            false => *read >= self.sure,
+        };
+    }
+
+    fn stages(&self, plan: u64) -> bool {
+        self.seen.get(&plan).is_some_and(|(_, stages)| *stages)
     }
 }
