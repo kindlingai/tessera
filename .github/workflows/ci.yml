@@ -72,6 +72,7 @@ jobs:
       build: ${{ steps.reuse.outputs.build }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       macos: ${{ steps.reuse.outputs.macos }}
+      tested: ${{ steps.reuse.outputs.tested }}
       docker: ${{ steps.image.outputs.docker || steps.reuse.outputs.docker }}
       mounts: ${{ steps.mounts.outputs.key }}
     steps:
@@ -102,6 +103,10 @@ jobs:
           printf 'build=%s\ndocker=%s\n' "$build" "$docker" | tee -a "$GITHUB_OUTPUT"
       # A push to main runs the full macOS job when its merge group did
       # not, so a reused landing still gets those tests.
+      # The merge queue pushes its group commit to main. When a merge
+      # group CI run passed on that commit, the push is tested: the Rust
+      # jobs only build, to fill the caches that pull requests read.
+      # Only merge group runs count. A cancelled push run passes success.
       - id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,17 +116,18 @@ jobs:
         run: |
           reuse=false
           macos=true
+          tested=false
           if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
             reuse=$(tools/scripts/queue-reuse.sh)
           fi
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            ran=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=macos%20%2F%20build" \
-              --jq '[.check_runs[] | select(.conclusion == "success")] | length')
-            [ "$ran" -eq 0 ] || macos=false
+            if [ "$(tools/scripts/check-passed.sh "$GITHUB_SHA" 'macos / build')" = true ]; then macos=false; fi
+            tested=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&event=merge_group&status=success" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml")] | length > 0')
           fi
           [ "$reuse" = false ] || BUILD=false
           [ "$reuse" = false ] || DOCKER=false
-          printf 'build=%s\nreuse=%s\nmacos=%s\ndocker=%s\n' "$BUILD" "$reuse" "$macos" "$DOCKER" | tee -a "$GITHUB_OUTPUT"
+          printf 'build=%s\nreuse=%s\nmacos=%s\ndocker=%s\ntested=%s\n' "$BUILD" "$reuse" "$macos" "$DOCKER" "$tested" | tee -a "$GITHUB_OUTPUT"
       # The docker job's Cargo cache mounts change only with these files.
       - id: mounts
         run: echo "key=${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Dockerfile') }}" | tee -a "$GITHUB_OUTPUT"
@@ -213,6 +219,9 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      # Builds the tests but does not run them on a tested push to main.
+      NO_RUN: ${{ needs.changes.outputs.tested == 'true' && '--no-run' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -227,7 +236,7 @@ jobs:
           tool: cargo-nextest@0.9.152
       - run: cargo clippy --workspace --all-targets --all-features
       # Profiles and test groups live in .config/nextest.toml.
-      - run: cargo nextest run --workspace --all-features --profile ci
+      - run: cargo nextest run --workspace --all-features --profile ci ${{ env.NO_RUN }}
       # The report job renders failed and slow tests into the PR comment.
       - if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
         run: >
@@ -288,6 +297,9 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      # Builds the tests but does not run them on a tested push to main.
+      NO_RUN: ${{ needs.changes.outputs.tested == 'true' && '--no-run' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -301,7 +313,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci
+      - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci ${{ env.NO_RUN }}
       - if: failure() && github.event_name == 'merge_group'
         uses: ./.github/actions/cancel-on-failure
 
@@ -328,6 +340,9 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      # Builds the tests but does not run them on a tested push to main.
+      NO_RUN: ${{ needs.changes.outputs.tested == 'true' && '--no-run' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -342,7 +357,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --profile ci ${{ env.NO_RUN }}
       - if: failure() && github.event_name == 'merge_group'
         uses: ./.github/actions/cancel-on-failure
 
@@ -512,6 +527,9 @@ jobs:
     permissions:
       contents: read
       actions: write
+    env:
+      # Builds the tests but does not run them on a tested push to main.
+      NO_RUN: ${{ needs.changes.outputs.tested == 'true' && '--no-run' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -519,19 +537,22 @@ jobs:
         with:
           shared-key: platforms
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The tests call these tools. A build-only run skips the install.
       - name: Install nvcc, cuobjdump, nvdisasm and clang
+        if: env.NO_RUN == ''
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -q
           sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cuobjdump-13-0 cuda-nvdisasm-13-0 clang
           echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
-      - run: which nvcc cuobjdump nvdisasm clang++
+      - if: env.NO_RUN == ''
+        run: which nvcc cuobjdump nvdisasm clang++
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
-      - run: cargo nextest run -p tessera-models --test kernels_test --profile ci --no-capture
+      - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture ${{ env.NO_RUN }}
+      - run: cargo nextest run -p tessera-models --test kernels_test --profile ci --no-capture ${{ env.NO_RUN }}
       - if: failure() && github.event_name == 'merge_group'
         uses: ./.github/actions/cancel-on-failure
 
