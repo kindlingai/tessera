@@ -1,4 +1,5 @@
 use super::super::response_test::GEMMA4_CFG;
+use super::TagDelims;
 use crate::{ResponseEvent, ResponseParser};
 use serde_json::{Value, json};
 
@@ -351,4 +352,84 @@ fn streams_regex_and_numbers() {
         whole.tool_calls[0].function.arguments,
         json!({"x": 1e-66, "id": "007"})
     );
+    check_tag_inline_flags();
+}
+
+fn check_tag_inline_flags() {
+    let base = r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter>";
+    assert!(TagDelims::from_pattern(&format!("(?s){base}")).is_some());
+    for raw in [
+        include_str!("../qwen35.json"),
+        include_str!("../glm53.json"),
+    ] {
+        let v: Value = serde_json::from_str(raw).unwrap();
+        let pat = v["fields"]["tool_calls"]["content_args"]["pattern"]
+            .as_str()
+            .unwrap();
+        let compiled = if pat.starts_with("(?") {
+            pat.to_string()
+        } else {
+            format!("(?s){pat}")
+        };
+        assert!(TagDelims::from_pattern(&compiled).is_some(), "{compiled}");
+    }
+    for prefix in ["(?is)", "(?i)", "(?-s)", "(?U)", "(?x)", "(?m)", "(?s)(?i)"] {
+        let pat = format!("{prefix}{base}");
+        assert!(TagDelims::from_pattern(&pat).is_none(), "{pat}");
+    }
+    assert!(
+        TagDelims::from_pattern(r"(?s)<parameter=(?P<key>(?i)[^>]+)>(?P<value>.*?)</parameter>")
+            .is_none()
+    );
+    let tag_pat = format!("(?is){base}");
+    let cases = [
+        (
+            [
+                "<tool_call><function=ping><PARAMETER=x>1</PARAMETER></function>",
+                " All done.",
+            ],
+            json!({"x": 1}),
+        ),
+        (
+            [
+                "<tool_call><function=ping><parameter=x>1</parameter><PARAMETER=y>2</PARAMETER></function>",
+                " All done.",
+            ],
+            json!({"x": 1, "y": 2}),
+        ),
+    ];
+    for close_pat in ["</function>", "[<]/function>"] {
+        let cfg = json!({"response_template": {"fields": {"tool_calls": {
+            "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+            "close_pattern": close_pat,
+            "content": "xml-inline",
+            "content_args": {"tag_pattern": tag_pat},
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+        }}}})
+        .to_string();
+        let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+        for (pieces, want) in &cases {
+            let full = pieces.concat();
+            let whole = parser.parse(&full, true, false);
+            assert_eq!(whole.content, " All done.");
+            assert_eq!(whole.tool_calls.len(), 1);
+            assert_eq!(whole.tool_calls[0].function.name, "ping");
+            assert_eq!(&whole.tool_calls[0].function.arguments, want);
+            let mut stream = parser.stream(true, false);
+            let mut events = Vec::new();
+            for p in pieces {
+                stream.push(p, &mut events);
+            }
+            stream.finish(&mut events);
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    ResponseEvent::Content(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, " All done.");
+            assert_eq!(collect_calls(&events), [("ping".into(), want.clone())]);
+        }
+    }
 }

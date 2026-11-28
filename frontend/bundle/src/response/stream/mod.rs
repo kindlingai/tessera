@@ -29,14 +29,20 @@ pub(super) struct TagDelims {
 impl TagDelims {
     /// Extracts literal delimiters from a `key`/`value` regex pattern.
     pub(super) fn from_pattern(pattern: &str) -> Option<Self> {
-        let rest = strip_inline_flags(pattern);
+        let rest = strip_dotall_flag(pattern);
         let key_at = rest.find("(?P<key>")?;
         let key_open = unescape_lit(&rest[..key_at])?;
         let key_end = matching_paren(rest, key_at)?;
+        if rest[key_at + 8..key_end].contains("(?") {
+            return None;
+        }
         let after_key = &rest[key_end + 1..];
         let val_at = after_key.find("(?P<value>")?;
         let mid = &after_key[..val_at];
         let val_end = matching_paren(after_key, val_at)?;
+        if after_key[val_at + 10..val_end].contains("(?") {
+            return None;
+        }
         let after_val = &after_key[val_end + 1..];
         let (key_close, val_open, trim_lead_nl) = match mid.split_once("\\s*") {
             Some((kc, vo)) => {
@@ -954,15 +960,9 @@ fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn strip_inline_flags(mut s: &str) -> &str {
-    while let Some(rest) = s.strip_prefix("(?") {
-        let Some(end) = rest.find(')') else { break };
-        let flags = &rest[..end];
-        if !flags.is_empty() && flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
-            s = &rest[end + 1..];
-        } else {
-            break;
-        }
+fn strip_dotall_flag(mut s: &str) -> &str {
+    while let Some(rest) = s.strip_prefix("(?s)") {
+        s = rest;
     }
     s
 }
