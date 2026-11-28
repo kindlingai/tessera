@@ -12,6 +12,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+const SPACES: [u8; 32] = [b' '; 32];
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 fn function_kind() -> String {
     "function".into()
 }
@@ -63,10 +66,37 @@ impl Message {
 /// A message with `reasoning` also as `reasoning_content`.
 #[derive(Serialize)]
 struct Shown<'a> {
-    #[serde(flatten)]
-    message: &'a Message,
+    role: &'a str,
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a [ToolCall]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
+}
+
+/// Top-level variables passed to the chat template.
+#[derive(Serialize)]
+struct RenderCtx<'a> {
+    messages: Vec<Shown<'a>>,
+    add_generation_prompt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bos_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eos_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [serde_json::Value]>,
 }
 
 /// Extra variables for rendering a chat prompt.
@@ -137,10 +167,37 @@ impl Formatter for Spaced {
 
 /// `value` as JSON text with Python's spacing.
 pub(crate) fn spaced(value: &serde_json::Value) -> String {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(128);
     let mut ser = serde_json::Serializer::with_formatter(&mut out, Spaced);
     value.serialize(&mut ser).expect("JSON values serialize");
     String::from_utf8(out).expect("JSON text is UTF-8")
+}
+
+/// Escapes non-ASCII characters in `text` as `\uXXXX` JSON escapes.
+fn escape_ascii(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 16);
+    let mut start = 0;
+    for (idx, c) in text.char_indices() {
+        if c.is_ascii() {
+            continue;
+        }
+        escaped.push_str(&text[start..idx]);
+        let mut units = [0u16; 2];
+        for &mut unit in c.encode_utf16(&mut units) {
+            let buf = [
+                b'\\',
+                b'u',
+                HEX[((unit >> 12) & 0xf) as usize],
+                HEX[((unit >> 8) & 0xf) as usize],
+                HEX[((unit >> 4) & 0xf) as usize],
+                HEX[(unit & 0xf) as usize],
+            ];
+            escaped.push_str(std::str::from_utf8(&buf).expect("hex is ASCII"));
+        }
+        start = idx + c.len_utf8();
+    }
+    escaped.push_str(&text[start..]);
+    escaped
 }
 
 /// Hugging Face's `tojson`: Python `json.dumps`, `ensure_ascii` off by default.
@@ -148,8 +205,12 @@ fn tojson(value: &Value, kwargs: Kwargs) -> Result<Value, minijinja::Error> {
     let indent: Option<usize> = kwargs.get("indent")?;
     let ascii: Option<bool> = kwargs.get("ensure_ascii")?;
     kwargs.assert_all_used()?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(128);
     let done = match indent {
+        Some(n) if n <= SPACES.len() => {
+            let fmt = PrettyFormatter::with_indent(&SPACES[..n]);
+            value.serialize(&mut serde_json::Serializer::with_formatter(&mut out, fmt))
+        }
         Some(n) => {
             let pad = vec![b' '; n];
             let fmt = PrettyFormatter::with_indent(&pad);
@@ -161,44 +222,42 @@ fn tojson(value: &Value, kwargs: Kwargs) -> Result<Value, minijinja::Error> {
     };
     done.map_err(|e| minijinja::Error::new(ErrorKind::InvalidOperation, e.to_string()))?;
     let text = String::from_utf8(out).unwrap_or_default();
-    if !ascii.unwrap_or(false) {
+    if !ascii.unwrap_or(false) || text.is_ascii() {
         return Ok(Value::from_safe_string(text));
     }
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_ascii() {
-            escaped.push(c);
-            continue;
-        }
-        let mut units = [0u16; 2];
-        for unit in c.encode_utf16(&mut units) {
-            escaped.push_str(&format!("\\u{unit:04x}"));
-        }
-    }
-    Ok(Value::from_safe_string(escaped))
+    Ok(Value::from_safe_string(escape_ascii(&text)))
 }
 
 /// Removes Hugging Face `generation` training-mask block tags.
-fn strip_generation(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(start) = rest.find("{%") {
-        let Some(end) = rest[start + 2..].find("%}") else {
+fn strip_generation(source: String) -> String {
+    if !source.contains("generation") {
+        return source;
+    }
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut pos = 0;
+    while let Some(rel) = source[pos..].find("{%") {
+        let start = pos + rel;
+        let Some(end) = source[start + 2..].find("%}") else {
             break;
         };
         let tag_end = start + 2 + end + 2;
-        let inner =
-            rest[start + 2..start + 2 + end].trim_matches(|c: char| c.is_whitespace() || c == '-');
+        let inner = source[start + 2..start + 2 + end]
+            .trim_matches(|c: char| c.is_whitespace() || c == '-');
         if matches!(inner, "generation" | "endgeneration") {
-            out.push_str(&rest[..start]);
-            rest = &rest[tag_end..];
-        } else {
-            out.push_str(&rest[..tag_end]);
-            rest = &rest[tag_end..];
+            let buf = out.get_or_insert_with(|| String::with_capacity(source.len()));
+            buf.push_str(&source[copied..start]);
+            copied = tag_end;
         }
+        pos = tag_end;
     }
-    out.push_str(rest);
-    out
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&source[copied..]);
+            buf
+        }
+        None => source,
+    }
 }
 
 pub struct Template {
@@ -206,6 +265,7 @@ pub struct Template {
     bos_token: Option<String>,
     eos_token: Option<String>,
     tool_prompt: bool,
+    has_developer: bool,
 }
 
 impl Template {
@@ -238,12 +298,15 @@ impl Template {
                 ))
             },
         );
-        env.add_template_owned("chat", strip_generation(&source))?;
+        let stripped = strip_generation(source);
+        let has_developer = stripped.contains("developer");
+        env.add_template_owned("chat", stripped)?;
         Ok(Self {
             env,
             bos_token: None,
             eos_token: None,
             tool_prompt: false,
+            has_developer,
         })
     }
 
@@ -345,38 +408,29 @@ impl Template {
         options: &RenderOptions<'_>,
     ) -> Result<String, minijinja::Error> {
         let template = self.env.get_template("chat")?;
-        let mut shown = Vec::with_capacity(messages.len());
-        for message in messages {
-            let reasoning_content = message.reasoning.as_deref();
-            shown.push(Shown {
-                message,
-                reasoning_content,
-            });
-        }
-        let messages = Value::from(Serde(shown));
-        let mut ctx = std::collections::BTreeMap::new();
-        ctx.insert("messages", messages);
-        ctx.insert("add_generation_prompt", Value::from(true));
-        if let Some(bos) = &self.bos_token {
-            ctx.insert("bos_token", Value::from(bos.as_str()));
-        }
-        if let Some(eos) = &self.eos_token {
-            ctx.insert("eos_token", Value::from(eos.as_str()));
-        }
-        // Left undefined, `enable_thinking` means the model's default.
-        if let Some(think) = options.think {
-            ctx.insert("enable_thinking", Value::from(think));
-        }
-        if let Some(clear) = options.clear_thinking {
-            ctx.insert("clear_thinking", Value::from(clear));
-        }
-        if let Some(effort) = options.reasoning_effort {
-            ctx.insert("reasoning_effort", Value::from(effort));
-        }
-        if !options.tools.is_empty() {
-            ctx.insert("tools", Value::from(Serde(options.tools)));
-        }
-        template.render(Value::from(ctx))
+        let shown: Vec<Shown<'_>> = messages
+            .iter()
+            .map(|m| Shown {
+                role: &m.role,
+                content: m.content.as_deref(),
+                reasoning: m.reasoning.as_deref(),
+                tool_calls: m.tool_calls.as_deref(),
+                tool_call_id: m.tool_call_id.as_deref(),
+                name: m.name.as_deref(),
+                reasoning_content: m.reasoning.as_deref(),
+            })
+            .collect();
+        let ctx = RenderCtx {
+            messages: shown,
+            add_generation_prompt: true,
+            bos_token: self.bos_token.as_deref(),
+            eos_token: self.eos_token.as_deref(),
+            enable_thinking: options.think,
+            clear_thinking: options.clear_thinking,
+            reasoning_effort: options.reasoning_effort,
+            tools: (!options.tools.is_empty()).then_some(options.tools),
+        };
+        template.render(Serde(ctx))
     }
 
     /// `messages` with `developer` normalized and any tool prompt added.
@@ -385,7 +439,7 @@ impl Template {
         messages: &'m [Message],
         tools: &[serde_json::Value],
     ) -> Result<Cow<'m, [Message]>, minijinja::Error> {
-        let remap = !self.mentions("developer") && messages.iter().any(|m| m.role == "developer");
+        let remap = !self.has_developer && messages.iter().any(|m| m.role == "developer");
         let add_tools = !tools.is_empty() && self.tool_prompt;
         if !remap && !add_tools {
             return Ok(Cow::Borrowed(messages));
@@ -419,8 +473,14 @@ impl Template {
 
 /// `messages` with object tool-call arguments as JSON text, if any.
 fn text_arguments(messages: &[Message]) -> Option<Vec<Message>> {
+    let any = messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten())
+        .any(|c| !c.function.arguments.is_string());
+    if !any {
+        return None;
+    }
     let mut out = messages.to_vec();
-    let mut changed = false;
     for call in out
         .iter_mut()
         .flat_map(|m| m.tool_calls.iter_mut().flatten())
@@ -428,8 +488,7 @@ fn text_arguments(messages: &[Message]) -> Option<Vec<Message>> {
         let args = &mut call.function.arguments;
         if !args.is_string() {
             *args = serde_json::Value::String(args.to_string());
-            changed = true;
         }
     }
-    changed.then_some(out)
+    Some(out)
 }
