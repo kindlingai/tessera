@@ -157,6 +157,8 @@ pub trait Forecast: Send {
     fn observe(&mut self, plan: u64, share: f64);
     /// Whether `plan`'s launches copy cold experts ahead.
     fn stages(&self, plan: u64) -> bool;
+    /// Whether copies wait for cross-rank steps on a shared bus.
+    fn turns(&self) -> bool;
 }
 
 /// Predicts nothing, so every cold read streams from host.
@@ -172,6 +174,10 @@ impl Forecast for Unknown {
     fn stages(&self, _: u64) -> bool {
         false
     }
+
+    fn turns(&self) -> bool {
+        false
+    }
 }
 
 /// Stages a plan whose launches read most cold experts.
@@ -184,6 +190,8 @@ pub struct Dense {
     pub decay: f64,
     /// Weights staged ahead of the one in use.
     pub parts: usize,
+    /// Copies and cross-rank steps take turns on the bus.
+    pub turns: bool,
     /// Per plan: its read share, and whether it stages.
     seen: HashMap<u64, (f64, bool)>,
 }
@@ -195,6 +203,7 @@ impl Default for Dense {
             idle: 0.5,
             decay: 0.5,
             parts: 4,
+            turns: true,
             seen: HashMap::new(),
         }
     }
@@ -217,5 +226,9 @@ impl Forecast for Dense {
 
     fn stages(&self, plan: u64) -> bool {
         self.seen.get(&plan).is_some_and(|(_, stages)| *stages)
+    }
+
+    fn turns(&self) -> bool {
+        self.turns
     }
 }

@@ -30,7 +30,7 @@ pub(crate) struct LaneSync {
 
 impl LaneSync {
     /// Derives minimal cross-lane event records and waits for `steps`.
-    pub(crate) fn plan<'a>(steps: impl IntoIterator<Item = &'a Step>) -> Self {
+    pub(crate) fn plan<'a>(steps: impl IntoIterator<Item = &'a Step>, turns: bool) -> Self {
         let steps: Vec<&Step> = steps.into_iter().collect();
         if !steps.iter().any(|s| s.lane != 0) {
             return Self::default();
@@ -59,7 +59,7 @@ impl LaneSync {
                 if synced[dst][src].is_some_and(|s| s >= j) {
                     continue;
                 }
-                if hazards(steps[j], steps[i]) {
+                if hazards(steps[j], steps[i], turns) {
                     need[src] = Some(j);
                 }
             }

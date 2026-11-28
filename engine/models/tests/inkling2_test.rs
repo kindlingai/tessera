@@ -515,7 +515,7 @@ fn metal_waves_compact() {
             kept[slot.buffer as usize] = true;
         }
         let step_haz = |a: &tessera_lower::Step, b: &tessera_lower::Step| {
-            hazards(a, b)
+            hazards(a, b, false)
                 || a.reads
                     .iter()
                     .any(|&x| kept[x.buffer as usize] && b.reads.iter().any(|&y| overlaps(x, y)))

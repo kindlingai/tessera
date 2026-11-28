@@ -383,8 +383,21 @@ impl<D: Device> Pager<D> {
                 .filter_map(cold)
                 .collect()
         };
-        place(&mut out, &weights, staging.ring, &mut staging.batches, pick);
+        let turns = staging.forecast.turns();
+        place(
+            &mut out,
+            &weights,
+            staging.ring,
+            &mut staging.batches,
+            turns,
+            pick,
+        );
         out
+    }
+
+    /// Whether copies wait for cross-rank steps.
+    pub(crate) fn turns(&self) -> bool {
+        self.staging.forecast.turns()
     }
 
     /// Whether `plan`'s launches copy cold experts ahead.

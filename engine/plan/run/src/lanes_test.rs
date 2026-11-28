@@ -1,6 +1,6 @@
 use crate::lanes::LaneSync;
 use tessera_graph::DType;
-use tessera_lower::kernels::{AllReduce, Map};
+use tessera_lower::kernels::{AllReduce, Map, Stage};
 use tessera_lower::{KernelRef, Slot, Step};
 
 fn dummy(lane: u8, reads: Vec<Slot>, write: Slot) -> Step {
@@ -34,7 +34,7 @@ fn ping_pong_events() {
         dummy(1, vec![b_mid], b_out),
         dummy(0, vec![a_out], a_in),
     ];
-    let sync = LaneSync::plan(&steps);
+    let sync = LaneSync::plan(&steps, false);
     assert!(sync.active);
     assert!(sync.forks.is_empty());
     assert!(sync.waits[0].is_empty());
@@ -48,7 +48,7 @@ fn ping_pong_events() {
 #[test]
 fn leading_comm_forks() {
     let steps = vec![dummy(1, vec![Slot::floats(0, 4)], Slot::floats(1, 4))];
-    let sync = LaneSync::plan(&steps);
+    let sync = LaneSync::plan(&steps, false);
     assert!(sync.active);
     assert_eq!(sync.forks.len(), 1);
     assert_eq!(sync.forks[0].0, 1);
@@ -68,7 +68,12 @@ fn collectives_serialize_across_lanes() {
         ar(1, Slot::floats(0, 4), Slot::floats(1, 4)),
         ar(0, Slot::floats(2, 4), Slot::floats(3, 4)),
     ];
-    let sync = LaneSync::plan(&steps);
+    let sync = LaneSync::plan(&steps, false);
     assert_eq!(sync.waits[1], vec![sync.records[0].unwrap()]);
     assert!(sync.joins.is_empty());
+    // A copy waits for a sum only with turns.
+    let copy = Stage { bytes: 8, batch: 0 }.step(Slot::floats(9, 4), Vec::new());
+    let steps = vec![ar(1, Slot::floats(0, 4), Slot::floats(1, 4)), copy];
+    let waits = |turns| LaneSync::plan(&steps, turns).waits[1].len();
+    assert_eq!((waits(false), waits(true)), (0, 1));
 }

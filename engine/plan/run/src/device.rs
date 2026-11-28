@@ -511,8 +511,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             order.retain(|(_, i, _)| i.is_some());
         }
         let ordered: Vec<&Step> = order.iter().map(|(.., s)| *s).collect();
+        let turns = self.pager.as_ref().is_some_and(Pager::turns);
         let sync = match self.ctx.has_lanes() {
-            true => LaneSync::plan(ordered.iter().copied()),
+            true => LaneSync::plan(ordered.iter().copied(), turns),
             false => LaneSync::default(),
         };
         let mut waves = Waves::new(&self.base.plan, self.ctx.has_barriers() && !sync.active);

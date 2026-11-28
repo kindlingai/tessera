@@ -29,16 +29,16 @@ fn stages(copy: &Step, other: &Step) -> bool {
     writes(copy).any(|w| touched().any(|t| same(w, t)))
 }
 
-/// Whether `later` must wait for `earlier`.
-pub fn hazards(earlier: &Step, later: &Step) -> bool {
+/// Whether `later` waits for `earlier`. `turns`: copies wait for sums.
+pub fn hazards(earlier: &Step, later: &Step, turns: bool) -> bool {
     if crosses(earlier.kernel.name()) && crosses(later.kernel.name()) {
         return true;
     }
     if earlier.kernel.name() == Stage::NAME {
-        return stages(earlier, later);
+        return (turns && crosses(later.kernel.name())) || stages(earlier, later);
     }
     if later.kernel.name() == Stage::NAME {
-        return stages(later, earlier);
+        return (turns && crosses(earlier.kernel.name())) || stages(later, earlier);
     }
     let raw = writes(earlier).any(|w| later.reads.iter().any(|&r| overlaps(w, r)));
     let war = earlier
@@ -50,10 +50,13 @@ pub fn hazards(earlier: &Step, later: &Step) -> bool {
 }
 
 /// The earliest place up to `at` for `step`.
-pub fn earliest(steps: &[Step], step: &Step, at: usize) -> usize {
+pub fn earliest(steps: &[Step], step: &Step, at: usize, turns: bool) -> usize {
     let mut place = at;
     // Steps on one lane keep their order.
-    while place > 0 && steps[place - 1].lane != step.lane && !hazards(&steps[place - 1], step) {
+    while place > 0
+        && steps[place - 1].lane != step.lane
+        && !hazards(&steps[place - 1], step, turns)
+    {
         place -= 1;
     }
     place
@@ -94,7 +97,7 @@ impl Waves {
         let hit = special
             || (self.start..at).any(|j| {
                 let prev = steps[j];
-                hazards(prev, step)
+                hazards(prev, step, false)
                     || prev.reads.iter().any(|&a| {
                         self.kept.get(a.buffer as usize).copied().unwrap_or(false)
                             && step.reads.iter().any(|&b| overlaps(a, b))

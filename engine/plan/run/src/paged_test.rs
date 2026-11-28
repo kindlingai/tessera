@@ -119,7 +119,9 @@ fn copies_reuse_ring() {
     let (mut plan, weights) = chain();
     let ring = Ring { parts: 2, slots: 1 };
     let mut batches = Batches::default();
-    place(&mut plan, &weights, ring, &mut batches, |_| vec![3, 5]);
+    place(&mut plan, &weights, ring, &mut batches, false, |_| {
+        vec![3, 5]
+    });
     let order = plan.sequence(0..3);
     let kinds: Vec<_> = order.iter().map(|(_, s)| s.kernel.staged()).collect();
     // Weight 2 reuses weight 0's part once its reader ran.
@@ -138,12 +140,14 @@ fn copies_reuse_ring() {
     assert_eq!(batches.list()[2].experts, vec![3]);
     assert_eq!(batches.list()[2].evicts, Some(0));
     assert_eq!(order[3].1.also, vec![weights[0].unwrap().0]);
-    let sync = LaneSync::plan(order.iter().map(|(_, s)| *s));
+    let sync = LaneSync::plan(order.iter().map(|(_, s)| *s), false);
     assert_eq!(sync.waits[3], vec![sync.records[2].unwrap()]);
     assert_eq!(sync.waits[5], vec![sync.records[3].unwrap()]);
     // The same plan asks for the same batches again.
     let (mut again, _) = chain();
-    place(&mut again, &weights, ring, &mut batches, |_| vec![3, 5]);
+    place(&mut again, &weights, ring, &mut batches, false, |_| {
+        vec![3, 5]
+    });
     assert_eq!(batches.list().len(), 5);
 }
 
@@ -151,8 +155,13 @@ fn copies_reuse_ring() {
 fn empty_forecast_adds_nothing() {
     let (mut plan, weights) = chain();
     let ring = Ring { parts: 2, slots: 1 };
-    place(&mut plan, &weights, ring, &mut Batches::default(), |_| {
-        Vec::new()
-    });
+    place(
+        &mut plan,
+        &weights,
+        ring,
+        &mut Batches::default(),
+        false,
+        |_| Vec::new(),
+    );
     assert!(plan.staged.is_empty());
 }
