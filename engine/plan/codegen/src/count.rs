@@ -3,7 +3,6 @@
 use crate::LANES;
 use crate::form::Load;
 use crate::ir::{BinOp, Body, Expr, Helper, Intrinsic, Param, Stmt, Ty};
-use std::collections::HashMap;
 use std::sync::Mutex;
 use tessera_work::Ops;
 
@@ -51,19 +50,19 @@ impl Advance {
 }
 
 /// A runtime loop being counted: its variable and step.
-struct Loop {
-    var: String,
+struct Loop<'a> {
+    var: &'a str,
     step: Option<f64>,
     /// Names bound from the variable inside the loop.
-    derived: Vec<String>,
+    derived: Vec<&'a str>,
 }
 
 /// Counts a trip's operations, inside the runtime loops.
 #[derive(Default)]
-struct Counter {
+struct Counter<'a> {
     trip: Ops,
     /// The runtime loops entered, innermost last.
-    loops: Vec<Loop>,
+    loops: Vec<Loop<'a>>,
     /// A body without runtime loops counts as one trip.
     straight: bool,
     /// The product of enclosing constant loop counts.
@@ -71,20 +70,30 @@ struct Counter {
     /// Freshness and width summed over loads, for their means.
     fresh: f64,
     width: f64,
-    buffers: HashMap<String, &'static dyn Load>,
-    shared: Vec<String>,
-    tiles: HashMap<String, (usize, usize)>,
+    buffers: Vec<(&'a str, &'static dyn Load)>,
+    shared: Vec<&'a str>,
+    tiles: Vec<(&'a str, usize, usize)>,
     /// Held slabs of A: rows and depth.
-    held: HashMap<String, (usize, usize)>,
+    held: Vec<(&'a str, usize, usize)>,
     /// Global loads this statement has made, which repeats share.
-    seen: Vec<Expr>,
+    seen: Vec<&'a Expr>,
     /// Ops each named helper spends per call.
-    calls: HashMap<String, Ops>,
+    calls: Vec<(&'a str, Ops)>,
+    /// Per-body cache of decode costs by form name and width.
+    decodes: Vec<(&'static str, bool, f64)>,
     /// Passes of the strided loops inside the trip. Zero: none.
     passes: f64,
 }
 
-impl Counter {
+fn lookup_dims(entries: &[(&str, usize, usize)], name: &str) -> Option<(usize, usize)> {
+    entries
+        .iter()
+        .rev()
+        .find(|(n, ..)| *n == name)
+        .map(|&(_, a, b)| (a, b))
+}
+
+impl<'a> Counter<'a> {
     fn add(&mut self, ops: Ops) {
         if self.loops.is_empty() && !self.straight {
             return;
@@ -126,17 +135,33 @@ impl Counter {
 
     /// Decodes `form` once per pass of the strided loops.
     fn decode(&mut self, form: &dyn Load, wide: bool) {
+        if self.loops.is_empty() && !self.straight {
+            return;
+        }
+        let name = form.name();
+        let cost = match self
+            .decodes
+            .iter()
+            .find(|&&(n, w, _)| n == name && w == wide)
+        {
+            Some(&(.., c)) => c,
+            None => {
+                let c = decoded(form, wide);
+                self.decodes.push((name, wide, c));
+                c
+            }
+        };
         self.add(Ops {
-            decode: decoded(form, wide) * self.passes.max(1.0),
+            decode: cost * self.passes.max(1.0),
             ..Ops::default()
         });
     }
 
     /// How `e` moves per trip of `l`, in index units.
-    fn advance(&self, e: &Expr, l: &Loop) -> Advance {
+    fn advance(&self, e: &Expr, l: &Loop<'_>) -> Advance {
         match e {
-            Expr::Var(name) if *name == l.var => Advance::By(1.0),
-            Expr::Var(name) if l.derived.contains(name) => Advance::Jumps,
+            Expr::Var(name) if name == l.var => Advance::By(1.0),
+            Expr::Var(name) if l.derived.contains(&name.as_str()) => Advance::Jumps,
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => Advance::Still,
             Expr::Neg(a) => self.advance(a, l).times(-1.0),
             Expr::Cast(_, a) => self.advance(a, l),
@@ -159,9 +184,9 @@ impl Counter {
     }
 
     /// Whether `e` reads the loop variable or a derivative.
-    fn mentions(&self, e: &Expr, l: &Loop) -> bool {
+    fn mentions(&self, e: &Expr, l: &Loop<'_>) -> bool {
         match e {
-            Expr::Var(name) => *name == l.var || l.derived.contains(name),
+            Expr::Var(name) => name == l.var || l.derived.contains(&name.as_str()),
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => false,
             Expr::Neg(a) | Expr::Not(a) | Expr::Cast(_, a) | Expr::Field(a, _) => {
                 self.mentions(a, l)
@@ -174,19 +199,23 @@ impl Counter {
 
     fn global(&self, e: &Expr) -> Option<&'static dyn Load> {
         match e {
-            Expr::Var(name) => self.buffers.get(name).copied(),
+            Expr::Var(name) => self
+                .buffers
+                .iter()
+                .find(|(n, _)| *n == name.as_str())
+                .map(|&(_, f)| f),
             _ => None,
         }
     }
 
-    fn expr(&mut self, e: &Expr) -> bool {
+    fn expr(&mut self, e: &'a Expr) -> bool {
         match e {
             Expr::Int(_) | Expr::Bool(_) | Expr::Var(_) => false,
             Expr::Float(_) => true,
             Expr::Neg(a) | Expr::Not(a) | Expr::Cast(_, a) => self.expr(a),
             Expr::Bin(op, a, b) => {
                 let (fa, fb) = (self.expr(a), self.expr(b));
-                let is_float = fa || fb || matches!(op, BinOp::Div) && (fa || fb);
+                let is_float = fa || fb;
                 match (op.compares(), is_float) {
                     (true, _) => self.add(int(1.0)),
                     (false, true) => self.add(float(1.0)),
@@ -198,12 +227,12 @@ impl Counter {
                 self.expr(at);
                 if let Some(form) = self.global(base) {
                     // The compiler loads a repeated element once.
-                    if !self.seen.contains(e) {
-                        self.seen.push(e.clone());
+                    if !self.seen.contains(&e) {
+                        self.seen.push(e);
                         self.load(at, form.element_bytes());
                         self.decode(form, false);
                     }
-                } else if matches!(&**base, Expr::Var(n) if self.shared.contains(n)) {
+                } else if matches!(&**base, Expr::Var(n) if self.shared.contains(&n.as_str())) {
                     self.add(Ops {
                         loads: 1.0,
                         width: 4.0,
@@ -226,7 +255,8 @@ impl Counter {
                 for a in args {
                     self.expr(a);
                 }
-                if let Some(ops) = self.calls.get(name).copied() {
+                if let Some(&(_, ops)) = self.calls.iter().rev().find(|(n, _)| *n == name.as_str())
+                {
                     self.add(ops);
                 }
                 *ty == Ty::F32
@@ -246,14 +276,14 @@ impl Counter {
         float
     }
 
-    fn stmts(&mut self, stmts: &[Stmt]) {
+    fn stmts(&mut self, stmts: &'a [Stmt]) {
         for s in stmts {
             self.seen.clear();
             self.stmt(s);
         }
     }
 
-    fn stmt(&mut self, s: &Stmt) {
+    fn stmt(&mut self, s: &'a Stmt) {
         match s {
             Stmt::Let { name, init } => {
                 self.expr(init);
@@ -261,13 +291,16 @@ impl Counter {
                 if let Some(l) = self.loops.last()
                     && self.mentions(init, l)
                 {
-                    let name = name.clone();
-                    self.loops.last_mut().expect("a loop").derived.push(name);
+                    self.loops
+                        .last_mut()
+                        .expect("a loop")
+                        .derived
+                        .push(name.as_str());
                 }
             }
             Stmt::Array { .. } => {}
             Stmt::Shared { name, .. } | Stmt::AtomicShared { name, .. } => {
-                self.shared.push(name.clone());
+                self.shared.push(name.as_str());
             }
             Stmt::AtomicAdd { at, value, .. } => {
                 self.expr(at);
@@ -278,13 +311,13 @@ impl Counter {
                 });
             }
             Stmt::TileAcc { name, rows, cols } => {
-                self.tiles.insert(name.clone(), (*rows, *cols));
+                self.tiles.push((name.as_str(), *rows, *cols));
             }
             Stmt::TileHeld { name, rows, depth } => {
-                self.held.insert(name.clone(), (*rows, *depth));
+                self.held.push((name.as_str(), *rows, *depth));
             }
             Stmt::TileHold { held, .. } => {
-                let Some((rows, depth)) = self.held.get(held).copied() else {
+                let Some((rows, depth)) = lookup_dims(&self.held, held) else {
                     panic!("`{held}` is not a held slab");
                 };
                 let held = (rows * depth) as f64 / LANES as f64;
@@ -357,7 +390,7 @@ impl Counter {
                             self.passes = was.max(1.0) * (*to as f64 / by).ceil();
                         }
                         self.loops.push(Loop {
-                            var: var.clone(),
+                            var: var.as_str(),
                             step,
                             derived: Vec::new(),
                         });
@@ -393,12 +426,12 @@ impl Counter {
                 parts,
                 ..
             } => {
-                let Some((rows, cols)) = self.tiles.get(acc).copied() else {
+                let Some((rows, cols)) = lookup_dims(&self.tiles, acc) else {
                     panic!("`{acc}` is not a tile block");
                 };
                 let lane = |n: usize| n as f64 / LANES as f64;
                 // A held slab reads only B from group memory.
-                let held = matches!(a, Expr::Var(n) if self.held.contains_key(n));
+                let held = matches!(a, Expr::Var(n) if lookup_dims(&self.held, n).is_some());
                 // Each part of A multiplies once. Words hold two bf16.
                 let (tile_flops, bf16_flops, shared) = match parts {
                     0 if held => (lane(2 * rows * cols * depth), 0.0, lane(cols * depth)),
@@ -434,7 +467,7 @@ impl Counter {
             Stmt::TileZero { .. } => {}
             Stmt::TileScale { acc, by } => {
                 self.expr(by);
-                if let Some((rows, cols)) = self.tiles.get(acc).copied() {
+                if let Some((rows, cols)) = lookup_dims(&self.tiles, acc) {
                     self.add(Ops {
                         float: (rows * cols) as f64 / LANES as f64,
                         ..Ops::default()
@@ -471,7 +504,7 @@ macro_rules! costs {
     ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
         { device: $dev:expr, text: $text:expr, wgsl: $wgsl:expr, host: $host:expr, count: $count:expr $(,)? })*) => {
         /// The count a call adds. True for a float value.
-        fn cost(i: Intrinsic) -> fn(&mut Counter, &[Expr]) -> bool {
+        fn cost<'a>(i: Intrinsic) -> fn(&mut Counter<'a>, &[Expr]) -> bool {
             match i {
                 $(Intrinsic::$var => $count,)*
             }
@@ -489,7 +522,7 @@ fn helper_ops(h: &Helper) -> Ops {
         ..Counter::default()
     };
     for inner in &h.body.helpers {
-        c.calls.insert(inner.name.clone(), helper_ops(inner));
+        c.calls.push((inner.name.as_str(), helper_ops(inner)));
     }
     c.stmts(&h.body.stmts);
     if let Some(ret) = &h.body.ret {
@@ -545,16 +578,18 @@ fn runtime_loops(stmts: &[Stmt]) -> bool {
 impl Body {
     /// One trip's operations: a runtime loop's, or the whole body's.
     pub fn trip(&self) -> Ops {
+        let mut buffers = Vec::with_capacity(self.params.len());
+        for param in &self.params {
+            if let Param::Buffer { name, form, .. } = param {
+                buffers.push((name.as_str(), *form));
+            }
+        }
         let mut c = Counter {
             times: 1.0,
             straight: !runtime_loops(&self.stmts),
+            buffers,
             ..Counter::default()
         };
-        for param in &self.params {
-            if let Param::Buffer { name, form, .. } = param {
-                c.buffers.insert(name.clone(), *form);
-            }
-        }
         c.stmts(&self.stmts);
         let mut trip = c.trip;
         if trip.loads > 0.0 {
