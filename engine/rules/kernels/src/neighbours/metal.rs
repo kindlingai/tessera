@@ -12,25 +12,13 @@ const TILE: usize = 32;
 const THREADS: usize = 128;
 const SMEM: usize = 2 * TILE * 36 * 4;
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("metal.metal");
 
 fn act_fmt(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        _ => None,
-    }
+    tessera_lower::form::metal_code(form, false)
 }
 
 fn weight_fmt(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        "fp8" => Some(3),
-        _ => None,
-    }
+    tessera_lower::form::metal_code(form, true)
 }
 
 /// Implicit-GEMM 3x3 convolution over `[Seqs, pixels, cin]` using Metal MMA.
@@ -91,7 +79,11 @@ fn metal_source(k: &NeighboursMetal) -> Source {
         "nb_mma_general"
     };
     Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
+        text: ByBackend([
+            tessera_lower::metal_source!(include_str!("metal.metal")),
+            "",
+            "",
+        ]),
         entry,
     }
 }

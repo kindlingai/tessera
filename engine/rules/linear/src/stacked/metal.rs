@@ -9,25 +9,13 @@ use tessera_lower::{
 };
 
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("metal.metal");
 
 fn act_fmt(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        _ => None,
-    }
+    tessera_lower::form::metal_code(form, false)
 }
 
 fn weight_fmt(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        "fp8" => Some(3),
-        _ => None,
-    }
+    tessera_lower::form::metal_code(form, true)
 }
 
 #[derive(Clone, Copy)]
@@ -165,7 +153,11 @@ fn metal_emits(k: &MetalStacked, form: &dyn Stored) -> bool {
 fn metal_source(k: &MetalStacked) -> Source {
     let e = pick_entry(k);
     Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
+        text: ByBackend([
+            tessera_lower::metal_source!(include_str!("metal.metal")),
+            "",
+            "",
+        ]),
         entry: e.name,
     }
 }
