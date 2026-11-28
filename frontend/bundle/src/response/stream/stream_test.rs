@@ -429,10 +429,19 @@ fn check_tag_capture_allowlist() {
         r"(?s)<parameter=(?P<key>[\s\S]+?)>(?P<value>.*?)</parameter>",
         r"(?s)<k=(?P<key>[^>]+)>\s*<v>(?P<value>.*?)</v>",
         r"<arg_key>(?P<key>[\s\S]*?)</arg_key>\s* <arg_value>(?P<value>[\s\S]*?)</arg_value>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter>|STOP",
+        r"(?s)<parameter=(?P<key>[^>]+)>\n?(?P<value>.*?)\n</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>\n?(?P<value>.*?)(?:\n</parameter>|\n</p>)",
     ];
     for pat in rejected {
         assert!(TagDelims::from_pattern(pat).is_none(), "{pat}");
     }
+    assert!(
+        TagDelims::from_pattern(
+            r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|STOP)"
+        )
+        .is_some()
+    );
     let quoted_pat = r#"<parameter=(?P<key>[^>]+)>(?P<value>"[^"]*")</parameter>"#;
     let quoted_cases = [
         (
@@ -502,6 +511,70 @@ fn check_tag_capture_allowlist() {
     ];
     assert_tag_parity(wild_pat, &wild_cases);
     check_glm_key_parity();
+    check_r17_tag_parity();
+}
+
+fn check_r17_tag_parity() {
+    assert_tag_parity(
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter>|STOP",
+        &[
+            (
+                [
+                    "<tool_call><function=ping><parameter=x>beforeSTOPafter</parameter></function>",
+                    " All done.",
+                ],
+                json!({"x": "beforeSTOPafter"}),
+            ),
+            (
+                [
+                    "<tool_call><function=ping><parameter=x>plain</parameter></function>",
+                    " All done.",
+                ],
+                json!({"x": "plain"}),
+            ),
+        ],
+    );
+    assert_tag_parity(
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|STOP)",
+        &[(
+            [
+                "<tool_call><function=ping><parameter=x>beforeSTOPafter</parameter></function>",
+                " All done.",
+            ],
+            json!({"x": "before"}),
+        )],
+    );
+    for pat in [
+        r"(?s)<parameter=(?P<key>[^>]+)>\n?(?P<value>.*?)\n</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>\n?(?P<value>.*?)(?:\n</parameter>|\n</p>)",
+    ] {
+        assert_tag_parity(
+            pat,
+            &[
+                (
+                    [
+                        "<tool_call><function=ping><parameter=x>\n</parameter></function>",
+                        " All done.",
+                    ],
+                    json!({"x": ""}),
+                ),
+                (
+                    [
+                        "<tool_call><function=ping><parameter=x>\n\n</parameter></function>",
+                        " All done.",
+                    ],
+                    json!({"x": ""}),
+                ),
+                (
+                    [
+                        "<tool_call><function=ping><parameter=x>\na\n</parameter></function>",
+                        " All done.",
+                    ],
+                    json!({"x": "a"}),
+                ),
+            ],
+        );
+    }
 }
 
 fn check_glm_key_parity() {

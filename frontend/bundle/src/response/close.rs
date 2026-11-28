@@ -390,6 +390,11 @@ fn strip_lookahead(s: &str) -> Option<&str> {
     }
 }
 
+/// Whether `s` contains an ungrouped top-level `|` alternative.
+pub(super) fn has_top_level_alt(s: &str) -> bool {
+    split_alt(s).len() > 1
+}
+
 /// Splits `s` on top-level unescaped `|` outside groups and classes.
 fn split_alt(s: &str) -> Vec<&str> {
     let mut out = Vec::new();

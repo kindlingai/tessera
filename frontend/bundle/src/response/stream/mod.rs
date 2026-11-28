@@ -7,8 +7,8 @@ pub(super) mod stream_test;
 pub(super) use json::parse_json;
 
 use super::close::{
-    Closer, Closers, cap_tag_emit, find_closers, find_closers_for, matching_paren,
-    parse_literal_closers, pick_tag_hit, unescape_lit,
+    Closer, Closers, cap_tag_emit, find_closers, find_closers_for, has_top_level_alt,
+    matching_paren, parse_literal_closers, pick_tag_hit, unescape_lit,
 };
 use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
 use json::{RelaxedState, finish_relaxed, is_json_number_prefix, step_relaxed};
@@ -56,9 +56,18 @@ impl TagDelims {
         };
         let (key_nonempty, key_forbid_nl) =
             allow_key_body(key_body, &key_close, &val_open, dotall)?;
-        let (vc, trim_trail_nl) = strip_opt_nl_start(&after_key[val_end + 1..]);
+        let after_val = &after_key[val_end + 1..];
+        if has_top_level_alt(after_val) {
+            return None;
+        }
+        let (vc, trim_trail_nl) = strip_opt_nl_start(after_val);
         let val_close = parse_literal_closers(vc)?;
-        if key_open.is_empty() || key_close.is_empty() || val_close.is_empty() {
+        let nl_closer = val_close.iter().any(|c| c.needle.starts_with('\n'));
+        if key_open.is_empty()
+            || key_close.is_empty()
+            || val_close.is_empty()
+            || ((trim_lead_nl || trim_trail_nl) && nl_closer)
+        {
             return None;
         }
         Some(Self {
