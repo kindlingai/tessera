@@ -58,6 +58,71 @@ fn f32_ty(dims: Vec<tessera_graph::DimExpr>) -> TensorType {
 }
 
 #[test]
+fn cut_small_dense() {
+    use tessera_graph::{CalibTap, Composite, DimName::Hidden, Region, verify};
+    for n in [4usize, 32] {
+        let mut g = Graph::new(vec![Dim::bounded(Rows, 64), Dim::fixed(Hidden, 16)]);
+        let ty = TensorType::new([Rows, Hidden], DType::F32);
+        g.entries.push(Entry {
+            kind: EntryKind::Forward,
+            inputs: vec![Port {
+                role: Role::Tokens,
+                ty: ty.clone(),
+            }],
+            outputs: vec![],
+        });
+        g.nodes.push(Node {
+            op: Op::Input { entry: 0, port: 0 },
+            args: vec![],
+            ty: ty.clone(),
+            numerics: None,
+        });
+        for i in 1..=n {
+            g.nodes.push(Node {
+                op: Op::Row(Row(vec![Stage::Add])),
+                args: vec![NodeId((i - 1) as u32), NodeId(i.saturating_sub(3) as u32)],
+                ty: ty.clone(),
+                numerics: None,
+            });
+        }
+        let last = NodeId(n as u32);
+        g.entries[0].outputs.push(Output {
+            role: Role::Logits,
+            node: last,
+        });
+        g.entries[0].outputs.push(Output {
+            role: Role::Calib(CalibTap::AttnIn),
+            node: NodeId((n / 2).max(1) as u32),
+        });
+        let r = Region {
+            kind: Composite::Layer,
+            start: NodeId(1),
+            end: NodeId((n + 1) as u32),
+            inputs: vec![NodeId(0)],
+            outputs: vec![last],
+        };
+        g.regions.push(r.clone());
+        let ids: Vec<NodeId> = (1..=n).map(|i| NodeId(i as u32)).collect();
+        let plain = tessera_lower::cut(&g, &ids);
+        verify(&plain).unwrap();
+        assert_eq!(
+            (plain.nodes.len(), plain.entries[0].outputs.len()),
+            (n + 1, 1)
+        );
+        let reg = tessera_lower::cut_region(&g, &r);
+        verify(&reg).unwrap();
+        assert_eq!(
+            (
+                reg.nodes.len(),
+                reg.regions.len(),
+                reg.entries[0].outputs.len()
+            ),
+            (n + 1, 1, 2)
+        );
+    }
+}
+
+#[test]
 fn chain_stops_turn() {
     let mut g = Graph::new(vec![Dim::bounded(Rows, 8)]);
     let x_ty = f32_ty(vec![Rows.into(), 128u64.into()]);
