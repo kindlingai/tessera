@@ -29,6 +29,8 @@ pub struct Base {
     launches: Vec<OnceLock<Vec<Launch>>>,
     /// The most bytes a plan may use. `None` checks nothing.
     pub(crate) budget: Option<u64>,
+    /// Bytes the runner holds beside the plan's buffers.
+    pub(crate) beside: u64,
     /// Whether weights past the budget may page from the host.
     pub(crate) streams: bool,
     /// Cold experts copy to VRAM ahead of their reader.
@@ -66,6 +68,12 @@ impl Base {
     /// Memory budget in bytes, if bounded.
     pub fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// Budget bytes in use: the plan and the expert cache.
+    pub fn planned(&self) -> u64 {
+        let buffers: u64 = self.plan.buffers.iter().map(|b| *b as u64).sum();
+        buffers + self.beside
     }
 
     /// Whether `weight` has a staged whole slot.
