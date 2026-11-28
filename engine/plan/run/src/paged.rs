@@ -733,52 +733,6 @@ impl<D: Device> HostKv<D> {
         Some(out)
     }
 
-    /// Copies `(vram_phys, host_phys)` sparse KV pages from VRAM to host.
-    pub(crate) fn demote(
-        &mut self,
-        held: &Held,
-        plan: &Plan,
-        pairs: &[(u32, u32)],
-    ) -> Result<bool, Error> {
-        if pairs.is_empty() {
-            return Ok(true);
-        }
-        let Some(raw) = self.spans(held, plan, pairs) else {
-            return Ok(false);
-        };
-        self.settle()?;
-        let mut spans: Vec<(u64, &mut [u8])> = raw
-            .into_iter()
-            // SAFETY: distinct `host_phys` ranges inside live pinned allocation.
-            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts_mut(ptr, len) }))
-            .collect();
-        self.ctx.download_batch(&mut spans)?;
-        Ok(true)
-    }
-
-    /// Starts copies of sparse KV pages from VRAM to host.
-    fn depart(&mut self, held: &Held, plan: &Plan, pairs: &[(u32, u32)]) -> Result<bool, Error> {
-        let Some(raw) = self.spans(held, plan, pairs) else {
-            return Ok(false);
-        };
-        // Queued steps may still write these pages.
-        self.ctx.finish()?;
-        let lane = self.ctx.active_lane();
-        self.ctx.set_lane(COPY_LANE);
-        self.busy = true;
-        let mut queued = Ok(());
-        for (dev, ptr, len) in raw {
-            // SAFETY: a distinct range of the live pinned pool.
-            let page = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            queued = self.ctx.queue_download(dev, page);
-            if queued.is_err() {
-                break;
-            }
-        }
-        self.ctx.set_lane(lane);
-        Ok(queued.map(|_| true)?)
-    }
-
     /// Waits for every started copy.
     fn settle(&mut self) -> Result<(), Error> {
         if std::mem::take(&mut self.busy) {
@@ -787,26 +741,43 @@ impl<D: Device> HostKv<D> {
         Ok(())
     }
 
-    /// Copies `(vram_phys, host_phys)` sparse KV pages from host to VRAM.
-    pub(crate) fn promote(
+    /// Copies `(vram_phys, host_phys)` sparse KV pages as `kind` says.
+    fn copy(
         &mut self,
         held: &Held,
         plan: &Plan,
+        kind: Move,
         pairs: &[(u32, u32)],
     ) -> Result<bool, Error> {
-        if pairs.is_empty() {
-            return Ok(true);
-        }
         let Some(raw) = self.spans(held, plan, pairs) else {
             return Ok(false);
         };
+        // SAFETY: each span is a distinct range of the pool.
+        let page = |s: &(u64, *mut u8, usize)| unsafe { std::slice::from_raw_parts_mut(s.1, s.2) };
+        // Queued steps may still write the pages that depart.
+        self.busy |= kind == Move::Depart;
         self.settle()?;
-        let spans: Vec<(u64, &[u8])> = raw
-            .into_iter()
-            // SAFETY: valid range inside live pinned allocation.
-            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts(ptr, len) }))
-            .collect();
-        self.ctx.upload_batch(&spans)?;
+        match kind {
+            Move::Settle => {}
+            Move::Promote => {
+                let spans: Vec<(u64, &[u8])> = raw.iter().map(|s| (s.0, &*page(s))).collect();
+                self.ctx.upload_batch(&spans)?;
+            }
+            Move::Demote => {
+                let mut spans: Vec<_> = raw.iter().map(|s| (s.0, page(s))).collect();
+                self.ctx.download_batch(&mut spans)?;
+            }
+            Move::Depart => {
+                self.busy = true;
+                let lane = self.ctx.active_lane();
+                self.ctx.set_lane(COPY_LANE);
+                let queued = raw
+                    .iter()
+                    .try_for_each(|s| self.ctx.queue_download(s.0, page(s)));
+                self.ctx.set_lane(lane);
+                queued?;
+            }
+        }
         Ok(true)
     }
 }
@@ -856,14 +827,9 @@ impl<D: Device> KvMem<D> {
         kind: Move,
         pairs: &[(u32, u32)],
     ) -> Result<bool, Error> {
-        let Some(host) = &mut self.host else {
-            return Ok(false);
-        };
-        match kind {
-            Move::Promote => host.promote(held, plan, pairs),
-            Move::Demote => host.demote(held, plan, pairs),
-            Move::Depart => host.depart(held, plan, pairs),
-            Move::Settle => host.settle().map(|_| true),
+        match &mut self.host {
+            Some(host) => host.copy(held, plan, kind, pairs),
+            None => Ok(false),
         }
     }
 }
