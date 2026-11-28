@@ -1,5 +1,5 @@
 use crate::form::{F32_FORM, named};
-use crate::paging::{Decayed, Dense, Forecast, Moves, Moving, Paged, Promote, Swap};
+use crate::paging::{Decayed, Dense, Forecast, Lent, Moves, Moving, Paged, Promote, Swap};
 use crate::paging::{Layout, desc_bytes, is_pageable};
 use crate::plan::{Loaded, Plan, Slot};
 
@@ -133,4 +133,25 @@ fn pageable_filter_and_rewrite() {
     let exp_slot = rewritten.weights.iter().find(moved).unwrap().slot;
     assert_eq!(rewritten.buffers[exp_slot.buffer as usize], desc_bytes(8));
     assert_eq!(exp_slot.offset, 0);
+}
+
+#[test]
+fn loans_leave_lowest() {
+    let mut lent = Lent::default();
+    lent.rebase(100);
+    // Slots fill top-down, above the plan's 10 bytes.
+    assert_eq!(lent.take(0, 1, 30, 10), Some(70));
+    assert_eq!(lent.take(0, 2, 30, 10), Some(40));
+    assert_eq!(lent.take(0, 3, 30, 10), Some(10));
+    assert_eq!(lent.take(0, 4, 30, 10), None);
+    assert_eq!(lent.land().len(), 3);
+    // An ended loan's slot goes to the next expert.
+    lent.forget(|loan| loan.expert == 2);
+    assert_eq!(lent.take(1, 9, 30, 10), Some(40));
+    // A plan writing 45 bytes pushes out the lowest two.
+    let out: Vec<_> = lent.evict(45).iter().map(|loan| loan.expert).collect();
+    assert_eq!(out, [3, 9]);
+    let left: Vec<_> = lent.loans().iter().map(|loan| loan.expert).collect();
+    assert_eq!(left, [1]);
+    assert_eq!(lent.take(0, 5, 30, 45), None);
 }

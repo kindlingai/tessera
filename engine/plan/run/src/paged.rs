@@ -1,7 +1,7 @@
 //! Hot-cold VRAM cache for stacked trellis expert weights.
 
 use crate::held::Held;
-use crate::lanes::{Source, Staging};
+use crate::lanes::{Lending, Source, Staging};
 use crate::run::Base;
 use crate::{Backed, Error, HostPool};
 use std::collections::HashMap;
@@ -11,35 +11,13 @@ use tessera_kv::Move;
 use tessera_lower::kernels::{Ring, place};
 use tessera_lower::paging::{
     Decayed, Dense, Forecast, HEAD, Layout, Moves, Paged, Promote, Spec, TABLE, Unknown, aligned,
+    shares,
 };
 use tessera_lower::{Plan, Slot};
 use tessera_mem::Backing;
 
 const PAGED_FLAG: u32 = 0x8000_0000;
 const RESERVE: u64 = 512 << 20;
-
-/// VRAM slots per weight within `avail`, and their bytes.
-fn shares(specs: &[Spec], avail: usize) -> (Vec<usize>, usize) {
-    let total: usize = specs.iter().map(|s| s.experts * s.stride).sum();
-    let mut counts = Vec::with_capacity(specs.len());
-    let mut used = 0usize;
-    // Give each paged weight a proportional share of slots.
-    for s in specs {
-        let share =
-            ((avail as u128 * (s.experts * s.stride) as u128) / total.max(1) as u128) as usize;
-        let h = (share / s.stride).min(s.experts);
-        counts.push(h);
-        used += h * s.stride;
-    }
-    // Top up any leftover space with extra slots.
-    for (i, s) in specs.iter().enumerate() {
-        while counts[i] < s.experts && used + s.stride <= avail {
-            counts[i] += 1;
-            used += s.stride;
-        }
-    }
-    (counts, used)
-}
 
 /// Per-weight backing store and VRAM hot slots.
 struct Entry<D: Device> {
@@ -70,6 +48,7 @@ pub(crate) struct Pager<D: Device> {
     sizes: HashMap<u64, u64>,
     /// Whether cross-rank sums share the bus with copies.
     shared_bus: bool,
+    lending: Lending,
 }
 
 impl<D: Device> Pager<D> {
@@ -108,7 +87,8 @@ impl<D: Device> Pager<D> {
         // Ring and slot counts depend on each other.
         let widest = layout.specs.iter().map(|s| s.stride).max().unwrap_or(0);
         let (mut ring, mut ring_bytes) = (Ring::default(), 0usize);
-        let (mut counts, mut pool_used) = shares(&layout.specs, avail);
+        let sizes: Vec<_> = layout.specs.iter().map(|s| (s.experts, s.stride)).collect();
+        let (mut counts, mut pool_used) = shares(&sizes, avail);
         while forecast.parts() > 0 {
             let cold = |(s, h): (&Spec, &usize)| s.experts - h;
             let slots = layout
@@ -127,7 +107,7 @@ impl<D: Device> Pager<D> {
                 slots,
             };
             ring_bytes = need;
-            (counts, pool_used) = shares(&layout.specs, avail - ring_bytes);
+            (counts, pool_used) = shares(&sizes, avail - ring_bytes);
         }
         let staging = Staging::open(ctx, forecast, ring, widest)?;
         let vram_pool = if pool_used > 0 {
@@ -180,6 +160,7 @@ impl<D: Device> Pager<D> {
             staging,
             sizes: HashMap::new(),
             shared_bus: false,
+            lending: Lending::default(),
         }))
     }
 
@@ -233,6 +214,18 @@ impl<D: Device> Pager<D> {
             pick,
         );
         out
+    }
+
+    /// Frees lent slots in the scratch a plan will write.
+    pub(crate) fn unlend(
+        &mut self,
+        ctx: &D,
+        tail: Option<(u64, usize, usize)>,
+    ) -> Result<(), Error> {
+        let mut lending = std::mem::take(&mut self.lending);
+        let fitted = lending.fit(ctx, tail, |idx| self.source(idx));
+        self.lending = lending;
+        fitted
     }
 
     /// Whether copies wait for cross-rank steps.
@@ -345,6 +338,7 @@ impl<D: Device> Pager<D> {
         }
         entry.desc_ptr = desc_ptr;
         held.upload(slot, &desc)?;
+        self.lending.forget(|loan| loan.weight == idx);
         Ok(true)
     }
 
@@ -361,7 +355,13 @@ impl<D: Device> Pager<D> {
         let fixed = self.vram_bytes - held as u64;
         let reserve = RESERVE.min(budget / 8);
         let avail = budget.saturating_sub(need + fixed + reserve) as usize;
-        let (counts, used) = shares(&self.layout.specs, avail);
+        let sizes: Vec<_> = self
+            .layout
+            .specs
+            .iter()
+            .map(|s| (s.experts, s.stride))
+            .collect();
+        let (counts, used) = shares(&sizes, avail);
         if used >= held {
             return Ok(());
         }
@@ -415,6 +415,7 @@ impl<D: Device> Pager<D> {
         self.vram_pool = pool;
         self.vram_bytes = fixed + used as u64;
         self.staging.reaim();
+        self.lending.reset();
         let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
         eprintln!(
             "tessera: expert VRAM cache {:.1} GiB -> {:.1} GiB for a larger plan",
@@ -465,6 +466,9 @@ impl<D: Device> Pager<D> {
         let (words, _) = self.raw_hits.as_chunks::<4>();
         let mut weights = Vec::with_capacity(self.entries.len());
         let (mut cold, mut read) = (0usize, 0usize);
+        // The policy counts a lent expert as slotted.
+        let mut views: Vec<_> = self.entries.iter().map(|e| e.slot_of.clone()).collect();
+        self.lending.mark(&mut views);
         for (idx, entry) in self.entries.iter().enumerate() {
             let counts = &words[entry.hits_offset..][..entry.spec.experts];
             self.hits.clear();
@@ -479,7 +483,7 @@ impl<D: Device> Pager<D> {
                 }
             }
             weights.push(Paged {
-                slots: &entry.slot_of,
+                slots: &views[idx],
                 stride: entry.spec.stride,
                 ready: entry.resident > 0
                     && entry.resident < entry.spec.experts
@@ -494,7 +498,8 @@ impl<D: Device> Pager<D> {
         }
         let flipped = self.staging.forecast.stages(plan) != staged;
         let swaps = self.policy.swaps(&weights);
-        let mut moved = Vec::new();
+        let picks = self.policy.fills(&weights);
+        let (mut moved, mut ended) = (Vec::new(), Vec::new());
         // The copies run beside the next step.
         let lane = ctx.active_lane();
         ctx.set_lane(COPY_LANE);
@@ -502,6 +507,8 @@ impl<D: Device> Pager<D> {
             let (cold, hot) = (swap.cold, swap.hot);
             let entry = &mut self.entries[swap.weight];
             let Some(slot) = self.moves.begin(&mut entry.slot_of, &swap) else {
+                // A lent expert gives its slot to a later fill.
+                ended.push((swap.weight, hot));
                 continue;
             };
             let stride = entry.spec.stride;
@@ -532,7 +539,11 @@ impl<D: Device> Pager<D> {
         }
         ctx.set_lane(lane);
         self.retarget(moved);
-        Ok(flipped)
+        let mut lending = std::mem::take(&mut self.lending);
+        let filled = lending.end(ctx, &ended, |idx| self.source(idx));
+        let filled = filled.and_then(|_| lending.fill(ctx, picks, |idx| self.source(idx)));
+        self.lending = lending;
+        filled.map(|_| flipped)
     }
 }
 

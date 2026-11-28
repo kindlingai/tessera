@@ -146,6 +146,15 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         self.ptrs = self.bound_ptrs();
         self.kv.bind(plan);
+        if let Some(pager) = &mut self.pager {
+            // Loans above this plan's scratch stay. The rest go cold.
+            let tail = self.base.held.scratch_tail(plan);
+            let tail = tail.map(|(buf, need)| {
+                let held = super::device_buf::<D>(buf);
+                (held.device_ptr(), held.size(), need)
+            });
+            pager.unlend(self.ctx, tail)?;
+        }
         if plan.id != 0 && plan.id == self.base.plan.id && self.kernels.len() == plan.steps.len() {
             return self.rebind(plan);
         }

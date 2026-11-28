@@ -1,11 +1,13 @@
 //! Lanes beside compute: their sync events and staged copies.
 
 use crate::Error;
+use tessera_gpukit::device::COPY_LANE;
 use tessera_gpukit::device::{Device, DeviceBuffer};
 use tessera_lower::Step;
 use tessera_lower::hazard::hazards;
 use tessera_lower::kernels::{Batches, Ring};
 use tessera_lower::paging::{Forecast, Unknown};
+use tessera_lower::paging::{Lent, Loan};
 use tessera_mem::Backing;
 
 // The plan's copy lane is the device's copy stream.
@@ -412,5 +414,135 @@ impl<D: Device> Staging<D> {
             ctx.queue_upload(at, &s.host[m * s.stride..][..s.stride])?;
         }
         self.flip(ctx, id, false, s)
+    }
+}
+
+/// Expert slots borrowed from the scratch buffer's idle end.
+#[derive(Default)]
+pub(crate) struct Lending {
+    lent: Lent,
+    /// The buffer's device address, and the bytes its plan writes.
+    base: u64,
+    need: usize,
+}
+
+impl Lending {
+    /// Forgets every loan. The caller rewrote the descriptors.
+    pub(crate) fn reset(&mut self) {
+        self.lent.rebase(self.lent.bytes());
+    }
+
+    /// Forgets loans of experts that `gone` names.
+    pub(crate) fn forget(&mut self, gone: impl Fn(&Loan) -> bool) {
+        self.lent.forget(gone);
+    }
+
+    /// Marks lent experts as slotted in each weight's `views`.
+    pub(crate) fn mark(&self, views: &mut [Vec<Option<usize>>]) {
+        for loan in self.lent.loans() {
+            views[loan.weight][loan.expert] = Some(usize::MAX);
+        }
+    }
+
+    /// Ends the loans of `gone` experts. They read from host.
+    pub(crate) fn end<'a, D: Device>(
+        &mut self,
+        ctx: &D,
+        gone: &[(usize, usize)],
+        source: impl Fn(usize) -> Source<'a>,
+    ) -> Result<(), Error> {
+        let named = |loan: &Loan| gone.contains(&(loan.weight, loan.expert));
+        for loan in self
+            .lent
+            .loans()
+            .iter()
+            .filter(|loan| loan.ready && named(loan))
+        {
+            let s = source(loan.weight);
+            let host = s.mapped + (loan.expert * s.stride) as u64;
+            Self::point(ctx, loan, s, host)?;
+        }
+        self.lent.forget(named);
+        Ok(())
+    }
+
+    /// Points one loan's expert at `addr`.
+    fn point<D: Device>(ctx: &D, loan: &Loan, s: Source<'_>, addr: u64) -> Result<(), Error> {
+        if s.desc == 0 || s.slots[loan.expert].is_some() {
+            return Ok(());
+        }
+        let at = s.desc + (s.table + loan.expert * 8) as u64;
+        Ok(ctx.upload(at, &addr.wrapping_sub(s.desc).to_le_bytes())?)
+    }
+
+    /// Frees the slots a plan will write.
+    pub(crate) fn fit<'a, D: Device>(
+        &mut self,
+        ctx: &D,
+        // The scratch buffer's address and length, and the plan's bytes.
+        tail: Option<(u64, usize, usize)>,
+        source: impl Fn(usize) -> Source<'a>,
+    ) -> Result<(), Error> {
+        let (base, bytes, need) = tail.unwrap_or((0, 0, 0));
+        let moved = base != self.base || bytes != self.lent.bytes();
+        let out = match moved {
+            true => self.lent.rebase(bytes),
+            false => self.lent.evict(need),
+        };
+        (self.base, self.need) = (base, need);
+        if out.is_empty() {
+            return Ok(());
+        }
+        // Queued copies and steps may still use these slots.
+        ctx.finish()?;
+        for loan in out.iter().filter(|loan| loan.ready) {
+            let s = source(loan.weight);
+            let host = s.mapped + (loan.expert * s.stride) as u64;
+            Self::point(ctx, loan, s, host)?;
+        }
+        Ok(())
+    }
+
+    /// Lands queued loans, then starts loans for `picks`.
+    pub(crate) fn fill<'a, D: Device>(
+        &mut self,
+        ctx: &D,
+        picks: Vec<(usize, usize)>,
+        source: impl Fn(usize) -> Source<'a>,
+    ) -> Result<(), Error> {
+        if self.base == 0 {
+            return Ok(());
+        }
+        let landed = self.lent.land();
+        if !landed.is_empty() {
+            ctx.finish()?;
+        }
+        for loan in &landed {
+            Self::point(ctx, loan, source(loan.weight), self.base + loan.at as u64)?;
+        }
+        // A pool slot ends the expert's loan.
+        self.lent
+            .forget(|loan| source(loan.weight).slots[loan.expert].is_some());
+        let lane = ctx.active_lane();
+        ctx.set_lane(COPY_LANE);
+        let mut queued = Ok(());
+        for (weight, m) in picks {
+            let s = source(weight);
+            if s.desc == 0 || s.slots[m].is_some() {
+                continue;
+            }
+            let Some(at) = self.lent.take(weight, m, s.stride, self.need) else {
+                break;
+            };
+            queued = ctx.queue_upload(self.base + at as u64, &s.host[m * s.stride..][..s.stride]);
+            if queued.is_err() {
+                // The slot holds stale bytes, so drop the loan.
+                self.lent
+                    .forget(|loan| loan.weight == weight && loan.expert == m);
+                break;
+            }
+        }
+        ctx.set_lane(lane);
+        Ok(queued?)
     }
 }

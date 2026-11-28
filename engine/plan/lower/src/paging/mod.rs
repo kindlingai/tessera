@@ -60,6 +60,8 @@ pub trait Promote: Send {
     fn observe(&mut self, weight: usize, hits: &[u32]);
     /// The swaps to make now, best first.
     fn swaps(&mut self, weights: &[Paged]) -> Vec<Swap>;
+    /// Cold `(weight, expert)` pairs worth a free slot, best first.
+    fn fills(&self, weights: &[Paged]) -> Vec<(usize, usize)>;
 }
 
 /// Scores each expert by decayed hits.
@@ -147,6 +149,149 @@ impl Promote for Decayed {
             out.push(swap);
         }
         out
+    }
+
+    fn fills(&self, weights: &[Paged]) -> Vec<(usize, usize)> {
+        let mut ranked = Vec::new();
+        for (weight, (paged, scores)) in weights.iter().zip(&self.scores).enumerate() {
+            if !paged.ready {
+                continue;
+            }
+            for (m, (&score, slot)) in scores.iter().zip(paged.slots).enumerate() {
+                if slot.is_none() && score > self.floor {
+                    ranked.push((score, weight, m));
+                }
+            }
+        }
+        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let mut moved = 0;
+        let mut out = Vec::new();
+        for (_, weight, m) in ranked {
+            moved += weights[weight].stride;
+            if moved > self.bytes {
+                break;
+            }
+            out.push((weight, m));
+        }
+        out
+    }
+}
+
+/// VRAM slots per weight within `avail`, and their bytes.
+pub fn shares(sizes: &[(usize, usize)], avail: usize) -> (Vec<usize>, usize) {
+    // Each size is a weight's experts and bytes per expert.
+    let total: usize = sizes.iter().map(|(experts, stride)| experts * stride).sum();
+    let mut counts = Vec::with_capacity(sizes.len());
+    let mut used = 0usize;
+    // Give each paged weight a proportional share of slots.
+    for &(experts, stride) in sizes {
+        let share = ((avail as u128 * (experts * stride) as u128) / total.max(1) as u128) as usize;
+        let h = (share / stride).min(experts);
+        counts.push(h);
+        used += h * stride;
+    }
+    // Top up any leftover space with extra slots.
+    for (i, &(experts, stride)) in sizes.iter().enumerate() {
+        while counts[i] < experts && used + stride <= avail {
+            counts[i] += 1;
+            used += stride;
+        }
+    }
+    (counts, used)
+}
+
+/// One expert in a slot lent from a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loan {
+    pub weight: usize,
+    pub expert: usize,
+    /// Its slot's byte offset and length in the buffer.
+    pub at: usize,
+    pub len: usize,
+    /// Set once its bytes are in the slot.
+    pub ready: bool,
+}
+
+/// Expert slots taken top-down from a buffer's idle end.
+#[derive(Default)]
+pub struct Lent {
+    bytes: usize,
+    /// The lowest offset a slot uses.
+    low: usize,
+    loans: Vec<Loan>,
+    /// Slots of ended loans: offset and length.
+    free: Vec<(usize, usize)>,
+}
+
+impl Lent {
+    /// The buffer's length.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Starts over with `bytes` of buffer. Returns the old loans.
+    pub fn rebase(&mut self, bytes: usize) -> Vec<Loan> {
+        (self.bytes, self.low) = (bytes, bytes);
+        self.free.clear();
+        std::mem::take(&mut self.loans)
+    }
+
+    /// The loans a plan that writes `need` bytes pushes out.
+    pub fn evict(&mut self, need: usize) -> Vec<Loan> {
+        let mut out = Vec::new();
+        while let Some(loan) = self.loans.pop_if(|loan| loan.at < need) {
+            out.push(loan);
+        }
+        self.free.retain(|(at, _)| *at >= need);
+        let lows = self.loans.iter().map(|loan| loan.at);
+        let lows = lows.chain(self.free.iter().map(|(at, _)| *at));
+        self.low = lows.min().unwrap_or(self.bytes);
+        out
+    }
+
+    /// A slot of `len` bytes above `need`, if room.
+    pub fn take(&mut self, weight: usize, expert: usize, len: usize, need: usize) -> Option<usize> {
+        // A freed slot of this size keeps the stack dense.
+        let fits = |slot: &(usize, usize)| slot.1 == len && slot.0 >= need;
+        let at = match self.free.iter().position(fits) {
+            Some(i) => self.free.swap_remove(i).0,
+            None => self.low.checked_sub(len).filter(|at| *at >= need)?,
+        };
+        self.low = self.low.min(at);
+        let loan = Loan {
+            weight,
+            expert,
+            at,
+            len,
+            ready: false,
+        };
+        // Loans stay sorted by offset, highest first.
+        let after = self.loans.iter().position(|other| other.at < at);
+        self.loans.insert(after.unwrap_or(self.loans.len()), loan);
+        Some(at)
+    }
+
+    /// Marks the queued loans ready. Returns them.
+    pub fn land(&mut self) -> Vec<Loan> {
+        let mut out = Vec::new();
+        for loan in self.loans.iter_mut().filter(|loan| !loan.ready) {
+            loan.ready = true;
+            out.push(*loan);
+        }
+        out
+    }
+
+    /// Ends the loans that `gone` names and frees their slots.
+    pub fn forget(&mut self, gone: impl Fn(&Loan) -> bool) {
+        for loan in self.loans.iter().filter(|loan| gone(loan)) {
+            self.free.push((loan.at, loan.len));
+        }
+        self.loans.retain(|loan| !gone(loan));
+    }
+
+    /// Every loan, highest slot first.
+    pub fn loans(&self) -> &[Loan] {
+        &self.loans
     }
 }
 
