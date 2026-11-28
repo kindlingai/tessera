@@ -75,7 +75,7 @@ fn listed_merge(
     // Only parts that saw keys carry a sum.
     for s in 0..splits {
         let p = at + s as u64 * stride;
-        if parts[p + 1] > 0.0 {
+        if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, parts[p]);
         }
     }
@@ -84,13 +84,31 @@ fn listed_merge(
     }
     for s in 0..splits {
         let p = at + s as u64 * stride;
-        if parts[p + 1] > 0.0 {
-            let wt = exp(parts[p] - best);
-            denom += parts[p + 1] * wt;
+        if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
+            denom += parts[p + 1] * exp(parts[p] - best);
+        }
+    }
+    let inv = if (denom.to_bits() & 0x7fff_ffff) != 0 {
+        1.0 / denom
+    } else {
+        0.0
+    };
+    // Each part's scaled mean joins by its share.
+    for s in 0..splits {
+        let p = at + s as u64 * stride;
+        if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
+            let wt = (parts[p + 1] * exp(parts[p] - best)) * inv;
             sum += parts[p + 2 + d as u64] * wt;
         }
     }
-    out[gid() as u64] = if denom > 0.0 { sum / denom } else { 0.0 };
+    // A finite mean stays finite at full scale.
+    let r = sum * 4.0;
+    let finite = (sum.to_bits() & 0x7f80_0000) != 0x7f80_0000;
+    out[gid() as u64] = if finite {
+        clamp(r, f32::MIN, f32::MAX)
+    } else {
+        r
+    };
 }
 
 /// Each list's parts merged, with its sink.

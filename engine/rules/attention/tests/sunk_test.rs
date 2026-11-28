@@ -168,6 +168,24 @@ const LAUNCHES: [Runs; 5] = [
     &[(0, 193, 61), (2, 66, 19), (1, 69, 30)],
 ];
 
+/// Runs `plan` on the open runner, or opens one.
+fn advance(
+    runner: &mut Option<Box<dyn Run>>,
+    plan: tessera_lower::Plan,
+    opens: impl FnOnce(tessera_lower::Plan) -> Box<dyn Run>,
+    inputs: &[Tensor],
+) -> Tensor {
+    let r = match runner.as_mut() {
+        Some(r) => {
+            r.replan(&plan).unwrap();
+            r
+        }
+        None => runner.insert(opens(plan)),
+    };
+    let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+    r.run(&views).unwrap().remove(0)
+}
+
 /// Runs `launches` under `rule`. It must take those `takes` names.
 fn parity(c: Case, launches: &[Runs], rule: &str, takes: fn(Runs) -> bool, draws: &mut Noise) {
     let settings = host();
@@ -181,15 +199,7 @@ fn parity(c: Case, launches: &[Runs], rule: &str, takes: fn(Runs) -> bool, draws
         let took = kernels(&plan).contains(&rule);
         assert_eq!(took, takes(runs), "{c:?}: {:?}", kernels(&plan));
         let ring = plan.kept_info[0].context;
-        let r = match runner.as_mut() {
-            Some(r) => {
-                r.replan(&plan).unwrap();
-                r
-            }
-            None => runner.insert(open(plan, &settings).unwrap()),
-        };
-        let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
-        let got = r.run(&views).unwrap().remove(0);
+        let got = advance(&mut runner, plan, |p| open(p, &settings).unwrap(), &inputs);
         let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
         assert!(off < 1e-4, "{c:?} ring {ring} on {runs:?}: off {off:e}");
     }
@@ -512,6 +522,71 @@ fn odd_values_masked() {
                     }
                 }
             });
+        }
+    }
+}
+
+/// A seen NaN key turns every later row NaN.
+#[test]
+fn odd_keys_propagate() {
+    let n = 64usize;
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+        let mut inputs = flat(c, n, 1.0, -30.0, 0.0);
+        inputs[0] = Tensor::f32(vec![n, 2, width], vec![1.0; n * 2 * width]);
+        let mut k = vec![0.0f32; n * width];
+        k[width] = f32::NAN;
+        inputs[1] = Tensor::f32(vec![n, 1, width], k);
+        tiled(c, n, &inputs, &format!("w={width}"), |got, on| {
+            for (i, g) in got.iter().enumerate() {
+                let row = i / (c.heads * width);
+                let fits = if row == 0 {
+                    (g - 1.0).abs() < 2e-2
+                } else {
+                    g.is_nan()
+                };
+                assert!(fits, "{on}: row {row} got {g}");
+            }
+        });
+    }
+}
+
+/// Split parts of huge opposite values merge to zero.
+#[test]
+fn split_cancels_large() {
+    let c = case(Mask::Causal, [2, 1, 64, 1, 0]);
+    let g = graph(c);
+    for settings in runs() {
+        let dev = Device::guess(&settings).favoring(SPLIT);
+        if dev.platform.backend != "host" && dev.platform.backend != "metal" {
+            continue;
+        }
+        for big in [f32::from_bits(0x7d80_0000), f32::MAX] {
+            let (mut store, mut runner) = (Store::default(), None);
+            for (start, n) in [(0usize, 128usize), (128, 127), (255, 1)] {
+                let run = [(0u32, start as u32, n as u32)];
+                let mut inputs = feeds(c, &run, &mut Noise(57));
+                inputs[0] = Tensor::f32(vec![n, 2, 64], vec![0.0; n * 128]);
+                inputs[1] = Tensor::f32(vec![n, 1, 64], vec![0.0; n * 64]);
+                // Eight keys of one sign, then eight of the other.
+                let sign = |t: usize| if (t / 8).is_multiple_of(2) { big } else { -big };
+                let vs = (start..start + n).flat_map(|t| vec![sign(t); 64]);
+                inputs[2] = Tensor::f32(vec![n, 1, 64], vs.collect());
+                inputs[5] = Tensor::f32(vec![2], vec![f32::NEG_INFINITY; 2]);
+                let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+                let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+                let split = kernels(&plan).contains(&SPLIT);
+                let got = advance(&mut runner, plan, |p| open(p, &settings).unwrap(), &inputs);
+                if n == 1 {
+                    let on = format!("{big:e} on {}", dev.platform.backend);
+                    assert!(split, "{on}: not split");
+                    let got = got.floats().unwrap();
+                    assert!(got.iter().all(|v| v.abs() < 1e-4), "{on}: {:?}", got[0]);
+                    let want = want[0].floats().unwrap()[0];
+                    // The interpreter loses the largest values to rounding.
+                    assert!(want == 0.0 || big == f32::MAX, "{on}: interp {want}");
+                }
+            }
         }
     }
 }

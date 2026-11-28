@@ -295,8 +295,9 @@ fn soften(st: &mut Stream, #[build] bk: u32) {
         sum = sum32(sum);
         let prev = st.state[(ROWS + i) as usize] * alpha;
         let l_new = prev + sum;
-        let old_scale = if l_new > 0.0 { prev / l_new } else { 0.0 };
-        let w_norm = if l_new > 0.0 { (p / l_new) * 0.25 } else { 0.0 };
+        let live = (l_new.to_bits() & 0x7fff_ffff) != 0;
+        let old_scale = if live { prev / l_new } else { 0.0 };
+        let w_norm = if live { (p / l_new) * 0.25 } else { 0.0 };
         if lane() < bk {
             st.p_s[at] = w_norm;
         }

@@ -182,9 +182,6 @@ kernel void flash_sunk_metal(
 
             // Values replace keys while scores soften, scaled down.
             bool odd = fs_stage(kv_bits, values, row0, kv_heads, live, tid, 0.25f);
-            // Each SIMD group flags a spare score column.
-            uint flag = simd_or(odd ? 1u : 0u);
-            if (lane == 0u) p_s[simd][FS_BK] = float(flag);
             uint t = k0 + lane;
             for (uint i = 0u; i < 8u; i++) {
                 uint row = simd * 8u + i;
@@ -213,14 +210,19 @@ kernel void flash_sunk_metal(
                 sum += simd_shuffle_xor(sum, 1);
                 float prev = l[i] * alpha;
                 float l_new = prev + sum;
-                float old_scale = (l_new > 0.0f) ? (prev / l_new) : 0.0f;
-                float w_norm = (l_new > 0.0f) ? (weight / l_new) : 0.0f;
+                bool live_l = (as_type<uint>(l_new) & 0x7FFFFFFFu) != 0u;
+                odd = odd || !fs_finite(l_new);
+                float old_scale = live_l ? (prev / l_new) : 0.0f;
+                float w_norm = live_l ? (weight / l_new) : 0.0f;
                 w_bits[row * FS_NEAR + lane] = fs_bf16(float4(w_norm, 0.0f, 0.0f, 0.0f)).x;
                 p_s[row][lane] = w_norm;
                 l[i] = l_new;
                 m[i] = m_new;
                 if (lane == 0u) alpha_s[row] = old_scale;
             }
+            // Each SIMD group flags a spare score column.
+            uint flag = simd_or(odd ? 1u : 0u);
+            if (lane == 0u) p_s[simd][FS_BK] = float(flag);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Each SIMD group folds 32 output columns.
