@@ -984,4 +984,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
 }
 
-tessera_lower::rule!("rope", propose);
+tessera_lower::rule!("rope", propose_all);
+
+mod metal;
+
+fn propose_all(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let mut drafts = propose(tree, at)?;
+    if let Some(d) = metal::draft(tree, at) {
+        drafts.push(d);
+    }
+    Some(drafts)
+}
