@@ -3,7 +3,7 @@
 use crate::names::Rule;
 use crate::repack::{self, Repack};
 use crate::{Bundle, Overrides, Stream, Weights, load_tapped, offer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Slice, exlr8};
@@ -91,7 +91,7 @@ pub(crate) struct Overlay<'a> {
     primary: &'a dyn Offer,
     fallback: &'a dyn Offer,
     slices: Vec<Slice>,
-    primary_names: Vec<String>,
+    primary_names: HashSet<String>,
     /// Virtual 2D layer slices carved from 3D stacked bridge weights.
     stacked: HashMap<String, (String, usize, usize)>,
 }
@@ -103,11 +103,13 @@ fn is_stacked_bridge(s: &Slice) -> bool {
 
 impl<'a> Overlay<'a> {
     pub fn new(primary: &'a dyn Offer, fallback: &'a dyn Offer) -> Self {
-        let mut slices = Vec::new();
-        let mut primary_names = Vec::new();
+        let primary_slices = primary.slices();
+        let mut slices = Vec::with_capacity(primary_slices.len() + 2);
+        let mut primary_names = HashSet::with_capacity(primary_slices.len());
         let mut stacked = HashMap::new();
-        for s in primary.slices() {
-            primary_names.push(s.name.clone());
+        let (mut has_embed, mut has_head) = (false, false);
+        for s in primary_slices {
+            primary_names.insert(s.name.clone());
             if is_stacked_bridge(&s) {
                 let count = s.shape[0];
                 let shape = vec![s.shape[1], s.shape[2]];
@@ -121,18 +123,17 @@ impl<'a> Overlay<'a> {
                     });
                 }
             } else {
+                has_embed = has_embed || is_embed(&s.name);
+                has_head = has_head || is_head(&s.name);
                 slices.push(s);
             }
         }
-        let has_embed = slices.iter().any(|s| is_embed(&s.name));
-        let has_head = slices.iter().any(|s| is_head(&s.name));
-        for s in fallback.slices() {
-            if primary_names.contains(&s.name) {
-                continue;
-            }
-            let take = (!has_embed && is_embed(&s.name)) || (!has_head && is_head(&s.name));
-            if take {
-                slices.push(s);
+        if !has_embed || !has_head {
+            for s in fallback.slices() {
+                let take = (!has_embed && is_embed(&s.name)) || (!has_head && is_head(&s.name));
+                if take && !primary_names.contains(&s.name) {
+                    slices.push(s);
+                }
             }
         }
         Self {
@@ -145,7 +146,7 @@ impl<'a> Overlay<'a> {
     }
 
     fn source(&self, name: &str) -> &'a dyn Offer {
-        match self.primary_names.iter().any(|n| n == name) {
+        match self.primary_names.contains(name) {
             true => self.primary,
             false => self.fallback,
         }
@@ -213,11 +214,11 @@ fn has_index(name: &str) -> bool {
 }
 
 fn is_embed(name: &str) -> bool {
-    !has_index(name) && (name.contains("embed") || name.contains("embd") || name.contains("wte"))
+    (name.contains("embed") || name.contains("embd") || name.contains("wte")) && !has_index(name)
 }
 
 fn is_head(name: &str) -> bool {
-    !has_index(name) && (name.contains("lm_head") || name.starts_with("output."))
+    (name.contains("lm_head") || name.starts_with("output.")) && !has_index(name)
 }
 
 /// Whether the drafter checkpoint carries per-head Q/K norms.
