@@ -1,20 +1,21 @@
 #!/bin/sh
-# Fails a pull request that waits on a human or is stacked on a branch
-# other than the default branch. The other CI jobs still run on it.
+# Fails a pull request that waits on a human, carries a held-* label or
+# is stacked on a branch other than the default branch. The other CI jobs still run on it.
 # Reads the PR live, so a rerun sees label, setting and base changes.
 # REVIEW holds the lint-<rule> labels that lint-gate.sh asks for. Each
 # must be on the PR, added by CI, so that its review was asked for.
 # Needs GH_TOKEN, PR and GITHUB_REPOSITORY in the environment.
 set -e
-# Four words: labeled for review, a fork maintainers cannot push to,
-# the base branch and the default branch.
+# Five words: labeled for review, a fork maintainers cannot push to,
+# the first held-* label or "-", the base branch and the default branch.
 state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '[
     (.labels | any(.name == "needs-human-review")),
     (.head.repo.full_name != .base.repo.full_name and (.maintainer_can_modify | not)),
+    ([.labels[].name | select(startswith("held-"))] | first // "-"),
     .base.ref, .base.repo.default_branch
 ] | map(tostring) | join(" ")')
 # Branch names cannot hold spaces.
-read -r review locked base main <<EOF
+read -r review locked held base main <<EOF
 $state
 EOF
 status=0
@@ -25,6 +26,10 @@ if [ "$base" != "$main" ]; then
 fi
 if [ "$review" = true ]; then
     echo "Protected files changed or a size limit breached. A maintainer reviews, then removes needs-human-review."
+    status=1
+fi
+if [ "$held" != - ]; then
+    echo "This PR is on hold: $held. Remove the label to land it."
     status=1
 fi
 if [ "$locked" = true ]; then
