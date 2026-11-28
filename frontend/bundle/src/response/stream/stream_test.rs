@@ -425,6 +425,10 @@ fn check_tag_capture_allowlist() {
         r"(?s)<parameter=(?P<key>[^<]+)>(?P<value>.*?)</parameter>",
         r"(?s)<parameter=(?P<key>[^>]+)</key>(?P<value>.*?)</parameter>",
         r"(?s)<parameter=(?P<key>[^>]+)>\s*(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>.+?)>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>[\s\S]+?)>(?P<value>.*?)</parameter>",
+        r"(?s)<k=(?P<key>[^>]+)>\s*<v>(?P<value>.*?)</v>",
+        r"<arg_key>(?P<key>[\s\S]*?)</arg_key>\s* <arg_value>(?P<value>[\s\S]*?)</arg_value>",
     ];
     for pat in rejected {
         assert!(TagDelims::from_pattern(pat).is_none(), "{pat}");
@@ -479,6 +483,62 @@ fn check_tag_capture_allowlist() {
         ),
     ];
     assert_tag_parity(qwen_pat, &key_edge_cases);
+    let wild_pat = r"(?s)<parameter=(?P<key>.+?)>(?P<value>.*?)</parameter>";
+    let wild_cases = [
+        (
+            [
+                "<tool_call><function=ping><parameter=>>1</parameter></function>",
+                " All done.",
+            ],
+            json!({">": 1}),
+        ),
+        (
+            [
+                "<tool_call><function=ping><parameter=x>1</parameter></function>",
+                " All done.",
+            ],
+            json!({"x": 1}),
+        ),
+    ];
+    assert_tag_parity(wild_pat, &wild_cases);
+    check_glm_key_parity();
+}
+
+fn check_glm_key_parity() {
+    let glm_cases = [
+        (
+            [
+                "<tool_call>ping\n<arg_key>x</arg_key>junk<arg_value>1</arg_value></tool_call>",
+                " All done.",
+            ],
+            json!({}),
+        ),
+        (
+            [
+                "<tool_call>ping\n<arg_key>a</arg_key>b</arg_key> <arg_value>1</arg_value></tool_call>",
+                " All done.",
+            ],
+            json!({"a</arg_key>b": 1}),
+        ),
+        (
+            [
+                "<tool_call>ping\n<arg_key>x</arg_key> \n\t<arg_value>1</arg_value></tool_call>",
+                " All done.",
+            ],
+            json!({"x": 1}),
+        ),
+    ];
+    for buffered in [false, true] {
+        let mut tmpl: Value = serde_json::from_str(include_str!("../glm53.json")).unwrap();
+        if buffered {
+            let t = tmpl["fields"]["tool_calls"].as_object_mut().unwrap();
+            t.remove("close");
+            t.insert("close_pattern".into(), json!("[<]/tool_call>"));
+        }
+        let cfg = json!({"response_template": tmpl}).to_string();
+        let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+        assert_parser_cases(&parser, &glm_cases);
+    }
 }
 
 fn assert_tag_parity(tag_pat: &str, cases: &[([&str; 2], Value)]) {
@@ -492,29 +552,33 @@ fn assert_tag_parity(tag_pat: &str, cases: &[([&str; 2], Value)]) {
         }}}})
         .to_string();
         let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
-        for (pieces, want) in cases {
-            let full = pieces.concat();
-            let whole = parser.parse(&full, true, false);
-            assert_eq!(whole.content, " All done.");
-            assert_eq!(whole.tool_calls.len(), 1);
-            assert_eq!(whole.tool_calls[0].function.name, "ping");
-            assert_eq!(&whole.tool_calls[0].function.arguments, want);
-            let mut stream = parser.stream(true, false);
-            let mut events = Vec::new();
-            for p in pieces {
-                stream.push(p, &mut events);
-            }
-            stream.finish(&mut events);
-            assert_stream_result(&events, want);
-            let mut char_stream = parser.stream(true, false);
-            let mut char_events = Vec::new();
-            for ch in full.chars() {
-                let mut buf = [0u8; 4];
-                char_stream.push(ch.encode_utf8(&mut buf), &mut char_events);
-            }
-            char_stream.finish(&mut char_events);
-            assert_stream_result(&char_events, want);
+        assert_parser_cases(&parser, cases);
+    }
+}
+
+fn assert_parser_cases(parser: &ResponseParser, cases: &[([&str; 2], Value)]) {
+    for (pieces, want) in cases {
+        let full = pieces.concat();
+        let whole = parser.parse(&full, true, false);
+        assert_eq!(whole.content, " All done.");
+        assert_eq!(whole.tool_calls.len(), 1);
+        assert_eq!(whole.tool_calls[0].function.name, "ping");
+        assert_eq!(&whole.tool_calls[0].function.arguments, want);
+        let mut stream = parser.stream(true, false);
+        let mut events = Vec::new();
+        for p in pieces {
+            stream.push(p, &mut events);
         }
+        stream.finish(&mut events);
+        assert_stream_result(&events, want);
+        let mut char_stream = parser.stream(true, false);
+        let mut char_events = Vec::new();
+        for ch in full.chars() {
+            let mut buf = [0u8; 4];
+            char_stream.push(ch.encode_utf8(&mut buf), &mut char_events);
+        }
+        char_stream.finish(&mut char_events);
+        assert_stream_result(&char_events, want);
     }
 }
 

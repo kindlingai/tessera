@@ -45,7 +45,8 @@ impl TagDelims {
             Some((kc, vo)) => {
                 let (vo, nl) = strip_opt_nl_end(vo);
                 let val_open = unescape_lit(vo)?;
-                (!val_open.is_empty()).then_some(())?;
+                (!val_open.is_empty() && !val_open.starts_with(char::is_whitespace))
+                    .then_some(())?;
                 (unescape_lit(kc)?, val_open, nl)
             }
             None => {
@@ -53,7 +54,8 @@ impl TagDelims {
                 (unescape_lit(kc)?, String::new(), nl)
             }
         };
-        let (key_nonempty, key_forbid_nl) = allow_key_body(key_body, &key_close, dotall)?;
+        let (key_nonempty, key_forbid_nl) =
+            allow_key_body(key_body, &key_close, &val_open, dotall)?;
         let (vc, trim_trail_nl) = strip_opt_nl_start(&after_key[val_end + 1..]);
         let val_close = parse_literal_closers(vc)?;
         if key_open.is_empty() || key_close.is_empty() || val_close.is_empty() {
@@ -106,10 +108,6 @@ pub(super) enum TagPhase {
     },
     ReadKey {
         first: bool,
-    },
-    SeekValOpen {
-        first: bool,
-        key: String,
     },
     WaitValLead {
         first: bool,
@@ -383,9 +381,9 @@ impl ToolState {
                 let start = delims.key_open.len();
                 let tail = &buf[start..];
                 let close = spec.close.find_for(buf, eof);
-                let key_at = tail.find(delims.key_close.as_str());
+                let key_hit = find_key_end(tail, delims);
                 if let Some(nl) = delims.key_forbid_nl.then(|| tail.find('\n')).flatten()
-                    && key_at.is_none_or(|k| nl < k)
+                    && key_hit.is_none_or(|(k, _)| nl < k)
                 {
                     if let Some((c_at, c_len)) = close
                         && c_at <= start + nl
@@ -397,32 +395,15 @@ impl ToolState {
                     }
                     return StepOutcome::Wait;
                 }
-                if let Some(k) = key_at
-                    && close.is_none_or(|(end, _)| start + k + delims.key_close.len() <= end)
-                    && (eof || close.is_some() || start + k + delims.key_close.len() <= safe_end)
+                if let Some((k, end)) = key_hit
+                    && close.is_none_or(|(c_at, _)| start + end <= c_at)
+                    && (eof || close.is_some() || start + end <= safe_end)
                 {
                     if delims.key_nonempty && k == 0 {
                         return reject_key(buf, phase, first);
                     }
                     let key = tail[..k].to_string();
-                    buf.drain(..start + k + delims.key_close.len());
-                    *phase = next_after_key(delims, first, key);
-                    return StepOutcome::Continue;
-                }
-                if let Some((at, len)) = close {
-                    return close_tags(buf, out, at + len);
-                }
-                StepOutcome::Wait
-            }
-            TagPhase::SeekValOpen { first, key } => {
-                let close = spec.close.find_for(buf, eof);
-                if let Some(at) = buf.find(delims.val_open.as_str())
-                    && close.is_none_or(|(end, _)| at + delims.val_open.len() <= end)
-                    && (eof || close.is_some() || at + delims.val_open.len() <= safe_end)
-                {
-                    let first = *first;
-                    let key = std::mem::take(key);
-                    buf.drain(..at + delims.val_open.len());
+                    buf.drain(..start + end);
                     *phase = next_after_val_open(delims, first, key);
                     return StepOutcome::Continue;
                 }
@@ -690,14 +671,6 @@ fn finish_tags(phase: &mut TagPhase, spec: &BlockSpec, rest: &str, out: &mut Vec
     }
 }
 
-fn next_after_key(delims: &TagDelims, first: bool, key: String) -> TagPhase {
-    if delims.val_open.is_empty() {
-        next_after_val_open(delims, first, key)
-    } else {
-        TagPhase::SeekValOpen { first, key }
-    }
-}
-
 fn next_after_val_open(delims: &TagDelims, first: bool, key: String) -> TagPhase {
     if delims.trim_lead_nl {
         TagPhase::WaitValLead { first, key }
@@ -934,16 +907,42 @@ fn reject_key(buf: &mut String, phase: &mut TagPhase, first: bool) -> StepOutcom
     StepOutcome::Continue
 }
 
+fn find_key_end(tail: &str, delims: &TagDelims) -> Option<(usize, usize)> {
+    if delims.val_open.is_empty() {
+        let k = tail.find(delims.key_close.as_str())?;
+        return Some((k, k + delims.key_close.len()));
+    }
+    let mut pos = 0;
+    while let Some(rel) = tail[pos..].find(delims.key_close.as_str()) {
+        let k = pos + rel;
+        let after_kc = k + delims.key_close.len();
+        let ws_end = after_kc
+            + tail[after_kc..]
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(tail.len() - after_kc);
+        if tail[ws_end..].starts_with(delims.val_open.as_str()) {
+            return Some((k, ws_end + delims.val_open.len()));
+        }
+        pos = k + tail[k..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
 fn is_lazy_any(body: &str, dotall: bool) -> bool {
     body == r"[\s\S]*?" || (dotall && body == ".*?")
 }
 
-fn allow_key_body(body: &str, key_close: &str, dotall: bool) -> Option<(bool, bool)> {
+fn allow_key_body(
+    body: &str,
+    key_close: &str,
+    val_open: &str,
+    dotall: bool,
+) -> Option<(bool, bool)> {
     if is_lazy_any(body, dotall) {
         return Some((false, false));
     }
-    if body == r"[\s\S]+?" || (dotall && body == ".+?") {
-        return Some((true, false));
+    if !val_open.is_empty() {
+        return None;
     }
     let rest = body.strip_prefix("[^")?;
     let (inner, nonempty) = match rest.strip_suffix("]+?").or(rest.strip_suffix("]+")) {
