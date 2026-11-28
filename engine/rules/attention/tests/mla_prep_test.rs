@@ -136,6 +136,8 @@ fn kv_scatter_matches() {
         (16, 6, Pairs::Adjacent, F32_FORM, 1e-4, false),
         (32, 16, Pairs::Adjacent, BF16_FORM, 2e-2, false),
         (32, 16, Pairs::Adjacent, FP8_FORM, 0.25, false),
+        (512, 64, Pairs::Adjacent, F32_FORM, 1e-4, false),
+        (1152, 16, Pairs::Adjacent, F32_FORM, 1e-4, false),
     ];
     for (lat, rope, pairs, form, tol, force_plain) in cases {
         let g = kv_graph(lat, rope, pairs);
@@ -145,8 +147,10 @@ fn kv_scatter_matches() {
             _ => Pins::default().activations(BF16_FORM).kept(form),
         };
         for &layout in &layouts {
-            // Odd-rope checks dense and paged16 layouts.
-            if rope == 6 && layout.name() != "dense" && layout.name() != "paged16" {
+            // Odd-rope and wide-latent cases run on dense layouts.
+            if (rope == 6 && layout.name() != "dense" && layout.name() != "paged16")
+                || (lat > 32 && layout.name() != "dense")
+            {
                 continue;
             }
             for settings in runs() {

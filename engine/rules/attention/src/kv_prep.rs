@@ -9,6 +9,22 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Needs, Shape, Source, Step, T, T
 /// Elements one wide load brings per lane.
 const WIDE: u32 = 4;
 
+/// Maximum wide trips cached in registers across passes.
+const CACHE_TRIPS: u32 = 8;
+
+/// Per-lane register slots for cached pass-1 latent values.
+const CACHE_SLOTS: usize = (CACHE_TRIPS * WIDE) as usize;
+
+/// Cached wide trip count for `latent`, or zero when uncached.
+fn cache_trips(latent: usize) -> u32 {
+    let trips = latent.div_ceil(LANES * WIDE as usize);
+    if trips <= CACHE_TRIPS as usize {
+        trips as u32
+    } else {
+        0
+    }
+}
+
 /// Rotation angle for one rotary pair at `pos`.
 #[kernel]
 pub(crate) fn rope_angle(pos: u32, pair: u32, width: u32, turned: u32, theta: f32) -> f32 {
@@ -36,6 +52,7 @@ fn kv_scatter(
     theta: f32,
     #[build] lanes: bool,
     #[build] adjacent: bool,
+    #[build] cached: u32,
     #[build] x_form: &'static dyn Stored,
     #[build] w_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
@@ -51,22 +68,55 @@ fn kv_scatter(
     let out_at = kept_row(slot, pos) as u64 * width as u64;
     if lanes {
         let l = lane();
+        let stride = LANES as u32 * WIDE;
+        let mut vals = [0.0f32; CACHE_SLOTS];
         let mut acc = 0.0f32;
-        for i in (l * WIDE..latent).by(LANES as u32 * WIDE) {
-            let v = x.load4(in_at + i as u64);
-            acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        if cached > 0 {
+            for t in (0..cached).unroll(CACHE_TRIPS) {
+                let i = l * WIDE + t * stride;
+                if i < latent {
+                    let v = x.load4(in_at + i as u64);
+                    let base = (t * WIDE) as usize;
+                    vals[base] = v.x;
+                    vals[base + 1] = v.y;
+                    vals[base + 2] = v.z;
+                    vals[base + 3] = v.w;
+                    acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+                }
+            }
+        } else {
+            for i in (l * WIDE..latent).by(stride) {
+                let v = x.load4(in_at + i as u64);
+                acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
         }
         acc = sum32(acc);
         let inv = rsqrt(acc / latent as f32 + eps);
-        for i in (l * WIDE..latent).by(LANES as u32 * WIDE) {
-            let v = x.load4(in_at + i as u64);
-            let g = w.load4(i as u64);
-            let mut o = F32x4::zero();
-            o.x = v.x * inv * g.x;
-            o.y = v.y * inv * g.y;
-            o.z = v.z * inv * g.z;
-            o.w = v.w * inv * g.w;
-            out.store4(out_at + i as u64, o);
+        if cached > 0 {
+            for t in (0..cached).unroll(CACHE_TRIPS) {
+                let i = l * WIDE + t * stride;
+                if i < latent {
+                    let g = w.load4(i as u64);
+                    let base = (t * WIDE) as usize;
+                    let mut o = F32x4::zero();
+                    o.x = vals[base] * inv * g.x;
+                    o.y = vals[base + 1] * inv * g.y;
+                    o.z = vals[base + 2] * inv * g.z;
+                    o.w = vals[base + 3] * inv * g.w;
+                    out.store4(out_at + i as u64, o);
+                }
+            }
+        } else {
+            for i in (l * WIDE..latent).by(stride) {
+                let v = x.load4(in_at + i as u64);
+                let g = w.load4(i as u64);
+                let mut o = F32x4::zero();
+                o.x = v.x * inv * g.x;
+                o.y = v.y * inv * g.y;
+                o.z = v.z * inv * g.z;
+                o.w = v.w * inv * g.w;
+                out.store4(out_at + i as u64, o);
+            }
         }
     } else {
         let mut acc = 0.0f32;
@@ -137,14 +187,20 @@ fn kv_emits(k: &KvScatter, form: &dyn Stored) -> bool {
 }
 
 fn kv_source(k: &KvScatter) -> Source {
+    let cached = if k.lanes { cache_trips(k.latent) } else { 0 };
     let body = kept::attach(
-        kv_scatter_ir(k.lanes, k.adjacent, k.x_form, k.w_form, k.out_form),
+        kv_scatter_ir(k.lanes, k.adjacent, cached, k.x_form, k.w_form, k.out_form),
         k.kept,
     );
     let mode = if k.lanes { "l" } else { "p" };
     let pair = if k.adjacent { "a" } else { "h" };
+    let tag = if cached > 0 {
+        format!("_c{cached}")
+    } else {
+        String::new()
+    };
     let entry = format!(
-        "plan_mla_kv_{mode}_{pair}_{}_{}_{}_{}",
+        "plan_mla_kv_{mode}_{pair}{tag}_{}_{}_{}_{}",
         k.kept.name(),
         k.x_form.name(),
         k.w_form.name(),
