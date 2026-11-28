@@ -113,9 +113,6 @@ fn linear_mm_entries() {
     ] {
         assert!(cuda.contains(entry), "missing {entry}");
     }
-    for entry in ["DTR_DEF(dtr_k4_t4,", "dtr_gen4(", "dtr_reduce("] {
-        assert!(trellis_source().contains(entry), "missing {entry}");
-    }
     for entry in [
         "dtr_prep(",
         "dtr_pre_k4_t8(",
@@ -128,7 +125,12 @@ fn linear_mm_entries() {
     ] {
         assert!(prefill_source().contains(entry), "missing {entry}");
     }
-    for entry in ["DTR_DEF(dtr_k4_t4,", "DTR_GEN_DEF(dtr_gen4,", "ptr_gen("] {
+    for entry in [
+        "DTR_DEF(dtr_k4_t4,",
+        "DTR_GEN_DEF(dtr_gen4,",
+        "dtr_reduce(",
+        "ptr_gen(",
+    ] {
         assert!(trellis_source().contains(entry), "missing {entry}");
     }
 }
