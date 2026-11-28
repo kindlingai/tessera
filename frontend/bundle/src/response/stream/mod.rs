@@ -432,9 +432,11 @@ impl ToolState {
                 StepOutcome::Continue
             }
             TagPhase::DetectVal { first, key, held } => {
+                let val_needles = delims.val_needles();
                 let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
-                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, eof) {
+                let val_safe = buf.len() - usize::from(!eof) * tail_hold(buf, &val_needles);
+                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, val_safe, eof) {
                     held.push_str(&buf[..hit.at]);
                     buf.drain(..hit.drain);
                     if hit.trim && delims.trim_trail_nl && held.ends_with('\n') {
@@ -454,9 +456,8 @@ impl ToolState {
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                let val_needles = delims.val_needles();
                 let raw = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
-                let emit = cap_tag_emit(buf, raw, val_hit, delims.trim_trail_nl);
+                let emit = cap_tag_emit(buf, raw, val_hit, blk_hit, delims.trim_trail_nl);
                 if emit > 0 {
                     held.push_str(&buf[..emit]);
                     buf.drain(..emit);
@@ -474,9 +475,11 @@ impl ToolState {
                 StepOutcome::Wait
             }
             TagPhase::StreamString => {
+                let val_needles = delims.val_needles();
                 let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
-                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, eof) {
+                let val_safe = buf.len() - usize::from(!eof) * tail_hold(buf, &val_needles);
+                if let Some(hit) = pick_tag_hit(val_hit, blk_hit, safe_end, val_safe, eof) {
                     let mut chunk = &buf[..hit.at];
                     if hit.trim && delims.trim_trail_nl {
                         chunk = chunk.strip_suffix('\n').unwrap_or(chunk);
@@ -492,9 +495,8 @@ impl ToolState {
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                let val_needles = delims.val_needles();
                 let raw = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
-                let emit = cap_tag_emit(buf, raw, val_hit, delims.trim_trail_nl);
+                let emit = cap_tag_emit(buf, raw, val_hit, blk_hit, delims.trim_trail_nl);
                 if emit > 0 {
                     let escaped = json_escape_inner(&buf[..emit]);
                     buf.drain(..emit);

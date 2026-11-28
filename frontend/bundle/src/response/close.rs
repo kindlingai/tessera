@@ -227,6 +227,7 @@ pub(super) fn pick_tag_hit(
     val_hit: Option<(usize, usize)>,
     blk_hit: Option<(usize, usize)>,
     safe_end: usize,
+    val_safe: usize,
     eof: bool,
 ) -> Option<TagHit> {
     if let Some((at, len)) = val_hit {
@@ -241,6 +242,9 @@ pub(super) fn pick_tag_hit(
         }
     }
     let (b_at, b_len) = blk_hit?;
+    if !eof && val_hit.is_none() && val_safe <= b_at {
+        return None;
+    }
     let (at, trim) = match val_hit {
         Some((v_at, _)) if v_at <= b_at => (v_at, true),
         _ => (b_at, false),
@@ -253,20 +257,22 @@ pub(super) fn pick_tag_hit(
     })
 }
 
-/// Caps safe emission before any held value closer match.
+/// Caps safe emission before any held closer match.
 pub(super) fn cap_tag_emit(
     buf: &str,
     emit: usize,
     val_hit: Option<(usize, usize)>,
+    blk_hit: Option<(usize, usize)>,
     trim_nl: bool,
 ) -> usize {
-    let Some((mut cap, _)) = val_hit else {
-        return emit;
-    };
-    if trim_nl && cap > 0 && buf.as_bytes()[cap - 1] == b'\n' {
-        cap -= 1;
+    let mut out = emit;
+    for (mut cap, _) in [val_hit, blk_hit].into_iter().flatten() {
+        if trim_nl && cap > 0 && buf.as_bytes()[cap - 1] == b'\n' {
+            cap -= 1;
+        }
+        out = out.min(cap);
     }
-    emit.min(cap)
+    out
 }
 
 /// Next tag capture bounded inside `body_len`.
