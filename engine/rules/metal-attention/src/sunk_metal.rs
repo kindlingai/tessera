@@ -1,9 +1,14 @@
 //! Metal bf16 matrix-unit tiles for wide ragged prefill.
 
-use super::sunk::{FlashSunk, GUESS, LACKS, check_sunk, sunk_accepts, sunk_emits, sunk_launches};
-use super::*;
-use crate::listed::Sizes;
-use tessera_lower::ByBackend;
+use tessera_attention::flash::THREADS;
+use tessera_attention::flash::sunk::{
+    BK, FlashSunk, GUESS, LACKS, check_sunk, sited, sunk_accepts, sunk_emits, sunk_launches,
+    why_not,
+};
+use tessera_attention::listed::Sizes;
+use tessera_codegen::prelude::*;
+use tessera_graph::Order;
+use tessera_lower::{ByBackend, Draft, Kernel, Launch, Needs, Source, Step, T, Tree};
 
 /// Queries and keys per block.
 const BLOCK: usize = 32;
@@ -60,12 +65,14 @@ fn launches(k: &SunkMetal, step: &Step) -> Vec<Launch> {
 }
 
 /// Dense and ring layouts read one scalar alike.
-pub(super) fn fits(s: &Sizes) -> bool {
+fn fits(s: &Sizes) -> bool {
     let plain = ["dense", "ring"].contains(&s.kept.name());
     plain && s.width == WIDTH && check_sunk(s, BLOCK as u32).is_ok()
 }
 
-pub(super) fn draft(sunk: FlashSunk, reads: [Read; 7]) -> Draft {
-    let len = sunk.0.len;
-    Draft::new(SunkMetal(sunk), reads, len)
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (sunk, reads) = sited(tree, at, |s| check_sunk(s, BK).is_ok() && fits(s))?;
+    Some(vec![Draft::new(SunkMetal(sunk), reads, sunk.0.len)])
 }
+
+tessera_lower::rule!("flash_sunk_metal", propose, why = why_not, lacks = LACKS);

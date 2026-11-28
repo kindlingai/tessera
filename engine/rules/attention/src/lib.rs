@@ -1,17 +1,15 @@
 //! Attention rules for the CPU and GPU. Linking registers them.
 
 mod attend;
-mod attn_metal;
 mod conv;
 mod cpu;
 mod delta;
-mod delta_metal;
-mod flash;
+pub mod flash;
 mod flash_rows;
-mod indexer;
+pub mod indexer;
 mod join_rope;
 mod kv_prep;
-mod listed;
+pub mod listed;
 mod packed;
 mod packed_gpu;
 mod slots;

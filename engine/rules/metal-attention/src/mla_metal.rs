@@ -1,6 +1,6 @@
 //! Native Metal grouped-Q split-K MLA attention kernels.
 
-use crate::indexer::{k_fmt_idx, kept_params, plain_fmt};
+use crate::indexer_metal::{k_fmt_idx, kept_params, plain_fmt};
 use tessera_codegen::kept::{Dense, Layout};
 use tessera_graph::{Op, Order, View};
 use tessera_lower::form::{Load as Stored, plain, writable};
@@ -13,7 +13,7 @@ const GEN_THREADS: usize = 256;
 const MLA_WIDTH: usize = 576;
 const MLA_LATENT: usize = 512;
 const MAX_GEN_WIDTH: usize = 1024;
-const SOURCE: &str = concat!(include_str!("../kv.metal"), include_str!("mla_metal.metal"));
+const SOURCE: &str = concat!(include_str!("kv.metal"), include_str!("mla_metal.metal"));
 /// Low default guess so Metal prefers native MLA attention.
 const GUESS: f64 = 1.0e-12;
 
@@ -286,7 +286,7 @@ fn red_launches(r: &MetalMlaReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let outer = tree.node(at);
     let (attend_t, sliced_out) = if let Term::Op(Op::View(View::Slice { axis: 2, start, .. })) =
         &outer.term
@@ -395,3 +395,5 @@ pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         ])
     }
 }
+
+tessera_lower::rule!("mla_metal", propose);

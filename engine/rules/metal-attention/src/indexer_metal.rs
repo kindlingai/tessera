@@ -1,13 +1,16 @@
 //! Native Metal simdgroup_matrix Lightning Indexer scoring kernel.
 
-use super::Sizes;
+use tessera_attention::indexer::{Sizes, find_site};
 use tessera_codegen::kept::Layout;
 use tessera_graph::Order;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 
 const THREADS: usize = 128;
-const SOURCE: &str = concat!(include_str!("../kv.metal"), include_str!("metal.metal"));
+const SOURCE: &str = concat!(
+    include_str!("kv.metal"),
+    include_str!("indexer_metal.metal")
+);
 /// Low default guess so Metal prefers native MMA indexer scoring.
 const GUESS: f64 = 1.0e-12;
 
@@ -73,14 +76,13 @@ fn tile_keys(s: &Sizes) -> usize {
     }
 }
 
-/// Returns the Metal MMA indexer draft when `sizes` fits.
-pub(super) fn drafts(sizes: Sizes, reads: &[T], out: usize) -> Vec<Draft> {
-    if fits(&sizes) {
-        vec![Draft::new(IndexerMetal(sizes), reads.iter().copied(), out).choice(2)]
-    } else {
-        Vec::new()
-    }
+/// Proposes the Metal MMA indexer draft when the site fits.
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (sizes, reads) = find_site(tree, at)?;
+    fits(&sizes).then(|| vec![Draft::new(IndexerMetal(sizes), reads, sizes.out_len())])
 }
+
+tessera_lower::rule!("indexer_metal", propose);
 
 /// Whether `s` fits the native Metal MMA Lightning Indexer kernel.
 fn fits(s: &Sizes) -> bool {

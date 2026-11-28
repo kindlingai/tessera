@@ -459,7 +459,7 @@ fn listed_mix(
 
 /// Query rows over `[Seqs, Keys, KvHeads, Width]` keys.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Sizes {
+pub struct Sizes {
     pub len: usize,
     pub seqs: usize,
     /// Queries per sequence. Ragged rows have one each.

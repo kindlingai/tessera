@@ -2,6 +2,7 @@
 
 use tessera_attention as _;
 use tessera_kernels as _;
+use tessera_metal_attention as _;
 
 use tessera_graph::DimName::{self, Context, HeadDim, Heads, KvHeads, Rows, Segments, Seqs};
 use tessera_graph::{DType, Dim, Graph, Size, TensorType};
@@ -345,7 +346,7 @@ fn sunk_metal_is_picked() {
             .iter()
             .find(|s| s.kernel.name() == METAL)
             .unwrap();
-        assert_eq!(step.rule, RULE);
+        assert_eq!(step.rule, METAL);
         let Source::Fixed { entry, .. } = step.kernel.source() else {
             panic!("a fixed kernel");
         };
@@ -402,14 +403,15 @@ fn tiled(c: Case, n: usize, inputs: &[Tensor], label: &str, check: impl Fn(&[f32
     let g = graph(c);
     let run = [(0u32, 0u32, n as u32)];
     for settings in runs() {
-        let dev = Device::guess(&settings).favoring(RULE);
+        let dev = Device::guess(&settings);
         if dev.platform.backend != "host" && dev.platform.backend != "metal" {
             continue;
         }
         let bf16 = dev.platform.backend == "metal" && dev.platform.limits.msl_bfloat;
+        let expect_kernel = if c.width == 128 && bf16 { METAL } else { RULE };
+        let dev = dev.favoring(expect_kernel);
         let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
         let names = kernels(&plan);
-        let expect_kernel = if c.width == 128 && bf16 { METAL } else { RULE };
         assert!(names.contains(&expect_kernel), "picked {names:?}");
         let mut runner = open(plan, &settings).unwrap();
         let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
@@ -863,7 +865,7 @@ fn sunk_metal_matches() {
         for launch in LAUNCHES {
             let inputs = feeds(c, launch, &mut draws);
             let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
-            let device = Device::guess(&settings).favoring(RULE);
+            let device = Device::guess(&settings).favoring(METAL);
             let plan = lower(&g, 0, &sizes(launch), &device).unwrap();
             assert!(kernels(&plan).contains(&METAL), "{c:?}: {launch:?}");
             let r = match runner.as_mut() {
