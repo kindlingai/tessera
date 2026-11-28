@@ -100,6 +100,7 @@ impl Precision {
     }
 
     /// `x` in the tile's form: `(hi, lo)` pieces.
+    #[inline]
     pub fn split(&self, x: f32) -> (f32, f32) {
         match self.operand {
             Operand::F32 => (x, 0.0),
@@ -115,43 +116,73 @@ impl Precision {
     }
 
     /// `acc + sum`, in the accumulator's precision.
+    #[inline]
     pub fn accumulate(&self, acc: f32, sum: f32) -> f32 {
         let total = acc + sum;
-        if !self.truncates || total == 0.0 || !total.is_finite() {
+        if !self.truncates || self.acc_bits >= 24 {
             return total;
         }
-        let ulp = 2f32.powi(total.abs().log2().floor() as i32 - self.acc_bits as i32 + 1);
-        (total / ulp).trunc() * ulp
+        let bits = total.to_bits();
+        let exp = (bits >> 23) & 0xff;
+        if exp == 0 || exp == 0xff {
+            return if total == 0.0 || exp == 0xff {
+                total
+            } else {
+                truncate_subnormal(total, self.acc_bits)
+            };
+        }
+        let shift = 24 - self.acc_bits;
+        f32::from_bits(bits & !((1u32 << shift) - 1))
     }
 }
 
-/// `x` rounded to `bits` significant bits, ties away from zero.
-fn round_to(x: f32, bits: i32) -> f32 {
-    if x == 0.0 || !x.is_finite() {
-        return x;
-    }
-    let ulp = 2f32.powi(x.abs().log2().floor() as i32 - bits + 1);
-    (x / ulp).round() * ulp
+#[cold]
+fn truncate_subnormal(total: f32, acc_bits: u32) -> f32 {
+    let x = f64::from(total);
+    let ulp = 2f64.powi(x.abs().log2().floor() as i32 - acc_bits as i32 + 1);
+    ((x / ulp).trunc() * ulp) as f32
 }
 
-/// `x` as tf32: 11 significant bits, f32's exponent.
+#[cold]
+fn round_subnormal(x: f32, bits: i32) -> f32 {
+    let v = f64::from(x);
+    let ulp = 2f64.powi(v.abs().log2().floor() as i32 - bits + 1);
+    ((v / ulp).round() * ulp) as f32
+}
+
+/// `x` as tf32: 11 significant bits, ties away from zero.
 fn tf32(x: f32) -> f32 {
-    round_to(x, 11)
+    let raw = x.to_bits();
+    let exp = (raw >> 23) & 0xff;
+    if exp == 0 || exp == 0xff {
+        return if x == 0.0 || exp == 0xff {
+            x
+        } else {
+            round_subnormal(x, 11)
+        };
+    }
+    f32::from_bits((raw + 0x1000) & !0x1fff)
 }
 
 /// `x` as f16, subnormals kept, overflow to infinity.
 fn f16(x: f32) -> f32 {
-    if x == 0.0 || !x.is_finite() {
+    let bits = x.to_bits();
+    let sign = bits & 0x8000_0000;
+    let mag = bits & 0x7fff_ffff;
+    if mag >= 0x7f80_0000 || mag == 0 {
         return x;
     }
-    let exp = x.abs().log2().floor() as i32;
-    // Below 2^-14 the step stays at 2^-24.
-    let ulp = 2f32.powi((exp - 10).max(-24));
-    let rounded = (x / ulp).round_ties_even() * ulp;
-    if rounded.abs() > 65504.0 {
-        return f32::INFINITY.copysign(x);
+    if mag >= 0x3880_0000 {
+        let half = 0x0fff + ((mag >> 13) & 1);
+        let r = mag.wrapping_add(half) & !0x1fff;
+        if r > 0x477f_e000 {
+            return f32::from_bits(sign | 0x7f80_0000);
+        }
+        return f32::from_bits(sign | r);
     }
-    rounded
+    const STEP: f32 = f32::from_bits(0x3380_0000);
+    const INV_STEP: f32 = f32::from_bits(0x4b80_0000);
+    (x * INV_STEP).round_ties_even() * STEP
 }
 
 /// How many rounded sums reach one output of a tree.
@@ -166,21 +197,44 @@ pub struct Terms {
 impl Terms {
     /// The error allowed in `x` times `w` transposed, `k` wide.
     pub fn matmul(&self, p: &Precision, x: &[f32], w: &[f32], k: usize) -> f32 {
-        let op = |v: &[f32]| -> Vec<f32> {
-            match self.tile > 0.0 {
-                true => v.iter().map(|x| p.operand_error(*x)).collect(),
-                false => v.iter().map(|x| x.abs() * 2f32.powi(-24)).collect(),
-            }
+        let tiled = self.tile > 0.0;
+        let eps = if tiled {
+            2f32.powi(-(p.bits() as i32))
+        } else {
+            2f32.powi(-24)
         };
-        let (ex, ew) = (op(x), op(w));
+        let floor = if tiled { p.floor() } else { 0.0 };
         let adds = self.tile as f32 * p.acc_error() + self.lane as f32 * 2f32.powi(-24);
         let mut most = 0.0f32;
-        for (xi, exi) in x.chunks(k).zip(ex.chunks(k)) {
-            for (wj, ewj) in w.chunks(k).zip(ew.chunks(k)) {
+        if floor == 0.0 {
+            let scale = 2.0 * eps + adds;
+            for xi in x.chunks(k) {
+                for wj in w.chunks(k) {
+                    let mut acc = [0.0f32; 4];
+                    let (xc, xr) = xi.as_chunks::<4>();
+                    let (wc, wr) = wj.as_chunks::<4>();
+                    for (a, b) in xc.iter().zip(wc) {
+                        for lane in 0..4 {
+                            acc[lane] += a[lane].abs() * b[lane].abs();
+                        }
+                    }
+                    let mut dot = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+                    for (&a, &b) in xr.iter().zip(wr) {
+                        dot += a.abs() * b.abs();
+                    }
+                    most = most.max(dot * scale);
+                }
+            }
+            return most;
+        }
+        for xi in x.chunks(k) {
+            for wj in w.chunks(k) {
                 let mut bound = 0.0f32;
-                for i in 0..k {
-                    let (a, b) = (xi[i].abs(), wj[i].abs());
-                    bound += a * ewj[i] + b * exi[i] + a * b * adds;
+                for (&a, &b) in xi.iter().zip(wj) {
+                    let (a, b) = (a.abs(), b.abs());
+                    let ex = (a * eps).max(floor);
+                    let ew = (b * eps).max(floor);
+                    bound += a * ew + b * ex + a * b * adds;
                 }
                 most = most.max(bound);
             }
