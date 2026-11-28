@@ -3,9 +3,7 @@
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites;
-use tessera_lower::{
-    ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
-};
+use tessera_lower::{Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
 
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
 const SOURCE: &str = include_str!("argmax_metal.metal");
@@ -14,10 +12,7 @@ const SMALL_MAX_K: usize = 32;
 const SPLIT_MIN_WIDTH: usize = 8192;
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    Source::metal(SOURCE, entry)
 }
 
 fn plain_f32<K>(_: &K, input: usize, form: &dyn Stored) -> bool {

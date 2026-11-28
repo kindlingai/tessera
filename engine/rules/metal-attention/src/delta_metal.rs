@@ -4,8 +4,8 @@ use tessera_graph::{Op, Order};
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Extent, Keeping, Kernel, KernelRef, Launch, Needs, Read, Shape, Source,
-    Step, T, Term, Tree, sites,
+    Arg, Draft, Extent, Keeping, Kernel, KernelRef, Launch, Needs, Read, Shape, Source, Step, T,
+    Term, Tree, sites,
 };
 
 const DM_THREADS: usize = 128;
@@ -20,10 +20,7 @@ const SOURCE: &str = include_str!("delta_metal.metal");
 const GUESS: f64 = 1.0e-13;
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    Source::metal(SOURCE, entry)
 }
 
 fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {

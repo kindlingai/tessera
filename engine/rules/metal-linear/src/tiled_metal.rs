@@ -4,7 +4,7 @@ use tessera_graph::Order;
 use tessera_linear::Product;
 use tessera_lower::form::BF16_FORM;
 use tessera_lower::{
-    Backend, ByBackend, Draft, GUESS, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
+    Backend, Draft, GUESS, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 
 const BLOCK: (usize, usize, usize) = (64, 64, 32);
@@ -38,10 +38,7 @@ struct TiledMetal {
 }
 
 fn source() -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry: "tiled_metal_bf16",
-    }
+    Source::metal(SOURCE, "tiled_metal_bf16")
 }
 
 fn needs() -> Needs {

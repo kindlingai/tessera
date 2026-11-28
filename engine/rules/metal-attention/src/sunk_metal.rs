@@ -8,7 +8,7 @@ use tessera_attention::flash::sunk::{
 use tessera_attention::listed::Sizes;
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
-use tessera_lower::{ByBackend, Draft, Kernel, Launch, Needs, Source, Step, T, Tree};
+use tessera_lower::{Draft, Kernel, Launch, Needs, Source, Step, T, Tree};
 
 /// Queries and keys per block.
 const BLOCK: usize = 32;
@@ -41,10 +41,7 @@ const SOURCE: &str = include_str!("sunk_metal.metal");
 struct SunkMetal(FlashSunk);
 
 fn source() -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry: "flash_sunk_metal",
-    }
+    Source::metal(SOURCE, "flash_sunk_metal")
 }
 
 fn needs() -> Needs {

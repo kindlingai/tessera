@@ -5,7 +5,7 @@ use super::epi::{
     has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads,
 };
 use super::mm::mm_draft;
-use super::{THREADS, WARPS, f32_only, rocm_needs, rocm_rule, rocm_source, weight_x_accepts};
+use super::{THREADS, WARPS, f32_only, rocm_needs, rocm_rule, weight_x_accepts};
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
 use tessera_graph::{Op, Order};
@@ -109,7 +109,7 @@ impl RocmGemvKind {
     emits = f32_only,
     needs = rocm_needs(self.kind.smem(), self.kind.threads(), false),
     order = Order::PerConfig,
-    source = rocm_source(rocm_linear_source(), self.kind.entry()),
+    source = tessera_lower::Source::rocm(rocm_linear_source(), self.kind.entry()),
     launches = gemv_launches,
     shape = Shape::Grid { across: self.kind.groups(self.n), down: 1, threads: self.kind.threads() },
     load = gemv_load,
@@ -274,7 +274,7 @@ impl RocmMmForm {
         true,
     ),
     order = Order::PerConfig,
-    source = rocm_source(
+    source = tessera_lower::Source::rocm(
         rocm_linear_source(),
         self.kind.entry(mm_bm(self.kind, self.m, self.n), self.ks > 1),
     ),

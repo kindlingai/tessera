@@ -22,7 +22,7 @@ use tessera_graph::Order;
 use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
+    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Tree,
 };
 
 const KERNEL: &str = include_str!("linear.cu");
@@ -180,13 +180,6 @@ fn dtr_needs(bytes: usize) -> Needs {
     }
 }
 
-pub(crate) fn rocm_source(text: &'static str, entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend(["", "", text]),
-        entry,
-    }
-}
-
 pub(crate) fn rocm_needs(group_bytes: usize, group_threads: usize, tile: bool) -> Needs {
     Needs {
         lanes: 32,
@@ -273,7 +266,7 @@ dtr_mma_kernel! {
     emits = mma_emits,
     needs = |t: &TrellisMma| if t.rocm { rocm_trellis::small_needs(t.tile) } else { dtr_needs(DTR_SMEM) },
     source = |t: &TrellisMma| if t.rocm {
-        rocm_source(rocm_trellis::rocm_trellis_source(), rocm_trellis::small_entry(t))
+        Source::rocm(rocm_trellis::rocm_trellis_source(), rocm_trellis::small_entry(t))
     } else {
         dtr_source(t)
     },
@@ -348,7 +341,7 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     needs = if self.rocm { rocm_needs(0, THREADS, false) } else { dtr_needs(0) },
     order = Order::PerConfig,
     source = if self.rocm {
-        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_reduce")
+        Source::rocm(rocm_trellis::rocm_trellis_source(), "rocm_dtr_reduce")
     } else {
         trellis_source_with(
             "dtr_reduce",
@@ -474,7 +467,7 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
     },
     order = Order::PerConfig,
     source = if self.rocm {
-        rocm_source(rocm_trellis::rocm_trellis_source(), "rocm_dtr_prep")
+        Source::rocm(rocm_trellis::rocm_trellis_source(), "rocm_dtr_prep")
     } else {
         prefill_source_with(
             "dtr_prep",
@@ -549,7 +542,7 @@ dtr_mma_kernel! {
     emits = pre_mma_emits,
     needs = |t: &TrellisPreMma| if t.rocm { rocm_trellis::pre_needs() } else { dtr_needs(DTR_PRE_SMEM) },
     source = |t: &TrellisPreMma| if t.rocm {
-        rocm_source(rocm_trellis::rocm_trellis_source(), rocm_trellis::pre_entry(t))
+        Source::rocm(rocm_trellis::rocm_trellis_source(), rocm_trellis::pre_entry(t))
     } else {
         dtr_pre_source(t)
     },

@@ -112,10 +112,7 @@ pub fn cuda_source_with<'a>(
     entry: &'static str,
     defs: impl IntoIterator<Item = (&'a str, usize)>,
 ) -> tessera_lower::Source {
-    tessera_lower::Source::Fixed {
-        text: tessera_lower::ByBackend(["", cuda_prefixed(base, defs), ""]),
-        entry,
-    }
+    tessera_lower::Source::cuda(cuda_prefixed(base, defs), entry)
 }
 
 /// A name a kernel may import after `<tessera/1/`.

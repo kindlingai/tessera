@@ -18,6 +18,16 @@ impl<T> ByBackend<T> {
     pub fn from_fn(mut f: impl FnMut(Backend) -> T) -> Self {
         Self(std::array::from_fn(|i| f(Backend::ALL[i])))
     }
+
+    /// `value` for `backend`, the default for the others.
+    pub fn only(backend: Backend, value: T) -> Self
+    where
+        T: Default,
+    {
+        let mut all = Self::from_fn(|_| T::default());
+        all.0[backend as usize] = value;
+        all
+    }
 }
 
 impl<T> std::ops::Index<Backend> for ByBackend<T> {

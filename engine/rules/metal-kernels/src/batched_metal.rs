@@ -3,7 +3,7 @@
 use tessera_graph::Order;
 use tessera_kernels::batched::site;
 use tessera_lower::{
-    Arg, Backend, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
+    Arg, Backend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 
 const METAL_THREADS: usize = 128;
@@ -65,10 +65,7 @@ fn metal_source(k: &BatchedMetal) -> Source {
     } else {
         DEC_ENTRIES[k.mt - 1]
     };
-    Source::Fixed {
-        text: ByBackend([METAL_SOURCE, "", ""]),
-        entry,
-    }
+    Source::metal(METAL_SOURCE, entry)
 }
 
 fn metal_cols_per_tg(mt: usize) -> usize {
