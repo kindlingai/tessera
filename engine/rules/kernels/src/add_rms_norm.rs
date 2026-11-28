@@ -3,10 +3,8 @@
 use crate::WIDE;
 use crate::lane_norm::norm_knobs;
 use crate::lane_norm::{
-    RowCfg, RowSpec, block_threads, cache_trips, row_body, row_launches, row_needs, row_shape,
-    row_tag,
+    RowCfg, RowSpec, row_body, row_launches, row_load, row_needs, row_shape, row_tag,
 };
-use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, Tree, sites};
@@ -109,26 +107,31 @@ fn add_norm_emits_at(k: &AddLaneNorm, output: usize, form: &dyn Stored) -> bool 
     }
 }
 
-fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
-    row_body(RowSpec {
-        width: k.width,
-        block: k.block,
-        warps: k.warps,
-        cache_trips: k.cache_trips,
-        ahead: k.ahead,
-        a_form: k.a_form,
+fn add_norm_spec(k: &AddLaneNorm) -> RowSpec {
+    RowSpec {
         b_form: k.b_form,
         c_form: k.c_form,
-        w_form: k.w_form,
-        out_form: k.out_form,
         sum_form: k.sum_form,
         add2: true,
         add3: k.add3,
-        weighted: k.weighted,
-        keep_w: k.weighted,
         save_sum: k.save_sum,
         reload_sum: k.reload_sum(),
-    })
+        ..RowSpec::base(
+            k.width,
+            k.block,
+            k.warps,
+            k.cache_trips,
+            k.ahead,
+            k.a_form,
+            k.w_form,
+            k.out_form,
+            k.weighted,
+        )
+    }
+}
+
+fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
+    row_body(add_norm_spec(k))
 }
 
 fn add_norm_launches(k: &AddLaneNorm, step: &Step) -> Vec<Launch> {
@@ -159,45 +162,11 @@ fn add_norm_source(k: &AddLaneNorm) -> Source {
 }
 
 fn add_norm_load(k: &AddLaneNorm, _: usize) -> Option<Load> {
-    let body = add_norm_body(k);
-    let elems = k.rows * k.width;
-    let mut reads = vec![k.a_form.bytes(elems) as f64, k.b_form.bytes(elems) as f64];
-    if k.add3 {
-        reads.push(k.c_form.bytes(elems) as f64);
-    }
-    if k.weighted {
-        reads.push(k.w_form.bytes(k.width) as f64);
-    }
-    let mut written = k.out_form.bytes(elems) as f64;
-    if k.save_sum {
-        written += k.sum_form.bytes(elems) as f64;
-    }
-    let span = (WIDE * k.ahead) as usize;
-    let mut flight = k.a_form.bytes(span) as f64 + k.b_form.bytes(span) as f64;
-    if k.add3 {
-        flight += k.c_form.bytes(span) as f64;
-    }
-    let threads = block_threads(k.warps) as usize;
-    let per_row = if k.block { threads } else { LANES };
-    let trips = if cache_trips(k.width, k.block, k.warps, k.cache_trips) > 0 {
-        1.0
-    } else {
-        (k.width as f64 / (per_row * WIDE as usize) as f64).ceil()
-    };
-    Some(Load {
-        threads: k.rows * per_row,
-        group: threads,
-        trips,
-        trip: body.trip(),
-        reads,
-        written,
-        flight,
-        ..Load::default()
-    })
+    row_load(&add_norm_spec(k), k.rows, 1)
 }
 
 /// Full-length `Stage::Add` operands of `t`, if elementwise add.
-fn add_operands(tree: &Tree, t: T, len: usize) -> Option<(T, T)> {
+pub(crate) fn add_operands(tree: &Tree, t: T, len: usize) -> Option<(T, T)> {
     let node = tree.node(t);
     let Term::Stage(Stage::Add) = &node.term else {
         return None;

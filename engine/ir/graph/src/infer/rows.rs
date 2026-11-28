@@ -1,7 +1,7 @@
 //! Typing of row stages.
 
 use crate::dims::{Dim, DimExpr, Shape};
-use crate::infer::{ErrorKind, TypeError, finite, front, need, same_shape, side};
+use crate::infer::{ErrorKind, TypeError, finite, front, need, poly, same_shape, side};
 use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
 
@@ -29,6 +29,55 @@ fn positions(
         };
     need(placed, ErrorKind::Placement, || {
         format!("{p:?} rows cannot follow {:?} positions", pos.placement)
+    })
+}
+
+/// Multi-axis integer coordinates lead `x` with trailing axis count.
+fn mrope_axes(
+    dims: &[Dim],
+    s: &Stage,
+    x: &TensorType,
+    pos: &TensorType,
+    p: Placement,
+) -> Result<(), TypeError> {
+    let Stage::Mrope { sections, .. } = *s else {
+        unreachable!("mrope stage expected");
+    };
+    let lead = pos.rank().saturating_sub(1);
+    let need_axes = if sections[2] > 0 {
+        3
+    } else if sections[1] > 0 {
+        2
+    } else {
+        1
+    };
+    let axes = pos
+        .shape
+        .0
+        .last()
+        .map(|e| poly(dims, e))
+        .transpose()?
+        .and_then(|n| n.as_const());
+    let fits = pos.rank() >= 2
+        && lead < x.rank()
+        && same_shape(dims, &front(&x.shape, lead), &front(&pos.shape, lead))?
+        && axes.is_some_and(|n| n >= need_axes);
+    need(fits, ErrorKind::Shape, || {
+        format!("axes {} do not fit {}", pos.shape, x.shape)
+    })?;
+    let sum: u64 = sections.iter().map(|&n| u64::from(n)).sum();
+    if let Some(width) = poly(dims, x.shape.0.last().expect("rank checked"))?.as_const() {
+        need(sum * 2 == width, ErrorKind::Shape, || {
+            format!("mrope sections {sections:?} do not cover width {width}")
+        })?;
+    }
+    need(pos.dtype.is_int(), ErrorKind::DType, || {
+        format!("axes must be integers, got {:?}", pos.dtype)
+    })?;
+    let last = x.rank() as u32 - 1;
+    let placed = pos.placement == Placement::Replicated && p != Placement::Split { axis: last };
+    need(placed, ErrorKind::Placement, || {
+        format!("{p:?} rows cannot follow {:?} axes", pos.placement)
     })
 }
 
@@ -145,6 +194,7 @@ fn takes(
             side("row weights", o, x.dtype, Placement::Replicated)
         }
         Takes::Positions => positions(dims, x, o, p),
+        Takes::Axes => mrope_axes(dims, s, x, o, p),
         Takes::Bits => allowed(dims, x, o),
     }
 }

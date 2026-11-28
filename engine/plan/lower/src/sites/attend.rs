@@ -18,6 +18,8 @@ pub struct Attend {
     pub sizes: Attn,
     /// Ragged rows: each query's slot and position.
     pub rows: Option<[T; 2]>,
+    /// Packed variable-length rows: `[Rows, 2]` segment bounds.
+    pub packed: Option<T>,
 }
 
 impl Pattern for Attend {
@@ -31,6 +33,37 @@ impl Pattern for Attend {
         // Kernels read one head width for all three.
         if wide(v).last() != wide(q).last() {
             return None;
+        }
+        if a.packed() {
+            let (&[queries, heads, width], &[_, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
+                return None;
+            };
+            let keys = tree.node(k).extents[0];
+            let sizes = Attn {
+                seqs: 1,
+                queries,
+                keys,
+                heads,
+                kv_heads,
+                width,
+                context: keys.most(),
+                kept: tree.kept,
+                segments: 1,
+                mask: a.mask,
+                k_form: plain(tree.node(k).form),
+                v_form: plain(tree.node(v).form),
+                out_form: writable(node.form),
+            };
+            return Some(Self {
+                scale: a.scale,
+                q,
+                k,
+                v,
+                q_form: plain(tree.node(q).form),
+                sizes,
+                rows: None,
+                packed: Some(node.args[3]),
+            });
         }
         // Ragged kernels read every key, not a list.
         if a.sinks || a.rel_bias || a.ragged && a.picked {
@@ -78,6 +111,7 @@ impl Pattern for Attend {
                 q_form: plain(tree.node(q).form),
                 sizes,
                 rows: Some([node.args[3], node.args[4]]),
+                packed: None,
             });
         }
         if a.picked {
@@ -144,12 +178,30 @@ impl Attend {
             q_form: plain(tree.node(q).form),
             sizes,
             rows: None,
+            packed: None,
         })
     }
 
     /// The output's element count.
     pub fn out(&self) -> usize {
         self.sizes.queries * self.sizes.heads * self.sizes.width
+    }
+
+    /// Scales `q`, then runs `kernel` over packed bounds.
+    pub fn packed_draft(&self, kernel: impl Kernel + 'static) -> Option<Vec<Draft>> {
+        let bounds = self.packed?;
+        let out = self.out();
+        let scale = Map::scaled(self.scale, self.q_form);
+        let reads = [
+            Read::Draft(0),
+            Read::Node(self.k),
+            Read::Node(self.v),
+            bounds.into(),
+        ];
+        Some(vec![
+            Draft::new(scale, [self.q], out),
+            Draft::new(kernel, reads, out),
+        ])
     }
 
     /// For ragged rows: scale `q`, run `kernel` over kept keys.

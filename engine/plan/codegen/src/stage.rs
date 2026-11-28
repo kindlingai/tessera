@@ -11,6 +11,7 @@ pub enum Row {
     Shift,
     Min,
     Max,
+    Gelu,
     GeluTanh,
     Silu,
     Sigmoid,
@@ -22,13 +23,14 @@ pub enum Row {
 }
 
 impl Row {
-    const ALL: [Row; 14] = [
+    const ALL: [Row; 15] = [
         Row::Add,
         Row::Mul,
         Row::Scale,
         Row::Shift,
         Row::Min,
         Row::Max,
+        Row::Gelu,
         Row::GeluTanh,
         Row::Silu,
         Row::Sigmoid,
@@ -81,6 +83,13 @@ pub fn tanh(x: f32) -> f32 {
     x * horner(&TANH_P) / horner(&TANH_Q)
 }
 
+pub use tessera_graph::erf;
+
+/// Exact GELU using `erf(v / sqrt(2))`.
+fn gelu_exact(v: f32) -> f32 {
+    0.5 * v * (1.0 + erf(v * std::f32::consts::FRAC_1_SQRT_2))
+}
+
 /// GELU with the tanh estimate, in the graph's spelling.
 fn gelu(v: f32) -> f32 {
     let inner = v + 0.044_715 * (v * v * v);
@@ -98,6 +107,7 @@ pub fn apply(stage: Row, out: &mut [f32], b: &[f32], s: f32) {
         Row::Shift => out.iter_mut().for_each(|o| *o += s),
         Row::Min => out.iter_mut().for_each(|o| *o = o.min(s)),
         Row::Max => out.iter_mut().for_each(|o| *o = o.max(s)),
+        Row::Gelu => each(out, gelu_exact),
         Row::GeluTanh => each(out, gelu),
         Row::Silu => each(out, |v| v / (1.0 + (-v).exp())),
         Row::Sigmoid => each(out, |v| 1.0 / (1.0 + (-v).exp())),

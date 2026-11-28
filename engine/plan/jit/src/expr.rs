@@ -428,6 +428,7 @@ impl Lowerer<'_, '_> {
                 let x = self.floats(args, t)?[0];
                 Val::S(self.tanh(x))
             }
+            Intrinsic::Erf => math(self, "erf")?,
             Intrinsic::Log => math(self, "log")?,
             Intrinsic::Cos => math(self, "cos")?,
             Intrinsic::Sin => math(self, "sin")?,

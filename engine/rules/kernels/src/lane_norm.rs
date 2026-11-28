@@ -3,7 +3,7 @@
 use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
-use tessera_lower::form::{Load as Stored, plain, writable};
+use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::{
     Draft, Kernel, Knobs, Launch, Load, Needs, Shape, Source, Step, T, ToArg, Tree, sites,
 };
@@ -25,9 +25,6 @@ const WIDE_WARPS_MIN: usize = 4096;
 
 /// Maximum rows where narrow block-wide RMS norm wins.
 pub(crate) const BLOCK_ROWS: usize = 16;
-
-/// Maximum rows where wide block-wide RMS norm wins.
-const WIDE_BLOCK_ROWS: usize = 2048;
 
 /// Maximum wide trips held in registers across passes.
 pub(crate) const CACHE_TRIPS: u32 = 8;
@@ -59,7 +56,7 @@ pub(crate) struct RowCfg {
     pub wide_block_min: usize,
     pub wide_warps_min: usize,
     pub block_rows: usize,
-    pub wide_block_rows: usize,
+    pub wide_block_rows: Option<usize>,
     pub cache_trips: u32,
     pub ahead: u32,
 }
@@ -73,7 +70,7 @@ impl Default for RowCfg {
             wide_block_min: WIDE_BLOCK_MIN,
             wide_warps_min: WIDE_WARPS_MIN,
             block_rows: BLOCK_ROWS,
-            wide_block_rows: WIDE_BLOCK_ROWS,
+            wide_block_rows: None,
             cache_trips: CACHE_TRIPS,
             ahead: AHEAD,
         }
@@ -103,7 +100,7 @@ impl RowCfg {
             cfg.block_rows = v;
         }
         if let Some(v) = knobs.get(kernel, "wide_block_rows") {
-            cfg.wide_block_rows = v;
+            cfg.wide_block_rows = Some(v);
         }
         if let Some(v) = knobs.get(kernel, "cache_trips") {
             cfg.cache_trips = v as u32;
@@ -124,7 +121,7 @@ impl RowCfg {
 
     pub(crate) fn use_block(self, rows: usize, width: usize) -> bool {
         (rows <= self.block_rows && width >= self.block_min)
-            || (rows <= self.wide_block_rows && width >= self.wide_block_min)
+            || (width >= self.wide_block_min && self.wide_block_rows.is_none_or(|cap| rows <= cap))
     }
 }
 
@@ -197,19 +194,23 @@ pub(crate) fn block_sum(acc: f32, #[build] warps: u32, #[build] cap: u32) -> f32
     tot
 }
 
-/// Loads up to three four-wide vectors and sums them.
+/// Loads up to three four-wide vectors and optional 1D bias.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 fn load_sum4(
     #[form(a_form)] a: Buf<Dyn>,
     #[form(b_form)] b: Buf<Dyn>,
     #[form(c_form)] c: Buf<Dyn>,
+    #[form(in_bias_form)] in_bias: Buf<Dyn>,
     off: u64,
+    col: u64,
     #[build] a_form: &'static dyn Stored,
     #[build] b_form: &'static dyn Stored,
     #[build] c_form: &'static dyn Stored,
+    #[build] in_bias_form: &'static dyn Stored,
     #[build] add2: bool,
     #[build] add3: bool,
+    #[build] add_bias: bool,
 ) -> F32x4 {
     // A packed load decodes per lane and cannot take `+=`.
     let va = a.load4(off);
@@ -228,14 +229,64 @@ fn load_sum4(
         s.z += vc.z;
         s.w += vc.w;
     }
+    if add_bias {
+        let vd = in_bias.load4(col);
+        s.x += vd.x;
+        s.y += vd.y;
+        s.z += vd.z;
+        s.w += vd.w;
+    }
     s
 }
 
-/// Scales four values by `inv` and optional weights, then stores.
+/// Reloads a saved sum or recomputes the fused input sum.
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+fn reload_or_sum4(
+    #[form(a_form)] a: Buf<Dyn>,
+    #[form(b_form)] b: Buf<Dyn>,
+    #[form(c_form)] c: Buf<Dyn>,
+    #[form(in_bias_form)] in_bias: Buf<Dyn>,
+    #[form(sum_form)] sum_out: BufMut<Dyn>,
+    off: u64,
+    col: u64,
+    #[build] a_form: &'static dyn Stored,
+    #[build] b_form: &'static dyn Stored,
+    #[build] c_form: &'static dyn Stored,
+    #[build] in_bias_form: &'static dyn Stored,
+    #[build] sum_form: &'static dyn Stored,
+    #[build] add2: bool,
+    #[build] add3: bool,
+    #[build] add_bias: bool,
+    #[build] reload_sum: bool,
+) -> F32x4 {
+    if reload_sum {
+        sum_out.load4(off)
+    } else {
+        load_sum4(
+            a,
+            b,
+            c,
+            in_bias,
+            off,
+            col,
+            a_form,
+            b_form,
+            c_form,
+            in_bias_form,
+            add2,
+            add3,
+            add_bias,
+        )
+    }
+}
+
+/// Scales four values by `inv`, optional weight and bias.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 fn scale_store4(
     #[form(w_form)] w: Buf<Dyn>,
+    #[form(bias_form)] bias: Buf<Dyn>,
     #[form(out_form)] mut out: BufMut<Dyn>,
     off: u64,
     col: u64,
@@ -245,8 +296,10 @@ fn scale_store4(
     v: f32,
     inv: f32,
     #[build] w_form: &'static dyn Stored,
+    #[build] bias_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
     #[build] weighted: bool,
+    #[build] biased: bool,
 ) {
     let mut o = F32x4::zero();
     if weighted {
@@ -261,6 +314,13 @@ fn scale_store4(
         o.z = z * inv;
         o.w = v * inv;
     }
+    if biased {
+        let d = bias.load4(col);
+        o.x += d.x;
+        o.y += d.y;
+        o.z += d.z;
+        o.w += d.w;
+    }
     out.store4(off, o);
 }
 
@@ -271,7 +331,9 @@ fn rms_norm_lanes<const WIDE: u32>(
     #[form(a_form)] a: Buf<Dyn>,
     #[form(b_form)] b: Buf<Dyn>,
     #[form(c_form)] c: Buf<Dyn>,
+    #[form(in_bias_form)] in_bias: Buf<Dyn>,
     #[form(w_form)] w: Buf<Dyn>,
+    #[form(bias_form)] bias: Buf<Dyn>,
     #[form(out_form)] mut out: BufMut<Dyn>,
     #[form(sum_form)] mut sum_out: BufMut<Dyn>,
     rows: u32,
@@ -280,12 +342,17 @@ fn rms_norm_lanes<const WIDE: u32>(
     #[build] a_form: &'static dyn Stored,
     #[build] b_form: &'static dyn Stored,
     #[build] c_form: &'static dyn Stored,
+    #[build] in_bias_form: &'static dyn Stored,
     #[build] w_form: &'static dyn Stored,
+    #[build] bias_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
     #[build] sum_form: &'static dyn Stored,
     #[build] add2: bool,
     #[build] add3: bool,
+    #[build] add_bias: bool,
+    #[build] center: bool,
     #[build] weighted: bool,
+    #[build] biased: bool,
     #[build] save_sum: bool,
     #[build] reload_sum: bool,
     #[build] block: bool,
@@ -311,12 +378,27 @@ fn rms_norm_lanes<const WIDE: u32>(
     let first = if block { lid() } else { lane() };
     let mut vals = local::<f32>(cache_slots);
     let mut acc = 0.0f32;
+    let mut mean = 0.0f32;
     if use_cache {
         for t in (0..cached).unroll(cache_cap) {
             let i = first * WIDE + t * (group_w * WIDE);
             if exact || i < width {
                 let off = at + i as u64;
-                let s = load_sum4(a, b, c, off, a_form, b_form, c_form, add2, add3);
+                let s = load_sum4(
+                    a,
+                    b,
+                    c,
+                    in_bias,
+                    off,
+                    i as u64,
+                    a_form,
+                    b_form,
+                    c_form,
+                    in_bias_form,
+                    add2,
+                    add3,
+                    add_bias,
+                );
                 if save_sum {
                     sum_out.store4(off, s);
                 }
@@ -325,17 +407,93 @@ fn rms_norm_lanes<const WIDE: u32>(
                 vals[idx + 1] = s.y;
                 vals[idx + 2] = s.z;
                 vals[idx + 3] = s.w;
-                acc += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+                if center {
+                    acc += (s.x + s.y) + (s.z + s.w);
+                } else {
+                    acc += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+                }
             }
         }
     } else {
         for i in (first * WIDE..width).by(group_w * WIDE).unroll(ahead) {
             let off = at + i as u64;
-            let s = load_sum4(a, b, c, off, a_form, b_form, c_form, add2, add3);
+            let s = load_sum4(
+                a,
+                b,
+                c,
+                in_bias,
+                off,
+                i as u64,
+                a_form,
+                b_form,
+                c_form,
+                in_bias_form,
+                add2,
+                add3,
+                add_bias,
+            );
             if save_sum {
                 sum_out.store4(off, s);
             }
-            acc += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+            if center {
+                acc += (s.x + s.y) + (s.z + s.w);
+            } else {
+                acc += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+            }
+        }
+    }
+    if center {
+        acc = sum32(acc);
+        let sum_x = if block {
+            block_sum(acc, warps, shared_cap)
+        } else {
+            acc
+        };
+        mean = sum_x / width as f32;
+        acc = 0.0f32;
+        if use_cache {
+            for t in (0..cached).unroll(cache_cap) {
+                let i = first * WIDE + t * (group_w * WIDE);
+                if exact || i < width {
+                    let idx = (t * WIDE) as usize;
+                    let dx = vals[idx] - mean;
+                    let dy = vals[idx + 1] - mean;
+                    let dz = vals[idx + 2] - mean;
+                    let dw = vals[idx + 3] - mean;
+                    vals[idx] = dx;
+                    vals[idx + 1] = dy;
+                    vals[idx + 2] = dz;
+                    vals[idx + 3] = dw;
+                    acc += dx * dx + dy * dy + dz * dz + dw * dw;
+                }
+            }
+        } else {
+            for i in (first * WIDE..width).by(group_w * WIDE).unroll(ahead) {
+                let off = at + i as u64;
+                let s = reload_or_sum4(
+                    a,
+                    b,
+                    c,
+                    in_bias,
+                    sum_out,
+                    off,
+                    i as u64,
+                    a_form,
+                    b_form,
+                    c_form,
+                    in_bias_form,
+                    sum_form,
+                    add2,
+                    add3,
+                    add_bias,
+                    reload_sum,
+                );
+                let dx = s.x - mean;
+                let dy = s.y - mean;
+                let dz = s.z - mean;
+                let dw = s.w - mean;
+                acc += dx * dx + dy * dy + dz * dz + dw * dw;
+            }
         }
     }
     acc = sum32(acc);
@@ -352,6 +510,7 @@ fn rms_norm_lanes<const WIDE: u32>(
                 let idx = (t * WIDE) as usize;
                 scale_store4(
                     w,
+                    bias,
                     out,
                     at + i as u64,
                     i as u64,
@@ -361,22 +520,43 @@ fn rms_norm_lanes<const WIDE: u32>(
                     vals[idx + 3],
                     inv,
                     w_form,
+                    bias_form,
                     out_form,
                     weighted,
+                    biased,
                 );
             }
         }
     } else {
         for i in (first * WIDE..width).by(group_w * WIDE).unroll(ahead) {
             let off = at + i as u64;
-            let mut s = F32x4::zero();
-            if reload_sum {
-                s = sum_out.load4(off);
-            } else {
-                s = load_sum4(a, b, c, off, a_form, b_form, c_form, add2, add3);
+            let mut s = reload_or_sum4(
+                a,
+                b,
+                c,
+                in_bias,
+                sum_out,
+                off,
+                i as u64,
+                a_form,
+                b_form,
+                c_form,
+                in_bias_form,
+                sum_form,
+                add2,
+                add3,
+                add_bias,
+                reload_sum,
+            );
+            if center {
+                s.x -= mean;
+                s.y -= mean;
+                s.z -= mean;
+                s.w -= mean;
             }
             scale_store4(
-                w, out, off, i as u64, s.x, s.y, s.z, s.w, inv, w_form, out_form, weighted,
+                w, bias, out, off, i as u64, s.x, s.y, s.z, s.w, inv, w_form, bias_form, out_form,
+                weighted, biased,
             );
         }
     }
@@ -462,6 +642,7 @@ fn norm_emits(k: &LaneNorm, form: &dyn Stored) -> bool {
 }
 
 /// Parameters for lowering a row-wise RMS norm body.
+#[derive(Clone, Copy)]
 pub(crate) struct RowSpec {
     pub width: usize,
     pub block: bool,
@@ -471,15 +652,61 @@ pub(crate) struct RowSpec {
     pub a_form: &'static dyn Stored,
     pub b_form: &'static dyn Stored,
     pub c_form: &'static dyn Stored,
+    pub in_bias_form: &'static dyn Stored,
     pub w_form: &'static dyn Stored,
+    pub bias_form: &'static dyn Stored,
     pub out_form: &'static dyn Stored,
     pub sum_form: &'static dyn Stored,
     pub add2: bool,
     pub add3: bool,
+    pub add_bias: bool,
+    pub center: bool,
     pub weighted: bool,
     pub keep_w: bool,
+    pub biased: bool,
     pub save_sum: bool,
     pub reload_sum: bool,
+}
+
+impl RowSpec {
+    /// Base spec for plain row norm, overridable for fused variants.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn base(
+        width: usize,
+        block: bool,
+        warps: u32,
+        cache_trips: u32,
+        ahead: u32,
+        a_form: &'static dyn Stored,
+        w_form: &'static dyn Stored,
+        out_form: &'static dyn Stored,
+        weighted: bool,
+    ) -> Self {
+        Self {
+            width,
+            block,
+            warps,
+            cache_trips,
+            ahead,
+            a_form,
+            b_form: F32_FORM,
+            c_form: F32_FORM,
+            in_bias_form: F32_FORM,
+            w_form,
+            bias_form: F32_FORM,
+            out_form,
+            sum_form: out_form,
+            add2: false,
+            add3: false,
+            add_bias: false,
+            center: false,
+            weighted,
+            keep_w: weighted,
+            biased: false,
+            save_sum: false,
+            reload_sum: false,
+        }
+    }
 }
 
 /// Builds the IR body for a row-wise RMS norm kernel.
@@ -487,18 +714,23 @@ pub(crate) fn row_body(s: RowSpec) -> tessera_codegen::ir::Body {
     let cached = cache_trips(s.width, s.block, s.warps, s.cache_trips);
     let exact = exact_trips(s.width, s.block, s.warps);
     let shared_cap = s.warps.max(MAX_WARPS);
-    let cache_cap = s.cache_trips.max(1);
+    let cache_cap = cached.max(1);
     let cache_slots = (cache_cap * WIDE) as usize;
     let mut body = rms_norm_lanes_ir::<WIDE>(
         s.a_form,
         s.b_form,
         s.c_form,
+        s.in_bias_form,
         s.w_form,
+        s.bias_form,
         s.out_form,
         s.sum_form,
         s.add2,
         s.add3,
+        s.add_bias,
+        s.center,
         s.weighted,
+        s.biased,
         s.save_sum,
         s.reload_sum,
         s.block,
@@ -517,8 +749,14 @@ pub(crate) fn row_body(s: RowSpec) -> tessera_codegen::ir::Body {
     if !s.add3 {
         body.params.retain(|p| p.name() != "c");
     }
+    if !s.add_bias {
+        body.params.retain(|p| p.name() != "in_bias");
+    }
     if !s.keep_w {
         body.params.retain(|p| p.name() != "w");
+    }
+    if !s.biased {
+        body.params.retain(|p| p.name() != "bias");
     }
     if !s.save_sum {
         body.params.retain(|p| p.name() != "sum_out");
@@ -527,25 +765,7 @@ pub(crate) fn row_body(s: RowSpec) -> tessera_codegen::ir::Body {
 }
 
 fn norm_body(k: &LaneNorm) -> tessera_codegen::ir::Body {
-    row_body(RowSpec {
-        width: k.width,
-        block: k.block,
-        warps: k.warps,
-        cache_trips: k.cache_trips,
-        ahead: k.ahead,
-        a_form: k.x_form,
-        b_form: k.x_form,
-        c_form: k.x_form,
-        w_form: k.w_form,
-        out_form: k.out_form,
-        sum_form: k.out_form,
-        add2: false,
-        add3: false,
-        weighted: k.weighted,
-        keep_w: true,
-        save_sum: false,
-        reload_sum: false,
-    })
+    row_body(norm_spec(k))
 }
 
 /// Builds the single launch for a row-wise RMS norm kernel.
@@ -589,36 +809,81 @@ fn norm_source(k: &LaneNorm) -> Source {
     Source::named(body, entry)
 }
 
-fn norm_load(k: &LaneNorm, _: usize) -> Option<Load> {
-    let body = norm_body(k);
-    let elems = k.rows * k.width;
-    let x_bytes = k.x_form.bytes(elems) as f64;
-    let cached = cache_trips(k.width, k.block, k.warps, k.cache_trips) > 0;
-    let mut reads = if cached {
-        vec![x_bytes]
-    } else {
-        vec![x_bytes, x_bytes]
-    };
-    if k.weighted {
-        reads.push(k.w_form.bytes(k.width) as f64);
+/// Builds the cost-model load for a row-wise norm spec.
+pub(crate) fn row_load(s: &RowSpec, rows: usize, uncached_passes: usize) -> Option<Load> {
+    let body = row_body(*s);
+    let elems = rows * s.width;
+    let cached = cache_trips(s.width, s.block, s.warps, s.cache_trips) > 0;
+    let passes = if cached { 1 } else { uncached_passes };
+    let mut reads = Vec::new();
+    for _ in 0..passes {
+        reads.push(s.a_form.bytes(elems) as f64);
+        if s.add2 {
+            reads.push(s.b_form.bytes(elems) as f64);
+        }
+        if s.add3 {
+            reads.push(s.c_form.bytes(elems) as f64);
+        }
     }
-    let threads = block_threads(k.warps) as usize;
-    let per_row = if k.block { threads } else { LANES };
+    if s.add_bias {
+        reads.push(s.in_bias_form.bytes(s.width) as f64);
+    }
+    if s.weighted {
+        reads.push(s.w_form.bytes(s.width) as f64);
+    }
+    if s.biased {
+        reads.push(s.bias_form.bytes(s.width) as f64);
+    }
+    let mut written = s.out_form.bytes(elems) as f64;
+    if s.save_sum {
+        written += s.sum_form.bytes(elems) as f64;
+    }
+    let span = (WIDE * s.ahead) as usize;
+    let mut flight = s.a_form.bytes(span) as f64;
+    if s.add2 {
+        flight += s.b_form.bytes(span) as f64;
+    }
+    if s.add3 {
+        flight += s.c_form.bytes(span) as f64;
+    }
+    let threads = block_threads(s.warps) as usize;
+    let per_row = if s.block { threads } else { LANES };
     let trips = if cached {
         1.0
     } else {
-        (k.width as f64 / (per_row * WIDE as usize) as f64).ceil()
+        (s.width as f64 / (per_row * WIDE as usize) as f64).ceil()
     };
     Some(Load {
-        threads: k.rows * per_row,
+        threads: rows * per_row,
         group: threads,
         trips,
         trip: body.trip(),
         reads,
-        written: k.out_form.bytes(elems) as f64,
-        flight: k.x_form.bytes((WIDE * k.ahead) as usize) as f64,
+        written,
+        flight,
         ..Load::default()
     })
+}
+
+fn norm_spec(k: &LaneNorm) -> RowSpec {
+    RowSpec {
+        keep_w: true,
+        ..RowSpec::base(
+            k.width,
+            k.block,
+            k.warps,
+            k.cache_trips,
+            k.ahead,
+            k.x_form,
+            k.w_form,
+            k.out_form,
+            k.weighted,
+        )
+    }
+}
+
+fn norm_load(k: &LaneNorm, _: usize) -> Option<Load> {
+    row_load(&norm_spec(k), k.rows, 2)
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

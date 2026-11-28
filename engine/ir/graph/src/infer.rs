@@ -139,6 +139,11 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             need(!a.ragged || a.mask.causal(), ErrorKind::Value, || {
                 format!("ragged attention is causal only, got {:?}", a.mask)
             })?;
+            need(
+                !a.packed() || (!a.ragged && !a.picked && !a.sinks && !a.rel_bias),
+                ErrorKind::Value,
+                || "packed attention cannot combine with ragged, picked, sinks or rel_bias".into(),
+            )?;
             attend(&g.dims, a, args)
         }
         Op::Delta(d) => {
@@ -365,7 +370,7 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             q.shape, k.shape, v.shape
         )
     })?;
-    heads_fit(dims, [v, q, k], 2, false)?;
+    heads_fit(dims, [v, q, k], 2, 2, false)?;
     delta_gates(dims, v, &a[3..5], 3)?;
     Ok(v.clone())
 }
@@ -478,7 +483,6 @@ pub(crate) fn row_ids(
     }
     Ok(())
 }
-
 /// Rows go to kept `[Seqs, Context, ..]` by slot and position.
 fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (rows, slots, positions) = (a[0], a[1], a[2]);

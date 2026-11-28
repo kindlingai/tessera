@@ -41,6 +41,7 @@ fn grid_reaches_rules() {
         "mm_metal",
         "fast_gemv",
         "fast_mm",
+        "fast_mm_bf128",
         "fast_mm_mx8",
         "fast_stacked",
         "fast_mla_attend",
@@ -49,6 +50,11 @@ fn grid_reaches_rules() {
         "picked_trellis",
         "picked_trellis_metal",
         "picked_bf16",
+        "rocm_gemv",
+        "rocm_mm",
+        "rocm_trellis_mma",
+        "flash_packed_cuda",
+        "flash_packed_rocm",
     ];
     // The grid reaches picked trellis on CUDA and Metal.
     let cuda = device.platform.backend == "cuda";
