@@ -242,4 +242,44 @@ fn check_r7_closers() {
     .to_string();
     let ep = ResponseParser::from_config(&early_cfg).unwrap().unwrap();
     check_parity(&ep, &["<think>planabcd", "efanswer"]);
+    // Lookbehind tool closers keep prior XML context intact across calls.
+    let compact = [
+        "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+        "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
+        " All done.",
+    ];
+    let joined = compact.concat();
+    let want = vec![
+        ("ping".to_string(), json!({"x": 1})),
+        ("ping".to_string(), json!({"x": 2})),
+    ];
+    for pat in [
+        r"(?<=</parameter></function>)</tool_call>",
+        r"(?<=</function>)</tool_call>",
+    ] {
+        let cfg = json!({"response_template": {"fields": {"tool_calls": {
+            "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+            "close_pattern": pat,
+            "content": "xml-inline",
+            "content_args": {"tag_pattern": r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>"},
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+        }}}})
+        .to_string();
+        let tp = ResponseParser::from_config(&cfg).unwrap().unwrap();
+        let whole = tp.parse(&joined, true, false);
+        let got: Vec<(String, Value)> = whole
+            .tool_calls
+            .into_iter()
+            .map(|tc| (tc.function.name, tc.function.arguments))
+            .collect();
+        assert_eq!(
+            (whole.content.as_str(), got),
+            ("\n All done.", want.clone())
+        );
+        let (_, content, calls) = parse_stream(&tp, &compact);
+        assert_eq!((content.as_str(), calls), ("\n All done.", want.clone()));
+        for i in 0..=joined.len() {
+            check_parity(&tp, &[&joined[..i], &joined[i..]]);
+        }
+    }
 }

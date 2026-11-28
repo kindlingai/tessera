@@ -469,67 +469,93 @@ fn check_stop_tail_usage() {
 }
 
 fn check_lookahead_tools() {
-    let tool_cfg = r#"{"response_template":{"fields":{"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close_pattern":"</tool_call>(?!-literal)","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?</parameter>"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
-    let mock = Arc::new(MockGenerator {
-        pieces: vec![
-            "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>"
-                .into(),
-            "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done."
-                .into(),
-        ],
-        ..MockGenerator::default()
-    });
-    let slot = loaded_with(&mock, true, ResponseParser::from_config(tool_cfg).unwrap());
-    let mut body = json!({
-        "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "ping"}}],
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-    });
-    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
-    assert_eq!(status, 200);
-    let calls = got["choices"][0]["message"]["tool_calls"]
-        .as_array()
-        .unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        calls[0]["function"],
-        json!({"name": "ping", "arguments": "{\"x\":1}"})
-    );
-    assert_eq!(
-        calls[1]["function"],
-        json!({"name": "ping", "arguments": "{\"x\":2}"})
-    );
-    body["stream"] = json!(true);
-    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
-    assert_eq!(s_status, 200);
-    let mut args = [String::new(), String::new()];
-    for line in sse
-        .lines()
-        .filter_map(|l| l.strip_prefix("data: "))
-        .filter(|d| *d != "[DONE]")
-    {
-        let v: Value = serde_json::from_str(line).unwrap();
-        for item in v["choices"][0]["delta"]["tool_calls"]
+    let cases: [(&str, &[&str]); 2] = [
+        (
+            "</tool_call>(?!-literal)",
+            &[
+                "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>",
+                "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done.",
+            ],
+        ),
+        (
+            r"(?<=</parameter></function>)</tool_call>",
+            &[
+                "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+                "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
+                " All done.",
+            ],
+        ),
+    ];
+    for (close_pat, pieces) in cases {
+        let tool_cfg = json!({"response_template": {"fields": {"tool_calls": {
+            "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+            "close_pattern": close_pat,
+            "content": "xml-inline",
+            "content_args": {"tag_pattern": r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>"},
+            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+        }}}})
+        .to_string();
+        let mock = Arc::new(MockGenerator {
+            pieces: pieces.iter().map(|s| (*s).into()).collect(),
+            ..MockGenerator::default()
+        });
+        let slot = loaded_with(&mock, true, ResponseParser::from_config(&tool_cfg).unwrap());
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "ping"}}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+        });
+        let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+        assert_eq!(status, 200);
+        assert_eq!(got["choices"][0]["message"]["content"], "\n All done.");
+        let calls = got["choices"][0]["message"]["tool_calls"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0]["function"],
+            json!({"name": "ping", "arguments": "{\"x\":1}"})
+        );
+        assert_eq!(
+            calls[1]["function"],
+            json!({"name": "ping", "arguments": "{\"x\":2}"})
+        );
+        body["stream"] = json!(true);
+        let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+        assert_eq!(s_status, 200);
+        let mut args = [String::new(), String::new()];
+        let mut content = String::new();
+        for line in sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
         {
-            let i = item["index"].as_u64().unwrap() as usize;
-            if let Some(a) = item["function"]["arguments"].as_str() {
-                args[i].push_str(a);
+            let v: Value = serde_json::from_str(line).unwrap();
+            if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(c);
+            }
+            for item in v["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let i = item["index"].as_u64().unwrap() as usize;
+                if let Some(a) = item["function"]["arguments"].as_str() {
+                    args[i].push_str(a);
+                }
             }
         }
+        assert_eq!(
+            serde_json::from_str::<Value>(&args[0]).unwrap(),
+            json!({"x": 1})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&args[1]).unwrap(),
+            json!({"x": 2})
+        );
+        assert_eq!(content, "\n All done.");
     }
-    assert_eq!(
-        serde_json::from_str::<Value>(&args[0]).unwrap(),
-        json!({"x": 1})
-    );
-    assert_eq!(
-        serde_json::from_str::<Value>(&args[1]).unwrap(),
-        json!({"x": 2})
-    );
-    assert!(sse.contains("All done."));
 }
 
 fn check_think_cases() {

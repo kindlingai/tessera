@@ -187,7 +187,7 @@ impl ToolState {
         out: &mut Vec<ResponseEvent>,
         eof: bool,
     ) -> StepOutcome {
-        if spec.close.is_empty() || spec.close.defers_until_eof() {
+        if spec.close.needs_buffer() {
             *self = Self::Buffer;
             return StepOutcome::Continue;
         }

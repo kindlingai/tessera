@@ -131,14 +131,18 @@ impl Closers {
         matches!(self, Self::Literals(list) if list.is_empty())
     }
 
-    pub(super) fn defers_until_eof(&self) -> bool {
-        matches!(
-            self,
-            Self::Pattern {
-                rule: StreamRule::DeferEof,
-                ..
-            }
-        )
+    pub(super) fn needs_buffer(&self) -> bool {
+        self.is_empty()
+            || matches!(
+                self,
+                Self::Pattern {
+                    rule: StreamRule::DeferEof,
+                    ..
+                } | Self::Pattern {
+                    unanchored: true,
+                    ..
+                }
+            )
     }
 
     pub(super) fn find_for(&self, text: &str, eof: bool) -> Option<(usize, usize)> {
@@ -154,20 +158,19 @@ impl Closers {
         if from > text.len() {
             return None;
         }
-        let slice = &text[from..];
         match self {
             Self::Literals(list) => {
-                find_closers_for(slice, list, eof).map(|(at, len)| (from + at, len))
+                find_closers_for(&text[from..], list, eof).map(|(at, len)| (from + at, len))
             }
             Self::Pattern { regex, rule, .. } => {
                 if !eof && matches!(rule, StreamRule::DeferEof) {
                     return None;
                 }
-                let m = regex.find(slice).ok().flatten()?;
-                if !eof && !rule.settled(text, from + m.end()) {
+                let m = regex.find_from_pos(text, from).ok().flatten()?;
+                if !eof && !rule.settled(text, m.end()) {
                     return None;
                 }
-                Some((from + m.start(), m.end() - m.start()))
+                Some((m.start(), m.end() - m.start()))
             }
         }
     }
