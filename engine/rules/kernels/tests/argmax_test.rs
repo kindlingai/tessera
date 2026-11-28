@@ -251,3 +251,81 @@ fn radix_indexed_attention() {
         assert!(diff < 1e-4, "off by {diff:e}");
     }
 }
+
+#[test]
+fn take_narrow_parity() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_graph::{Act, DType, TensorType};
+    use tessera_lower::Pins;
+    use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, Load as Stored};
+    use tessera_trace::Port;
+
+    let cases: [(usize, usize, &'static dyn Stored, &'static dyn Stored, f32); 6] = [
+        (64, 8, F32_FORM, F32_FORM, 1e-5),
+        (64, 6, F32_FORM, F32_FORM, 1e-5),
+        (64, 8, BF16_FORM, BF16_FORM, 2e-2),
+        (64, 8, BF16_FORM, F32_FORM, 2e-2),
+        (64, 8, F32_FORM, BF16_FORM, 2e-2),
+        (64, 8, FP8_FORM, F32_FORM, 2e-1),
+    ];
+    for (width, picks, act, out_form, tol) in cases {
+        let m = Model::new(vec![
+            Dim::bounded(Rows, 16),
+            Dim::fixed(Hidden, width as u64),
+            Dim::fixed(TopK, picks as u64),
+        ]);
+        let p_x = Port {
+            role: Role::Logits,
+            ty: TensorType::new([Rows, Hidden], DType::F32),
+        };
+        let p_ids = Port {
+            role: Role::Tokens,
+            ty: TensorType::new([Rows, TopK], DType::U32),
+        };
+        let [x_in, ids_in] = m.entry(EntryKind::Forward, [p_x, p_ids]);
+        let g = m.finish([(Role::Logits, &x_in.act(Act::Silu).take(&ids_in))]);
+        let rows = 4usize;
+        let sizes = [(Rows, rows as u64)];
+        let x = fill(&g, &g.entries[0].inputs[0].ty, &sizes, &mut Noise(61)).unwrap();
+        // Include out-of-range ids to verify zero fill.
+        let ids_vec: Vec<u32> = (0..rows * picks)
+            .map(|i| {
+                if i % 7 == 0 {
+                    width as u32 + 5
+                } else {
+                    (i * 13 % width) as u32
+                }
+            })
+            .collect();
+        let ids = Tensor::u32(vec![rows, picks], ids_vec);
+        let want = run(&g, &[], 0, &[x.clone(), ids.clone()]).unwrap();
+        let dev = Device::guess(&host()).pinned(Pins::all(act).activations(act).outputs(out_form));
+        let plan = lower(&g, 0, &sizes, &dev).unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| s.kernel.name() == "take")
+            .expect("take step");
+        assert!(!plan.steps.iter().any(|s| s.kernel.name() == "widen"));
+        assert!(!plan.steps.iter().any(|s| s.kernel.name() == "narrow"));
+        if let Source::Made(body) = step.kernel.source() {
+            let want_entry = match (act.name(), out_form.name()) {
+                ("f32", "f32") => "plan_take".into(),
+                (a, b) => format!("plan_take_{a}_{b}"),
+            };
+            assert_eq!(body.entry, want_entry);
+        }
+        let feeds = [x.view(), ids.view()];
+        for settings in runs() {
+            let mut runner = open(plan.clone(), &settings).unwrap();
+            let got = runner.run(&feeds).unwrap();
+            let diff = max_abs_diff(got[0].floats().unwrap(), want[0].floats().unwrap());
+            assert!(
+                diff < tol,
+                "picks={picks} {}->{} diff={diff:e}",
+                act.name(),
+                out_form.name()
+            );
+        }
+    }
+}
