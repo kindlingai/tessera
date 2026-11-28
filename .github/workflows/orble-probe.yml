@@ -1,0 +1,34 @@
+name: orble probe
+
+# Throwaway: runs the success job's steps on an orble runner.
+on:
+  pull_request:
+
+jobs:
+  probe:
+    runs-on: orble-1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - run: |
+          uname -a
+          for tool in git gh jq bash awk sh; do
+            printf '%s: ' "$tool"; command -v "$tool" || echo MISSING
+          done
+          git --version; gh --version | head -1
+          git log --oneline -1 origin/main
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY" --jq .full_name
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: tools/scripts/pr-gate.sh || echo "pr-gate exit $?"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: tools/scripts/protected-ran.sh || echo "protected-ran exit $?"
+      - uses: ./.github/actions/tier-gate
+        continue-on-error: true
