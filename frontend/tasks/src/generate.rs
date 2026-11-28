@@ -182,41 +182,81 @@ impl Generator for Queued {
             if ended {
                 return false;
             }
-            let step = match event {
+            match event {
                 Event::Kept(rows) => {
                     cached = rows;
-                    return true;
+                    true
                 }
-                Event::Scores(_) => return true,
+                Event::Scores(_) => true,
                 Event::Token(id) => {
                     tokens += 1;
                     let piece = spool.push(id, |ids| match raw {
                         true => generate.tokenizer.decode_raw(ids),
                         false => generate.tokenizer.decode(ids),
                     });
-                    let (text, cut) = stops.push(&piece);
-                    match cut {
-                        false => Step::Token { id, text },
-                        true => Step::Done {
-                            text,
-                            finish: Finish::Stop,
-                            tokens,
-                            cached,
-                        },
+                    if stops.is_buffering() {
+                        let (parts, cut) = stops.push_tagged(tokens, &piece);
+                        for (token, text) in parts {
+                            if !sink(Step::Text { token, text }) {
+                                ended = true;
+                                return false;
+                            }
+                        }
+                        if cut {
+                            ended = true;
+                            let _ = sink(Step::Done {
+                                text: String::new(),
+                                finish: Finish::Stop,
+                                tokens,
+                                cached,
+                            });
+                            return false;
+                        }
+                        true
+                    } else {
+                        let (text, cut) = stops.push(&piece);
+                        let step = match cut {
+                            false => Step::Token { id, text },
+                            true => Step::Done {
+                                text,
+                                finish: Finish::Stop,
+                                tokens,
+                                cached,
+                            },
+                        };
+                        ended = matches!(step, Step::Done { .. });
+                        sink(step) && !ended
                     }
                 }
-                Event::Done(reason) => Step::Done {
-                    text: stops.rest(),
-                    finish: match reason {
+                Event::Done(reason) => {
+                    ended = true;
+                    let finish = match reason {
                         Reason::Stop | Reason::Guide => Finish::Stop,
                         Reason::Length | Reason::Context => Finish::Length,
-                    },
-                    tokens,
-                    cached,
-                },
-            };
-            ended = matches!(step, Step::Done { .. });
-            sink(step) && !ended
+                    };
+                    if stops.is_buffering() {
+                        for (token, text) in stops.rest_tagged() {
+                            if !sink(Step::Text { token, text }) {
+                                return false;
+                            }
+                        }
+                        let _ = sink(Step::Done {
+                            text: String::new(),
+                            finish,
+                            tokens,
+                            cached,
+                        });
+                    } else {
+                        let _ = sink(Step::Done {
+                            text: stops.rest(),
+                            finish,
+                            tokens,
+                            cached,
+                        });
+                    }
+                    false
+                }
+            }
         };
         self.send((request, Box::new(each)))
     }

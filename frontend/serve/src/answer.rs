@@ -438,11 +438,13 @@ impl Started {
             .as_ref()
             .map(|p| p.stream(self.parsing.tools, self.parsing.thinking));
         let mut events = Vec::new();
+        let mut seen = 0usize;
         if !self.parsing.forced_prefix.is_empty()
             && let Some(s) = &mut stream
         {
             feed_stream(
                 s,
+                Some(0),
                 &self.parsing.forced_prefix,
                 false,
                 &mut events,
@@ -453,9 +455,18 @@ impl Started {
         while let Ok(step) = self.steps.recv() {
             match step {
                 Step::Token { text: piece, .. } => {
+                    seen += 1;
                     if let Some(s) = &mut stream {
                         events.clear();
-                        feed_stream(s, &piece, false, &mut events, &mut reasoning);
+                        feed_stream(s, Some(seen), &piece, false, &mut events, &mut reasoning);
+                    }
+                    text += &piece;
+                }
+                Step::Text { token, text: piece } => {
+                    seen = seen.max(token);
+                    if let Some(s) = &mut stream {
+                        events.clear();
+                        feed_stream(s, Some(token), &piece, false, &mut events, &mut reasoning);
                     }
                     text += &piece;
                 }
@@ -467,7 +478,13 @@ impl Started {
                 } => {
                     if let Some(s) = &mut stream {
                         events.clear();
-                        feed_stream(s, &rest, true, &mut events, &mut reasoning);
+                        let tok = (!rest.is_empty()).then(|| {
+                            if seen < tokens {
+                                seen += 1;
+                            }
+                            seen
+                        });
+                        feed_stream(s, tok, &rest, true, &mut events, &mut reasoning);
                     }
                     text += &rest;
                     let choice = match self.choice(&text, Some(finish)) {
@@ -500,8 +517,8 @@ impl Started {
         }
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
-                Step::Token { text, .. } if text.is_empty() => continue,
-                Step::Token { text, .. } => (text, None),
+                Step::Token { text, .. } | Step::Text { text, .. } if text.is_empty() => continue,
+                Step::Token { text, .. } | Step::Text { text, .. } => (text, None),
                 Step::Done {
                     text,
                     finish,
@@ -565,9 +582,11 @@ impl Started {
         let mut active_call: Option<usize> = None;
         let mut suppress_call = false;
         let mut reasoning = 0usize;
+        let mut seen = 0usize;
         if !self.parsing.forced_prefix.is_empty() {
             feed_stream(
                 &mut stream,
+                Some(0),
                 &self.parsing.forced_prefix,
                 false,
                 &mut events,
@@ -575,17 +594,33 @@ impl Started {
             );
         }
         while let Ok(step) = self.steps.recv() {
-            let (text, end) = match step {
-                Step::Token { text, .. } => (text, None),
+            let (tok, text, end) = match step {
+                Step::Token { text, .. } => {
+                    seen += 1;
+                    (Some(seen), text, None)
+                }
+                Step::Text { token, text } => {
+                    seen = seen.max(token);
+                    (Some(token), text, None)
+                }
                 Step::Done {
                     text,
                     finish,
                     tokens,
                     cached,
-                } => (text, Some((finish, (tokens, cached)))),
+                } => {
+                    let tok = (!text.is_empty()).then(|| {
+                        if seen < tokens {
+                            seen += 1;
+                        }
+                        seen
+                    });
+                    (tok, text, Some((finish, (tokens, cached))))
+                }
             };
             feed_stream(
                 &mut stream,
+                tok,
                 &text,
                 end.is_some(),
                 &mut events,
@@ -741,13 +776,16 @@ pub(crate) fn chat_completions(slot: &Slot, request: &Request) -> Response {
 /// Feeds one token's text to `stream` and updates reasoning count.
 fn feed_stream(
     stream: &mut ResponseStream<'_>,
+    token: Option<usize>,
     text: &str,
     done: bool,
     events: &mut Vec<ResponseEvent>,
     reasoning: &mut usize,
 ) {
-    if !done || !text.is_empty() {
-        stream.push(text, events);
+    if let Some(id) = token
+        && (!done || !text.is_empty())
+    {
+        stream.push_for(id, text, events);
     }
     if done {
         stream.finish(events);

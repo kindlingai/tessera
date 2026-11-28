@@ -393,6 +393,9 @@ impl ResponseParser {
             lead: false,
             tool: ToolState::Start,
             reasoning_tokens: 0,
+            next_token: 0,
+            last_token: 0,
+            last_counted: true,
             spans: Vec::new(),
         }
     }
@@ -457,6 +460,7 @@ enum Hit {
 
 #[derive(Clone, Copy)]
 struct TokenSpan {
+    token: usize,
     start: usize,
     end: usize,
     counted: bool,
@@ -478,6 +482,12 @@ pub struct ResponseStream<'a> {
     tool: ToolState,
     /// Confirmed reasoning tokens pushed so far.
     reasoning_tokens: usize,
+    /// Auto-assigned token counter for `push`.
+    next_token: usize,
+    /// Most recent token id pushed via `push_for`.
+    last_token: usize,
+    /// Whether `last_token` was already counted as reasoning.
+    last_counted: bool,
     /// Buffered token byte ranges in `buf`.
     spans: Vec<TokenSpan>,
 }
@@ -495,28 +505,43 @@ impl<'a> ResponseStream<'a> {
 
     /// Feeds raw decoded text and appends completed events.
     pub fn push(&mut self, piece: &str, out: &mut Vec<ResponseEvent>) {
+        self.next_token += 1;
+        self.push_for(self.next_token, piece, out);
+    }
+
+    /// Feeds decoded text tagged with its monotonic `token` id.
+    pub fn push_for(&mut self, token: usize, piece: &str, out: &mut Vec<ResponseEvent>) {
         if self.mode == Mode::Closed {
-            return;
-        }
-        if piece.is_empty() {
-            if self.mode == Mode::Thinking {
-                let at = self.buf.len();
-                self.spans.push(TokenSpan {
-                    start: at,
-                    end: at,
-                    counted: false,
-                });
-            }
             return;
         }
         let start = self.buf.len();
         self.buf.push_str(piece);
-        self.spans.push(TokenSpan {
-            start,
-            end: self.buf.len(),
-            counted: false,
-        });
-        self.drain(out, false);
+        if token == self.last_token {
+            if let Some(last) = self.spans.last_mut()
+                && last.token == token
+            {
+                last.end = self.buf.len();
+            } else {
+                self.spans.push(TokenSpan {
+                    token,
+                    start,
+                    end: self.buf.len(),
+                    counted: self.last_counted,
+                });
+            }
+        } else {
+            self.last_token = token;
+            self.last_counted = false;
+            self.spans.push(TokenSpan {
+                token,
+                start,
+                end: self.buf.len(),
+                counted: false,
+            });
+        }
+        if !piece.is_empty() {
+            self.drain(out, false);
+        }
     }
 
     /// Flushes remaining buffered text when generation ends.
@@ -562,7 +587,11 @@ impl<'a> ResponseStream<'a> {
                 }
             }
             if rest.is_empty() {
-                self.spans.clear();
+                if self.mode == Mode::Thinking {
+                    self.count_all_spans();
+                } else {
+                    self.spans.clear();
+                }
                 return;
             }
         }
@@ -597,8 +626,11 @@ impl<'a> ResponseStream<'a> {
             if reasoning && !span.counted && span.start < cut {
                 span.counted = true;
                 self.reasoning_tokens += 1;
+                if span.token == self.last_token {
+                    self.last_counted = true;
+                }
             }
-            if span.end > cut {
+            if span.end > cut || (span.start == span.end && span.start == cut) {
                 span.start = span.start.saturating_sub(cut);
                 span.end -= cut;
                 self.spans[kept] = span;
@@ -612,6 +644,9 @@ impl<'a> ResponseStream<'a> {
         for span in &self.spans {
             if !span.counted {
                 self.reasoning_tokens += 1;
+                if span.token == self.last_token {
+                    self.last_counted = true;
+                }
             }
         }
         self.spans.clear();

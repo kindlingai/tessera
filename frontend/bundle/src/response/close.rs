@@ -386,34 +386,50 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
     }
     let bytes = pat.as_bytes();
     let mut i = 0;
-    let mut in_class = false;
     let mut max_la = 0usize;
     let mut needs_context = false;
     while i < bytes.len() {
         match bytes[i] {
             b'\\' => {
-                if !in_class && i + 1 < bytes.len() {
-                    match bytes[i + 1] {
-                        b'z' | b'Z' => return (StreamRule::DeferEof, needs_context),
-                        b'b' | b'B' => {
-                            max_la = max_la.max(1);
-                            needs_context = true;
-                        }
-                        _ => {}
+                if i + 1 >= bytes.len() {
+                    return (StreamRule::DeferEof, needs_context);
+                }
+                match bytes[i + 1] {
+                    b'z' | b'Z' | b'1'..=b'9' | b'k' | b'K' | b'G' => {
+                        return (StreamRule::DeferEof, needs_context);
                     }
+                    b'A' => needs_context = true,
+                    b'b' | b'B' => {
+                        max_la = max_la.max(1);
+                        needs_context = true;
+                    }
+                    _ => {}
                 }
                 i += 2;
                 continue;
             }
-            b'[' if !in_class => in_class = true,
-            b']' if in_class => in_class = false,
-            b'$' | b'|' if !in_class => return (StreamRule::DeferEof, needs_context),
-            b'(' if !in_class && i + 2 < bytes.len() && bytes[i + 1] == b'?' => {
+            b'[' => {
+                let Some(next) = skip_class(bytes, i) else {
+                    return (StreamRule::DeferEof, needs_context);
+                };
+                i = next;
+                continue;
+            }
+            b'^' => needs_context = true,
+            b'$' | b'|' | b'*' | b'+' | b'?' => return (StreamRule::DeferEof, needs_context),
+            b'{' => {
+                let Some(next) = parse_fixed_quant(pat, i) else {
+                    return (StreamRule::DeferEof, needs_context);
+                };
+                i = next;
+                continue;
+            }
+            b'(' if i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
                 let Some(end) = matching_paren(pat, i) else {
                     return (StreamRule::DeferEof, needs_context);
                 };
-                if bytes[i + 2] == b'<'
-                    && i + 3 < bytes.len()
+                if i + 3 < bytes.len()
+                    && bytes[i + 2] == b'<'
                     && matches!(bytes[i + 3], b'=' | b'!')
                 {
                     needs_context = true;
@@ -423,7 +439,7 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
                     i = end + 1;
                     continue;
                 }
-                if matches!(bytes[i + 2], b'=' | b'!') {
+                if i + 2 < bytes.len() && matches!(bytes[i + 2], b'=' | b'!') {
                     let Some(width) = max_match_chars(&pat[i + 3..end]) else {
                         return (StreamRule::DeferEof, needs_context);
                     };
@@ -432,10 +448,21 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
                     continue;
                 }
                 let head = &pat[i + 2..end];
-                let flags = head.split_once(':').map_or(head, |(f, _)| f);
-                if flags.contains('x') {
+                if let Some((flags, _)) = head.split_once(':') {
+                    if flags.contains('x')
+                        || !flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+                    {
+                        return (StreamRule::DeferEof, needs_context);
+                    }
+                    i += 3 + flags.len();
+                    continue;
+                }
+                if head.contains('x') || !head.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+                {
                     return (StreamRule::DeferEof, needs_context);
                 }
+                i = end + 1;
+                continue;
             }
             _ => {}
         }
@@ -448,35 +475,37 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
     (rule, needs_context)
 }
 
-/// Extracts literal guards from a single trailing `(?!...)` closer.
+/// Extracts literal guards from a fixed body plus trailing `(?!...)`.
 fn parse_neg_guards(pat: &str) -> Option<Vec<String>> {
     let branches = split_alt(strip_group(pat));
     if branches.len() != 1 {
         return None;
     }
     let b = strip_group(branches[0]);
-    let mut guards = Vec::new();
     let bytes = b.as_bytes();
     let mut i = 0;
-    let mut in_class = false;
+    let mut depth = 0usize;
     while i < bytes.len() {
         match bytes[i] {
             b'\\' => {
-                if !in_class
-                    && i + 1 < bytes.len()
-                    && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
-                {
-                    return None;
-                }
                 i += 2;
                 continue;
             }
-            b'[' if !in_class => in_class = true,
-            b']' if in_class => in_class = false,
-            b'$' | b'|' if !in_class => return None,
-            b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
+            b'[' => {
+                i = skip_class(bytes, i)?;
+                continue;
+            }
+            b'(' if depth == 0
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == b'?'
+                && bytes[i + 2] == b'!' =>
+            {
                 let end = matching_paren(b, i)?;
-                if i + 2 < bytes.len() && bytes[i + 2] == b'!' && end + 1 == b.len() {
+                if end + 1 == b.len() {
+                    if !is_fixed_consuming(&b[..i]) {
+                        return None;
+                    }
+                    let mut guards = Vec::new();
                     for alt in split_alt(strip_group(&b[i + 3..end])) {
                         let lit = unescape_lit(strip_group(alt))?;
                         if lit.is_empty() {
@@ -484,10 +513,58 @@ fn parse_neg_guards(pat: &str) -> Option<Vec<String>> {
                         }
                         guards.push(lit);
                     }
-                    break;
+                    return (!guards.is_empty()).then_some(guards);
                 }
+                return None;
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `body` consumes a fixed length without context assertions.
+fn is_fixed_consuming(body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len()
+                    || matches!(
+                        bytes[i + 1],
+                        b'b' | b'B' | b'z' | b'Z' | b'A' | b'G' | b'K' | b'k' | b'1'..=b'9'
+                    )
+                {
+                    return false;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' => {
+                let Some(next) = skip_class(bytes, i) else {
+                    return false;
+                };
+                i = next;
+                continue;
+            }
+            b'^' | b'$' | b'|' | b'*' | b'+' | b'?' => return false,
+            b'{' => {
+                let Some(next) = parse_fixed_quant(body, i) else {
+                    return false;
+                };
+                i = next;
+                continue;
+            }
+            b'(' if i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
                 if !(i + 2 < bytes.len() && bytes[i + 2] == b':') {
-                    return None;
+                    return false;
                 }
                 i += 3;
                 continue;
@@ -496,7 +573,26 @@ fn parse_neg_guards(pat: &str) -> Option<Vec<String>> {
         }
         i += 1;
     }
-    (!guards.is_empty()).then_some(guards)
+    true
+}
+
+/// Parses an exact `{n}` or `{n,n}` quantifier.
+fn parse_fixed_quant(s: &str, start: usize) -> Option<usize> {
+    let close = s[start + 1..].find('}')?;
+    let body = &s[start + 1..start + 1 + close];
+    match body.split_once(',') {
+        Some((lo, hi)) => {
+            let a = lo.parse::<usize>().ok()?;
+            let b = hi.parse::<usize>().ok()?;
+            if a != b {
+                return None;
+            }
+        }
+        None => {
+            body.parse::<usize>().ok()?;
+        }
+    }
+    Some(start + 2 + close)
 }
 
 fn has_forward_assert(pat: &str) -> bool {

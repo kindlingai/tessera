@@ -153,4 +153,50 @@ fn lookahead_closer_parity() {
         (alt_stream.0.as_str(), alt_stream.1.as_str()),
         ("plan", "answer")
     );
+    check_optional_delayed_spans();
+}
+
+fn check_optional_delayed_spans() {
+    for pat in [
+        r"</think>(?:\s*</analysis>)?(?!-literal)",
+        r"</think>(?:\s*</analysis>)?",
+    ] {
+        let cfg = json!({"response_template": {"fields": {
+            "reasoning_content": {"open": "<think>", "close_pattern": pat, "content": "text"},
+        }}})
+        .to_string();
+        let p = ResponseParser::from_config(&cfg).unwrap().unwrap();
+        let whole = p.parse("<think>plan</think> </analysis>answer", true, false);
+        let split = parse_stream(&p, &["<think>plan</think> ", "</analysis>answer"]);
+        assert_eq!(
+            (whole.reasoning.as_str(), whole.content.as_str()),
+            ("plan", "answer")
+        );
+        assert_eq!((split.0.as_str(), split.1.as_str()), ("plan", "answer"));
+    }
+    // Deferred content closer preserves empty UTF-8 lead tokens inside thinking.
+    let delay_cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think>","content":"text"},"content":{"close_pattern":"<end>(?!.*literal)","content":"text"}}}}"#;
+    let dp = ResponseParser::from_config(delay_cfg).unwrap().unwrap();
+    let mut s = dp.stream(true, false);
+    let mut ev = Vec::new();
+    for piece in ["<end>-literal <think>plan", "", "é", " more</think>answer"] {
+        s.push(piece, &mut ev);
+    }
+    s.finish(&mut ev);
+    assert_eq!(s.reasoning_tokens(), 4);
+    // Empty token counts after opener, not after closer.
+    let mut after_open = dp.stream(true, false);
+    ev.clear();
+    for piece in ["<end>-literal <think>", "", "é</think>answer"] {
+        after_open.push(piece, &mut ev);
+    }
+    after_open.finish(&mut ev);
+    assert_eq!(after_open.reasoning_tokens(), 3);
+    let mut after_close = dp.stream(true, false);
+    ev.clear();
+    for piece in ["<end>-literal <think>plan</think>", "", "é"] {
+        after_close.push(piece, &mut ev);
+    }
+    after_close.finish(&mut ev);
+    assert_eq!(after_close.reasoning_tokens(), 1);
 }

@@ -227,7 +227,10 @@ impl tessera_tasks::api::Generator for UnguidedMock {
     }
 }
 
-fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
+fn custom_slot(
+    generator: Arc<dyn tessera_tasks::api::Generator>,
+    parser: ResponseParser,
+) -> crate::Slot {
     let slot: crate::Slot = Arc::new(std::sync::OnceLock::new());
     slot.set(crate::Model {
         info: tessera_tasks::api::Info {
@@ -238,7 +241,7 @@ fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
         chat: Some(Arc::new(crate::mocks::MockChat {
             response: Some(parser),
         })),
-        generator: Some(Arc::new(UnguidedMock(text))),
+        generator: Some(generator),
         score: None,
         strict: true,
         asks: None,
@@ -248,6 +251,10 @@ fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
     .ok()
     .unwrap();
     slot
+}
+
+fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
+    custom_slot(Arc::new(UnguidedMock(text)), parser)
 }
 
 #[test]
@@ -310,18 +317,36 @@ fn check_think_case(
     want_content: &str,
     want_tokens: u64,
 ) {
-    let cfg = json!({"response_template": {"fields": {
+    check_think_with_content(pat, None, pieces, want_reason, want_content, want_tokens);
+}
+
+fn check_think_with_content(
+    pat: &str,
+    content_close: Option<&str>,
+    pieces: &[&str],
+    want_reason: &str,
+    want_content: &str,
+    want_tokens: u64,
+) {
+    let mut fields = json!({
         "reasoning_content": {"open": "<think>", "close_pattern": pat, "content": "text"},
-    }}})
-    .to_string();
+    });
+    if let Some(close) = content_close {
+        fields["content"] = json!({"close_pattern": close, "content": "text"});
+    }
+    let cfg = json!({"response_template": {"fields": fields}}).to_string();
     let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
     let mock = Arc::new(MockGenerator {
         pieces: pieces.iter().map(|s| (*s).into()).collect(),
         ..MockGenerator::default()
     });
     let slot = loaded_with(&mock, true, Some(parser));
+    check_slot_think(&slot, want_reason, want_content, want_tokens);
+}
+
+fn check_slot_think(slot: &crate::Slot, want_reason: &str, want_content: &str, want_tokens: u64) {
     let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
-    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    let (status, got) = json(slot, "/v1/chat/completions", Some(body.clone()));
     assert_eq!(status, 200);
     assert_eq!(
         got["choices"][0]["message"]["reasoning_content"],
@@ -334,9 +359,10 @@ fn check_think_case(
     );
     body["stream"] = json!(true);
     body["stream_options"] = json!({"include_usage": true});
-    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    let (s_status, sse) = call(slot, "/v1/chat/completions", Some(body));
     assert_eq!(s_status, 200);
     let mut content = String::new();
+    let mut reasoning = String::new();
     for line in sse
         .lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -346,12 +372,100 @@ fn check_think_case(
         if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
             content.push_str(c);
         }
+        if let Some(r) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+            reasoning.push_str(r);
+        }
     }
     assert_eq!(content, want_content);
+    assert_eq!(reasoning, want_reason);
     assert!(
         sse.contains(&format!("\"reasoning_tokens\":{want_tokens}")),
         "sse: {sse}"
     );
+}
+
+struct StepsMock(Vec<tessera_tasks::api::Step>);
+
+impl tessera_tasks::api::Generator for StepsMock {
+    fn generate(
+        &self,
+        _prompt: Vec<u32>,
+        _params: tessera_tasks::api::Params,
+        mut sink: tessera_tasks::api::Sink,
+    ) -> Result<(), tessera_tasks::Error> {
+        for step in &self.0 {
+            if !sink(step.clone()) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn steps_slot(steps: Vec<tessera_tasks::api::Step>, parser: ResponseParser) -> crate::Slot {
+    custom_slot(Arc::new(StepsMock(steps)), parser)
+}
+
+fn check_stop_tail_usage() {
+    use tessera_tasks::api::{Finish, Step};
+    let cfg = json!({"response_template": {"fields": {
+        "reasoning_content": {"open": "<think>", "close_pattern": "</think>", "content": "text"},
+    }}})
+    .to_string();
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let flush = steps_slot(
+        vec![
+            Step::Token {
+                id: 1,
+                text: "preface".into(),
+            },
+            Step::Token {
+                id: 2,
+                text: " <think>".into(),
+            },
+            Step::Done {
+                text: "é".into(),
+                finish: Finish::Stop,
+                tokens: 2,
+                cached: 0,
+            },
+        ],
+        parser.clone(),
+    );
+    check_slot_think(&flush, "é", "preface ", 1);
+    // Tagged stop pieces keep third non-reasoning token uncounted.
+    let tagged = steps_slot(
+        vec![
+            Step::Text {
+                token: 1,
+                text: "<think>".into(),
+            },
+            Step::Text {
+                token: 1,
+                text: "a".into(),
+            },
+            Step::Text {
+                token: 2,
+                text: "</think".into(),
+            },
+            Step::Text {
+                token: 2,
+                text: ">".into(),
+            },
+            Step::Text {
+                token: 3,
+                text: "b".into(),
+            },
+            Step::Done {
+                text: String::new(),
+                finish: Finish::Stop,
+                tokens: 3,
+                cached: 0,
+            },
+        ],
+        parser,
+    );
+    check_slot_think(&tagged, "a", "b", 2);
 }
 
 fn check_lookahead_tools() {
@@ -468,6 +582,28 @@ fn check_think_cases() {
         " answer",
         4,
     );
+    check_think_case(
+        "</think>(?:\\s*</analysis>)?(?!-literal)",
+        &["<think>plan</think> ", "</analysis>answer", ""],
+        "plan",
+        "answer",
+        2,
+    );
+    check_think_with_content(
+        "</think>",
+        Some("<end>(?!.*literal)"),
+        &[
+            "<end>-literal <think>plan",
+            "",
+            "é",
+            " more</think>answer",
+            "",
+        ],
+        "plané more",
+        "<end>-literal answer",
+        4,
+    );
+    check_stop_tail_usage();
 }
 
 #[test]

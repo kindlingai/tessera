@@ -453,7 +453,9 @@ impl Started {
         let mut text = String::new();
         while let Ok(step) = self.steps.recv() {
             match step {
-                Step::Token { text: piece, .. } => text.push_str(&piece),
+                Step::Token { text: piece, .. } | Step::Text { text: piece, .. } => {
+                    text.push_str(&piece)
+                }
                 Step::Done {
                     text: tail,
                     finish,
@@ -531,7 +533,7 @@ impl Started {
         let mut called = false;
         while let Ok(step) = self.steps.recv() {
             let (piece, end) = match step {
-                Step::Token { text, .. } => (text, None),
+                Step::Token { text, .. } | Step::Text { text, .. } => (text, None),
                 Step::Done {
                     text,
                     finish,

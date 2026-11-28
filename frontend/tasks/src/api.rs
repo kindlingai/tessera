@@ -118,6 +118,8 @@ pub enum Finish {
 pub enum Step {
     /// A token, and the text it lets out, maybe none.
     Token { id: u32, text: String },
+    /// Buffered text released from an earlier generated token.
+    Text { token: usize, text: String },
     /// The last text, the reason, and the token count.
     Done {
         text: String,
