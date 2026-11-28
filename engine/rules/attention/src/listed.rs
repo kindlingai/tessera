@@ -1,5 +1,7 @@
 //! Masked attention over listed keys, or computed keys by row.
 
+mod split;
+
 use tessera_codegen::kept::{self, Dense, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
@@ -25,7 +27,7 @@ const MAX_SLOTS: usize = MAX_WIDTH / LANES;
 /// Unroll bound for per-lane wide-load loops.
 const MAX_QUADS: u32 = (MAX_SLOTS / WIDE as usize) as u32;
 
-/// Fused split-K attention: one group per query and head.
+/// Fused split-K attention: `splits` groups per query and head.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 fn listed_attend(
@@ -53,13 +55,14 @@ fn listed_attend(
     rel_win: u32,
     #[build] width: u32,
     #[build] warps: u32,
+    #[build] splits: u32,
     #[build] threads: u32,
     #[build] q_form: &'static dyn Stored,
     #[build] k_form: &'static dyn Stored,
     #[build] v_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
 ) {
-    let list = gid() / threads;
+    let list = gid() / (threads * splits);
     if list >= lists {
         return;
     }
@@ -84,7 +87,7 @@ fn listed_attend(
     } else {
         keys
     };
-    let q_at = list as u64 * width as u64;
+    let mut q_at = list as u64 * width as u64;
     let quads = (width + LANES as u32 * WIDE - 1) / (LANES as u32 * WIDE);
     let mut qr = [0.0f32; MAX_SLOTS];
     let mut acc = [0.0f32; MAX_SLOTS];
@@ -105,7 +108,10 @@ fn listed_attend(
     }
     let mut peak = f32::NEG_INFINITY;
     let mut total = 0.0f32;
-    let start = if from_list == 0 { from } else { 0 };
+    let mut start = if from_list == 0 { from } else { 0 };
+    if splits > 1 {
+        start += (gid() / threads % splits) * warps;
+    }
     let mut stop = if from_list == 0 && to < picks {
         to
     } else {
@@ -129,7 +135,7 @@ fn listed_attend(
             stop = lo;
         }
     }
-    for p in (start + warp..stop).by(warps) {
+    for p in (start + warp..stop).by(warps * splits) {
         let mut j = p;
         if from_list == 1 {
             j = ids[row as u64 * picks as u64 + p as u64];
@@ -209,7 +215,16 @@ fn listed_attend(
             denom += l_s[w] * exp(m_s[w] - best);
         }
     }
-    let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+    let mut inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+    if splits > 1 {
+        // A part keeps its peak, sum and unscaled values.
+        inv = 1.0;
+        q_at = (gid() / threads) as u64 * (width + 2) as u64 + 2;
+        if lid() == 0 {
+            out[q_at - 2] = best;
+            out[q_at - 1] = denom;
+        }
+    }
     for d in (lid()..width).by(threads) {
         let mut sum = 0.0f32;
         for w in 0..warps {
@@ -536,25 +551,30 @@ impl Sizes {
     /// Single-launch split-K attention when width fits.
     fn fused(self, reads: [T; 8], warps: u32) -> Option<Vec<Draft>> {
         self.check_fused().ok()?;
-        Some(vec![Draft::new(ListedAttend(self, warps), reads, self.len)])
+        Some(vec![Draft::new(
+            ListedAttend(self, warps, 1),
+            reads,
+            self.len,
+        )])
     }
 }
 
 /// Fused split-K attention over listed or ragged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "listed_attend",
+    name = split::name(self.2),
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.scores() * self.0.width,
+    guess = split::guess(self.2),
     needs = attend_needs(self),
     order = Order::PerConfig,
     accepts = attend_accepts,
     emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
-    shape = Shape::grid((self.0.lists(), 1), (self.1 * LANES as u32) as usize),
+    shape = Shape::grid((self.0.lists() * self.2 as usize, 1), (self.1 * LANES as u32) as usize),
 )]
-pub(crate) struct ListedAttend(pub Sizes, pub u32);
+pub(crate) struct ListedAttend(pub Sizes, pub u32, pub u32);
 
 fn attend_accepts(k: &ListedAttend, input: usize, form: &dyn Stored) -> bool {
     match input {
@@ -579,6 +599,7 @@ fn attend_source(k: &ListedAttend) -> Source {
         listed_attend_ir(
             s.width as u32,
             warps,
+            k.2,
             warps * LANES as u32,
             s.q_form,
             s.k_form,
@@ -587,16 +608,17 @@ fn attend_source(k: &ListedAttend) -> Source {
         ),
         s.kept,
     );
-    let tag = if warps == WARPS {
-        String::new()
-    } else {
-        format!("_w{warps}")
+    let tag = match (k.2, warps) {
+        (1, WARPS) => String::new(),
+        (1, _) => format!("_w{warps}"),
+        (splits, _) => format!("_w{warps}_s{splits}"),
     };
     let suffix = Sizes::form_suffix(&[s.q_form, s.k_form, s.v_form, s.out_form]);
     Source::named(
         body,
         format!(
-            "plan_listed_attend_{}_{}{suffix}{tag}",
+            "plan_{}_{}_{}{suffix}{tag}",
+            split::name(k.2),
             s.kept.name(),
             s.width
         ),
@@ -609,6 +631,7 @@ fn attend_needs(k: &ListedAttend) -> Needs {
         lanes: LANES,
         group_bytes: 4 * (warps * (k.0.width + 2)),
         group_threads: warps * LANES,
+        lacks: split::lacks(k.2),
         ..Needs::default()
     }
 }
@@ -629,7 +652,8 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
         usize::from(s.from_list),
         s.window.0,
         s.window.1,
-        s.sink_mode,
+        // The merge folds the sinks of split lists.
+        if k.2 > 1 { 0 } else { s.sink_mode },
         s.rel_win,
     ];
     args.extend(counts.into_iter().map(Arg::count));

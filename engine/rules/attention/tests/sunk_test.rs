@@ -1,4 +1,4 @@
-//! The tiled sink rule against the interpreter.
+//! The tiled and split sink rules against the interpreter.
 
 use tessera_attention as _;
 use tessera_kernels as _;
@@ -13,6 +13,11 @@ use tessera_testkit::{Noise, max_abs_diff};
 use tessera_trace::{EntryKind, Mask, Model, Port, Role};
 
 const RULE: &str = "flash_sunk";
+
+const SPLIT: &str = "listed_split";
+
+/// One launch: runs of (slot, first position, count).
+type Runs = &'static [(u32, u32, u32)];
 
 /// One ragged site: heads, key heads, width, sinks, bias.
 #[derive(Clone, Copy, Debug)]
@@ -153,7 +158,7 @@ const CASES: [Case; 6] = [
 ];
 
 /// A prefill over two slots, then rows wrapping the ring.
-const LAUNCHES: [&[(u32, u32, u32)]; 5] = [
+const LAUNCHES: [Runs; 5] = [
     &[(0, 0, 40), (1, 0, 24)],
     &[(0, 40, 33), (1, 24, 17), (2, 0, 16)],
     &[(2, 16, 50), (0, 73, 20)],
@@ -161,35 +166,95 @@ const LAUNCHES: [&[(u32, u32, u32)]; 5] = [
     &[(0, 193, 61), (2, 66, 19), (1, 69, 30)],
 ];
 
+/// Runs `launches` under `rule`. It must take those `takes` names.
+fn parity(c: Case, launches: &[Runs], rule: &str, takes: fn(Runs) -> bool, draws: &mut Noise) {
+    let settings = host();
+    let g = graph(c);
+    let (mut store, mut runner): (Store, Option<Box<dyn Run>>) = (Store::default(), None);
+    for runs in launches {
+        let inputs = feeds(c, runs, draws);
+        let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+        let device = Device::guess(&settings).favoring(rule);
+        let plan = lower(&g, 0, &sizes(runs), &device).unwrap();
+        let took = kernels(&plan).contains(&rule);
+        assert_eq!(took, takes(runs), "{c:?}: {:?}", kernels(&plan));
+        let ring = plan.kept_info[0].context;
+        let r = match runner.as_mut() {
+            Some(r) => {
+                r.replan(&plan).unwrap();
+                r
+            }
+            None => runner.insert(open(plan, &settings).unwrap()),
+        };
+        let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+        let got = r.run(&views).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-4, "{c:?} ring {ring} on {runs:?}: off {off:e}");
+    }
+}
+
 #[test]
 fn sunk_matches_interp() {
     let mut draws = Noise(57);
-    let settings = host();
     for c in CASES {
+        parity(c, &LAUNCHES, RULE, |_| true, &mut draws);
+    }
+}
+
+const SPLIT_CASES: [Case; 5] = [
+    case(Mask::Causal, [4, 2, 64, 1, 3]),
+    case(Mask::Back(300), [4, 2, 64, 2, 5]),
+    case(Mask::Back(300), [6, 2, 128, 0, 4]),
+    case(Mask::Causal, [2, 2, 16, 2, 0]),
+    case(Mask::Back(270), [4, 4, 32, 1, 0]),
+];
+
+/// Prefills, then steps of few rows past the ring's wrap.
+const STEPS: [Runs; 10] = [
+    &[(0, 0, 128)],
+    &[(0, 128, 128)],
+    &[(0, 256, 100), (1, 0, 20)],
+    &[(0, 356, 3), (1, 20, 2)],
+    &[(0, 359, 1)],
+    &[(0, 360, 128)],
+    &[(0, 488, 128)],
+    &[(0, 616, 60), (2, 0, 30)],
+    &[(0, 676, 5), (1, 22, 7), (2, 30, 1)],
+    &[(1, 29, 1)],
+];
+
+/// Whether a launch is a step over enough keys.
+fn steps(runs: Runs) -> bool {
+    let rows: u32 = runs.iter().map(|r| r.2).sum();
+    rows < 16 && sizes(runs)[2].1 >= 256
+}
+
+#[test]
+fn split_matches_interp() {
+    let mut draws = Noise(91);
+    for c in SPLIT_CASES {
+        parity(c, &STEPS, SPLIT, steps, &mut draws);
+    }
+}
+
+/// Metal steps split each list. Other backends do not.
+#[test]
+fn metal_takes_split() {
+    let apple = Device::guess(&host()).on(platform("metal", "apple9"));
+    let step: Runs = &[(0, 900, 8)];
+    for c in SPLIT_CASES.into_iter().filter(|c| c.width >= 64) {
         let g = graph(c);
-        let (mut store, mut runner): (Store, Option<Box<dyn Run>>) = (Store::default(), None);
-        for runs in LAUNCHES {
-            let inputs = feeds(c, runs, &mut draws);
-            let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
-            let device = Device::guess(&settings).favoring(RULE);
-            let plan = lower(&g, 0, &sizes(runs), &device).unwrap();
-            assert!(
-                kernels(&plan).contains(&RULE),
-                "{c:?}: {:?}",
-                kernels(&plan)
-            );
-            let ring = plan.kept_info[0].context;
-            let r = match runner.as_mut() {
-                Some(r) => {
-                    r.replan(&plan).unwrap();
-                    r
-                }
-                None => runner.insert(open(plan, &settings).unwrap()),
-            };
-            let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
-            let got = r.run(&views).unwrap().remove(0);
-            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-            assert!(off < 1e-4, "{c:?} ring {ring} on {runs:?}: off {off:e}");
+        let names = kernels(&lower(&g, 0, &sizes(step), &apple).unwrap());
+        assert!(names.contains(&SPLIT), "{c:?}: {names:?}");
+        assert!(names.contains(&"listed_merge"), "{c:?}: {names:?}");
+        assert!(!names.contains(&"listed_attend"), "{c:?}: {names:?}");
+        // Few keys stay whole.
+        let near = kernels(&lower(&g, 0, &sizes(&[(0, 100, 8)]), &apple).unwrap());
+        assert!(!near.contains(&SPLIT), "{c:?}: {near:?}");
+        for (backend, arch) in [("cuda", "sm_121"), ("rocm", "gfx11_5")] {
+            let other = Device::guess(&host()).on(platform(backend, arch));
+            let names = kernels(&lower(&g, 0, &sizes(step), &other).unwrap());
+            assert!(!names.contains(&SPLIT), "{c:?} on {backend}: {names:?}");
         }
     }
 }
