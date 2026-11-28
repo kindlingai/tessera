@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fails on Co-Authored-By trailers that credit an AI tool or bot.
-# A bot has a known name, or an unread address.
+# A bot has a known name, or an unread address. Allowed lines skip this.
 # Usage: check-coauthors.sh <rev-range>
 #        check-coauthors.sh --message <file>
 set -e
@@ -8,10 +8,12 @@ set -e
 bots='anthropic|claude|openai|chatgpt|codex|z\.ai|zhipu|glm|copilot|gemini|cursor|devin|aider|\[bot\]'
 unread='<(no-?reply|bot)@|\.(invalid|example|test|localhost)>'
 pattern="^[[:space:]]*co-authored-by:.*($bots|$unread)"
+# The repository's own rebase app. The account id stops a copy of the name.
+allowed='^[[:space:]]*co-authored-by: tessera-rebase\[bot\] <361704602\+tessera-rebase\[bot\]@users\.noreply\.github\.com>[[:space:]]*$'
 
 # Prints offending lines from stdin. True if any.
 offending() {
-    grep -v '^#' | grep -Ei "$pattern"
+    grep -v '^#' | grep -Eiv "$allowed" | grep -Ei "$pattern"
 }
 
 if [ "$1" = "--message" ]; then
@@ -30,7 +32,7 @@ fi
 failed=0
 for c in $(git rev-list "$1"); do
     lines=$(git log -1 --format=%B "$c" | offending) || continue
-    echo "$(git log -1 --format='%h %s' "$c")" >&2
+    git log -1 --format='%h %s' "$c" >&2
     echo "$lines" | sed 's/^/    /' >&2
     failed=1
 done
