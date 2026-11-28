@@ -52,7 +52,7 @@ fn entry(form: &str, m: usize) -> Option<&'static str> {
     emits = crate::f32_only,
     needs = metal_needs(),
     order = Order::PerConfig,
-    source = crate::metal_fixed(SOURCE, self.entry),
+    source = tessera_lower::Source::metal(SOURCE, self.entry),
     launches = launches,
     load = load,
 )]

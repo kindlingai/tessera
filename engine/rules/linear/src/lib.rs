@@ -21,14 +21,6 @@ pub use product::Product;
 pub use tiled::{BF16, PARTS, SCHEDULES, Schedule, Tiled};
 pub use turned::Turned;
 
-/// A fixed Metal kernel: `text`, entered at `entry`.
-pub(crate) fn metal_fixed(text: &'static str, entry: &'static str) -> tessera_lower::Source {
-    tessera_lower::Source::Fixed {
-        text: tessera_lower::ByBackend([text, "", ""]),
-        entry,
-    }
-}
-
 /// Emits only f32 values.
 pub(crate) fn f32_only<K>(_: &K, form: &dyn tessera_lower::form::Load) -> bool {
     form.name() == "f32"

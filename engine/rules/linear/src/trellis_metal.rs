@@ -54,7 +54,7 @@ fn split_k(knobs: &Knobs, m: usize, n: usize, k: usize) -> usize {
 }
 
 fn fixed(entry: &'static str) -> Source {
-    crate::metal_fixed(SOURCE, entry)
+    tessera_lower::Source::metal(SOURCE, entry)
 }
 
 fn tile_rows(m: usize, mid_rows: usize) -> usize {

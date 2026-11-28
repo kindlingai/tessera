@@ -71,7 +71,7 @@ const ENTRIES: &[EntrySet] = &[
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "mm_metal",
-    source = crate::metal_fixed(SOURCE, self.entry),
+    source = tessera_lower::Source::metal(SOURCE, self.entry),
     order = Order::PerConfig,
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,

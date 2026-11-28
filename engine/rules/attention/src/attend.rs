@@ -453,3 +453,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 }
 
 tessera_lower::rule!("attend", propose);
+
+mod mla_metal;
+
+tessera_lower::rule!("mla_metal", mla_metal::propose);

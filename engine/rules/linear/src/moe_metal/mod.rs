@@ -42,7 +42,7 @@ fn lookup(form: &str) -> Option<(&'static str, bool)> {
     emits = crate::f32_only,
     needs = moe_needs(),
     order = Order::PerConfig,
-    source = crate::metal_fixed(SOURCE, self.entry),
+    source = tessera_lower::Source::metal(SOURCE, self.entry),
     launches = moe_launches,
     load = moe_load,
 )]

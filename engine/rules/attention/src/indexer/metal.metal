@@ -1,111 +1,16 @@
-#include <metal_stdlib>
-#include <metal_simdgroup_matrix>
-
-using namespace metal;
-
 constant uint IDX_WARPS = 4u;
 constant uint IDX_THREADS = 128u;
 constant uint IDX_MAX_TILE = 256u;
 
-enum IdxFmt : uint {
-    IDX_F32 = 0u,
-    IDX_BF16 = 1u,
-    IDX_F16 = 2u,
-    IDX_FP8 = 3u,
-};
-
-static inline uint idx_kept_row(
-    uint slot,
-    uint pos,
-    uint kept_mode,
-    uint kept_param,
-    uint page_shift,
-    uint page_mask,
-    device const uint *page_table) {
-    if (kept_mode == 0u) {
-        return slot * kept_param + pos;
-    }
-    if (kept_mode == 2u) {
-        return slot * kept_param + (pos % kept_param);
-    }
-    uint pg = page_table[slot * kept_param + (pos >> page_shift)];
-    return (pg << page_shift) | (pos & page_mask);
-}
-
-// Packed uint2 E4M3 to half4 decode.
-static inline half4 idx_fp8_h4(uchar4 raw) {
-    uint2 u = uint2(uint(raw.x) | (uint(raw.y) << 16u), uint(raw.z) | (uint(raw.w) << 16u));
-    uint2 s = (u & 0x00800080u) << 8u;
-    uint2 m = u & 0x007F007Fu;
-    half4 norm = as_type<half4>(s | ((m << 7u) + 0x20002000u));
-    half4 sub = as_type<half4>(s | 0x40004000u | m) - as_type<half4>(s | 0x40004000u);
-    return select(norm, sub, abs(norm) < half4(0.015625h));
-}
-
-template <uint FMT>
-static inline float4 idx_load4_f32(device const uchar *base, ulong elem_off) {
-    if constexpr (FMT == IDX_F32) {
-        return *(device const float4 *)(base + (elem_off << 2u));
-    } else if constexpr (FMT == IDX_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return as_type<float4>(uint4(raw) << 16u);
-    } else if constexpr (FMT == IDX_F16) {
-        return float4(*(device const half4 *)(base + (elem_off << 1u)));
-    } else {
-        return float4(idx_fp8_h4(*(device const uchar4 *)(base + elem_off)));
-    }
-}
-
-template <uint FMT>
-static inline half4 idx_load4_h4(device const uchar *base, ulong elem_off) {
-    if constexpr (FMT == IDX_F32) {
-        return half4(*(device const float4 *)(base + (elem_off << 2u)));
-    } else if constexpr (FMT == IDX_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return half4(as_type<float4>(uint4(raw) << 16u));
-    } else if constexpr (FMT == IDX_F16) {
-        return *(device const half4 *)(base + (elem_off << 1u));
-    } else {
-        return idx_fp8_h4(*(device const uchar4 *)(base + elem_off));
-    }
-}
-
-static inline float4 idx_load4_plain(device const uchar *base, ulong elem_off, uint fmt) {
-    if (fmt == IDX_F32) {
-        return *(device const float4 *)(base + (elem_off << 2u));
-    }
-    if (fmt == IDX_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return as_type<float4>(uint4(raw) << 16u);
-    }
-    return float4(*(device const half4 *)(base + (elem_off << 1u)));
-}
-
 static inline float idx_load1_plain(device const uchar *base, ulong elem_off, uint fmt) {
-    if (fmt == IDX_F32) {
+    if (fmt == KV_F32) {
         return *(device const float *)(base + (elem_off << 2u));
     }
-    if (fmt == IDX_BF16) {
+    if (fmt == KV_BF16) {
         ushort raw = *(device const ushort *)(base + (elem_off << 1u));
         return as_type<float>(uint(raw) << 16u);
     }
     return float(*(device const half *)(base + (elem_off << 1u)));
-}
-
-static inline ushort idx_f32_to_bf16(float x) {
-    uint u = as_type<uint>(x);
-    uint rnd = 0x7FFFu + ((u >> 16u) & 1u);
-    return ushort((u + rnd) >> 16u);
-}
-
-static inline void idx_store1(device uchar *base, ulong elem_off, float val, uint out_fmt) {
-    if (out_fmt == IDX_F32) {
-        *(device float *)(base + (elem_off << 2u)) = val;
-    } else if (out_fmt == IDX_BF16) {
-        *(device ushort *)(base + (elem_off << 1u)) = idx_f32_to_bf16(val);
-    } else {
-        *(device half *)(base + (elem_off << 1u)) = half(val);
-    }
 }
 
 template <uint HQ, uint BK, uint STRIDE, typename T>
@@ -177,7 +82,7 @@ static inline void idx_mma_body(
     ulong out_row = ulong(row) * out_keys;
     if (j_begin >= to || j_end <= from) {
         for (uint j = j_begin + tid; j < j_end; j += IDX_THREADS) {
-            idx_store1(out_buf, out_row + j, -INFINITY, out_fmt);
+            kv_store1(out_buf, out_row + j, -INFINITY, out_fmt);
         }
         return;
     }
@@ -212,7 +117,7 @@ static inline void idx_mma_body(
             T4 qv = T4(0);
             if (h < nh) {
                 ulong qoff = (ulong(row) * heads + hc + h) * dim + ulong(q4) * 4ull;
-                qv = T4(idx_load4_plain(q_buf, qoff, q_fmt));
+                qv = T4(kv_load4_plain(q_buf, qoff, q_fmt));
             }
             *(threadgroup T4 *)(sm.q_s + h * STRIDE + q4 * 4u) = qv;
         }
@@ -221,7 +126,7 @@ static inline void idx_mma_body(
         for (uint j0 = j_begin + simd * BK; j0 < j_end; j0 += IDX_WARPS * BK) {
             if (j0 >= to || j0 + BK <= from) {
                 if (!multi && lane < BK && j0 + lane < j_end) {
-                    idx_store1(out_buf, out_row + j0 + lane, -INFINITY, out_fmt);
+                    kv_store1(out_buf, out_row + j0 + lane, -INFINITY, out_fmt);
                 }
                 continue;
             }
@@ -233,13 +138,13 @@ static inline void idx_mma_body(
                 T4 kv = T4(0);
                 if (j >= from && j < to && j < j_end) {
                     uint krow = (ragged == 1u)
-                        ? idx_kept_row(slot, j, kept_mode, kept_param, page_shift, page_mask, page_table)
+                        ? kv_kept_row(slot, j, kept_mode, kept_param, page_shift, page_mask, page_table)
                         : (slot * out_keys + j);
                     ulong koff = ulong(krow) * dim + ulong(q4) * 4ull;
                     if constexpr (sizeof(T) == 2u) {
-                        kv = idx_load4_h4<K_FMT>(k_buf, koff);
+                        kv = kv_load4_h4<K_FMT>(k_buf, koff);
                     } else {
-                        kv = idx_load4_f32<K_FMT>(k_buf, koff);
+                        kv = kv_load4_f32<K_FMT>(k_buf, koff);
                     }
                 }
                 *(threadgroup T4 *)(k_mine + kr * STRIDE + q4 * 4u) = kv;
@@ -305,22 +210,22 @@ static inline void idx_mma_body(
                 } else {
                     if (k0 < j_end) {
                         float v = (k0 >= from && k0 < to) ? acc0 : -INFINITY;
-                        idx_store1(out_buf, out_row + k0, v, out_fmt);
+                        kv_store1(out_buf, out_row + k0, v, out_fmt);
                     }
                     if (k1 < j_end) {
                         float v = (k1 >= from && k1 < to) ? acc1 : -INFINITY;
-                        idx_store1(out_buf, out_row + k1, v, out_fmt);
+                        kv_store1(out_buf, out_row + k1, v, out_fmt);
                     }
                     if constexpr (BK == 16u) {
                         uint k2 = j0 + 8u + tile_col;
                         uint k3 = k2 + 1u;
                         if (k2 < j_end) {
                             float v = (k2 >= from && k2 < to) ? acc2 : -INFINITY;
-                            idx_store1(out_buf, out_row + k2, v, out_fmt);
+                            kv_store1(out_buf, out_row + k2, v, out_fmt);
                         }
                         if (k3 < j_end) {
                             float v = (k3 >= from && k3 < to) ? acc3 : -INFINITY;
-                            idx_store1(out_buf, out_row + k3, v, out_fmt);
+                            kv_store1(out_buf, out_row + k3, v, out_fmt);
                         }
                     }
                 }
@@ -336,7 +241,7 @@ static inline void idx_mma_body(
         for (uint idx = tid; idx < span; idx += IDX_THREADS) {
             uint j = j_begin + idx;
             float v = (j >= from && j < to) ? sm.acc_s[idx] : -INFINITY;
-            idx_store1(out_buf, out_row + j, v, out_fmt);
+            kv_store1(out_buf, out_row + j, v, out_fmt);
         }
     }
 }
@@ -384,12 +289,12 @@ static inline void idx_mma_body(
             past, back, ahead, flags, tg, tid, sm);                                          \
     }
 
-IDX_F32_ENTRY(idx_128_f32, IDX_F32, 16u, 8u, 136u)
-IDX_HALF_ENTRY(idx_128_bf16, IDX_BF16, 32u, 16u, 136u)
-IDX_HALF_ENTRY(idx_128_f16, IDX_F16, 32u, 16u, 136u)
-IDX_HALF_ENTRY(idx_128_fp8, IDX_FP8, 32u, 16u, 136u)
+IDX_F32_ENTRY(idx_128_f32, KV_F32, 16u, 8u, 136u)
+IDX_HALF_ENTRY(idx_128_bf16, KV_BF16, 32u, 16u, 136u)
+IDX_HALF_ENTRY(idx_128_f16, KV_F16, 32u, 16u, 136u)
+IDX_HALF_ENTRY(idx_128_fp8, KV_FP8, 32u, 16u, 136u)
 
-IDX_F32_ENTRY(idx_256_f32, IDX_F32, 8u, 8u, 264u)
-IDX_HALF_ENTRY(idx_256_bf16, IDX_BF16, 16u, 8u, 264u)
-IDX_HALF_ENTRY(idx_256_f16, IDX_F16, 16u, 8u, 264u)
-IDX_HALF_ENTRY(idx_256_fp8, IDX_FP8, 16u, 8u, 264u)
+IDX_F32_ENTRY(idx_256_f32, KV_F32, 8u, 8u, 264u)
+IDX_HALF_ENTRY(idx_256_bf16, KV_BF16, 16u, 8u, 264u)
+IDX_HALF_ENTRY(idx_256_f16, KV_F16, 16u, 8u, 264u)
+IDX_HALF_ENTRY(idx_256_fp8, KV_FP8, 16u, 8u, 264u)

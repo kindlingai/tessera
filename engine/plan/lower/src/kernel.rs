@@ -204,6 +204,18 @@ pub struct Needs {
 }
 
 impl Needs {
+    /// Hand-written Metal text in 32-lane SIMD groups.
+    pub fn metal(group_threads: usize, group_bytes: usize) -> Self {
+        Needs {
+            lanes: 32,
+            group_bytes,
+            group_threads,
+            compiler: true,
+            lacks: &[Backend::Cuda, Backend::Rocm],
+            ..Needs::default()
+        }
+    }
+
     /// A SIMD group per row, in groups of 256 threads.
     pub fn lanes() -> Self {
         Needs {

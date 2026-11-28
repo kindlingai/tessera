@@ -663,3 +663,5 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 tessera_lower::rule!("indexer", propose);
 
 mod metal;
+
+pub(crate) use metal::{k_fmt_idx, kept_params, plain_fmt};

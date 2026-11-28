@@ -200,6 +200,14 @@ pub enum Source {
 }
 
 impl Source {
+    /// Hand-written Metal text.
+    pub fn metal(text: &'static str, entry: &'static str) -> Source {
+        Source::Fixed {
+            text: ByBackend([text, "", ""]),
+            entry,
+        }
+    }
+
     /// A tree under its own entry name.
     pub fn named(mut body: Body, entry: impl Into<String>) -> Source {
         body.entry = entry.into();

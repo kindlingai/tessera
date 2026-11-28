@@ -3,17 +3,15 @@
 use super::Sizes;
 use tessera_codegen::kept::Layout;
 use tessera_graph::Order;
-use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T};
 
 const THREADS: usize = 128;
-const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("metal.metal");
+const SOURCE: &str = concat!(include_str!("../kv.metal"), include_str!("metal.metal"));
 /// Low default guess so Metal prefers native MMA indexer scoring.
 const GUESS: f64 = 1.0e-12;
 
-fn plain_fmt(form: &dyn Stored) -> Option<usize> {
+pub(crate) fn plain_fmt(form: &dyn Stored) -> Option<usize> {
     match form.name() {
         "f32" => Some(0),
         "bf16" => Some(1),
@@ -22,7 +20,7 @@ fn plain_fmt(form: &dyn Stored) -> Option<usize> {
     }
 }
 
-fn k_fmt_idx(form: &dyn Stored) -> Option<usize> {
+pub(crate) fn k_fmt_idx(form: &dyn Stored) -> Option<usize> {
     match form.name() {
         "f32" => Some(0),
         "bf16" => Some(1),
@@ -32,7 +30,7 @@ fn k_fmt_idx(form: &dyn Stored) -> Option<usize> {
     }
 }
 
-fn kept_params(
+pub(crate) fn kept_params(
     layout: &'static dyn Layout,
     context: usize,
 ) -> Option<(usize, usize, usize, usize)> {
@@ -117,14 +115,7 @@ struct IndexerMetal(Sizes);
 
 fn metal_needs(s: &Sizes) -> Needs {
     let (_, smem) = pick_entry(s.dim, s.k_form).expect("verified entry");
-    Needs {
-        lanes: 32,
-        group_bytes: smem,
-        group_threads: THREADS,
-        compiler: true,
-        lacks: LACKS,
-        ..Needs::default()
-    }
+    Needs::metal(THREADS, smem)
 }
 
 fn metal_accepts(k: &IndexerMetal, input: usize, form: &dyn Stored) -> bool {
@@ -137,10 +128,7 @@ fn metal_emits(k: &IndexerMetal, form: &dyn Stored) -> bool {
 
 fn metal_source(s: &Sizes) -> Source {
     let (entry, _) = pick_entry(s.dim, s.k_form).expect("verified entry");
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    Source::metal(SOURCE, entry)
 }
 
 fn metal_load(k: &IndexerMetal, _: usize) -> Option<Load> {
