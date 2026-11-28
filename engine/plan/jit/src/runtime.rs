@@ -201,6 +201,8 @@ macro_rules! tiles {
 tiles! {
     dots_f32 = F32_FORM;
     dots_bf16 = BF16_FORM;
+    dots_f16 = &F16;
+    dots_fp8 = &Fp8;
 }
 
 /// One stage over a row. Only two stages read `b`.

@@ -1,5 +1,6 @@
 //! `x[m, k]` times `w[n, k]` transposed, dense or picked.
 
+use tessera_codegen::form::Read;
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Stmt, Ty};
 use tessera_codegen::prelude::*;
 use tessera_lower::form::Load as Stored;
@@ -191,9 +192,9 @@ fn row_calls(after: &After) -> Option<Vec<Stmt>> {
     Some(calls)
 }
 
-/// Blocks need f32 or bf16 weights, at any width.
+/// Blocks need plain float weights, at any width.
 fn tiles(form: &dyn Stored) -> bool {
-    ["f32", "bf16"].contains(&form.name())
+    matches!(form.read(), Read::F32 | Read::Bf16 | Read::F16 | Read::Fp8)
 }
 
 /// Multiply-adds one packed weight costs, as a guess.
@@ -231,11 +232,13 @@ pub struct Dense {
 }
 
 fn dense_launches(k: &Dense, step: &Step) -> Vec<Launch> {
-    vec![Launch::plain(
-        step,
-        &[k.m, k.n, k.k],
-        Shape::Line(k.m * k.n),
-    )]
+    // One thread a group: workers split outputs evenly.
+    let shape = Shape::Grid {
+        across: k.m * k.n,
+        down: 1,
+        threads: 1,
+    };
+    vec![Launch::plain(step, &[k.m, k.n, k.k], shape)]
 }
 
 /// A matmul in square blocks, and its stages.
@@ -301,7 +304,12 @@ fn picked_launches(k: &Picked, step: &Step) -> Vec<Launch> {
         p.repeat,
         p.first.unwrap_or(0),
     ];
-    vec![Launch::plain(step, &counts, Shape::Line(k.m * k.n))]
+    let shape = Shape::Grid {
+        across: k.m * k.n,
+        down: 1,
+        threads: 1,
+    };
+    vec![Launch::plain(step, &counts, shape)]
 }
 
 /// Any finished matmul, dense or picked.
