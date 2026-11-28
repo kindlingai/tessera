@@ -1,231 +1,23 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
-use crate::exlr8_experts as experts;
-use crate::exlr8_shard::{Shard, layer_prefix, past};
+mod experts;
+mod format;
+mod shard;
+
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored, narrow};
+pub use format::codes;
+use format::{
+    BF16, FP8_BLOCK, FP8_ROW, FP32, ROWS, TRELLIS, block_form, blocks, bounds, coded, codes_packed,
+    halves, matrix, plain, record, rows, span, turned,
+};
+use shard::{Shard, layer_prefix, past};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tessera_engine::storage::Form;
 use tessera_engine::trellis::Codebook;
 pub use tessera_engine::trellis::rotated;
-use tessera_engine::{E4M3, F16, block, trellis};
-
-/// Record field 0: how the matrix is stored.
-const TRELLIS: i64 = 1;
-const INT4: i64 = 2;
-const MXFP8: i64 = 3;
-const FP8_BLOCK: i64 = 4;
-const FP8_ROW: i64 = 5;
-const BF16: i64 = 6;
-const FP32: i64 = 7;
-const ROWS: i64 = 9;
-const INT2: i64 = 10;
-
-/// A matrix's record: format, shape, trellis width, sharded side.
-struct Record {
-    format: i64,
-    out: usize,
-    inp: usize,
-    k: u32,
-    side: i64,
-}
-
-fn record(f: &File, name: &str) -> Result<Record, Error> {
-    let bytes = f.bytes(&format!("{name}.record"))?;
-    let field = |i: usize| i64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().expect("8 bytes"));
-    Ok(Record {
-        format: field(0),
-        out: field(1) as usize,
-        inp: field(2) as usize,
-        k: field(3) as u32,
-        side: field(4),
-    })
-}
-
-fn halves(f: &File, name: &str) -> Result<Vec<f32>, Error> {
-    Ok(F16::floats(&f.bytes(name)?))
-}
-
-fn e4m3(bits: u8) -> f32 {
-    f32::from(E4M3(bits))
-}
-
-/// Tensor `stem` in a known codebook, and that codebook.
-pub(crate) fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
-    for book in Codebook::ALL {
-        let tensor = format!("{stem}{}", book.suffix());
-        if f.shape(&tensor).is_some() {
-            return Ok((tensor, book));
-        }
-    }
-    Err(Error::Missing(format!("{stem} in a known codebook")))
-}
-
-/// Row trellis `name`, each value through `each`.
-fn rows<T: Clone + Send>(
-    f: &File,
-    name: &str,
-    r: &Record,
-    each: impl Fn(&f32) -> T + Sync,
-) -> Result<Vec<T>, Error> {
-    let (tensor, book) = coded(f, &format!("{name}.rows"))?;
-    let side = |s: &str| halves(f, &format!("{name}.{s}"));
-    let (suh, svh) = (side("suh")?, side("svh")?);
-    let bad = || Error::DType(format!("{name}: unreadable K{} {book:?} rows", r.k));
-    trellis::rows(r.k, book, &f.bytes(&tensor)?, [&suh, &svh], each).ok_or_else(bad)
-}
-
-/// Trellis matrix `name` packed: a header, then its entries.
-fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
-    let tensor = coded(f, &format!("{name}.trellis"))?.0;
-    let len = f.byte_len(&tensor)? as usize;
-    let mut out = trellis::alloc_packed(r.inp, r.out, r.side as u32, len);
-    f.read_into(&tensor, 0, &mut out[trellis::HEAD..])?;
-    Ok(out)
-}
-
-/// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
-fn decoded(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
-    let book = coded(f, &format!("{name}.trellis"))?.1;
-    let form = trellis::form_for(r.k, book)
-        .ok_or_else(|| Error::DType(format!("{name}: K{} {book:?}", r.k)))?;
-    let bytes = packed(f, name, r)?;
-    Ok(form.unpack_all(&bytes))
-}
-
-/// Matrix `name` as f32 `[out][in]`, decoded by its record.
-fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
-    let r = record(f, name)?;
-    match r.format {
-        TRELLIS => {
-            let suh = halves(f, &format!("{name}.suh"))?;
-            let svh = halves(f, &format!("{name}.svh"))?;
-            let t = decoded(f, name, &r)?;
-            Ok(trellis::rotated(&t, r.inp, r.out, &suh, &svh))
-        }
-        other => plain(f, name, &r, other),
-    }
-}
-
-/// Packed codes of `name`, or `rows` as `(first, count)`.
-fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
-    let r = record(f, name)?;
-    if r.format != TRELLIS {
-        let what = format!("{name} is in exlr8 format {}, not trellis", r.format);
-        return Err(Error::DType(what));
-    }
-    let Some((first, count)) = rows else {
-        return packed(f, name, &r);
-    };
-    // Output-side entries are 128 rows: a range is whole entries.
-    let entry = r.inp * 128 * r.k as usize / 8;
-    if r.side == trellis::INPUT_SIDE as i64 || first % 128 != 0 || count % 128 != 0 {
-        return Err(Error::DType(format!(
-            "{name}: rows {first}.. are not whole entries"
-        )));
-    }
-    let tensor = coded(f, &format!("{name}.trellis"))?.0;
-    let at = (first / 128 * entry) as u64;
-    let take = count / 128 * entry;
-    let mut out = trellis::alloc_packed(r.inp, count, r.side as u32, take);
-    f.read_into(&tensor, at, &mut out[trellis::HEAD..])?;
-    Ok(out)
-}
-
-/// Matrix `name` as f32 `[out][in]` before its rotations, if any.
-pub fn codes(f: &File, name: &str) -> Result<Vec<f32>, Error> {
-    let r = record(f, name)?;
-    match r.format {
-        TRELLIS => decoded(f, name, &r),
-        other => plain(f, name, &r, other),
-    }
-}
-
-/// A matrix in a format other than trellis, as `[out][in]`.
-fn plain(f: &File, name: &str, r: &Record, format: i64) -> Result<Vec<f32>, Error> {
-    let inp = r.inp;
-    let fp8 = || f.bytes(&format!("{name}.fp8"));
-    if let Some(form) = block_form(format) {
-        return Ok(form.unpack_all(&blocks(f, name, r, (0, r.out))?));
-    }
-    match format {
-        FP8_ROW => {
-            let scale = f.floats(&format!("{name}.scale"))?;
-            let row = |(i, c): (usize, &u8)| e4m3(*c) * scale[i / inp];
-            Ok(fp8()?.iter().enumerate().map(row).collect())
-        }
-        // One scale per 128 by 128 block.
-        FP8_BLOCK => {
-            let scale = f.floats(&format!("{name}.scale"))?;
-            let at = |i: usize| scale[i / inp / 128 * inp.div_ceil(128) + i % inp / 128];
-            let value = |(i, c): (usize, &u8)| e4m3(*c) * at(i);
-            Ok(fp8()?.iter().enumerate().map(value).collect())
-        }
-        BF16 => f.floats(&format!("{name}.bf16")),
-        FP32 => f.floats(&format!("{name}.fp32")),
-        ROWS => rows(f, name, r, |x| *x),
-        other => Err(Error::DType(format!("{name} is in exlr8 format {other}"))),
-    }
-}
-
-/// The block form a format's planes join into.
-fn block_form(format: i64) -> Option<&'static dyn Form> {
-    match format {
-        INT4 => Some(&block::INT4_G32),
-        INT2 => Some(&block::INT2_G32),
-        MXFP8 => Some(&block::MXFP8),
-        _ => None,
-    }
-}
-
-/// Rows `first..first + count` of a block form matrix.
-fn blocks(
-    f: &File,
-    name: &str,
-    r: &Record,
-    (first, count): (usize, usize),
-) -> Result<Vec<u8>, Error> {
-    // One scale and 32 codes per 32 inputs.
-    let (scale_part, code_part, scale_bytes, code_bytes) = match r.format {
-        INT4 => ("s4", "q4", 2, 16),
-        INT2 => ("s2", "q2", 2, 8),
-        _ => ("e8m0", "fp8", 1, 32),
-    };
-    let scales = f.bytes(&format!("{name}.{scale_part}"))?;
-    let codes = f.bytes(&format!("{name}.{code_part}"))?;
-    if !r.inp.is_multiple_of(32) || first + count > r.out {
-        return Err(Error::DType(format!("{name}: {count} rows of {}", r.inp)));
-    }
-    // Input-side int4 shards hold 128 inputs of every output.
-    let grouped = r.format == INT4 && r.side == trellis::INPUT_SIDE as i64;
-    let groups = r.inp / 32;
-    let mut out = Vec::with_capacity(count * groups * (scale_bytes + code_bytes));
-    for o in first..first + count {
-        for g in 0..groups {
-            let at = match grouped {
-                true => (g / 4 * r.out + o) * 4 + g % 4,
-                false => o * groups + g,
-            };
-            out.extend_from_slice(&scales[at * scale_bytes..(at + 1) * scale_bytes]);
-            out.extend_from_slice(&codes[at * code_bytes..(at + 1) * code_bytes]);
-        }
-    }
-    Ok(out)
-}
-
-/// A trellis matrix as a rotated file, rotations after codes.
-fn turned(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
-    let mut bytes = codes_packed(f, name, rows)?;
-    bytes.extend(f.bytes(&format!("{name}.suh"))?);
-    let svh = f.bytes(&format!("{name}.svh"))?;
-    match rows {
-        Some((first, count)) => bytes.extend_from_slice(&svh[2 * first..2 * (first + count)]),
-        None => bytes.extend(svh),
-    }
-    Ok(bytes)
-}
+use tessera_engine::{F16, trellis};
 
 /// An exlr8 release, read by HF tensor name.
 pub struct Release {
@@ -636,6 +428,11 @@ impl Release {
         read(&files[file])
     }
 
+    /// Whether release file `file` opens.
+    fn has(&self, file: &str) -> bool {
+        self.with(file, |_| Ok(())).is_ok()
+    }
+
     /// Packed bytes of `name`, or `range` rows `(first, count)`.
     pub fn packed(&self, name: &str, range: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
         if let Some((layer, local)) = self.expert(name) {
@@ -663,22 +460,17 @@ impl Release {
             }
             Ok(r) if r.format == ROWS => {
                 let mut all = rows(f, &matrix, &r, narrow)?;
-                if let Some((first, count)) = range {
-                    all = all
-                        .into_iter()
-                        .skip(first * r.inp)
-                        .take(count * r.inp)
-                        .collect();
-                }
+                let keep = bounds(all.len(), range, r.inp);
+                all.truncate(keep.end);
+                all.drain(..keep.start);
                 Ok(all.into_flattened())
             }
             Ok(r) if r.format == FP8_BLOCK || r.format == FP8_ROW => {
                 let floats = plain(f, &matrix, &r, r.format)?;
-                let slice = match range {
-                    Some((first, count)) => &floats[first * r.inp..(first + count) * r.inp],
-                    None => &floats,
-                };
-                Ok(slice.iter().flat_map(narrow).collect())
+                Ok(span(&floats, range, r.inp)
+                    .iter()
+                    .flat_map(narrow)
+                    .collect())
             }
             Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix, range),
             Ok(_) => codes_packed(f, &matrix, range),
@@ -794,7 +586,7 @@ impl Release {
         };
         for layer in 0.. {
             let file = format!("{layers}{layer:03}");
-            if self.with(&file, |_| Ok(())).is_err() {
+            if !self.has(&file) {
                 break;
             }
             let mut shard = Shard::new(file, format!("{prefix}{layer}."));
@@ -852,26 +644,19 @@ impl Release {
             };
             // Keep the matrix packed, its rotations beside the codes.
             let whole = trellis::turned_for(k, book).map_or(Stored::F32, Stored::Form);
-            out.push(Slice {
-                name: name("weight"),
-                shape: vec![outp, inp],
-                stored: whole,
-            });
-            out.push(Slice {
-                name: name("codes"),
-                shape: vec![outp, inp],
-                stored: Stored::Form(form),
-            });
-            out.push(Slice {
-                name: name("suh"),
-                shape: vec![inp],
-                stored: Stored::F16,
-            });
-            out.push(Slice {
-                name: name("svh"),
-                shape: vec![outp],
-                stored: Stored::F16,
-            });
+            let parts = [
+                ("weight", vec![outp, inp], whole),
+                ("codes", vec![outp, inp], Stored::Form(form)),
+                ("suh", vec![inp], Stored::F16),
+                ("svh", vec![outp], Stored::F16),
+            ];
+            for (part, shape, stored) in parts {
+                out.push(Slice {
+                    name: name(part),
+                    shape,
+                    stored,
+                });
+            }
         }
         // Each matrix's stored parts, then codebook-named codes.
         let parts = [
@@ -921,11 +706,9 @@ impl Offer for Release {
             }
         }
         for layer in 0.. {
-            let has_idx = self.with(&experts::index_file(layer), |_| Ok(())).is_ok();
-            let has_dense = dense.single.is_none()
-                && self
-                    .with(&format!("dense/exlr8-dense-{layer:03}"), |_| Ok(()))
-                    .is_ok();
+            let has_idx = self.has(&experts::index_file(layer));
+            let has_dense =
+                dense.single.is_none() && self.has(&format!("dense/exlr8-dense-{layer:03}"));
             if !has_idx && !has_dense {
                 break;
             }
@@ -937,7 +720,7 @@ impl Offer for Release {
         layers.dedup();
         for layer in layers {
             let index = experts::index_file(layer);
-            if self.with(&index, |_| Ok(())).is_err() {
+            if !self.has(&index) {
                 continue;
             }
             let Some(forms) = self.expert_forms(layer) else {

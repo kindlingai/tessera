@@ -1,6 +1,6 @@
 //! Routed and shared exlr8 expert storage and manifest widths.
 
-use crate::exlr8::coded;
+use super::format::coded;
 use crate::file::{Error, File};
 use crate::offer::{Slice, Stored};
 use std::collections::HashMap;
