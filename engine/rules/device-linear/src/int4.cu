@@ -1,27 +1,10 @@
 #include <tessera/1/core>
 #include <tessera/1/trellis>
-
-using namespace tessera;
+#include "common.cuh"
 
 #if defined(TESSERA_CUDA)
 
-static __device__ __forceinline__ float i4_epilogue(
-    float v, const trellis::o_t* other, u64 off, u32 col, u32 mode) {
-    if (mode == 1u) return v + trellis::load_o(other, off);
-    if (mode == 2u) return v + trellis::load_o(other, col);
-    if (mode == 3u) return (v / (1.0f + expf(-v))) * trellis::load_o(other, off);
-    if (mode == 4u) return v * trellis::load_o(other, off);
-    if (mode == 5u) return v / (1.0f + expf(-v));
-    return v;
-}
-
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-static __device__ __forceinline__ void i4_cp16(void* smem, const void* gmem, bool pred) {
-    u32 dst = static_cast<u32>(__cvta_generic_to_shared(smem));
-    if (pred) asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(gmem));
-    else *reinterpret_cast<uint4*>(smem) = make_uint4(0u, 0u, 0u, 0u);
-}
-
 static __device__ __forceinline__ void i4_ldm4(u32 (&r)[4], const void* smem_ptr) {
     u32 addr = static_cast<u32>(__cvta_generic_to_shared(smem_ptr));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -57,8 +40,8 @@ static __device__ __forceinline__ void i4_hilo_pair(const trellis::x_t* p, u32& 
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r16(
-    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out,
-    u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r16_smem& sm) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, const u8* bias_p,
+    trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r16_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 r0 = blockIdx.y << 4u, nb = n >> 4u;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -68,9 +51,9 @@ static __device__ __forceinline__ void fg_int4_r16(
     u32 r_l = tid >> 3u, c_l = tid & 7u;
     auto load_w = [&](u32 st, u32 ch) {
         u64 off = u64(ch) * 144ull;
-        i4_cp16(&sm.sw[st][r_l][c_l << 2u], w + u64(n0 + r_l) * row_bytes + off + (c_l << 4u), true);
-        if (tid < 16u) i4_cp16(&sm.sw[st][tid][32u], w + u64(n0 + tid) * row_bytes + off + 128u, true);
-        asm volatile("cp.async.commit_group;\n" ::);
+        dl_cp16(&sm.sw[st][r_l][c_l << 2u], w + u64(n0 + r_l) * row_bytes + off + (c_l << 4u), true);
+        if (tid < 16u) dl_cp16(&sm.sw[st][tid][32u], w + u64(n0 + tid) * row_bytes + off + 128u, true);
+        dl_cp_commit();
     };
     float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
     load_w(0u, ch0);
@@ -79,9 +62,9 @@ static __device__ __forceinline__ void fg_int4_r16(
         bool has_nxt = (ch + 1u < ch1);
         if (has_nxt) {
             load_w(st ^ 1u, ch + 1u);
-            asm volatile("cp.async.wait_group 1;\n" ::);
+            dl_cp_wait1();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
+            dl_cp_wait0();
         }
         prim::block_sync();
         const u8* sb0 = reinterpret_cast<const u8*>(sm.sw[st][g]);
@@ -134,7 +117,7 @@ static __device__ __forceinline__ void fg_int4_r16(
         float v = sm.red[0][tr][col] + sm.red[1][tr][col] +
                   sm.red[2][tr][col] + sm.red[3][tr][col];
         u64 off = u64(SPLIT ? (p * m + r0 + tr) : (r0 + tr)) * n + n0 + col;
-        trellis::store_y(out, off, SPLIT ? v : i4_epilogue(v, other, off, n0 + col, mode));
+        trellis::store_y(out, off, SPLIT ? v : dl_epilogue(v, other, off, n0 + col, mode, bias_p));
     }
 }
 
@@ -167,16 +150,14 @@ static __device__ __forceinline__ void i4_load_x(
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r64(
-    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out,
-    u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r64_smem& sm) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, const u8* bias_p,
+    trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
     u32 g = lane >> 2u, t = lane & 3u, wn = warp & 3u, wm = warp >> 2u;
     u32 nb = (n + 127u) >> 7u, mb = (m + 63u) >> 6u;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
-    u32 lin = blockIdx.y * nb + ob, grp_sz = 8u * mb;
-    u32 gid = lin / grp_sz, rem = lin - gid * grp_sz;
-    u32 first_n = gid * 8u, width = min(8u, nb - first_n);
-    u32 by = rem / width, bx = first_n + (rem - by * width);
+    u32 bx, by;
+    dl_swizzle(nb, mb, ob, blockIdx.y, bx, by);
     u32 n0 = bx << 7u, r0 = by << 6u;
 
     u32 chunks = k >> 8u, ch_per = SPLIT ? (chunks / ks) : chunks;
@@ -203,16 +184,16 @@ static __device__ __forceinline__ void fg_int4_r64(
 #pragma unroll
         for (u32 dr = 0u; dr < 128u; dr += 32u) {
             u32 nr = r0_t + dr;
-            i4_cp16(&sm.k.sw[nr][col16 << 2u],
+            dl_cp16(&sm.k.sw[nr][col16 << 2u],
                     w + u64(n0 + nr) * row_bytes + ch_off + (col16 << 4u), n0 + nr < n);
         }
         if (tid < 128u) {
-            i4_cp16(&sm.k.sw[tid][32u],
+            dl_cp16(&sm.k.sw[tid][32u],
                     w + u64(n0 + tid) * row_bytes + ch_off + 128u, n0 + tid < n);
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        dl_cp_commit();
         i4_load_x(sm.k.sx[0], x, r0, ch << 8u, m, k, r0_t, col16);
-        asm volatile("cp.async.wait_group 0;\n" ::);
+        dl_cp_wait0();
         prim::block_sync();
 #pragma unroll
         for (u32 sub = 0u; sub < 4u; sub++) {
@@ -278,10 +259,10 @@ static __device__ __forceinline__ void fg_int4_r64(
             float4 v = *reinterpret_cast<const float4*>(&sm.out[sr + dr][sc4]);
             u64 off = u64(SPLIT ? (p * m + row) : row) * n + col;
             if (!SPLIT && mode != 0u) {
-                v.x = i4_epilogue(v.x, other, off, col, mode);
-                v.y = i4_epilogue(v.y, other, off + 1u, col + 1u, mode);
-                v.z = i4_epilogue(v.z, other, off + 2u, col + 2u, mode);
-                v.w = i4_epilogue(v.w, other, off + 3u, col + 3u, mode);
+                v.x = dl_epilogue(v.x, other, off, col, mode, bias_p);
+                v.y = dl_epilogue(v.y, other, off + 1u, col + 1u, mode, bias_p);
+                v.z = dl_epilogue(v.z, other, off + 2u, col + 2u, mode, bias_p);
+                v.w = dl_epilogue(v.w, other, off + 3u, col + 3u, mode, bias_p);
             }
             trellis::store_y4(out + off, v);
         }
@@ -293,19 +274,21 @@ static __device__ __forceinline__ void fg_int4_r64(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define I4_RUN(SM, FN, SPLIT, KS) \
     __shared__ SM sm; \
-    FN<SPLIT>(x, w, other, out, m, n, k, mode, KS, sm)
+    FN<SPLIT>(x, w, other, bias_p, out, m, n, k, mode, KS, sm)
 #else
 #define I4_RUN(SM, FN, SPLIT, KS) \
-    (void)x; (void)w; (void)other; (void)out; (void)m; (void)n; (void)k; (void)mode
+    (void)x; (void)w; (void)other; (void)bias_p; (void)out; (void)m; (void)n; (void)k; (void)mode
 #endif
 
 #define I4_PAIR(TAG, TH, BLK, SM, FN) \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG( \
-        const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode) { \
+        const trellis::x_t* x, const u8* w, const trellis::o_t* other, const u8* bias_p, \
+        trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode) { \
         I4_RUN(SM, FN, false, 1u); \
     } \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG##_sk( \
-        const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
+        const trellis::x_t* x, const u8* w, const trellis::o_t* other, const u8* bias_p, \
+        trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
         (void)ks; \
         I4_RUN(SM, FN, true, ks); \
     }

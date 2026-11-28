@@ -1,12 +1,22 @@
 use crate::mm::{propose_mm, propose_mm_mx8};
-use crate::{cuda_source, hip_source, prefill_source, trellis_source};
+use crate::{bf16_mm_source, cuda_source, hip_source, int4_source, prefill_source, trellis_source};
+use tessera_gpukit::backend::{Backend, picked};
 use tessera_graph::DimName::Rows;
-use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
+use tessera_graph::{
+    Act, DType, Dim, F16, Graph, Node, NodeId, Op, PathSeg, Port, Role, Row, Stage, TensorType,
+};
+use tessera_interp::{Tensor, run};
 use tessera_kernels as _;
 use tessera_linear as _;
 use tessera_lower::form::{BF16_FORM, named};
-use tessera_lower::{Device, Knobs, Limits, Pins, Platform, Source, Tree, Wants, explain, lower};
-use tessera_testkit::graphs::linear;
+use tessera_lower::{
+    Device, Knobs, Limits, Pins, Platform, Site, Source, Tree, Wants, Weight, explain, lower,
+};
+use tessera_mem::trellis;
+use tessera_run::open;
+use tessera_run::testing::runs;
+use tessera_testkit::graphs::{linear, turned};
+use tessera_testkit::{Noise, cosine_f32};
 
 fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static str, usize)> {
     mm_shaped(g, rows, form, Knobs::default())
@@ -93,6 +103,111 @@ pub(crate) fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType
     g
 }
 
+fn with_bias_weight(mut g: Graph, bias_ty: TensorType) -> Graph {
+    let mat = g.entries[0].outputs[0].node;
+    let ty = g.nodes[mat.0 as usize].ty.clone();
+    let idx = g.weights.len() as u32;
+    g.weights.push(tessera_graph::Weight {
+        path: vec![PathSeg::Field("bias".into())],
+        ty: bias_ty.clone(),
+    });
+    let bias = push_node(&mut g, Op::Weight(idx), Vec::new(), bias_ty);
+    let out = push_node(&mut g, Op::Row(Row(vec![Stage::Add])), vec![mat, bias], ty);
+    g.entries[0].outputs[0].node = out;
+    g
+}
+
+fn with_mode(base: Graph, mode: u8) -> Graph {
+    let out_ty = base.nodes[base.entries[0].outputs[0].node.0 as usize]
+        .ty
+        .clone();
+    let bias_ty = TensorType::new(vec![out_ty.shape.0[1].clone()], DType::F32);
+    let add_bias = |g: Graph| {
+        if (mode & 16) != 0 {
+            with_bias_weight(g, bias_ty.clone())
+        } else {
+            with_stage(g, Stage::Add, Some(bias_ty.clone()))
+        }
+    };
+    match mode & 15 {
+        1 => with_stage(base, Stage::Add, Some(out_ty)),
+        2 => add_bias(base),
+        3 => with_stage(
+            with_stage(base, Stage::Act(Act::Silu), None),
+            Stage::Mul,
+            Some(out_ty),
+        ),
+        6 => with_stage(add_bias(base), Stage::Act(Act::GeluTanh), None),
+        7 => with_stage(add_bias(base), Stage::Act(Act::Gelu), None),
+        8 => with_stage(add_bias(base), Stage::Add, Some(out_ty)),
+        _ => base,
+    }
+}
+
+fn with_bf16_x(mut g: Graph) -> Graph {
+    g.entries[0].inputs[0].ty.dtype = DType::Bf16;
+    for n in &mut g.nodes {
+        if matches!(n.op, Op::Input { port: 0, .. }) {
+            n.ty.dtype = DType::Bf16;
+        }
+    }
+    g
+}
+
+fn extra_inputs(mode: u8, m: usize, n: usize, rng: &mut Noise) -> (Vec<Tensor>, Option<Vec<f32>>) {
+    let mut bias_w = None;
+    let mut ins = Vec::new();
+    if matches!(mode & 15, 2 | 6 | 7 | 8) {
+        let vals: Vec<f32> = (0..n).map(|_| rng.draw() * 0.25).collect();
+        if (mode & 16) != 0 {
+            bias_w = Some(BF16_FORM.roundtrip(&vals));
+        } else {
+            ins.push(Tensor::f32(vec![n], vals));
+        }
+    }
+    if matches!(mode & 15, 1 | 3 | 8) {
+        ins.push(Tensor::f32(
+            vec![m, n],
+            (0..m * n).map(|_| rng.draw() * 0.5).collect(),
+        ));
+    }
+    (ins, bias_w)
+}
+
+fn x_pair(m: usize, k: usize, x_bf16: bool, rng: &mut Noise) -> (Tensor, Tensor) {
+    let vals: Vec<f32> = (0..m * k).map(|_| rng.draw() * 0.5).collect();
+    let shape = vec![m, k];
+    if x_bf16 {
+        (
+            Tensor::f32(shape.clone(), BF16_FORM.roundtrip(&vals)),
+            Tensor::from_bytes(shape, DType::Bf16, &BF16_FORM.pack(&vals)),
+        )
+    } else {
+        let t = Tensor::f32(shape, vals);
+        (t.clone(), t)
+    }
+}
+
+macro_rules! cuda_setup {
+    () => {{
+        if picked() != Some(Backend::Cuda) {
+            return;
+        }
+        let Some(settings) = runs().into_iter().find(|s| s.gpu() == Some(Backend::Cuda)) else {
+            return;
+        };
+        let probe = lower(
+            &linear(&[Dim::bounded(Rows, 64)], 64, 64),
+            0,
+            &[(Rows, 1)],
+            &Device::guess(&settings),
+        )
+        .unwrap();
+        let platform = open(probe, &settings).unwrap().platform();
+        (settings, platform)
+    }};
+}
+
 #[test]
 fn linear_mm_entries() {
     let cuda = cuda_source();
@@ -114,11 +229,21 @@ fn linear_mm_entries() {
         assert!(cuda.contains(entry), "missing {entry}");
     }
     for entry in [
+        "tessera_mm_bf64(",
+        "tessera_mm_bf64_sk(",
+        "tessera_mm_bf128(",
+    ] {
+        assert!(bf16_mm_source().contains(entry), "missing {entry}");
+    }
+    for entry in [
         "dtr_prep(",
-        "dtr_pre_k4_t8(",
-        "dtr_pre_k4_t16(",
-        "dtr_pre_gen8(",
-        "dtr_pre_gen16(",
+        "DTR_PRE_DEF(dtr_pre_k4_t8,",
+        "DTR_PRE_DEF(dtr_pre_k4_t8s,",
+        "DTR_PRE_DEF(dtr_pre_k4_t16,",
+        "DTR_PRE_DEF(dtr_pre_k4_t16s,",
+        "DTR_PGEN_DEF(dtr_pre_gen8,",
+        "DTR_PGEN_DEF(dtr_pre_gen16,",
+        "dtr_reduce_epi(",
         "tessera_mm_mxfp8_prep(",
         "tessera_mm_mxfp8_mx8(",
         "tessera_mm_mxfp8_mx8_sk(",
@@ -126,6 +251,7 @@ fn linear_mm_entries() {
         assert!(prefill_source().contains(entry), "missing {entry}");
     }
     for entry in [
+        "DTR_DEF(dtr_k4_t4s,",
         "DTR_DEF(dtr_k4_t4,",
         "DTR_GEN_DEF(dtr_gen4,",
         "dtr_reduce(",
@@ -133,12 +259,14 @@ fn linear_mm_entries() {
     ] {
         assert!(trellis_source().contains(entry), "missing {entry}");
     }
+    for entry in ["I4_PAIR(r16,", "I4_PAIR(r64,"] {
+        assert!(int4_source().contains(entry), "missing {entry}");
+    }
 }
 
 #[test]
 fn fast_mm_selection() {
-    let rows = [Dim::bounded(Rows, 128)];
-    // Wide-N bf16 picks 16x32, narrow-N picks split-K 16x16.
+    let rows = [Dim::bounded(Rows, 1024)];
     assert_eq!(
         mm_entry(&linear(&rows, 4096, 12288), 16, "bf16"),
         Some(("fast_mm_bf16", "tessera_mm_bf16", 2))
@@ -151,13 +279,21 @@ fn fast_mm_selection() {
         mm_entry(&linear(&rows, 36864, 1536), 8, "bf16"),
         Some(("fast_mm_bf16_sk", "tessera_mm_bf16_sk", 2))
     );
+    // Tall bf16 rows and K%16 shapes use bf64 / bf64_sk.
+    assert_eq!(
+        mm_entry(&linear(&rows, 4304, 1152), 16, "bf16"),
+        Some(("fast_mm_bf16_sk", "tessera_mm_bf64_sk", 2))
+    );
+    assert_eq!(
+        mm_entry(&linear(&rows, 4096, 12288), 64, "bf16"),
+        Some(("fast_mm_bf16", "tessera_mm_bf64", 2))
+    );
     let mut one = Knobs::default();
     one.parse("fast_mm_bf16_sk:splits=1").unwrap();
     assert_eq!(
         mm_shaped(&linear(&rows, 36864, 1536), 8, "bf16", one),
         Some(("fast_mm_bf16", "tessera_mm_bf16_ks2", 2))
     );
-    // Narrow MXFP8 r8 uses split-K, wide N stays single-pass.
     assert_eq!(
         mm_entry(&linear(&rows, 6144, 576), 8, "mxfp8"),
         Some(("fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r8_sk", 2))
@@ -182,7 +318,6 @@ fn fast_mm_selection() {
         mm_entry(&linear(&rows, 2048, 4096), 256, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r64", 2))
     );
-    // The splits knob also sets r64 splits.
     for (splits, rows_n, kind, entry) in [
         (2, 256, "fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r64_sk"),
         (1, 24, "fast_mm_mxfp8", "tessera_mm_mxfp8_r64"),
@@ -195,11 +330,10 @@ fn fast_mm_selection() {
             Some((kind, entry, 2))
         );
     }
-    // One row and unaligned K decline. Tall M is accepted.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
     assert!(mm_entry(&linear(&rows, 6144, 576), 4096, "mxfp8").is_some());
     assert_eq!(mm_entry(&linear(&rows, 256, 64), 8, "mxfp8"), None);
-    // Fused epilogues: residual, bias, SwiGLU, mul, silu.
+    // Fused epilogues: residual, bias, SwiGLU, mul, silu, GELU, bias+residual.
     let base = linear(&rows, 4096, 12288);
     let out_ty = base.nodes[base.entries[0].outputs[0].node.0 as usize]
         .ty
@@ -209,7 +343,7 @@ fn fast_mm_selection() {
     let add_bias = with_stage(base.clone(), Stage::Add, Some(bias_ty));
     let silu_only = with_stage(base.clone(), Stage::Act(Act::Silu), None);
     let swiglu = with_stage(silu_only.clone(), Stage::Mul, Some(out_ty.clone()));
-    let mul_only = with_stage(base, Stage::Mul, Some(out_ty));
+    let mul_only = with_stage(base.clone(), Stage::Mul, Some(out_ty));
     for (g, reads) in [
         (add_res, 3),
         (add_bias, 3),
@@ -226,12 +360,22 @@ fn fast_mm_selection() {
             Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r8", reads))
         );
     }
+    for mode in [6u8, 7] {
+        assert_eq!(
+            mm_entry(&with_mode(base.clone(), mode), 16, "bf16"),
+            Some(("fast_mm_bf16", "tessera_mm_bf16", 3))
+        );
+    }
+    assert_eq!(
+        mm_entry(&with_mode(base, 8), 16, "bf16"),
+        Some(("fast_mm_bf16", "tessera_mm_bf64", 4))
+    );
 }
 
 /// Fast-path diagnostics report rule and hardware rejections accurately.
 #[test]
 fn lowering_report_diagnostics() {
-    let rows = [Dim::bounded(Rows, 1 << 21)];
+    let rows = [Dim::bounded(Rows, 1 << 24)];
     let cuda = Platform {
         backend: "cuda".into(),
         ..Platform::host(Limits::assumed())
@@ -246,7 +390,6 @@ fn lowering_report_diagnostics() {
     };
     let mxfp8 = named("mxfp8").expect("mxfp8 form");
 
-    // Aligned m=1 bf16 hits fast_gemv with no warning.
     let g_ok = linear(&rows, 512, 256);
     let dev = Device::default()
         .on(cuda.clone())
@@ -255,7 +398,6 @@ fn lowering_report_diagnostics() {
     assert!(!r.has_fallbacks(), "{}", r.format(10));
     assert!(r.warning("--explain-lowering").is_none());
 
-    // Unaligned k=768 mxfp8 misses fast_gemv and emits boot warning.
     let g_unaligned = linear(&rows, 768, 256);
     let dev_mxfp8 = Device::default().on(cuda.clone()).pinned(Pins::all(mxfp8));
     let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_mxfp8).unwrap();
@@ -270,15 +412,13 @@ fn lowering_report_diagnostics() {
     );
     assert!(warn.contains("--explain-lowering"), "{warn}");
 
-    // 4096 rows stay fast. The launch grid bounds fast_mm.
     let r = explain(&g_ok, 0, &[(Rows, 4096)], &dev).unwrap();
     assert!(!r.has_fallbacks(), "{}", r.format(10));
-    let msg = explain(&g_ok, 0, &[(Rows, 1 << 20)], &dev)
+    let msg = explain(&g_ok, 0, &[(Rows, 1 << 23)], &dev)
         .unwrap()
         .format(9);
-    assert!(msg.contains("grid height 65536 exceeds 65535"), "{msg}");
+    assert!(msg.contains("exceeds 65535"), "{msg}");
 
-    // Missing bf16 tensor tiles reports hardware mismatch via Needs.
     let dev_no_tile = Device::default()
         .on(cuda_no_bf16)
         .pinned(Pins::all(BF16_FORM));
@@ -288,12 +428,10 @@ fn lowering_report_diagnostics() {
     assert!(msg.contains("fast_mm"), "{msg}");
     assert!(msg.contains("requires bf16 tensor tiles"), "{msg}");
 
-    // Metal ignores CUDA-only fast_gemv to avoid false boot warnings.
     let dev_metal = Device::default().on(metal).pinned(Pins::all(mxfp8));
     let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_metal).unwrap();
     assert!(!r.has_fallbacks(), "{}", r.format(10));
 
-    // Blackwell sm_121 picks native MXFP8 MMA, sm_90 stays on r64.
     let g_mx = linear(&rows, 6144, 6144);
     let dyn_limits = Limits {
         group_bytes: 48 * 1024,
@@ -336,11 +474,10 @@ fn lowering_report_diagnostics() {
     .unwrap();
     let kva_names: Vec<&str> = pkva.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(kva_names, ["fast_mm_mxfp8_prep", "fast_mm_mxfp8_mx8"]);
-    // Two MXFP8 projections share one prep via CSE.
     let mut g_pair = linear(&rows, 6144, 2048);
     let x = g_pair.nodes[g_pair.entries[0].outputs[0].node.0 as usize].args[0];
     let mut w2 = g_pair.weights[0].clone();
-    w2.path.push(tessera_graph::PathSeg::Field("b".into()));
+    w2.path.push(PathSeg::Field("b".into()));
     let w2_ty = w2.ty.clone();
     let wid = g_pair.weights.len() as u32;
     let w2_node = push_node(&mut g_pair, Op::Weight(wid), Vec::new(), w2_ty);
@@ -452,7 +589,7 @@ fn fast_mm_loads() {
     let (_, e_base, _, _) = mm_draft(&g_blk, 16, "bf16", Knobs::default(), false).unwrap();
     let (_, e_blk, _, _) = mm_draft(&g_blk, 16, "bf16", k_blk.clone(), false).unwrap();
     assert_eq!(e_base, e_blk);
-    let pins = Pins::all(tessera_lower::form::named("bf16").unwrap());
+    let pins = Pins::all(named("bf16").unwrap());
     let parts = Device::default().division();
     let mut tree = Tree::upto(
         &g_blk,
@@ -476,13 +613,7 @@ fn fast_mm_loads() {
 
 #[test]
 fn bf16_inputs_skip_widen() {
-    let mut g = linear(&[Dim::bounded(Rows, 64)], 4096, 4096);
-    g.entries[0].inputs[0].ty.dtype = DType::Bf16;
-    for n in &mut g.nodes {
-        if matches!(n.op, Op::Input { .. }) {
-            n.ty.dtype = DType::Bf16;
-        }
-    }
+    let g = with_bf16_x(linear(&[Dim::bounded(Rows, 256)], 4096, 4096));
     let limits = Limits {
         group_bytes: 48 * 1024,
         dynamic_group_bytes: 99 * 1024,
@@ -501,6 +632,8 @@ fn bf16_inputs_skip_widen() {
     for (w_form, rows) in [
         ("bf16", 1),
         ("bf16", 16),
+        ("bf16", 64),
+        ("bf16", 256),
         ("mxfp8", 1),
         ("mxfp8", 16),
         ("mxfp8", 64),
@@ -510,7 +643,7 @@ fn bf16_inputs_skip_widen() {
         ("trellis_k4", 64),
     ] {
         let pins = Pins::all(named(w_form).expect("form"))
-            .site(tessera_lower::Site::Matmul, BF16_FORM)
+            .site(Site::Matmul, BF16_FORM)
             .outputs(BF16_FORM);
         let dev = cuda.clone().pinned(pins);
         let plan = lower(&g, 0, &[(Rows, rows)], &dev).expect("lowers");
@@ -536,6 +669,258 @@ fn bf16_inputs_skip_widen() {
         assert!(
             has_x && has_y,
             "{w_form} rows={rows}: missing X/Y_BF16 in {names:?}"
+        );
+    }
+}
+
+#[test]
+fn cuda_trellis_selection() {
+    let rows = [Dim::bounded(Rows, 2048)];
+    let cuda = Platform {
+        backend: "cuda".into(),
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        units: 48,
+        bandwidth: 273e9,
+        ..Platform::host(Limits {
+            group_bytes: 48 * 1024,
+            dynamic_group_bytes: 99 * 1024,
+            ..Limits::assumed()
+        })
+    };
+    let form = named("trellis_k4").unwrap();
+    let dev = Device::default()
+        .on(cuda.clone())
+        .pinned(Pins::default().pin("w", form));
+    let g = turned(&rows);
+    let step_names = |g: &Graph, m: u64, d: &Device| -> Vec<&'static str> {
+        lower(g, 0, &[(Rows, m)], d)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|s| s.kernel.name())
+            .collect()
+    };
+    assert_eq!(
+        step_names(&g, 24, &dev),
+        ["trellis_turned_trellis_k4", "trellis_reduce"]
+    );
+    assert_eq!(
+        step_names(&g, 64, &dev),
+        ["trellis_prep_f16", "trellis_turned_f16_trellis_k4"]
+    );
+    let tr_rot = named("trellis_k4_rot").unwrap();
+    let dev_rot = Device::default().on(cuda.clone()).pinned(Pins::all(tr_rot));
+    let g2k = linear(&rows, 2048, 2048);
+    assert_eq!(
+        step_names(&g2k, 52, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+    assert_eq!(
+        step_names(&with_mode(g2k.clone(), 6), 64, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+    let g4k = linear(&rows, 4096, 4096);
+    assert_eq!(
+        step_names(&with_mode(g4k, 8), 65, &dev_rot),
+        [
+            "trellis_prep_f16",
+            "trellis_turned_f16_trellis_k4",
+            "trellis_reduce_epi"
+        ]
+    );
+    let mut knobs = Knobs::default();
+    knobs.parse("trellis_turned:t8_min_blocks=3").unwrap();
+    knobs.parse("trellis_turned:prep_min_blocks=2").unwrap();
+    knobs.parse("trellis_turned:reduce_min_blocks=5").unwrap();
+    let mut dev_k = Device::default().on(cuda).pinned(Pins::all(tr_rot));
+    dev_k.knobs = knobs;
+    let plan = lower(&g2k, 0, &[(Rows, 52)], &dev_k).unwrap();
+    let src = |i: usize| match plan.steps[i].kernel.source() {
+        Source::Fixed { text, .. } => text[tessera_lower::Backend::Cuda],
+        _ => panic!("expected fixed source"),
+    };
+    assert!(src(0).contains("#define DTR_FORCE_FP16 1"));
+    assert!(src(0).contains("#define DTR_PREP_BLK 2"));
+    assert!(src(1).contains("#define DTR_T8_BLK 3"));
+    assert!(src(2).contains("#define DTR_RED_BLK 5"));
+}
+
+#[test]
+fn cuda_dense_parity() {
+    let (settings, platform) = cuda_setup!();
+    let rows = [Dim::bounded(Rows, 2048)];
+    let mut rng = Noise(0xC0DA_4304);
+    let cases: &[(&str, u64, u64, u64, u8, bool, bool)] = &[
+        ("bf16", 4304, 1152, 16, 2 | 16, false, false),
+        ("bf16", 1536, 1024, 16, 8 | 16, true, true),
+        ("bf16", 4304, 1152, 64, 0, false, false),
+        ("bf16", 1152, 4304, 40, 6 | 16, true, false),
+        ("bf16", 1152, 4304, 64, 7, false, true),
+        ("bf16", 512, 4304, 192, 6 | 16, false, false),
+        ("bf16", 1024, 2048, 256, 8 | 16, true, true),
+        ("int4_g32", 1024, 512, 16, 0, false, false),
+        ("int4_g32", 2048, 1024, 64, 1, true, true),
+        ("int4_g32", 1024, 1024, 40, 3, false, false),
+        ("int4_g32", 1024, 2048, 128, 8 | 16, true, false),
+    ];
+    for &(fname, k, n, m, mode, x_bf16, y_bf16) in cases {
+        let form = named(fname).unwrap();
+        let base_g = with_mode(linear(&rows, k, n), mode);
+        let g = if x_bf16 {
+            with_bf16_x(base_g.clone())
+        } else {
+            base_g.clone()
+        };
+        let mut pins = Pins::all(form);
+        if (mode & 16) != 0 {
+            pins = pins.pin("bias", BF16_FORM);
+        }
+        if y_bf16 {
+            pins = pins.site(Site::Matmul, BF16_FORM).outputs(BF16_FORM);
+        }
+        let dev = Device::default().on(platform.clone()).pinned(pins);
+        let plan = lower(&g, 0, &[(Rows, m)], &dev).unwrap();
+        assert!(
+            plan.steps.iter().all(|s| {
+                let nm = s.kernel.name();
+                nm != "map" && !nm.contains("widen") && !nm.contains("narrow")
+            }),
+            "{fname} {m}x{n}x{k} mode={mode} x_bf16={x_bf16} y_bf16={y_bf16}: {:?}",
+            plan.steps
+                .iter()
+                .map(|s| s.kernel.name())
+                .collect::<Vec<_>>()
+        );
+        if fname == "bf16" && m >= 192 {
+            assert_eq!(plan.steps.len(), 1);
+            let Source::Fixed { entry, .. } = plan.steps[0].kernel.source() else {
+                panic!("fixed source");
+            };
+            assert_eq!(entry, "tessera_mm_bf128");
+        }
+        let (x_ref, x_gpu) = x_pair(m as usize, k as usize, x_bf16, &mut rng);
+        let (extra, bias_w) = extra_inputs(mode, m as usize, n as usize, &mut rng);
+        let mut ref_ins = vec![x_ref];
+        ref_ins.extend(extra.clone());
+        let mut ins = vec![x_gpu];
+        ins.extend(extra);
+        let raw: Vec<f32> = (0..(n * k) as usize).map(|_| rng.draw() * 0.5).collect();
+        let w = Tensor::f32(vec![n as usize, k as usize], form.roundtrip(&raw));
+        let mut ws = vec![w.clone()];
+        if let Some(bv) = &bias_w {
+            ws.push(Tensor::f32(vec![n as usize], bv.clone()));
+        }
+        let want = run(&base_g, &ws, 0, &ref_ins).unwrap();
+        let mut runner = open(plan, &settings).unwrap();
+        runner.load(0, w.view()).unwrap();
+        if let Some(bv) = &bias_w {
+            runner
+                .load_weight(1, &Weight::Packed(BF16_FORM, BF16_FORM.pack(bv)))
+                .unwrap();
+        }
+        let views: Vec<_> = ins.iter().map(Tensor::view).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let want_v = if y_bf16 {
+            BF16_FORM.roundtrip(want[0].floats().unwrap())
+        } else {
+            want[0].floats().unwrap().to_vec()
+        };
+        let cos = cosine_f32(got.floats().unwrap(), &want_v);
+        assert!(
+            cos >= 0.99999,
+            "{fname} {m}x{n}x{k} mode={mode} x_bf16={x_bf16} y_bf16={y_bf16}: cos={cos}"
+        );
+    }
+}
+
+#[test]
+fn cuda_trellis_parity() {
+    let (settings, platform) = cuda_setup!();
+    let rows = [Dim::bounded(Rows, 2048)];
+    let mut rng = Noise(0xC0DA_7731);
+    let tr_form = named("trellis_k4_rot").unwrap();
+    for &(k, n, m, side, mode, x_bf16, y_bf16) in &[
+        (512usize, 512usize, 24u64, 0u32, 0u8, false, false),
+        (512, 512, 24, 0, 0, true, true),
+        (1024, 512, 52, 0, 0, false, false),
+        (1024, 512, 64, 0, 6 | 16, true, true),
+        (512, 512, 64, 2, 7, false, false),
+        (1024, 2048, 65, 0, 8 | 16, true, false),
+        (512, 2048, 128, 2, 8 | 16, false, true),
+        (512, 512, 128, 0, 3, true, true),
+        (256, 2048, 192, 0, 1, false, false),
+    ] {
+        let base_g = with_mode(linear(&rows, k as u64, n as u64), mode);
+        let g = if x_bf16 {
+            with_bf16_x(base_g.clone())
+        } else {
+            base_g.clone()
+        };
+        let entries: Vec<u8> = (0..n * k / 2).map(|_| (rng.word() & 0xFF) as u8).collect();
+        let mut bytes = trellis::packed(k, n, side, &entries);
+        let scales = (0..k + n).flat_map(|i| F16::from(1.0 + (i % 7) as f32 / 8.0).0.to_le_bytes());
+        bytes.extend(scales);
+        let w = Tensor::f32(vec![n, k], tr_form.unpack_all(&bytes));
+        let (x_ref, x_gpu) = x_pair(m as usize, k, x_bf16, &mut rng);
+        let (extra, bias_w) = extra_inputs(mode, m as usize, n, &mut rng);
+        let mut ref_ins = vec![x_ref];
+        ref_ins.extend(extra.clone());
+        let mut ins = vec![x_gpu];
+        ins.extend(extra);
+        let mut ws = vec![w];
+        if let Some(bv) = &bias_w {
+            ws.push(Tensor::f32(vec![n], bv.clone()));
+        }
+        let want = run(&base_g, &ws, 0, &ref_ins).unwrap();
+        let mut pins = Pins::all(tr_form);
+        if (mode & 16) != 0 {
+            pins = pins.pin("bias", BF16_FORM);
+        }
+        if y_bf16 {
+            pins = pins.site(Site::Matmul, BF16_FORM).outputs(BF16_FORM);
+        }
+        let dev = Device::default().on(platform.clone()).pinned(pins);
+        let plan = lower(&g, 0, &[(Rows, m)], &dev).unwrap();
+        assert!(
+            plan.steps.iter().all(|s| {
+                let nm = s.kernel.name();
+                nm != "map" && !nm.contains("widen") && !nm.contains("narrow")
+            }),
+            "trellis_k4 {m}x{n}x{k} mode={mode} x_bf16={x_bf16} y_bf16={y_bf16}: {:?}",
+            plan.steps
+                .iter()
+                .map(|s| s.kernel.name())
+                .collect::<Vec<_>>()
+        );
+        let mut runner = open(plan, &settings).unwrap();
+        runner
+            .load_weight(0, &Weight::Packed(tr_form, bytes))
+            .unwrap();
+        if let Some(bv) = &bias_w {
+            runner
+                .load_weight(1, &Weight::Packed(BF16_FORM, BF16_FORM.pack(bv)))
+                .unwrap();
+        }
+        let views: Vec<_> = ins.iter().map(Tensor::view).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let want_v = if y_bf16 {
+            BF16_FORM.roundtrip(want[0].floats().unwrap())
+        } else {
+            want[0].floats().unwrap().to_vec()
+        };
+        let cos = cosine_f32(got.floats().unwrap(), &want_v);
+        assert!(
+            cos >= 0.99999,
+            "trellis_k4_rot {m}x{n}x{k} side={side} mode={mode} x_bf16={x_bf16} y_bf16={y_bf16}: cos={cos}"
         );
     }
 }
