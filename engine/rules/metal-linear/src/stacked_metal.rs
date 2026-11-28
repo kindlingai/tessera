@@ -4,9 +4,7 @@ use tessera_graph::{Op, Order};
 use tessera_linear::blocks;
 use tessera_lower::Backend;
 use tessera_lower::form::{Load as Stored, plain, writable};
-use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
 
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
 
@@ -152,14 +150,10 @@ fn metal_emits(k: &MetalStacked, form: &dyn Stored) -> bool {
 
 fn metal_source(k: &MetalStacked) -> Source {
     let e = pick_entry(k);
-    Source::Fixed {
-        text: ByBackend([
-            tessera_lower::metal_source!(include_str!("stacked_metal.metal")),
-            "",
-            "",
-        ]),
-        entry: e.name,
-    }
+    Source::metal(
+        tessera_lower::metal_source!(include_str!("stacked_metal.metal")),
+        e.name,
+    )
 }
 
 fn metal_load(k: &MetalStacked, _: usize) -> Option<Load> {

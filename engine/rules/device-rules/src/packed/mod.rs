@@ -7,9 +7,7 @@ use tessera_device::{
 use tessera_graph::Order;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites;
-use tessera_lower::{
-    Arg, Attn, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
-};
+use tessera_lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 
 const PACKED_KERNEL: &str = include_str!("packed_gpu.cu");
 const FA2_BQ: usize = 64;
@@ -49,12 +47,11 @@ pub fn packed_rocm_source() -> &'static str {
 }
 
 fn packed_source(rocm: bool, entry: &'static str) -> Source {
-    let text = if rocm {
-        ByBackend(["", "", packed_rocm_source()])
+    if rocm {
+        Source::rocm(packed_rocm_source(), entry)
     } else {
-        ByBackend(["", packed_cuda_source(), ""])
-    };
-    Source::Fixed { text, entry }
+        Source::cuda(packed_cuda_source(), entry)
+    }
 }
 
 fn packed_bq(width: usize) -> usize {

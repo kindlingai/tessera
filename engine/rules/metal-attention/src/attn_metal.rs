@@ -5,8 +5,7 @@ use tessera_graph::{Mask, Op, Order};
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term,
-    Tree,
+    Arg, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 const THREADS: usize = 256;
@@ -78,10 +77,7 @@ const PF_ENTRIES: [(usize, [&str; 4]); 3] = [
 ];
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    Source::metal(SOURCE, entry)
 }
 
 fn find_entry(

@@ -6,7 +6,7 @@ use super::epi::{
 };
 use super::{
     CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, io_defs, prefill_source_with,
-    rocm_needs, rocm_source, weight_io_accepts, x_accepts, x_defs,
+    rocm_needs, weight_io_accepts, x_accepts, x_defs,
 };
 mod mx8;
 
@@ -421,7 +421,7 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
     needs = mm_red_needs(self.rocm),
     order = Order::PerConfig,
     source = if self.rocm {
-        rocm_source(super::rocm_mm::rocm_linear_source(), "rocm_mm_reduce")
+        tessera_lower::Source::rocm(super::rocm_mm::rocm_linear_source(), "rocm_mm_reduce")
     } else {
         cuda_source_with(
             "tessera_mm_reduce",

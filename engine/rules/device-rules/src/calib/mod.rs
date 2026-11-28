@@ -7,7 +7,7 @@ use tessera_graph::Bf16;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 const KERNEL: &str = include_str!("grouped.cu");
@@ -153,10 +153,7 @@ fn bf16_needs(group_bytes: usize, group_threads: usize) -> Needs {
 }
 
 fn fixed_cuda(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend(["", cuda_source(), ""]),
-        entry,
-    }
+    Source::cuda(cuda_source(), entry)
 }
 
 fn gemm_source(k: &PickedBf16) -> Source {

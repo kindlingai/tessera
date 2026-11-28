@@ -3,7 +3,7 @@
 use super::epi::{epi_accepts, has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads};
 use super::{
     BLOCK, THREADS, TrellisMma, TrellisPreMma, TrellisPrep, TrellisReduce, f32_only,
-    reduce_load_for, rocm_needs, rocm_rule, rocm_source,
+    reduce_load_for, rocm_needs, rocm_rule,
 };
 use std::sync::OnceLock;
 use tessera_device::{Backend, flatten_for};
@@ -108,7 +108,7 @@ pub(crate) fn pre_entry(t: &TrellisPreMma) -> &'static str {
     emits = f32_only,
     needs = rocm_needs(0, THREADS, false),
     order = Order::PerConfig,
-    source = rocm_source(rocm_trellis_source(), "rocm_dtr_reduce_epi"),
+    source = tessera_lower::Source::rocm(rocm_trellis_source(), "rocm_dtr_reduce_epi"),
     launches = red_launches,
     load = red_load,
     unproven,

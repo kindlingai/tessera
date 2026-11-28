@@ -3,8 +3,8 @@
 use tessera_graph::{Op, Order, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, Backend, ByBackend, Compute, Draft, Home, Kernel, Launch, Load, Needs, Ops, Shape, Source,
-    Step, T, Term, Tree,
+    Arg, Backend, Compute, Draft, Home, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T,
+    Term, Tree,
 };
 
 const KERNEL: &str = include_str!("stacked_fused.cu");
@@ -123,10 +123,7 @@ fn sf_source(k: &StackedFused) -> Source {
         (SfKind::Scalar, true) => "tessera_sf_wide",
         (SfKind::Scalar, false) => "tessera_sf_lanes",
     };
-    Source::Fixed {
-        text: ByBackend(["", KERNEL, ""]),
-        entry,
-    }
+    Source::cuda(KERNEL, entry)
 }
 
 fn sf_load(k: &StackedFused, _: usize) -> Option<Load> {

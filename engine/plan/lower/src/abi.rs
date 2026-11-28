@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tessera_codegen::hash;
 use tessera_codegen::ir::{Body, Param};
-use tessera_engine_settings::ByBackend;
+use tessera_engine_settings::{Backend, ByBackend};
 use tessera_graph::DimName;
 
 /// One kernel argument, in the order its source declares.
@@ -200,12 +200,27 @@ pub enum Source {
 }
 
 impl Source {
-    /// Hand-written Metal text.
-    pub fn metal(text: &'static str, entry: &'static str) -> Source {
+    /// Hand-written text for one backend.
+    pub fn only(backend: Backend, text: &'static str, entry: &'static str) -> Source {
         Source::Fixed {
-            text: ByBackend([text, "", ""]),
+            text: ByBackend::only(backend, text),
             entry,
         }
+    }
+
+    /// Hand-written Metal text.
+    pub fn metal(text: &'static str, entry: &'static str) -> Source {
+        Source::only(Backend::Metal, text, entry)
+    }
+
+    /// Hand-written CUDA text.
+    pub fn cuda(text: &'static str, entry: &'static str) -> Source {
+        Source::only(Backend::Cuda, text, entry)
+    }
+
+    /// Hand-written ROCm text.
+    pub fn rocm(text: &'static str, entry: &'static str) -> Source {
+        Source::only(Backend::Rocm, text, entry)
     }
 
     /// A tree under its own entry name.

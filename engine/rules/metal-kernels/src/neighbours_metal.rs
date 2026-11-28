@@ -4,7 +4,7 @@ use tessera_graph::{Op, Order};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::sites::Near;
 use tessera_lower::{
-    Arg, Backend, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
+    Arg, Backend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
 };
 
 const TAPS: usize = 9;
@@ -78,14 +78,10 @@ fn metal_source(k: &NeighboursMetal) -> Source {
     } else {
         "nb_mma_general"
     };
-    Source::Fixed {
-        text: ByBackend([
-            tessera_lower::metal_source!(include_str!("neighbours_metal.metal")),
-            "",
-            "",
-        ]),
+    Source::metal(
+        tessera_lower::metal_source!(include_str!("neighbours_metal.metal")),
         entry,
-    }
+    )
 }
 
 fn metal_load(k: &NeighboursMetal, _: usize) -> Option<Load> {

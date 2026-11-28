@@ -22,7 +22,7 @@ impl Kernel for FixedGpu {
 
     fn source(&self) -> Source {
         Source::Fixed {
-            text: ByBackend(["", "", ""]),
+            text: ByBackend::default(),
             entry: "fixed_gpu_only",
         }
     }

@@ -21,3 +21,14 @@ fn asks_empty_wakes() {
     drop(again);
     assert_eq!(wakes.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn only_fills_one_backend() {
+    use crate::{Backend, ByBackend};
+    for &backend in Backend::ALL {
+        let text = ByBackend::only(backend, "text");
+        for &other in Backend::ALL {
+            assert_eq!(text[other] == "text", other == backend);
+        }
+    }
+}
