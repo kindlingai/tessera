@@ -79,7 +79,7 @@ fn listed_merge(
             best = max(best, parts[p]);
         }
     }
-    if sink_mode > 0 && sinks[sink_at as u64] > f32::NEG_INFINITY {
+    if sink_mode > 0 && sinks[sink_at as u64].to_bits() != 0xff80_0000 {
         denom = exp(sinks[sink_at as u64] - best);
     }
     for s in 0..splits {
@@ -96,10 +96,10 @@ fn listed_merge(
     // Each part's scaled mean joins by its share.
     for s in 0..splits {
         let p = at + s as u64 * stride;
-        if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
-            let wt = (parts[p + 1] * exp(parts[p] - best)) * inv;
-            sum += parts[p + 2 + d as u64] * wt;
-        }
+        // A dead part weighs zero, yet passes on a NaN.
+        let live = (parts[p + 1].to_bits() & 0x7fff_ffff) != 0;
+        let share = if live { exp(parts[p] - best) } else { 1.0 };
+        sum += parts[p + 2 + d as u64] * ((parts[p + 1] * share) * inv);
     }
     // A finite mean stays finite at full scale.
     let r = sum * 4.0;

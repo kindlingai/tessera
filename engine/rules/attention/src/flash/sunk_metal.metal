@@ -293,9 +293,13 @@ kernel void flash_sunk_metal(
             float f = 1.0f;
             int k = 2;
             uint r = q0 + simd * 8u + i;
-            if (sink_mode > 0u && r < queries && l[i] > 0.0f) {
+            if (sink_mode > 0u && r < queries) {
                 float sink = sinks[sink_mode == 1u ? head : r * heads + head];
-                if (sink > fs_floor()) {
+                uint sb = as_type<uint>(sink);
+                if ((sb & 0x7FFFFFFFu) > 0x7F800000u) {
+                    // A NaN sink reaches every row of its head.
+                    f = sink;
+                } else if (sb != 0xFF800000u && l[i] > 0.0f) {
                     float d = (m[i] - sink) + precise::log(l[i]);
                     if (d >= 0.0f) {
                         f = 1.0f / (1.0f + exp(-d));

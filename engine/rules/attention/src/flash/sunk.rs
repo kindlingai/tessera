@@ -99,7 +99,9 @@ fn fold_sinks(
             let at = if sink_mode == 1 { hd.head } else { list };
             let sink = sinks[at as u64];
             let sum = st.state[(ROWS + i) as usize];
-            if sink > f32::NEG_INFINITY && sum > 0.0 {
+            // A NaN sink reaches rows with zero weight too.
+            let odd = (sink.to_bits() & 0x7fff_ffff) > 0x7f80_0000;
+            if sink.to_bits() != 0xff80_0000 && (sum > 0.0 || odd) {
                 let peak = st.state[i as usize];
                 let d = (peak - sink) + log(sum);
                 if d >= 0.0 {

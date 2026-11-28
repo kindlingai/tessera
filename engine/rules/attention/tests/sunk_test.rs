@@ -638,6 +638,75 @@ fn huge_query_stays_finite() {
     }
 }
 
+/// Whether each value matches, NaN for NaN.
+fn alike(got: &[f32], want: &[f32], tol: f32) -> bool {
+    let fits = |(g, w): (&f32, &f32)| g.is_nan() && w.is_nan() || (g - w).abs() < tol;
+    got.iter().zip(want).all(fits)
+}
+
+/// Checks the last row under the tiled and listed plans.
+fn across(c: Case, fill: impl Fn(&mut [Tensor], usize, usize), check: impl Fn(&[f32], &str)) {
+    let n = 64usize;
+    let mut inputs = flat(c, n, 1.0, f32::NEG_INFINITY, 0.0);
+    fill(&mut inputs, 0, n);
+    let want = run_kept(&graph(c), &[], &mut Store::default(), 0, &inputs).unwrap();
+    let at = (n - 1) * c.heads * c.width;
+    let want = &want[0].floats().unwrap()[at..];
+    tiled(c, n, &inputs, "last row", |got, on| {
+        assert!(alike(&got[at..], want, 2e-2), "{on}: got {:?}", &got[at..]);
+        check(&got[at..], on);
+    });
+    for rule in [SPLIT, "listed_attend"] {
+        decoded(c, rule, &fill, |got, want, on| {
+            assert!(alike(got, want, 1e-4), "{on}: got {got:?}");
+            check(got, on);
+        });
+    }
+}
+
+/// A NaN sink logit makes its whole head NaN.
+#[test]
+fn odd_sink_propagates() {
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+        let fill = |inputs: &mut [Tensor], _: usize, _: usize| {
+            inputs[5] = Tensor::f32(vec![2], vec![f32::NAN, f32::NEG_INFINITY]);
+        };
+        across(c, fill, |got, on| {
+            let (odd, plain) = got.split_at(width);
+            let ones = plain.iter().all(|v| (v - 1.0).abs() < 2e-2);
+            assert!(odd.iter().all(|v| v.is_nan()) && ones, "{on}: {got:?}");
+        });
+    }
+}
+
+/// A key barred by bias still shows its NaN value.
+#[test]
+fn barred_value_shows() {
+    for (width, odd) in [(64usize, true), (64, false), (128, true)] {
+        let c = case(Mask::Causal, [2, 1, width, 1, 256]);
+        let fill = |inputs: &mut [Tensor], start: usize, n: usize| {
+            let mut bias = vec![0.0f32; n * 2 * 256];
+            // The first head of each row bars key 0.
+            for r in 0..n {
+                bias[r * 512 + start + r] = f32::NEG_INFINITY;
+            }
+            inputs[6] = Tensor::f32(vec![n, 2, 256], bias);
+            let mut v = vec![1.0f32; n * width];
+            if start == 0 && odd {
+                v[0] = f32::NAN;
+            }
+            inputs[2] = Tensor::f32(vec![n, 1, width], v);
+        };
+        across(c, fill, |got, on| {
+            let from = if odd { 1 } else { 0 };
+            let ones = got[from..width].iter().all(|v| (v - 1.0).abs() < 2e-2);
+            let first = got[0].is_nan() == odd;
+            assert!(first && ones, "{on}: {:?}", &got[..2]);
+        });
+    }
+}
+
 /// Runs on a Metal GPU alone: bf16 rounds each operand.
 #[test]
 fn sunk_metal_matches() {
