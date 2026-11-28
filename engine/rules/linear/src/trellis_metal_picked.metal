@@ -265,8 +265,8 @@ static inline void tm_pickmix_pf_out(
     }
 }
 
-// One rotated PMCGX tile: each SIMD group owns two strips.
-template <uint K, uint TM>
+// One rotated PMCGX tile. `GUARD` skips row groups past `nr`.
+template <uint K, uint TM, bool GUARD>
 static inline void tm_pickmix_pf_body(
     device const float *x, device const uchar *w, device const uchar *mat,
     device const float *su, device const float *sv,
@@ -282,7 +282,9 @@ static inline void tm_pickmix_pf_body(
     TmWordMap wm = tm_word_map<K, TM_BOOK_PMCGX>(lane);
     threadgroup half *wown = ws[simd];
     uint wr0 = (rr << 1u) * 32u + cc;
-    bool held = (K == 4u) || lane < tw;
+    uint sh = (K == 4u) ? 20u : wm.sh;
+    uint rsh = 32u - sh, rsh3 = 26u - sh;
+    uint i0 = wm.i0, i1 = wm.i1;
     device const float *sue = su + ulong(e) * k;
     simdgroup_float8x8 acc[TM][4];
     for (uint tm = 0u; tm < TM; tm++) {
@@ -300,13 +302,14 @@ static inline void tm_pickmix_pf_body(
 
         device const uint *tiles = (device const uint *)gb;
         for (uint u = 0u; u < 8u; u++) {
-            uint at = (u * 8u + simd * 2u) * tw + lane;
-            uint raw0 = held ? tiles[at] : 0u;
-            uint raw1 = held ? tiles[at + tw] : 0u;
+            uint at = (u * 8u + simd * 2u) * tw;
             half4 wa, wb;
-            tm_decode_tile<K, TM_BOOK_PMCGX>(raw0, wm, wa, wb);
+            tm_decode_words<K, TM_BOOK_PMCGX>(
+                tiles[at + i0], tiles[at + i1], sh, rsh, rsh3, wa, wb);
             tm_ws_put(wown + wr0, wa, wb);
-            tm_decode_tile<K, TM_BOOK_PMCGX>(raw1, wm, wa, wb);
+            at += tw;
+            tm_decode_words<K, TM_BOOK_PMCGX>(
+                tiles[at + i0], tiles[at + i1], sh, rsh, rsh3, wa, wb);
             tm_ws_put(wown + wr0 + 16u, wa, wb);
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -316,6 +319,7 @@ static inline void tm_pickmix_pf_body(
                     simdgroup_load(tb[j], wown + k8 * 32u + j * 8u, 32u);
                 }
                 for (uint tm = 0u; tm < TM; tm++) {
+                    if (GUARD && tm * 8u >= nr) continue;
                     simdgroup_half8x8 ta;
                     simdgroup_load(ta, &xs[tm * 8u][u * 16u + k8], 128u);
                     for (uint j = 0u; j < 4u; j++) {
@@ -411,23 +415,23 @@ static inline void tm_pick_pf_body(
         TM_PICK_PF_K(BOOK, TM, false, 0u)                                                    \
     }
 
-#define TM_PICKMIX_PF_K(K, TM)                                                               \
-    tm_pickmix_pf_body<K, TM>(                                                               \
+#define TM_PICKMIX_PF_K(K, TM, GUARD)                                                        \
+    tm_pickmix_pf_body<K, TM, GUARD>(                                                        \
         x, w, mat, su, sv, extra, out, n, k, repeat, post, e, ob, nr, tid, xs, ws, row_ids);
 
-// Four SIMD groups per work tile.
-#define TM_PICKMIX_PF_KERNEL(NAME, TM)                                                       \
+// Four SIMD groups per work tile. Short tiles take `GUARD`.
+#define TM_PICKMIX_PF_KERNEL(NAME, TM, GUARD)                                                \
     kernel void NAME(TM_PICKED_ARGS) {                                                       \
         (void)book; (void)turned;                                                            \
         threadgroup half xs[TM * 8u][128];                                                   \
         threadgroup half ws[4][16 * 32];                                                     \
         TM_PICK_TILE_START(TM)                                                               \
         if (ek == 2u) {                                                                      \
-            TM_PICKMIX_PF_K(2u, TM)                                                          \
+            TM_PICKMIX_PF_K(2u, TM, GUARD)                                                   \
         } else if (ek == 3u) {                                                               \
-            TM_PICKMIX_PF_K(3u, TM)                                                          \
+            TM_PICKMIX_PF_K(3u, TM, GUARD)                                                   \
         } else {                                                                             \
-            TM_PICKMIX_PF_K(4u, TM)                                                          \
+            TM_PICKMIX_PF_K(4u, TM, GUARD)                                                   \
         }                                                                                    \
     }
 
@@ -445,7 +449,7 @@ static inline void tm_pick_pf_body(
         }                                                                                    \
     }
 
-TM_PICKMIX_PF_KERNEL(tm_pickmix_pf16_pmcgx_t, 2u)
-TM_PICKMIX_PF_KERNEL(tm_pickmix_pf32_pmcgx_t, 4u)
+TM_PICKMIX_PF_KERNEL(tm_pickmix_pf16_pmcgx_t, 2u, true)
+TM_PICKMIX_PF_KERNEL(tm_pickmix_pf32_pmcgx_t, 4u, false)
 TM_PICK_PF_GEN_KERNEL(tm_pick_pf16_gen, 2u)
 TM_PICK_PF_GEN_KERNEL(tm_pick_pf32_gen, 4u)

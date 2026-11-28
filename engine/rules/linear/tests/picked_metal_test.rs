@@ -229,19 +229,30 @@ fn metal_picked_matches_cpu() {
     let sv = fill_f32(vec![COUNT, OUT], &mut draws);
     let signs = fill_f32(vec![OUT], &mut draws);
     for side in [1u32, INPUT_SIDE] {
-        for (mixed, rotated, post, repeat, rows, want_entries) in [
-            (true, true, 0, 1, 5usize, vec![MIXED]),
-            (true, true, 1, 1, 5, vec![MIXED]),
-            (true, true, 2, 2, 5, vec![MIXED]),
-            (true, false, 0, 1, 5, vec![GENERAL]),
-            (false, true, 1, 2, 5, vec![GENERAL]),
-            (false, false, 0, 1, 5, vec![GENERAL]),
+        for (mixed, rotated, post, repeat, rows, skew, want_entries) in [
+            (true, true, 0, 1, 5usize, false, vec![MIXED]),
+            (true, true, 1, 1, 5, false, vec![MIXED]),
+            (true, true, 2, 2, 5, false, vec![MIXED]),
+            (true, false, 0, 1, 5, false, vec![GENERAL]),
+            (false, true, 1, 2, 5, false, vec![GENERAL]),
+            (false, false, 0, 1, 5, false, vec![GENERAL]),
             (
                 true,
                 true,
                 0,
                 1,
                 64,
+                false,
+                vec!["tm_pick_group", "tm_pickmix_pf16_pmcgx_t"],
+            ),
+            // Skewed counts force short tail tiles.
+            (
+                true,
+                true,
+                0,
+                1,
+                64,
+                true,
                 vec!["tm_pick_group", "tm_pickmix_pf16_pmcgx_t"],
             ),
             (
@@ -250,6 +261,7 @@ fn metal_picked_matches_cpu() {
                 1,
                 2,
                 40,
+                false,
                 vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
             ),
             (
@@ -258,6 +270,7 @@ fn metal_picked_matches_cpu() {
                 2,
                 2,
                 40,
+                false,
                 vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
             ),
             (
@@ -266,6 +279,7 @@ fn metal_picked_matches_cpu() {
                 1,
                 2,
                 128,
+                false,
                 vec!["tm_pick_group", "tm_pickmix_pf32_pmcgx_t"],
             ),
             (
@@ -274,6 +288,7 @@ fn metal_picked_matches_cpu() {
                 0,
                 1,
                 80,
+                false,
                 vec!["tm_pick_group", "tm_pick_pf32_gen"],
             ),
         ] {
@@ -282,7 +297,18 @@ fn metal_picked_matches_cpu() {
             let g = picked_graph(rotated, post, repeat);
             let x = fill_f32(vec![rows, INP], &mut draws);
             let id_vals: Vec<u32> = (0..rows * repeat)
-                .map(|i| ((i * 3 + 1) % COUNT) as u32)
+                .map(|i| {
+                    if skew {
+                        match i {
+                            0..37 => 0,
+                            37..56 => 1,
+                            56..61 => 2,
+                            _ => 3,
+                        }
+                    } else {
+                        ((i * 3 + 1) % COUNT) as u32
+                    }
+                })
                 .collect();
             let id_shape = if repeat > 1 {
                 vec![rows, repeat]

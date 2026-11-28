@@ -27,8 +27,7 @@ enum TmBook : uint {
 // Rounds four half values (|v| < 448) to E4M3.
 static inline half4 tm_round_e4m3_4(half4 v) {
     // Exponents clamp at the subnormal step.
-    ushort4 eb = max(as_type<ushort4>(v) & ushort4(0x7C00u), ushort4(0x2400u));
-    uint2 ebu = as_type<uint2>(eb);
+    uint2 ebu = as_type<uint2>(fmax(fabs(v), half4(0.015625h))) & 0x7C007C00u;
     half4 sc = as_type<half4>(0x84008400u - ebu);
     half4 inv = as_type<half4>(ebu - 0x0C000C00u);
     return rint(v * sc) * inv;
@@ -74,9 +73,7 @@ static inline half4 tm_decode_pmcgx2(uint w0, uint w1) {
     uint2 w = uint2(w0, w1);
     uint2 x = ((w * TM_MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
     uint2 y = ((w * TM_PMCG2) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-    half2 hx0 = as_type<half2>(x.x), hy0 = as_type<half2>(y.x);
-    half2 hx1 = as_type<half2>(x.y), hy1 = as_type<half2>(y.y);
-    return tm_round_e4m3_4(half4(hx0 + hy0.yx, hx1 + hy1.yx));
+    return tm_round_e4m3_4(as_type<half4>(x) + as_type<half4>(y).yxwz);
 }
 
 struct TmWordMap {
@@ -107,24 +104,37 @@ static inline uint tm_extract(uint hi, uint lo) {
     }
 }
 
-// Decodes one SIMD-held tile word with pure 32-bit shifts.
+// Decodes a tile from two ring words at offset `sh`.
 template <uint K, uint BOOK>
-static inline void tm_decode_tile(uint raw, TmWordMap wm, thread half4 &wa, thread half4 &wb) {
-    uint w0 = simd_shuffle(raw, wm.i0);
-    uint w1 = (K == 4u) ? raw : simd_shuffle(raw, wm.i1);
-    uint hi, lo;
-    if constexpr (K == 4u) {
-        hi = (w0 << 20u) | (w1 >> 12u);
-        lo = w1 << 20u;
-    } else {
-        uint sh = wm.sh;
-        hi = (sh == 0u) ? w0 : ((w0 << sh) | (w1 >> (32u - sh)));
-        lo = w1 << sh;
-    }
+static inline void tm_decode_words(
+    uint w0, uint w1, uint sh, uint rsh, uint rsh3, thread half4 &wa, thread half4 &wb) {
     if constexpr (BOOK == TM_BOOK_PMCGX) {
-        wa = tm_decode_pmcgx2(tm_extract<20u, 0u>(hi, lo), tm_extract<20u, 2u * K>(hi, lo));
-        wb = tm_decode_pmcgx2(tm_extract<20u, 4u * K>(hi, lo), tm_extract<20u, 6u * K>(hi, lo));
+        // Four 20-bit fields, `2 * K` bits apart.
+        uint e0, e1, e2, e3;
+        if constexpr (K == 4u) {
+            e0 = ((w0 << 8u) | (w1 >> 24u)) & 0xFFFFFu;
+            e1 = ((w0 << 16u) | (w1 >> 16u)) & 0xFFFFFu;
+            e2 = extract_bits(w1, 8u, 20u);
+            e3 = w1 & 0xFFFFFu;
+        } else if constexpr (K == 3u) {
+            // This book's offsets here are 2, 10, 18 or 26.
+            uint hi = (w0 << sh) | (w1 >> rsh);
+            e0 = hi >> 12u;
+            e1 = extract_bits(hi, 6u, 20u);
+            e2 = hi & 0xFFFFFu;
+            e3 = ((hi << 6u) & 0xFFFFFu) | ((w1 >> rsh3) & 0x3Fu);
+        } else {
+            uint hi = (sh == 0u) ? w0 : ((w0 << 16u) | (w1 >> 16u));
+            e0 = hi >> 12u;
+            e1 = extract_bits(hi, 8u, 20u);
+            e2 = extract_bits(hi, 4u, 20u);
+            e3 = hi & 0xFFFFFu;
+        }
+        wa = tm_decode_pmcgx2(e0, e1);
+        wb = tm_decode_pmcgx2(e2, e3);
     } else {
+        uint hi = (sh == 0u) ? w0 : ((w0 << sh) | (w1 >> rsh));
+        uint lo = w1 << sh;
         uint s0 = tm_extract<16u, 0u>(hi, lo);
         uint s1 = tm_extract<16u, K>(hi, lo);
         uint s2 = tm_extract<16u, 2u * K>(hi, lo);
@@ -136,6 +146,15 @@ static inline void tm_decode_tile(uint raw, TmWordMap wm, thread half4 &wa, thre
         wa = tm_decode_quad<BOOK>(s0, s1, s2, s3);
         wb = tm_decode_quad<BOOK>(s4, s5, s6, s7);
     }
+}
+
+// Decodes one SIMD-held tile word.
+template <uint K, uint BOOK>
+static inline void tm_decode_tile(uint raw, TmWordMap wm, thread half4 &wa, thread half4 &wb) {
+    uint w0 = simd_shuffle(raw, wm.i0);
+    uint w1 = (K == 4u) ? raw : simd_shuffle(raw, wm.i1);
+    uint sh = (K == 4u) ? 20u : wm.sh;
+    tm_decode_words<K, BOOK>(w0, w1, sh, 32u - sh, 26u - sh, wa, wb);
 }
 
 // Weight blocks split `p` of `ks` reads for output `ob`.
@@ -271,17 +290,6 @@ static inline void tm_dec_finish(
     }
 }
 
-// Reads one block's eight tile words together.
-template <uint K>
-static inline void tm_fetch8(
-    device const uchar *gb, uint tw, uint simd, uint lane, thread uint *raw) {
-    device const uint *tiles = (device const uint *)gb;
-    bool held = (K == 4u) || lane < tw;
-    for (uint u = 0u; u < 8u; u++) {
-        raw[u] = held ? tiles[(u * 8u + simd) * tw + lane] : 0u;
-    }
-}
-
 // Stages four input blocks per barrier, then streams their tiles.
 template <uint K, uint BOOK>
 static inline void tm_dec1_run(
@@ -299,6 +307,9 @@ static inline void tm_dec1_run(
     uint rr = lane & 3u;
     // Each lane's four inputs per tile sit together.
     uint put = ((lane >> 2u) << 4u) + ((lane & 1u) << 3u) + (lane & 2u);
+    uint sh = (K == 4u) ? 20u : wm.sh;
+    uint rsh = 32u - sh, rsh3 = 26u - sh;
+    uint i0 = wm.i0, i1 = wm.i1;
     device const uchar *gb = walk.at;
     for (uint c0 = 0u; c0 < walk.blocks; c0 += 4u) {
         uint nb = min(4u, walk.blocks - c0);
@@ -316,11 +327,17 @@ static inline void tm_dec1_run(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint b = 0u; b < nb; b++) {
-            uint raw[8];
-            tm_fetch8<K>(gb, tw, simd, lane, raw);
+            // Each lane loads its own two ring words.
+            device const uint *tiles = (device const uint *)gb;
+            uint ra[8], rb[8];
+            for (uint u = 0u; u < 8u; u++) {
+                uint at = (u * 8u + simd) * tw;
+                ra[u] = tiles[at + i0];
+                rb[u] = tiles[at + i1];
+            }
             for (uint u = 0u; u < 8u; u++) {
                 half4 wa, wb;
-                tm_decode_tile<K, BOOK>(raw[u], wm, wa, wb);
+                tm_decode_words<K, BOOK>(ra[u], rb[u], sh, rsh, rsh3, wa, wb);
                 uint xb = u * 16u + (rr << 2u);
                 float4 xv = float4(*(threadgroup const packed_float4 *)&xs[b][xb]);
                 acc0 += dot(xv, float4(wa));
@@ -376,6 +393,9 @@ static void tm_dec4_body(
 
     float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint sh = (K == 4u) ? 20u : wm.sh;
+    uint rsh = 32u - sh, rsh3 = 26u - sh;
+    uint i0 = wm.i0, i1 = wm.i1;
 
     for (uint b = 0u; b < walk.blocks; b++) {
         if (b > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -389,9 +409,9 @@ static void tm_dec4_body(
 
         device const uint *tiles = (device const uint *)gb;
         for (uint u = 0u; u < 8u; u++) {
-            uint raw = (K == 4u || lane < tw) ? tiles[(u * 8u + simd) * tw + lane] : 0u;
+            uint at = (u * 8u + simd) * tw;
             half4 wa, wb;
-            tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
+            tm_decode_words<K, BOOK>(tiles[at + i0], tiles[at + i1], sh, rsh, rsh3, wa, wb);
             uint xb = u * 16u + (rr << 1u);
             for (uint r = 0u; r < m; r++) {
                 float x0 = xs[r][xb];
