@@ -1,8 +1,9 @@
 //! A kernel and its includes, as one translation unit.
 
 use crate::{Backend, EDITION, HEADERS, Import};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::fmt;
+use std::fmt::{self, Write};
 
 /// The engine's choices for one compile.
 #[derive(Clone, Copy, Debug)]
@@ -36,12 +37,12 @@ pub struct Flat {
 /// Local files in include order, each after what it includes.
 struct Files<'a> {
     load: &'a dyn Fn(&str) -> Option<String>,
-    done: Vec<(String, String, Scan)>,
+    done: Vec<(String, Cow<'a, str>, Scan)>,
     open: Vec<String>,
 }
 
-impl Files<'_> {
-    fn visit(&mut self, name: &str, text: String) -> Result<(), Error> {
+impl<'a> Files<'a> {
+    fn visit(&mut self, name: &str, text: Cow<'a, str>) -> Result<(), Error> {
         let whole = |problem| Error {
             file: name.into(),
             line: 0,
@@ -57,7 +58,7 @@ impl Files<'_> {
                 continue;
             }
             let text = (self.load)(path).ok_or_else(|| whole(Problem::Missing(path.clone())))?;
-            self.visit(path, text)?;
+            self.visit(path, Cow::Owned(text))?;
         }
         self.open.pop();
         self.done.push((name.into(), text, found));
@@ -66,7 +67,54 @@ impl Files<'_> {
 }
 
 fn line(out: &mut String, n: usize, name: &str) {
-    out.push_str(&format!("#line {n} \"{name}\"\n"));
+    let _ = writeln!(out, "#line {n} \"{name}\"");
+}
+
+/// Appends `text` with sorted `includes` line numbers blanked out.
+fn append_stripped(out: &mut String, text: &str, includes: &[usize]) {
+    if !text.contains('\r') {
+        let Some(&last) = includes.last() else {
+            out.push_str(text);
+            if !text.is_empty() && !text.ends_with('\n') {
+                out.push('\n');
+            }
+            return;
+        };
+        let mut inc = 0;
+        let mut pos = 0;
+        for n in 0..=last {
+            let rest = &text[pos..];
+            let (slice, next) = match rest.find('\n') {
+                Some(nl) => (&rest[..nl], pos + nl + 1),
+                None => (rest, text.len()),
+            };
+            if inc < includes.len() && includes[inc] == n {
+                inc += 1;
+            } else {
+                out.push_str(slice);
+            }
+            out.push('\n');
+            pos = next;
+            if pos >= text.len() {
+                return;
+            }
+        }
+        let tail = &text[pos..];
+        out.push_str(tail);
+        if !tail.is_empty() && !tail.ends_with('\n') {
+            out.push('\n');
+        }
+        return;
+    }
+    let mut inc = 0;
+    for (n, l) in text.lines().enumerate() {
+        if inc < includes.len() && includes[inc] == n {
+            inc += 1;
+        } else {
+            out.push_str(l);
+        }
+        out.push('\n');
+    }
 }
 
 /// Flattens kernel `name`. `load` reads other recipe files.
@@ -90,11 +138,11 @@ pub fn flatten(
         done: Vec::new(),
         open: Vec::new(),
     };
-    files.visit(name, text.into())?;
+    files.visit(name, Cow::Borrowed(text))?;
     let imports: BTreeSet<Import> = files
         .done
         .iter()
-        .flat_map(|(.., s)| s.imports.clone())
+        .flat_map(|(.., s)| s.imports.iter().copied())
         .collect();
     let imports: Vec<Import> = imports.into_iter().collect();
     if imports.is_empty() {
@@ -112,8 +160,25 @@ pub fn flatten(
     if options.remote_kv && !(collective && imports.contains(&Import::Kept)) {
         return Err(whole(Problem::RemoteKv));
     }
-    let mut out = String::new();
-    let mut define = |name: &str| out.push_str(&format!("#define {name} 1\n"));
+    let headers: Vec<_> = HEADERS
+        .iter()
+        .filter(|h| (h.needed)(&imports, backend))
+        .collect();
+    let texts: Vec<_> = headers.iter().map(|h| (h.name, (h.text)())).collect();
+    let cap: usize = 256
+        + texts
+            .iter()
+            .map(|(n, t)| t.len() + n.len() + 16)
+            .sum::<usize>()
+        + files
+            .done
+            .iter()
+            .map(|(f, t, _)| t.len() + f.len() + 16)
+            .sum::<usize>();
+    let mut out = String::with_capacity(cap);
+    let mut define = |name: &str| {
+        let _ = writeln!(out, "#define {name} 1");
+    };
     define(backend.define());
     if options.remote_kv {
         define("TESSERA_REMOTE_KV");
@@ -121,23 +186,16 @@ pub fn flatten(
     if options.marks {
         define("TESSERA_MARKS");
     }
-    let headers = HEADERS.iter().filter(|h| (h.needed)(&imports, backend));
-    let headers: Vec<_> = headers.collect();
     for cap in headers.iter().filter_map(|h| h.cap) {
         define(cap);
     }
-    for h in headers {
-        line(&mut out, 1, h.name);
-        out.push_str((h.text)());
+    for (name, body) in &texts {
+        line(&mut out, 1, name);
+        out.push_str(body);
     }
     for (file, text, found) in &files.done {
         line(&mut out, 1, file);
-        for (n, l) in text.lines().enumerate() {
-            if !found.includes.contains(&n) {
-                out.push_str(l);
-            }
-            out.push('\n');
-        }
+        append_stripped(&mut out, text, &found.includes);
     }
     Ok(Flat { text: out, imports })
 }
@@ -199,30 +257,70 @@ pub(crate) struct Scan {
     pub includes: Vec<usize>,
 }
 
-/// The part of `line` outside comments.
-fn code(line: &str, open: &mut bool) -> String {
-    let mut out = String::new();
+/// Next `//` or `/*` in `s`, as `(index, is_block)`.
+fn next_comment(s: &str) -> Option<(usize, bool)> {
+    let bytes = s.as_bytes();
+    let mut at = 0;
+    while let Some(rel) = s[at..].find('/') {
+        let i = at + rel;
+        match bytes.get(i + 1) {
+            Some(b'/') => return Some((i, false)),
+            Some(b'*') => return Some((i, true)),
+            _ => at = i + 1,
+        }
+    }
+    None
+}
+
+/// The part of `line` outside comments, borrowing when unsplit.
+fn code<'a>(line: &'a str, open: &mut bool) -> Cow<'a, str> {
     let mut rest = line;
+    if *open {
+        let Some(end) = rest.find("*/") else {
+            return Cow::Borrowed("");
+        };
+        rest = &rest[end + 2..];
+        *open = false;
+    }
+    let Some((pos, block)) = next_comment(rest) else {
+        return Cow::Borrowed(rest);
+    };
+    if !block {
+        return Cow::Borrowed(&rest[..pos]);
+    }
+    *open = true;
+    let after = &rest[pos + 2..];
+    let Some(end) = after.find("*/") else {
+        return Cow::Borrowed(&rest[..pos]);
+    };
+    *open = false;
+    let mut out = String::with_capacity(rest.len());
+    out.push_str(&rest[..pos]);
+    out.push(' ');
+    rest = &after[end + 2..];
     loop {
         if *open {
             let Some(end) = rest.find("*/") else {
-                return out;
+                return Cow::Owned(out);
             };
             rest = &rest[end + 2..];
             *open = false;
         }
-        let line_at = rest.find("//");
-        let block_at = rest.find("/*");
-        match (line_at, block_at) {
-            (Some(l), Some(b)) if l < b => return out + &rest[..l],
-            (_, Some(b)) => {
-                out.push_str(&rest[..b]);
+        match next_comment(rest) {
+            Some((p, false)) => {
+                out.push_str(&rest[..p]);
+                return Cow::Owned(out);
+            }
+            Some((p, true)) => {
+                out.push_str(&rest[..p]);
                 out.push(' ');
-                rest = &rest[b + 2..];
+                rest = &rest[p + 2..];
                 *open = true;
             }
-            (Some(l), None) => return out + &rest[..l],
-            (None, None) => return out + rest,
+            None => {
+                out.push_str(rest);
+                return Cow::Owned(out);
+            }
         }
     }
 }
@@ -247,13 +345,15 @@ fn local(path: &str) -> Result<String, Problem> {
 }
 
 fn tessera(target: &str) -> Result<Import, Problem> {
-    let parts: Vec<&str> = target.split('/').collect();
-    match parts[..] {
-        ["tessera", _] => Err(Problem::Bare(target.into())),
-        ["tessera", edition, name] if edition == EDITION.to_string() => {
+    let mut parts = target.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("tessera"), Some(_), None, None) => Err(Problem::Bare(target.into())),
+        (Some("tessera"), Some(edition), Some(name), None)
+            if edition.parse::<u32>() == Ok(EDITION) =>
+        {
             Import::parse(name).ok_or_else(|| Problem::Unknown(name.into()))
         }
-        ["tessera", edition, _] => Err(Problem::Edition(edition.into())),
+        (Some("tessera"), Some(edition), Some(_), None) => Err(Problem::Edition(edition.into())),
         _ => Err(Problem::Foreign(target.into())),
     }
 }
@@ -283,6 +383,7 @@ pub(crate) fn scan(file: &str, text: &str) -> Result<Scan, Error> {
         line: line + 1,
         problem,
     };
+    let has_probe = text.contains("__has_include");
     let mut scan = Scan::default();
     let mut open = false;
     let mut leading = true;
@@ -292,7 +393,7 @@ pub(crate) fn scan(file: &str, text: &str) -> Result<Scan, Error> {
         if code.is_empty() {
             continue;
         }
-        let late = code.contains("__has_include") || code.starts_with("%:");
+        let late = (has_probe && code.contains("__has_include")) || code.starts_with("%:");
         let kind = directive(code);
         let named = |word: &str| kind.is_some_and(|d| d.starts_with(word));
         if leading && named("include") && !late {
