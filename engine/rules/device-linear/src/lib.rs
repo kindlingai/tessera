@@ -6,6 +6,7 @@ mod gemv;
 pub(crate) mod mm;
 mod moe;
 mod stacked;
+mod stacked_fused;
 #[cfg(test)]
 mod stacked_test;
 

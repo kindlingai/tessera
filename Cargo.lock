@@ -1843,8 +1843,6 @@ name = "tessera-attention"
 version = "0.1.0"
 dependencies = [
  "tessera-codegen",
- "tessera-device",
- "tessera-gpukit",
  "tessera-graph",
  "tessera-interp",
  "tessera-kernels",
@@ -1992,10 +1990,15 @@ dependencies = [
 name = "tessera-device-rules"
 version = "0.1.0"
 dependencies = [
+ "tessera-attention",
  "tessera-device",
+ "tessera-gpukit",
  "tessera-graph",
+ "tessera-interp",
  "tessera-lower",
+ "tessera-run",
  "tessera-testkit",
+ "tessera-trace",
 ]
 
 [[package]]

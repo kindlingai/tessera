@@ -11,10 +11,7 @@ mod join_rope;
 mod kv_prep;
 pub mod listed;
 mod packed;
-mod packed_gpu;
 mod slots;
-
-pub use packed_gpu::{packed_cuda_source, packed_rocm_source};
 
 use tessera_lower::form::Load as Stored;
 use tessera_lower::kernels::Map;

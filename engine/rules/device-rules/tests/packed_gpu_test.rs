@@ -1,4 +1,5 @@
-use tessera_attention::{packed_cuda_source, packed_rocm_source};
+use tessera_attention as _;
+use tessera_device_rules::{packed_cuda_source, packed_rocm_source};
 use tessera_gpukit::backend::{Backend, picked};
 use tessera_gpukit::platform::{Asked, Platform};
 use tessera_graph::DimName::{HeadDim, Heads, KvHeads, Rows};
