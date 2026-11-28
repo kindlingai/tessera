@@ -39,6 +39,7 @@ pub(super) enum Closers {
         needles: Vec<String>,
         consuming: Vec<String>,
         unanchored: bool,
+        defer_eof: bool,
     },
 }
 
@@ -63,6 +64,7 @@ impl Closers {
             return Ok(Self::Literals(list));
         }
         let regex = Regex::new(&pat)?;
+        let defer_eof = has_stream_unsafe_assertion(&pat);
         let mut needles = Vec::new();
         let mut consuming = Vec::new();
         let mut unanchored = false;
@@ -96,6 +98,7 @@ impl Closers {
             needles,
             consuming,
             unanchored,
+            defer_eof,
         })
     }
 
@@ -103,22 +106,34 @@ impl Closers {
         matches!(self, Self::Literals(list) if list.is_empty())
     }
 
-    pub(super) fn find(&self, text: &str) -> Option<(usize, usize)> {
-        self.find_from(text, 0)
+    pub(super) fn find_for(&self, text: &str, eof: bool) -> Option<(usize, usize)> {
+        self.find_from_for(text, 0, eof)
     }
 
-    pub(super) fn find_from(&self, text: &str, from: usize) -> Option<(usize, usize)> {
+    pub(super) fn find_from_for(
+        &self,
+        text: &str,
+        from: usize,
+        eof: bool,
+    ) -> Option<(usize, usize)> {
         if from > text.len() {
             return None;
         }
         let slice = &text[from..];
         match self {
             Self::Literals(list) => find_closers(slice, list).map(|(at, len)| (from + at, len)),
-            Self::Pattern { regex, .. } => regex
-                .find(slice)
-                .ok()
-                .flatten()
-                .map(|m| (from + m.start(), m.end() - m.start())),
+            Self::Pattern {
+                regex, defer_eof, ..
+            } => {
+                if !eof && *defer_eof {
+                    return None;
+                }
+                let m = regex.find(slice).ok().flatten()?;
+                if !eof && from + m.end() == text.len() {
+                    return None;
+                }
+                Some((from + m.start(), m.end() - m.start()))
+            }
         }
     }
 
@@ -329,4 +344,39 @@ pub(super) fn literal_prefix(pattern: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Whether a regex contains lookarounds or end/boundary assertions unsafe mid-stream.
+fn has_stream_unsafe_assertion(pat: &str) -> bool {
+    let bytes = pat.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if !in_class
+                    && i + 1 < bytes.len()
+                    && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
+                {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'$' if !in_class => return true,
+            b'(' if !in_class && i + 2 < bytes.len() && bytes[i + 1] == b'?' => {
+                let lookbehind = bytes[i + 2] == b'<'
+                    && i + 3 < bytes.len()
+                    && matches!(bytes[i + 3], b'=' | b'!');
+                if matches!(bytes[i + 2], b'=' | b'!') || lookbehind {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }

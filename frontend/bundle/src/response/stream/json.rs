@@ -239,6 +239,7 @@ pub(super) fn step_relaxed(
     state: &mut RelaxedState,
     buf: &mut String,
     out: &mut Vec<ResponseEvent>,
+    eof: bool,
 ) -> StepOutcome {
     let Body::Json(args) = &spec.body else {
         unreachable!()
@@ -255,7 +256,7 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = spec.close.find(buf) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     emitted.push_str(&json_escape_inner(&buf[..at]));
                     emitted.push('"');
                     buf.drain(..at + len);
@@ -287,7 +288,7 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = spec.close.find(buf) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     emitted.push_str(&buf[..at]);
                     buf.drain(..at + len);
                     break true;
@@ -316,7 +317,7 @@ pub(super) fn step_relaxed(
                 if buf.is_empty() {
                     break false;
                 }
-                if let Some((0, len)) = spec.close.find(buf) {
+                if let Some((0, len)) = spec.close.find_for(buf, eof) {
                     buf.drain(..len);
                     break true;
                 }
@@ -327,7 +328,7 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::InDelim(idx);
                     continue;
                 }
-                if prefix_of_any(buf, args, &spec.close) {
+                if !eof && prefix_of_any(buf, args, &spec.close) {
                     break false;
                 }
                 let first = buf.as_bytes()[0];
@@ -390,7 +391,7 @@ pub(super) fn step_relaxed(
                     _ => {
                         let len = buf.bytes().take_while(|b| is_prim_byte(*b)).count();
                         if len == 0 {
-                            if let Some((at, clen)) = spec.close.find(buf) {
+                            if let Some((at, clen)) = spec.close.find_for(buf, eof) {
                                 buf.drain(..at + clen);
                                 break true;
                             }

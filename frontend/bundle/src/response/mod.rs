@@ -481,22 +481,16 @@ impl<'a> ResponseStream<'a> {
             return;
         }
         self.buf.push_str(piece);
-        loop {
-            let moved = match self.mode {
-                Mode::Text => self.step_text(out),
-                Mode::Thinking => self.step_thinking(out),
-                Mode::ToolCall => self.step_tool(out),
-                Mode::Calls => self.step_calls(),
-                Mode::Closed => false,
-            };
-            if !moved {
-                break;
-            }
-        }
+        self.drain(out, false);
     }
 
     /// Flushes remaining buffered text when generation ends.
     pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
+        if self.mode == Mode::Closed {
+            self.buf.clear();
+            return;
+        }
+        self.drain(out, true);
         if self.mode == Mode::Closed {
             self.buf.clear();
             return;
@@ -529,7 +523,22 @@ impl<'a> ResponseStream<'a> {
         }
     }
 
-    fn step_text(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn drain(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) {
+        loop {
+            let moved = match self.mode {
+                Mode::Text => self.step_text(out, eof),
+                Mode::Thinking => self.step_thinking(out, eof),
+                Mode::ToolCall => self.step_tool(out, eof),
+                Mode::Calls => self.step_calls(),
+                Mode::Closed => false,
+            };
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    fn step_text(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         if self.lead {
             let kept = self.buf.trim_start_matches('\n').len();
             self.buf.drain(..self.buf.len() - kept);
@@ -538,7 +547,15 @@ impl<'a> ResponseStream<'a> {
             }
             self.lead = false;
         }
-        if let Some((at, skip, hit)) = self.find_hit() {
+        let close_hold = if eof {
+            0
+        } else {
+            self.parser.content_close.tail_hold(&self.buf)
+        };
+        let safe_end = self.buf.len() - close_hold;
+        if let Some((at, skip, hit)) = self.find_hit(eof)
+            && (eof || matches!(hit, Hit::Close) || at < safe_end)
+        {
             if at > 0 {
                 out.push(ResponseEvent::Content(self.buf[..at].to_string()));
             }
@@ -562,6 +579,9 @@ impl<'a> ResponseStream<'a> {
             };
             return self.mode != Mode::Closed;
         }
+        if eof {
+            return false;
+        }
         let mut needles: Vec<&str> = Vec::new();
         if let Some(t) = &self.parser.thinking {
             needles.extend(t.open.triggers());
@@ -572,8 +592,7 @@ impl<'a> ResponseStream<'a> {
             needles.extend(t.open.triggers());
             needles.extend(t.outer.as_ref().map(|[o, _]| o.as_str()));
         }
-        let keep =
-            tail_hold(&self.buf, &needles).max(self.parser.content_close.tail_hold(&self.buf));
+        let keep = tail_hold(&self.buf, &needles).max(close_hold);
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Content(self.buf[..emit].to_string()));
@@ -582,17 +601,17 @@ impl<'a> ResponseStream<'a> {
         false
     }
 
-    fn step_thinking(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn step_thinking(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         let Some(spec) = &self.parser.thinking else {
             self.mode = Mode::Text;
             return true;
         };
         if self.opening {
             let from = spec.open.min_close_offset(&self.buf);
-            let close = spec.close.find_from(&self.buf, from);
+            let close = spec.close.find_from_for(&self.buf, from, eof);
             match (self.opener_len(&self.buf), close) {
                 // Text after the match shows that the opener is complete.
-                (Some(cut), _) if cut < self.buf.len() => {
+                (Some(cut), _) if cut < self.buf.len() || eof => {
                     self.buf.drain(..cut);
                     self.opening = false;
                 }
@@ -606,7 +625,7 @@ impl<'a> ResponseStream<'a> {
                 _ => return false,
             }
         }
-        if let Some((at, len)) = spec.close.find(&self.buf) {
+        if let Some((at, len)) = spec.close.find_for(&self.buf, eof) {
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
             }
@@ -614,6 +633,9 @@ impl<'a> ResponseStream<'a> {
             self.mode = Mode::Text;
             self.lead = true;
             return true;
+        }
+        if eof {
+            return false;
         }
         let keep = spec.close.tail_hold(&self.buf);
         let emit = self.buf.len() - keep;
@@ -624,12 +646,12 @@ impl<'a> ResponseStream<'a> {
         false
     }
 
-    fn step_tool(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn step_tool(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         let Some(spec) = &self.parser.tool_calls else {
             self.mode = Mode::Text;
             return true;
         };
-        match self.tool.step(spec, &mut self.buf, out) {
+        match self.tool.step(spec, &mut self.buf, out, eof) {
             StepOutcome::Wait => false,
             StepOutcome::Continue => true,
             StepOutcome::Done => {
@@ -675,7 +697,7 @@ impl<'a> ResponseStream<'a> {
         Some(text.len() - rest.len())
     }
 
-    fn find_hit(&self) -> Option<(usize, usize, Hit)> {
+    fn find_hit(&self, eof: bool) -> Option<(usize, usize, Hit)> {
         let mut best: Option<(usize, usize, Hit)> = None;
         let mut pick = |at: usize, skip: usize, hit: Hit| {
             if best.is_none_or(|(b, _, _)| at < b) {
@@ -704,7 +726,7 @@ impl<'a> ResponseStream<'a> {
         {
             pick(at, open.len(), Hit::Calls);
         }
-        if let Some((at, len)) = self.parser.content_close.find(&self.buf) {
+        if let Some((at, len)) = self.parser.content_close.find_for(&self.buf, eof) {
             pick(at, len, Hit::Close);
         }
         best

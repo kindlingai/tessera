@@ -133,15 +133,16 @@ impl ToolState {
         spec: &BlockSpec,
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
+        eof: bool,
     ) -> StepOutcome {
         match self {
-            Self::Start => self.step_start(spec, buf, out),
-            Self::Buffer => step_buffer(spec, buf, out),
-            Self::RawJson => step_raw_json(spec, buf, out),
-            Self::RelaxedJson(state) => step_relaxed(spec, state, buf, out),
-            Self::Tags(_) => self.step_tags(spec, buf, out),
-            Self::JsonArgs { .. } => self.step_json_args(spec, buf, out),
-            Self::DrainClose => step_drain_close(spec, buf),
+            Self::Start => self.step_start(spec, buf, out, eof),
+            Self::Buffer => step_buffer(spec, buf, out, eof),
+            Self::RawJson => step_raw_json(spec, buf, out, eof),
+            Self::RelaxedJson(state) => step_relaxed(spec, state, buf, out, eof),
+            Self::Tags(_) => self.step_tags(spec, buf, out, eof),
+            Self::JsonArgs { .. } => self.step_json_args(spec, buf, out, eof),
+            Self::DrainClose => step_drain_close(spec, buf, eof),
         }
     }
 
@@ -183,6 +184,7 @@ impl ToolState {
         spec: &BlockSpec,
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
+        eof: bool,
     ) -> StepOutcome {
         if spec.close.is_empty() {
             *self = Self::Buffer;
@@ -194,14 +196,16 @@ impl ToolState {
                 Body::Tags {
                     delims: Some(_), ..
                 },
-            ) => self.start_pattern(spec, buf, out, false),
-            (Opener::Pattern { .. }, Body::Json(_)) => self.start_pattern(spec, buf, out, true),
+            ) => self.start_pattern(spec, buf, out, false, eof),
+            (Opener::Pattern { .. }, Body::Json(_)) => {
+                self.start_pattern(spec, buf, out, true, eof)
+            }
             (Opener::Literal(_), Body::Json(args))
                 if spec.transform.is_none()
                     && args.string_delims.is_empty()
                     && !args.unquoted_keys =>
             {
-                self.start_literal_json(spec, buf, out)
+                self.start_literal_json(spec, buf, out, eof)
             }
             _ => {
                 *self = Self::Buffer;
@@ -216,10 +220,11 @@ impl ToolState {
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
         expect_json: bool,
+        eof: bool,
     ) -> StepOutcome {
         let Some((caps, rest)) = spec.open.strip(buf) else {
             let from = spec.open.min_close_offset(buf);
-            return match spec.close.find_from(buf, from) {
+            return match spec.close.find_from_for(buf, from, eof) {
                 Some(_) => {
                     *self = Self::Buffer;
                     StepOutcome::Continue
@@ -238,7 +243,7 @@ impl ToolState {
                 .first()
                 .is_some_and(|b| is_json_start(*b));
             if !valid_start {
-                if spec.close.find_from(buf, cut).is_some() {
+                if spec.close.find_from_for(buf, cut, eof).is_some() {
                     *self = Self::Buffer;
                     return StepOutcome::Continue;
                 }
@@ -278,6 +283,7 @@ impl ToolState {
         spec: &BlockSpec,
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
+        eof: bool,
     ) -> StepOutcome {
         let Some((_, rest)) = spec.open.strip(buf) else {
             *self = Self::Buffer;
@@ -285,7 +291,7 @@ impl ToolState {
         };
         let open_len = buf.len() - rest.len();
         match scan_json_header(rest) {
-            HeaderScan::Wait => match spec.close.find_from(buf, open_len) {
+            HeaderScan::Wait => match spec.close.find_from_for(buf, open_len, eof) {
                 Some(_) => {
                     *self = Self::Buffer;
                     StepOutcome::Continue
@@ -320,6 +326,7 @@ impl ToolState {
         spec: &BlockSpec,
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
+        eof: bool,
     ) -> StepOutcome {
         let Body::Tags {
             delims: Some(delims),
@@ -335,7 +342,7 @@ impl ToolState {
             TagPhase::SeekKey { first } => {
                 let first = *first;
                 let key_at = buf.find(delims.key_open.as_str());
-                let close = spec.close.find(buf);
+                let close = spec.close.find_for(buf, eof);
                 match (key_at, close) {
                     (Some(at), c) if c.is_none_or(|(end, _)| at < end) => {
                         buf.drain(..at + delims.key_open.len());
@@ -364,7 +371,7 @@ impl ToolState {
                     *phase = next_after_key(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = spec.close.find(buf) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -380,7 +387,7 @@ impl ToolState {
                     *phase = next_after_val_open(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = spec.close.find(buf) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -406,7 +413,7 @@ impl ToolState {
             }
             TagPhase::DetectVal { first, key, held } => {
                 let val_hit = find_closers(buf, &delims.val_close);
-                let blk_hit = spec.close.find(buf);
+                let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)
                 {
@@ -456,7 +463,7 @@ impl ToolState {
             }
             TagPhase::StreamString => {
                 let val_hit = find_closers(buf, &delims.val_close);
-                let blk_hit = spec.close.find(buf);
+                let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)
                 {
@@ -494,6 +501,7 @@ impl ToolState {
         spec: &BlockSpec,
         buf: &mut String,
         out: &mut Vec<ResponseEvent>,
+        eof: bool,
     ) -> StepOutcome {
         let Self::JsonArgs {
             depth,
@@ -504,7 +512,7 @@ impl ToolState {
         else {
             unreachable!()
         };
-        let close = spec.close.find(buf);
+        let close = spec.close.find_for(buf, eof);
         let limit = match close {
             Some((at, _)) => at,
             None => buf.len() - spec.close.tail_hold(buf),
@@ -549,7 +557,7 @@ impl ToolState {
             out.push(ResponseEvent::ToolCallArgs(buf[..limit].to_string()));
             buf.drain(..limit);
         }
-        if let Some((at, len)) = spec.close.find(buf) {
+        if let Some((at, len)) = spec.close.find_for(buf, eof) {
             buf.drain(..at + len);
             out.push(ResponseEvent::ToolCallEnd);
             return StepOutcome::Done;
@@ -558,12 +566,17 @@ impl ToolState {
     }
 }
 
-fn step_buffer(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>) -> StepOutcome {
+fn step_buffer(
+    spec: &BlockSpec,
+    buf: &mut String,
+    out: &mut Vec<ResponseEvent>,
+    eof: bool,
+) -> StepOutcome {
     let from = match spec.open.strip(buf) {
         Some((_, rest)) => buf.len() - rest.len(),
         None => spec.open.min_close_offset(buf),
     };
-    let Some((at, len)) = spec.close.find_from(buf, from) else {
+    let Some((at, len)) = spec.close.find_from_for(buf, from, eof) else {
         return StepOutcome::Wait;
     };
     let block = buf[..at].to_string();
@@ -576,8 +589,13 @@ fn step_buffer(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>)
     StepOutcome::Done
 }
 
-fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>) -> StepOutcome {
-    if let Some((at, len)) = spec.close.find(buf) {
+fn step_raw_json(
+    spec: &BlockSpec,
+    buf: &mut String,
+    out: &mut Vec<ResponseEvent>,
+    eof: bool,
+) -> StepOutcome {
+    if let Some((at, len)) = spec.close.find_for(buf, eof) {
         let tail = buf[..at].trim_end();
         if !tail.is_empty() {
             out.push(ResponseEvent::ToolCallArgs(tail.to_string()));
@@ -595,8 +613,8 @@ fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent
     StepOutcome::Wait
 }
 
-fn step_drain_close(spec: &BlockSpec, buf: &mut String) -> StepOutcome {
-    if let Some((at, len)) = spec.close.find(buf) {
+fn step_drain_close(spec: &BlockSpec, buf: &mut String, eof: bool) -> StepOutcome {
+    if let Some((at, len)) = spec.close.find_for(buf, eof) {
         buf.drain(..at + len);
         return StepOutcome::Done;
     }

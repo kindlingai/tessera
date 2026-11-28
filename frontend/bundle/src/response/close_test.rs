@@ -1,5 +1,5 @@
-use crate::ResponseParser;
-use serde_json::json;
+use crate::{ResponseEvent, ResponseParser};
+use serde_json::{Value, json};
 
 #[test]
 fn xml_inline_closers() {
@@ -48,4 +48,74 @@ fn escaped_close_prefix() {
     let odd_cfg = r#"{"response_template":{"fields":{"tool_calls":{"open_pattern":"<call\\s+\\[(?P<name>\\w+)\\]>","close":"</call>","content":"json"}}}}"#;
     let odd = ResponseParser::from_config(odd_cfg).unwrap().unwrap();
     assert!(odd.call_prefix(Some("echo")).is_none());
+}
+
+fn check_parity(parser: &ResponseParser, chunks: &[&str]) {
+    let whole = parser.parse(&chunks.concat(), true, false);
+    let mut s = parser.stream(true, false);
+    let mut ev = Vec::new();
+    for part in chunks {
+        s.push(part, &mut ev);
+    }
+    s.finish(&mut ev);
+    let (mut reasoning, mut content, mut calls, mut cur) =
+        (String::new(), String::new(), Vec::new(), None);
+    for e in ev {
+        match e {
+            ResponseEvent::Reasoning(t) => reasoning.push_str(&t),
+            ResponseEvent::Content(t) => content.push_str(&t),
+            ResponseEvent::ToolCall(tc) => calls.push((tc.function.name, tc.function.arguments)),
+            ResponseEvent::ToolCallStart { name, .. } => cur = Some((name, String::new())),
+            ResponseEvent::ToolCallArgs(a) => cur.as_mut().unwrap().1.push_str(&a),
+            ResponseEvent::ToolCallEnd => {
+                let (n, a) = cur.take().unwrap();
+                calls.push((n, serde_json::from_str(&a).unwrap()));
+            }
+        }
+    }
+    let want_calls: Vec<(String, Value)> = whole
+        .tool_calls
+        .into_iter()
+        .map(|tc| (tc.function.name, tc.function.arguments))
+        .collect();
+    assert_eq!(
+        (reasoning, content, calls),
+        (whole.reasoning, whole.content, want_calls)
+    );
+}
+
+#[test]
+fn lookahead_closer_parity() {
+    let think_cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think>(?!-literal)","content":"text"},"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close":"</tool_call>","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?</parameter>"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
+    let p = ResponseParser::from_config(think_cfg).unwrap().unwrap();
+    check_parity(
+        &p,
+        &[
+            "<think>draft </think>",
+            "-literal <tool_call><function=ping><parameter=x>1</parameter></function></tool_call> still thinking</think>answer",
+        ],
+    );
+    check_parity(
+        &p,
+        &[
+            "<think>draft </think>",
+            " <tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+        ],
+    );
+    let end_cfg = r#"{"response_template":{"fields":{"content":{"close_pattern":"<end>(?!-more)","content":"text"},"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close":"</tool_call>","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?</parameter>"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
+    let ep = ResponseParser::from_config(end_cfg).unwrap().unwrap();
+    check_parity(
+        &ep,
+        &[
+            "answer<end>",
+            " <tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+        ],
+    );
+    check_parity(
+        &ep,
+        &[
+            "answer<end>",
+            "-more <tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+        ],
+    );
 }
