@@ -767,6 +767,8 @@ impl Lowerer<'_, '_> {
                 let f = match (bufs[0].0, bufs[1].0, bufs[2].0) {
                     (Read::F32, Read::F32, Read::F32) => "dots_f32",
                     (Read::F32, Read::F32, Read::Bf16) => "dots_bf16",
+                    (Read::F32, Read::F32, Read::F16) => "dots_f16",
+                    (Read::F32, Read::F32, Read::Fp8) => "dots_fp8",
                     other => return Err(format!("no dots over {other:?}")),
                 };
                 let mut call = Vec::new();

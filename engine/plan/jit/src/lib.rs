@@ -88,6 +88,8 @@ helpers! {
     stage_f32(P, P, P, P, I32, F32, P, P, P);
     dots_f32(P, P, P, P, P, P, P, P, P, P, P, P, P);
     dots_bf16(P, P, P, P, P, P, P, P, P, P, P, P, P);
+    dots_f16(P, P, P, P, P, P, P, P, P, P, P, P, P);
+    dots_fp8(P, P, P, P, P, P, P, P, P, P, P, P, P);
     st_f32(P, P, P, F32);
     st_bf16(P, P, P, F32);
     st_fp8(P, P, P, F32);
