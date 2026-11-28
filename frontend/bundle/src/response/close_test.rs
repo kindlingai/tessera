@@ -199,4 +199,47 @@ fn check_optional_delayed_spans() {
     }
     after_close.finish(&mut ev);
     assert_eq!(after_close.reasoning_tokens(), 1);
+    check_r7_closers();
+}
+
+fn check_r7_closers() {
+    // Lookbehind after quantifier still retains left context until EOF.
+    for pat in [r"</think\s*>(?<!raw</think>)", r"</think>(?<!raw</think>)"] {
+        let cfg = json!({"response_template": {"fields": {
+            "reasoning_content": {"open": "<think>", "close_pattern": pat, "content": "text"},
+        }}})
+        .to_string();
+        let p = ResponseParser::from_config(&cfg).unwrap().unwrap();
+        let whole = p.parse("<think>raw</think> first end</think>answer", true, false);
+        let split = parse_stream(&p, &["<think>raw</think> first", " end</think>answer"]);
+        assert_eq!(
+            (whole.reasoning.as_str(), whole.content.as_str()),
+            ("raw</think> first end", "answer")
+        );
+        assert_eq!(
+            (split.0.as_str(), split.1.as_str()),
+            ("raw</think> first end", "answer")
+        );
+    }
+    // Competing longer literal holds short match until disambiguated.
+    let lit_cfg = json!({"response_template": {"fields": {
+        "reasoning_content": {
+            "open": "<think>",
+            "close_pattern": "</think></analysis>|</think>",
+            "content": "text",
+        },
+    }}})
+    .to_string();
+    let lp = ResponseParser::from_config(&lit_cfg).unwrap().unwrap();
+    let sample = "<think>plan</think></analysis>answer";
+    for i in 0..=sample.len() {
+        check_parity(&lp, &[&sample[..i], &sample[i..]]);
+    }
+    // Earlier partial literal beats later short match across chunks.
+    let early_cfg = json!({"response_template": {"fields": {
+        "reasoning_content": {"open": "<think>", "close_pattern": "cd|abcdef", "content": "text"},
+    }}})
+    .to_string();
+    let ep = ResponseParser::from_config(&early_cfg).unwrap().unwrap();
+    check_parity(&ep, &["<think>planabcd", "efanswer"]);
 }

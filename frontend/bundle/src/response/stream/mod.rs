@@ -7,7 +7,8 @@ pub(super) mod stream_test;
 pub(super) use json::parse_json;
 
 use super::close::{
-    Closer, Closers, find_closers, matching_paren, parse_literal_closers, unescape_lit,
+    Closer, Closers, find_closers, find_closers_for, matching_paren, parse_literal_closers,
+    unescape_lit,
 };
 use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
 use json::{RelaxedState, finish_relaxed, step_relaxed};
@@ -428,7 +429,7 @@ impl ToolState {
                 StepOutcome::Continue
             }
             TagPhase::DetectVal { first, key, held } => {
-                let val_hit = find_closers(buf, &delims.val_close);
+                let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)
@@ -479,7 +480,7 @@ impl ToolState {
                 StepOutcome::Wait
             }
             TagPhase::StreamString => {
-                let val_hit = find_closers(buf, &delims.val_close);
+                let val_hit = find_closers_for(buf, &delims.val_close, eof);
                 let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)

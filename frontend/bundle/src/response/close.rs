@@ -89,10 +89,10 @@ impl Closers {
             return Ok(Self::Literals(list));
         }
         let regex = Regex::new(&pat)?;
-        let (rule, needs_context) = stream_rule(&pat);
+        let rule = stream_rule(&pat);
         let mut needles = Vec::new();
         let mut consuming = Vec::new();
-        let mut unanchored = needs_context;
+        let mut unanchored = needs_left_context(&pat);
         for branch in split_alt(strip_group(&pat)) {
             let b = strip_group(branch);
             if let Some(inner) = strip_lookahead(b) {
@@ -156,7 +156,9 @@ impl Closers {
         }
         let slice = &text[from..];
         match self {
-            Self::Literals(list) => find_closers(slice, list).map(|(at, len)| (from + at, len)),
+            Self::Literals(list) => {
+                find_closers_for(slice, list, eof).map(|(at, len)| (from + at, len))
+            }
             Self::Pattern { regex, rule, .. } => {
                 if !eof && matches!(rule, StreamRule::DeferEof) {
                     return None;
@@ -211,17 +213,54 @@ impl Closers {
 
 /// Finds the earliest match among literal and lookahead closers.
 pub(super) fn find_closers(text: &str, closers: &[Closer]) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for c in closers {
-        if let Some(at) = text.find(c.needle.as_str()) {
-            let len = c.consumed_len();
-            let better = best.is_none_or(|(b_at, b_len)| at < b_at || (at == b_at && len > b_len));
-            if better {
-                best = Some((at, len));
+    find_closers_for(text, closers, true)
+}
+
+/// Finds a settled literal or lookahead match for streaming/EOF.
+pub(super) fn find_closers_for(
+    text: &str,
+    closers: &[Closer],
+    eof: bool,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (idx, c) in closers.iter().enumerate() {
+        if let Some(at) = text.find(c.needle.as_str())
+            && best.is_none_or(|(b_at, _, _)| at < b_at)
+        {
+            best = Some((at, c.consumed_len(), idx));
+        }
+    }
+    let (best_at, best_len, best_idx) = best?;
+    if !eof && has_pending_better(text, closers, best_at, best_idx) {
+        return None;
+    }
+    Some((best_at, best_len))
+}
+
+fn has_pending_better(text: &str, closers: &[Closer], best_at: usize, best_idx: usize) -> bool {
+    for (idx, c) in closers.iter().enumerate() {
+        let max_len = c.needle.len().saturating_sub(1);
+        if max_len == 0 {
+            continue;
+        }
+        let lo = text.len().saturating_sub(max_len);
+        let hi = if idx < best_idx {
+            best_at
+        } else if best_at > 0 {
+            best_at - 1
+        } else {
+            continue;
+        };
+        if lo > hi {
+            continue;
+        }
+        for p in lo..=hi {
+            if text.is_char_boundary(p) && c.needle.starts_with(&text[p..]) {
+                return true;
             }
         }
     }
-    best
+    false
 }
 
 /// Parses an alternation of literal and `(?=literal)` closer branches.
@@ -379,30 +418,80 @@ pub(super) fn literal_prefix(pattern: &str) -> String {
     out
 }
 
+/// Whether `pat` can inspect text before the match start.
+fn needs_left_context(pat: &str) -> bool {
+    let bytes = pat.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len()
+                    || matches!(
+                        bytes[i + 1],
+                        b'A' | b'b' | b'B' | b'G' | b'K' | b'k' | b'1'..=b'9'
+                    )
+                {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' => {
+                let Some(next) = skip_class(bytes, i) else {
+                    return true;
+                };
+                i = next;
+                continue;
+            }
+            b'^' => return true,
+            b'(' if i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
+                let Some(end) = matching_paren(pat, i) else {
+                    return true;
+                };
+                if i + 3 < bytes.len()
+                    && bytes[i + 2] == b'<'
+                    && matches!(bytes[i + 3], b'=' | b'!')
+                {
+                    return true;
+                }
+                if i + 2 < bytes.len() && matches!(bytes[i + 2], b':' | b'=' | b'!') {
+                    i += 3;
+                    continue;
+                }
+                let head = &pat[i + 2..end];
+                let flags = head.split_once(':').map_or(head, |(f, _)| f);
+                if flags.contains('x') {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Determines when a regex closer match settles mid-stream.
-fn stream_rule(pat: &str) -> (StreamRule, bool) {
+fn stream_rule(pat: &str) -> StreamRule {
     if let Some(guards) = parse_neg_guards(pat) {
-        return (StreamRule::NotPrefixes(guards), false);
+        return StreamRule::NotPrefixes(guards);
     }
     let bytes = pat.as_bytes();
     let mut i = 0;
     let mut max_la = 0usize;
-    let mut needs_context = false;
     while i < bytes.len() {
         match bytes[i] {
             b'\\' => {
                 if i + 1 >= bytes.len() {
-                    return (StreamRule::DeferEof, needs_context);
+                    return StreamRule::DeferEof;
                 }
                 match bytes[i + 1] {
                     b'z' | b'Z' | b'1'..=b'9' | b'k' | b'K' | b'G' => {
-                        return (StreamRule::DeferEof, needs_context);
+                        return StreamRule::DeferEof;
                     }
-                    b'A' => needs_context = true,
-                    b'b' | b'B' => {
-                        max_la = max_la.max(1);
-                        needs_context = true;
-                    }
+                    b'b' | b'B' => max_la = max_la.max(1),
                     _ => {}
                 }
                 i += 2;
@@ -410,38 +499,36 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
             }
             b'[' => {
                 let Some(next) = skip_class(bytes, i) else {
-                    return (StreamRule::DeferEof, needs_context);
+                    return StreamRule::DeferEof;
                 };
                 i = next;
                 continue;
             }
-            b'^' => needs_context = true,
-            b'$' | b'|' | b'*' | b'+' | b'?' => return (StreamRule::DeferEof, needs_context),
+            b'$' | b'|' | b'*' | b'+' | b'?' => return StreamRule::DeferEof,
             b'{' => {
                 let Some(next) = parse_fixed_quant(pat, i) else {
-                    return (StreamRule::DeferEof, needs_context);
+                    return StreamRule::DeferEof;
                 };
                 i = next;
                 continue;
             }
             b'(' if i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
                 let Some(end) = matching_paren(pat, i) else {
-                    return (StreamRule::DeferEof, needs_context);
+                    return StreamRule::DeferEof;
                 };
                 if i + 3 < bytes.len()
                     && bytes[i + 2] == b'<'
                     && matches!(bytes[i + 3], b'=' | b'!')
                 {
-                    needs_context = true;
                     if has_forward_assert(&pat[i + 4..end]) {
-                        return (StreamRule::DeferEof, true);
+                        return StreamRule::DeferEof;
                     }
                     i = end + 1;
                     continue;
                 }
                 if i + 2 < bytes.len() && matches!(bytes[i + 2], b'=' | b'!') {
                     let Some(width) = max_match_chars(&pat[i + 3..end]) else {
-                        return (StreamRule::DeferEof, needs_context);
+                        return StreamRule::DeferEof;
                     };
                     max_la = max_la.max(width);
                     i = end + 1;
@@ -452,14 +539,14 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
                     if flags.contains('x')
                         || !flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
                     {
-                        return (StreamRule::DeferEof, needs_context);
+                        return StreamRule::DeferEof;
                     }
                     i += 3 + flags.len();
                     continue;
                 }
                 if head.contains('x') || !head.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
                 {
-                    return (StreamRule::DeferEof, needs_context);
+                    return StreamRule::DeferEof;
                 }
                 i = end + 1;
                 continue;
@@ -468,11 +555,10 @@ fn stream_rule(pat: &str) -> (StreamRule, bool) {
         }
         i += 1;
     }
-    let rule = match max_la {
+    match max_la {
         0 => StreamRule::AfterEnd,
         n => StreamRule::TrailingChars(n),
-    };
-    (rule, needs_context)
+    }
 }
 
 /// Extracts literal guards from a fixed body plus trailing `(?!...)`.

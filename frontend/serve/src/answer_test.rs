@@ -589,6 +589,20 @@ fn check_think_cases() {
         "answer",
         2,
     );
+    check_think_case(
+        r"</think\s*>(?<!raw</think>)",
+        &["<think>raw</think> first", " end</think>answer", ""],
+        "raw</think> first end",
+        "answer",
+        2,
+    );
+    check_think_case(
+        "</think></analysis>|</think>",
+        &["<think>plan</think>", "</analysis>answer", ""],
+        "plan",
+        "answer",
+        2,
+    );
     check_think_with_content(
         "</think>",
         Some("<end>(?!.*literal)"),
