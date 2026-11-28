@@ -572,8 +572,8 @@ impl<'a> ResponseStream<'a> {
             needles.extend(t.open.triggers());
             needles.extend(t.outer.as_ref().map(|[o, _]| o.as_str()));
         }
-        needles.extend(self.parser.content_close.needles());
-        let keep = tail_hold(&self.buf, &needles);
+        let keep =
+            tail_hold(&self.buf, &needles).max(self.parser.content_close.tail_hold(&self.buf));
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Content(self.buf[..emit].to_string()));
@@ -615,8 +615,7 @@ impl<'a> ResponseStream<'a> {
             self.lead = true;
             return true;
         }
-        let needles = spec.close.needles();
-        let keep = tail_hold(&self.buf, &needles);
+        let keep = spec.close.tail_hold(&self.buf);
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Reasoning(self.buf[..emit].to_string()));

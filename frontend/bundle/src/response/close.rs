@@ -38,6 +38,7 @@ pub(super) enum Closers {
         regex: Regex,
         needles: Vec<String>,
         consuming: Vec<String>,
+        unanchored: bool,
     },
 }
 
@@ -64,16 +65,23 @@ impl Closers {
         let regex = Regex::new(&pat)?;
         let mut needles = Vec::new();
         let mut consuming = Vec::new();
+        let mut unanchored = false;
         for branch in split_alt(strip_group(&pat)) {
             let b = strip_group(branch);
             if let Some(inner) = strip_lookahead(b) {
                 let p = literal_prefix(inner);
-                if !p.is_empty() {
+                if p.is_empty() {
+                    unanchored = true;
+                } else {
                     needles.push(p);
                 }
-            } else if !b.starts_with("(?") {
+            } else if b.starts_with("(?") {
+                unanchored = true;
+            } else {
                 let p = literal_prefix(b);
-                if !p.is_empty() {
+                if p.is_empty() {
+                    unanchored = true;
+                } else {
                     needles.push(p);
                 }
                 if let Some(lit) = unescape_lit(b)
@@ -87,6 +95,7 @@ impl Closers {
             regex,
             needles,
             consuming,
+            unanchored,
         })
     }
 
@@ -113,10 +122,30 @@ impl Closers {
         }
     }
 
-    pub(super) fn needles(&self) -> Vec<&str> {
+    /// Trailing bytes held to match closers across chunk boundaries.
+    pub(super) fn tail_hold(&self, buf: &str) -> usize {
         match self {
-            Self::Literals(list) => list.iter().map(|c| c.needle.as_str()).collect(),
-            Self::Pattern { needles, .. } => needles.iter().map(String::as_str).collect(),
+            Self::Literals(list) => {
+                let needles: Vec<&str> = list.iter().map(|c| c.needle.as_str()).collect();
+                super::tail_hold(buf, &needles)
+            }
+            Self::Pattern {
+                needles,
+                unanchored,
+                ..
+            } => {
+                if *unanchored {
+                    return buf.len();
+                }
+                let refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+                let mut hold = super::tail_hold(buf, &refs);
+                for needle in needles {
+                    if let Some(at) = buf.find(needle.as_str()) {
+                        hold = hold.max(buf.len() - at);
+                    }
+                }
+                hold
+            }
         }
     }
 
@@ -268,7 +297,7 @@ pub(super) fn literal_prefix(pattern: &str) -> String {
     let mut out = String::new();
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
+        let ch = if c == '\\' {
             let Some(&next) = chars.peek() else { break };
             if matches!(
                 next,
@@ -284,16 +313,20 @@ pub(super) fn literal_prefix(pattern: &str) -> String {
                 _ => break,
             };
             chars.next();
-            out.push(escaped);
-            continue;
-        }
-        if matches!(
-            c,
-            '(' | ')' | '[' | ']' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '^' | '$'
-        ) {
+            escaped
+        } else {
+            if matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '^' | '$'
+            ) {
+                break;
+            }
+            c
+        };
+        if matches!(chars.peek(), Some('?' | '*' | '{')) {
             break;
         }
-        out.push(c);
+        out.push(ch);
     }
     out
 }

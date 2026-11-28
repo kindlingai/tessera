@@ -6,7 +6,9 @@ pub(super) mod stream_test;
 
 pub(super) use json::parse_json;
 
-use super::close::{Closer, find_closers, matching_paren, parse_literal_closers, unescape_lit};
+use super::close::{
+    Closer, Closers, find_closers, matching_paren, parse_literal_closers, unescape_lit,
+};
 use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
 use json::{RelaxedState, finish_relaxed, step_relaxed};
 use serde_json::Value;
@@ -347,9 +349,8 @@ impl ToolState {
                         StepOutcome::Done
                     }
                     _ => {
-                        let mut needles = spec.close.needles();
-                        needles.push(delims.key_open.as_str());
-                        let keep = tail_hold(buf, &needles);
+                        let keep = tail_hold(buf, &[delims.key_open.as_str()])
+                            .max(spec.close.tail_hold(buf));
                         buf.drain(..buf.len() - keep);
                         StepOutcome::Wait
                     }
@@ -436,8 +437,7 @@ impl ToolState {
                     return StepOutcome::Done;
                 }
                 let val_needles = delims.val_needles();
-                let blk_needles = spec.close.needles();
-                let emit = safe_value_emit(buf, &val_needles, &blk_needles, delims.trim_trail_nl);
+                let emit = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
                 if emit > 0 {
                     held.push_str(&buf[..emit]);
                     buf.drain(..emit);
@@ -478,8 +478,7 @@ impl ToolState {
                     return StepOutcome::Done;
                 }
                 let val_needles = delims.val_needles();
-                let blk_needles = spec.close.needles();
-                let emit = safe_value_emit(buf, &val_needles, &blk_needles, delims.trim_trail_nl);
+                let emit = safe_value_emit(buf, &val_needles, &spec.close, delims.trim_trail_nl);
                 if emit > 0 {
                     let escaped = json_escape_inner(&buf[..emit]);
                     buf.drain(..emit);
@@ -508,10 +507,7 @@ impl ToolState {
         let close = spec.close.find(buf);
         let limit = match close {
             Some((at, _)) => at,
-            None => {
-                let needles = spec.close.needles();
-                buf.len() - tail_hold(buf, &needles)
-            }
+            None => buf.len() - spec.close.tail_hold(buf),
         };
         let bytes = buf.as_bytes();
         let mut end = None;
@@ -590,8 +586,7 @@ fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent
         out.push(ResponseEvent::ToolCallEnd);
         return StepOutcome::Done;
     }
-    let needles = spec.close.needles();
-    let keep = tail_hold(buf, &needles);
+    let keep = spec.close.tail_hold(buf);
     let emit = buf.len() - keep;
     if emit > 0 {
         out.push(ResponseEvent::ToolCallArgs(buf[..emit].to_string()));
@@ -605,8 +600,7 @@ fn step_drain_close(spec: &BlockSpec, buf: &mut String) -> StepOutcome {
         buf.drain(..at + len);
         return StepOutcome::Done;
     }
-    let needles = spec.close.needles();
-    let keep = tail_hold(buf, &needles);
+    let keep = spec.close.tail_hold(buf);
     buf.drain(..buf.len() - keep);
     StepOutcome::Wait
 }
@@ -677,13 +671,10 @@ fn is_json_start(b: u8) -> bool {
 pub(super) fn safe_value_emit(
     buf: &str,
     val_closes: &[&str],
-    block_closes: &[&str],
+    block_close: &Closers,
     trim_nl: bool,
 ) -> usize {
-    let mut needles = Vec::with_capacity(block_closes.len() + val_closes.len());
-    needles.extend_from_slice(block_closes);
-    needles.extend_from_slice(val_closes);
-    let keep = tail_hold(buf, &needles);
+    let keep = tail_hold(buf, val_closes).max(block_close.tail_hold(buf));
     let mut emit = buf.len() - keep;
     if trim_nl && emit > 0 && buf.as_bytes()[emit - 1] == b'\n' {
         emit -= 1;
@@ -724,15 +715,58 @@ fn could_be_json_prefix(s: &str) -> bool {
         b'n' => {
             "null".starts_with(t) || t.strip_prefix("null").is_some_and(|r| r.trim().is_empty())
         }
-        b'-' | b'0'..=b'9' => {
-            let trimmed = t.trim_end();
-            trimmed.len() <= 64
-                && trimmed
-                    .bytes()
-                    .all(|b| matches!(b, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
-        }
+        b'-' | b'0'..=b'9' => is_json_number_prefix(t),
         _ => false,
     }
+}
+
+/// Whether left-trimmed `t` can prefix a JSON number.
+fn is_json_number_prefix(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    if i == b.len() {
+        return true;
+    }
+    match b[i] {
+        b'0' => i += 1,
+        b'1'..=b'9' => {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let frac = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == frac {
+            return false;
+        }
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == exp {
+            return false;
+        }
+    }
+    b[i..].iter().all(u8::is_ascii_whitespace)
 }
 
 /// Extracts `(id, kind, name)` when `tmpl` maps `arguments` to `{content}`.

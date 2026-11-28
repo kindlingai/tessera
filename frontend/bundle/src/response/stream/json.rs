@@ -1,7 +1,7 @@
 //! Relaxed JSON parser and incremental streaming normalizer.
 
 use super::super::close::Closers;
-use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent, tail_hold};
+use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent};
 use super::{StepOutcome, json_escape_inner, json_str, safe_value_emit};
 use serde_json::{Map, Value};
 
@@ -261,8 +261,7 @@ pub(super) fn step_relaxed(
                     buf.drain(..at + len);
                     break true;
                 }
-                let blk_needles = spec.close.needles();
-                let emit = safe_value_emit(buf, &[close_delim.as_str()], &blk_needles, false);
+                let emit = safe_value_emit(buf, &[close_delim.as_str()], &spec.close, false);
                 if emit > 0 {
                     emitted.push_str(&json_escape_inner(&buf[..emit]));
                     buf.drain(..emit);
@@ -293,8 +292,7 @@ pub(super) fn step_relaxed(
                     buf.drain(..at + len);
                     break true;
                 }
-                let needles = spec.close.needles();
-                let emit = buf.len() - tail_hold(buf, &needles);
+                let emit = buf.len() - spec.close.tail_hold(buf);
                 if emit > 0 {
                     let mut esc = matches!(state.mode, RelaxedMode::InQuoted { escaped: true });
                     for &b in &buf.as_bytes()[..emit] {
@@ -435,7 +433,7 @@ fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &Closers) -> bool {
         .string_delims
         .iter()
         .any(|[open, _]| open.starts_with(buf));
-    let any_close = closes.needles().iter().any(|c| c.starts_with(buf));
+    let any_close = !buf.is_empty() && closes.tail_hold(buf) == buf.len();
     any_delim || any_close
 }
 

@@ -280,3 +280,75 @@ fn streams_split_closers() {
         ]
     );
 }
+
+#[test]
+fn streams_regex_and_numbers() {
+    let think_cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think\\s*>","content":"text"},"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close":"</tool_call>","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?</parameter>"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
+    let p = ResponseParser::from_config(think_cfg).unwrap().unwrap();
+    let mut s = p.stream(true, true);
+    let mut ev = Vec::new();
+    for part in [
+        "plan</think",
+        " ><tool_call><function=echo><parameter=x>1</parameter></function></tool_call>",
+    ] {
+        s.push(part, &mut ev);
+    }
+    s.finish(&mut ev);
+    let reasoning: String = ev
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Reasoning(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, "plan");
+    assert_eq!(collect_calls(&ev), [("echo".into(), json!({"x": 1}))]);
+
+    let end_cfg = r#"{"response_template":{"fields":{"content":{"close_pattern":"<end(?:_turn)?>","content":"text"}}}}"#;
+    let end_p = ResponseParser::from_config(end_cfg).unwrap().unwrap();
+    let mut es = end_p.stream(true, false);
+    let mut eev = Vec::new();
+    for part in ["answer<end", "_turn>trailer"] {
+        es.push(part, &mut eev);
+    }
+    es.finish(&mut eev);
+    let text: String = eev
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Content(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "answer");
+
+    let digits = format!("0.{}1", "0".repeat(65));
+    let mut ns = p.stream(true, false);
+    let mut nev = Vec::new();
+    ns.push(
+        &format!("<tool_call><function=echo><parameter=x>{digits}"),
+        &mut nev,
+    );
+    ns.push(
+        "</parameter><parameter=id>007</parameter></function></tool_call>",
+        &mut nev,
+    );
+    ns.finish(&mut nev);
+    let whole = p.parse(
+        &format!(
+            "<tool_call><function=echo><parameter=x>{digits}</parameter><parameter=id>007</parameter></function></tool_call>"
+        ),
+        true,
+        false,
+    );
+    assert_eq!(
+        collect_calls(&nev),
+        [(
+            "echo".into(),
+            whole.tool_calls[0].function.arguments.clone()
+        )]
+    );
+    assert_eq!(
+        whole.tool_calls[0].function.arguments,
+        json!({"x": 1e-66, "id": "007"})
+    );
+}
