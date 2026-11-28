@@ -171,6 +171,7 @@ DTR_DEF(dtr_k4_p1s, 4u, trellis::BOOK_MCG, 1u, false, true, DTR_T1_BLK)
 DTR_DEF(dtr_k4_p1, 4u, trellis::BOOK_MCG, 1u, false, false, DTR_T1_BLK)
 DTR_DEF(dtr_k4_t2s, 4u, trellis::BOOK_MCG, 2u, true, true, DTR_T2_BLK)
 DTR_DEF(dtr_k4_t2, 4u, trellis::BOOK_MCG, 2u, true, false, DTR_T2_BLK)
+DTR_DEF(dtr_k4_t4s, 4u, trellis::BOOK_MCG, 4u, true, true, DTR_T4_BLK)
 DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, DTR_T4_BLK)
 
 #define DTR_GEN_DEF(NAME, NT)                                                                 \

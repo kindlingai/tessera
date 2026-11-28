@@ -1,6 +1,8 @@
 //! RDNA 3/3.5 ROCm trellis WMMA rule dispatch.
 
-use super::epi::{epi_accepts, has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads};
+use super::epi::{
+    epi_accepts, has_bias2, has_other, match_epi_site, pick_divisor, push_epi_reads, rocm_o_bf16,
+};
 use super::{
     BLOCK, THREADS, TrellisMma, TrellisPreMma, TrellisPrep, TrellisReduce, f32_only,
     reduce_load_for, rocm_needs, rocm_rule, rocm_source,
@@ -124,14 +126,14 @@ struct RocmTrellisRed {
 fn red_accepts(r: &RocmTrellisRed, input: usize, form: &dyn Stored) -> bool {
     let other_at = 1 + usize::from(r.turned);
     if input >= other_at {
-        return epi_accepts(r.mode, input, other_at, form);
+        return epi_accepts(r.mode, input, other_at, rocm_o_bf16(r.mode), form);
     }
     form.name() == "f32"
 }
 
 fn red_load(r: &RocmTrellisRed, _: usize) -> Option<Load> {
     let mut load = reduce_load_for(r.m, r.n, r.ks, r.turned, false)?;
-    push_epi_reads(&mut load.reads, r.mode, r.m, r.n);
+    push_epi_reads(&mut load.reads, r.mode, rocm_o_bf16(r.mode), r.m, r.n);
     Some(load)
 }
 
@@ -175,11 +177,11 @@ fn dense_pick(tree: &Tree, at: T) -> Option<Dense> {
 }
 
 fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    let Some((d, mode, other, bias2)) = match_epi_site(tree, at, dense_pick) else {
+    let Some((d, epi)) = match_epi_site(tree, at, dense_pick) else {
         return Dense::find(tree, at, BLOCK).and_then(|r| r.err().map(Err));
     };
     let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
-    if m < 33 && mode != 0 {
+    if m < 33 && epi.mode != 0 {
         return None;
     }
     if m >= 33 {
@@ -190,6 +192,7 @@ fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
             k,
             min_blocks: None,
             turned,
+            mx8: false,
             x_bf16: false,
             rocm: true,
         };
@@ -211,10 +214,11 @@ fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
                 bits: d.bits,
                 book: d.book,
                 turned,
-                x_bf16: false,
                 y_bf16: false,
                 rocm: true,
+                mx8: false,
                 mode: 0,
+                o_bf16: false,
                 form: d.form,
             };
             let red = RocmTrellisRed {
@@ -222,13 +226,13 @@ fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
                 n,
                 ks,
                 turned,
-                mode,
+                mode: epi.mode,
             };
             let r_reads = [Read::Draft(1)]
                 .into_iter()
                 .chain(svh.map(Read::Node))
-                .chain(other.map(Read::Node))
-                .chain(bias2.map(Read::Node));
+                .chain(epi.other.map(Read::Node))
+                .chain(epi.bias2.map(Read::Node));
             return Some(Ok(vec![
                 Draft::new(prep, p_reads, pre_len),
                 Draft::new(mma, [Read::Draft(0), Read::Node(d.w)], ks * m * n),
@@ -238,8 +242,8 @@ fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         let m_reads = [Read::Draft(0), Read::Node(d.w)]
             .into_iter()
             .chain(svh.map(Read::Node))
-            .chain(other.map(Read::Node))
-            .chain(bias2.map(Read::Node));
+            .chain(epi.other.map(Read::Node))
+            .chain(epi.bias2.map(Read::Node));
         let mma = TrellisPreMma {
             m,
             n,
@@ -250,10 +254,11 @@ fn eval_rocm_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
             bits: d.bits,
             book: d.book,
             turned,
-            x_bf16: false,
             y_bf16: false,
             rocm: true,
-            mode,
+            mx8: false,
+            mode: epi.mode,
+            o_bf16: epi.o_bf16,
             form: d.form,
         };
         return Some(Ok(vec![
