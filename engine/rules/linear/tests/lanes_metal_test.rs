@@ -186,3 +186,33 @@ fn multi_row_exact() {
         assert_eq!(bits4, bits1, "m=4 row 0 diverged from m=1 on {k}->{n}");
     }
 }
+
+#[test]
+fn rejects_overflowing_k() {
+    let apple = Device::guess(&host())
+        .on(Platform {
+            backend: "metal".into(),
+            arch: "apple9".into(),
+            name: "Apple M4 Pro".into(),
+            units: 20,
+            bandwidth: 273e9,
+            ..Platform::assumed(Limits::assumed())
+        })
+        .favoring("lanes_metal")
+        .pinned(Pins::all(BF16_FORM));
+    for k in [1u64 << 32, (u32::MAX as u64) - 3] {
+        let g = linear(k, 1);
+        if let Ok(plan) = lower(&g, 0, &[(Rows, 2)], &apple) {
+            assert!(
+                plan.steps
+                    .iter()
+                    .all(|s| !s.kernel.name().starts_with("lanes_metal")),
+                "lanes_metal accepted overflowing k={k}: {:?}",
+                plan.steps
+                    .iter()
+                    .map(|s| s.kernel.name())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}

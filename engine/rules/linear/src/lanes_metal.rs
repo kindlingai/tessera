@@ -89,6 +89,14 @@ impl Mode {
             .checked_mul(self.threads())
     }
 
+    fn k_step(self) -> usize {
+        match self {
+            Self::SmallK => (SUB * WIDE) as usize,
+            Self::SmallN { simds } => simds as usize * LANES * WIDE as usize,
+            Self::WideN { pair } => LANES * if pair { 2 * WIDE } else { WIDE } as usize,
+        }
+    }
+
     fn shape(self, m: usize, n: usize) -> Shape {
         Shape::Grid {
             across: self.groups_per_row(n) * m,
@@ -449,9 +457,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let mode = pick_mode(product.n, product.k);
-    if mode
-        .total_threads(product.m, product.n)
-        .is_none_or(|t| t > u32::MAX as usize)
+    if u32::try_from(product.n).is_err()
+        || product
+            .k
+            .checked_add(mode.k_step() * 4)
+            .is_none_or(|end| end > u32::MAX as usize)
+        || mode
+            .total_threads(product.m, product.n)
+            .is_none_or(|t| t > u32::MAX as usize)
     {
         return None;
     }

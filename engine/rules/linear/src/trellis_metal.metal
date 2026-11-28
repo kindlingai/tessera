@@ -698,4 +698,3 @@ kernel void tm_reduce(
         *(device float4 *)(out + ulong(r) * n + base) = sum;
     }
 }
-
