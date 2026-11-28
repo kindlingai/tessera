@@ -88,7 +88,7 @@ fn fold_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32, #[bui
                 }
             }
         }
-        st.state[(ROWS + i) as usize] = denom;
+        st.state[(ROWS + i) as usize] = denom * 0.25;
         if lane() == 0 {
             st.alpha_s[simd * ROWS + i] = h;
         }

@@ -295,7 +295,7 @@ fn soften(st: &mut Stream, #[build] bk: u32) {
         let prev = st.state[(ROWS + i) as usize] * alpha;
         let l_new = prev + sum;
         let old_scale = if l_new > 0.0 { prev / l_new } else { 0.0 };
-        let w_norm = if l_new > 0.0 { p / l_new } else { 0.0 };
+        let w_norm = if l_new > 0.0 { (p / l_new) * 0.25 } else { 0.0 };
         if lane() < bk {
             st.p_s[at] = w_norm;
         }
@@ -350,7 +350,7 @@ fn write_pair<const ZERO_EMPTY: bool, const DIVIDE: bool>(
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + r < hd.queries)) {
             let at = ((hd.q0 + r) * hd.heads + hd.head) as u64 * w as u64;
             out[at + (col + c) as u64] = if live {
-                if DIVIDE { v / st.l_s[r] } else { v }
+                if DIVIDE { v / st.l_s[r] } else { v * 4.0 }
             } else {
                 0.0
             };
@@ -361,7 +361,7 @@ fn write_pair<const ZERO_EMPTY: bool, const DIVIDE: bool>(
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + 16 + r < hd.queries)) {
             let at = ((hd.q0 + 16 + r) * hd.heads + hd.head) as u64 * w as u64;
             out[at + (col + c) as u64] = if live {
-                if DIVIDE { v / st.l_s[16 + r] } else { v }
+                if DIVIDE { v / st.l_s[16 + r] } else { v * 4.0 }
             } else {
                 0.0
             };

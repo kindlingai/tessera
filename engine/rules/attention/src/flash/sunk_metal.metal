@@ -27,20 +27,21 @@ static inline void fs_put4(threadgroup ushort *at, ushort4 v) {
     at[3] = v.w;
 }
 
-// Stages `live` rows of `src` as bf16, `step` apart.
+// Stages `live` scaled rows as bf16, `step` apart.
 static inline void fs_stage(
     threadgroup ushort *bits,
     device const float *src,
     ulong row0,
     uint step,
     uint live,
-    uint tid) {
+    uint tid,
+    float gain) {
     for (uint i = tid; i < FS_BK * (FS_D / 4u); i += 128u) {
         uint t = i >> 5u;
         uint d = (i & 31u) << 2u;
         ushort4 v = ushort4(0u);
         if (t < live) {
-            v = fs_bf16(*(device const float4 *)(src + (row0 + ulong(t) * step) * FS_D + d));
+            v = fs_bf16(*(device const float4 *)(src + (row0 + ulong(t) * step) * FS_D + d) * gain);
         }
         fs_put4(bits + t * FS_WIDE + d, v);
     }
@@ -89,7 +90,7 @@ kernel void flash_sunk_metal(
     uint er = ((lane >> 2u) & 4u) + ((lane >> 1u) & 3u);
     uint ec = ((lane >> 2u) & 2u) * 2u + (lane & 1u) * 2u;
 
-    fs_stage(q_bits, q, ulong(q0) * heads + head, heads, min(FS_BQ, queries - q0), tid);
+    fs_stage(q_bits, q, ulong(q0) * heads + head, heads, min(FS_BQ, queries - q0), tid, 1.0f);
 
     float o[4][4][2];
     float m[8];
@@ -141,7 +142,7 @@ kernel void flash_sunk_metal(
             // A ring of whole blocks keeps each block unbroken.
             ulong row0 = (ulong(slot) * kept + (k0 % kept)) * kv_heads + kvh;
             uint live = min(FS_BK, hi - k0);
-            fs_stage(kv_bits, k, row0, kv_heads, live, tid);
+            fs_stage(kv_bits, k, row0, kv_heads, live, tid, 1.0f);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Each SIMD group scores one 16x16 quadrant.
@@ -169,8 +170,8 @@ kernel void flash_sunk_metal(
             simdgroup_store(s11, &p_s[sr + 8u][sc + 8u], ulong(FS_NEAR));
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Values replace the keys while scores soften.
-            fs_stage(kv_bits, values, row0, kv_heads, live, tid);
+            // Values replace keys while scores soften, scaled down.
+            fs_stage(kv_bits, values, row0, kv_heads, live, tid, 0.25f);
             uint t = k0 + lane;
             for (uint i = 0u; i < 8u; i++) {
                 uint row = simd * 8u + i;
@@ -239,10 +240,10 @@ kernel void flash_sunk_metal(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // Folds any sink without overflowing or flushing subnormals.
+        // Folds any sink and restores value headroom without overflowing.
         for (uint i = 0u; i < 8u; i++) {
             float f = 1.0f;
-            int k = 0;
+            int k = 2;
             uint r = q0 + simd * 8u + i;
             if (sink_mode > 0u && r < queries && l[i] > 0.0f) {
                 float sink = sinks[sink_mode == 1u ? head : r * heads + head];
@@ -252,12 +253,14 @@ kernel void flash_sunk_metal(
                         f = 1.0f / (1.0f + exp(-d));
                     } else if (d < -260.0f) {
                         f = 0.0f;
+                        k = 0;
                     } else {
-                        k = int(ceil(d * 1.4426950408889634f));
-                        int k1 = k / 2;
-                        float mf = exp(d - float(k) * 0.6931471805599453f);
-                        float ed = (d < -104.0f) ? 0.0f : ldexp(ldexp(mf, k1), k - k1);
+                        int kd = int(ceil(d * 1.4426950408889634f));
+                        int kd1 = kd / 2;
+                        float mf = exp(d - float(kd) * 0.6931471805599453f);
+                        float ed = (d < -104.0f) ? 0.0f : ldexp(ldexp(mf, kd1), kd - kd1);
                         f = mf / (1.0f + ed);
+                        k = kd + 2;
                     }
                 }
             }
@@ -279,7 +282,7 @@ kernel void flash_sunk_metal(
                 for (uint j = 0u; j < 4u; j++) {
                     float v0 = o[i][j][0] * f;
                     float v1 = o[i][j][1] * f;
-                    if (k < 0) {
+                    if (k != 0) {
                         v0 = ldexp(ldexp(v0, k1), k2);
                         v1 = ldexp(ldexp(v1, k1), k2);
                     }

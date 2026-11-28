@@ -370,14 +370,19 @@ fn sunk_metal_is_picked() {
 /// Large values, sinks and shifted logits stay finite and accurate.
 #[test]
 fn sink_stays_finite() {
+    let near_max = f32::from_bits(0x7f7f_fffe);
     let cases = [
-        (16usize, 0.0f32, 90.0f32),
-        (64, 0.0, 90.0),
-        (64, 0.0, 64.0),
-        (64, 536_870_912.0, 64.0),
-        (64, 0.0, 0.5),
+        (16usize, 0.0f32, 90.0f32, 1e37f32),
+        (64, 0.0, 90.0, 1e37),
+        (64, 0.0, 64.0, 1e37),
+        (64, 536_870_912.0, 64.0, 1e37),
+        (64, 0.0, 0.5, 1e37),
+        (64, 0.0, 90.0, near_max),
+        (64, 0.0, 0.5, near_max),
+        (64, 0.0, 90.0, f32::MAX),
+        (64, 0.0, 0.5, f32::MAX),
     ];
-    for (n, shift, gap) in cases {
+    for (n, shift, gap, val) in cases {
         for width in [64usize, 128] {
             let win = if shift != 0.0 { n } else { 0 };
             let c = case(Mask::Causal, [2, 1, width, 1, win]);
@@ -392,7 +397,7 @@ fn sink_stays_finite() {
                 ),
                 Tensor::f32(
                     vec![n, c.kv_heads, c.width],
-                    vec![1e37; n * c.kv_heads * c.width],
+                    vec![val; n * c.kv_heads * c.width],
                 ),
                 Tensor::u32(vec![n], vec![0; n]),
                 Tensor::u32(vec![n], (0..n as u32).collect()),
