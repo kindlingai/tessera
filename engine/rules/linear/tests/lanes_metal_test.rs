@@ -150,3 +150,39 @@ fn metal_picks_lanes_metal() {
         }
     }
 }
+
+#[test]
+fn multi_row_exact() {
+    let mut draws = Noise(97);
+    let settings = host();
+    let device = Device::guess(&settings)
+        .favoring("lanes_metal")
+        .pinned(Pins::all(BF16_FORM));
+    for (k, n) in [(64, 32), (256, 128), (256, 520)] {
+        let g = linear(k, n);
+        let w = noise(vec![n as usize, k as usize], &mut draws);
+        let rounded = BF16_FORM.roundtrip(w.floats().unwrap());
+        let weights = [Tensor::f32(w.shape.clone(), rounded)];
+        let x4 = noise(vec![4, k as usize], &mut draws);
+        let x1 = Tensor::f32(
+            vec![1, k as usize],
+            x4.floats().unwrap()[..k as usize].to_vec(),
+        );
+        let plan4 = lower(&g, 0, &[(Rows, 4)], &device).unwrap();
+        let plan1 = lower(&g, 0, &[(Rows, 1)], &device).unwrap();
+        assert_eq!(plan4.steps[0].kernel.name(), "lanes_metal_bf16");
+        assert_eq!(plan1.steps[0].kernel.name(), "lanes_metal_bf16");
+        let mut run4 = open(plan4, &settings).unwrap();
+        let mut run1 = open(plan1, &settings).unwrap();
+        run4.load(0, weights[0].view()).unwrap();
+        run1.load(0, weights[0].view()).unwrap();
+        let out4 = run4.run(&[x4.view()]).unwrap().remove(0);
+        let out1 = run1.run(&[x1.view()]).unwrap().remove(0);
+        let bits4: Vec<u32> = out4.floats().unwrap()[..n as usize]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let bits1: Vec<u32> = out1.floats().unwrap().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(bits4, bits1, "m=4 row 0 diverged from m=1 on {k}->{n}");
+    }
+}

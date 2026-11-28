@@ -1,6 +1,6 @@
-//! Single-row Metal GEMV for small-K, small-N and wide-N shapes.
+//! Small-batch Metal GEMV for small-K, small-N and wide-N shapes.
 
-use crate::product::{Product, Variant};
+use crate::product::{Product, Variant, place};
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
@@ -10,6 +10,9 @@ use tessera_lower::{Backend, Draft, GUESS, Kernel, Launch, Load, Needs, Shape, S
 
 /// Backends this rule skips (Metal / portable GPU only).
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
+
+/// Maximum rows handled per launch.
+const MAX_ROWS: usize = 8;
 
 /// Elements per wide load.
 const WIDE: u32 = 4;
@@ -72,17 +75,25 @@ impl Mode {
         }
     }
 
-    fn shape(self, n: usize) -> Shape {
-        let threads = self.threads();
-        let across = match self {
+    fn groups_per_row(self, n: usize) -> usize {
+        match self {
             Self::SmallK => n.div_ceil((SUB_THREADS / SUB) as usize),
             Self::SmallN { .. } => n,
             Self::WideN { .. } => n.div_ceil((WIDE_SIMDS * WIDE_COLS) as usize),
-        };
+        }
+    }
+
+    fn total_threads(self, m: usize, n: usize) -> Option<usize> {
+        self.groups_per_row(n)
+            .checked_mul(m)?
+            .checked_mul(self.threads())
+    }
+
+    fn shape(self, m: usize, n: usize) -> Shape {
         Shape::Grid {
-            across,
+            across: self.groups_per_row(n) * m,
             down: 1,
-            threads,
+            threads: self.threads(),
         }
     }
 }
@@ -96,23 +107,34 @@ fn gemv_col(
     #[form(out_form)] out: BufMut<Dyn>,
     n: u32,
     k: u32,
+    #[build] m: usize,
     #[build] simds: u32,
     #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
 ) {
+    let mut row = 0u32;
     let mut col = 0u32;
     let mut s = 0.0f32;
     if simds == 0 {
         let sub_lane = lane() % SUB;
-        col = (gid() / SUB_THREADS) * (SUB_THREADS / SUB) + (lid() / SUB);
+        let mut blk = gid() / SUB_THREADS;
+        if m > 1 {
+            row = blk % m as u32;
+            blk /= m as u32;
+        }
+        col = blk * (SUB_THREADS / SUB) + (lid() / SUB);
         if col >= n {
             return;
         }
         let at = col as u64 * k as u64;
+        let mut x_base = 0u64;
+        if m > 1 {
+            x_base = row as u64 * k as u64;
+        }
         for i in (sub_lane * WIDE..k).by(SUB * WIDE).unroll(4) {
             let c = w.load4(at + i as u64);
-            let v = x.load4(i as u64);
+            let v = x.load4(x_base + i as u64);
             s += v.x * c.x + v.y * c.y + v.z * c.z + v.w * c.w;
         }
         s += shfl_xor(s, 4);
@@ -124,14 +146,23 @@ fn gemv_col(
     } else {
         let mut smem = shared::<f32>(simds.max(4));
         let threads = simds * LANES as u32;
-        col = gid() / threads;
+        let mut blk = gid() / threads;
+        if m > 1 {
+            row = blk % m as u32;
+            blk /= m as u32;
+        }
+        col = blk;
         if col >= n {
             return;
         }
         let at = col as u64 * k as u64;
+        let mut x_base = 0u64;
+        if m > 1 {
+            x_base = row as u64 * k as u64;
+        }
         for i in (lid() * WIDE..k).by(threads * WIDE).unroll(4) {
             let c = w.load4(at + i as u64);
-            let v = x.load4(i as u64);
+            let v = x.load4(x_base + i as u64);
             s += v.x * c.x + v.y * c.y + v.z * c.z + v.w * c.w;
         }
         s = sum32(s);
@@ -151,19 +182,27 @@ fn gemv_col(
 
 /// 4 columns per SIMD group, reusing `x`.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 fn gemv_wide_n(
     #[form(x_form)] x: Buf<Dyn>,
     #[form(form)] w: Buf<Dyn>,
     #[form(out_form)] out: BufMut<Dyn>,
     n: u32,
     k: u32,
+    #[build] m: usize,
     #[build] pair: bool,
     #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
 ) {
-    let simd_global = gid() / LANES as u32;
-    let col0 = simd_global * WIDE_COLS;
+    let mut row = 0u32;
+    let mut blk = gid() / WIDE_THREADS;
+    if m > 1 {
+        row = blk % m as u32;
+        blk /= m as u32;
+    }
+    let simd = blk * WIDE_SIMDS + lid() / LANES as u32;
+    let col0 = simd * WIDE_COLS;
     if col0 >= n {
         return;
     }
@@ -183,6 +222,10 @@ fn gemv_wide_n(
     let at1 = col1 as u64 * k as u64;
     let at2 = col2 as u64 * k as u64;
     let at3 = col3 as u64 * k as u64;
+    let mut x_base = 0u64;
+    if m > 1 {
+        x_base = row as u64 * k as u64;
+    }
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
     let mut s2 = 0.0f32;
@@ -193,8 +236,8 @@ fn gemv_wide_n(
             .by(LANES as u32 * 2 * WIDE)
             .unroll(2)
         {
-            let v0 = x.load4(i as u64);
-            let v1 = x.load4((i + WIDE) as u64);
+            let v0 = x.load4(x_base + i as u64);
+            let v1 = x.load4(x_base + (i + WIDE) as u64);
             let w0a = w.load4(at0 + i as u64);
             let w0b = w.load4(at0 + (i + WIDE) as u64);
             s0 += v0.x * w0a.x + v0.y * w0a.y + v0.z * w0a.z + v0.w * w0a.w;
@@ -214,7 +257,7 @@ fn gemv_wide_n(
         }
     } else {
         for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(4) {
-            let v = x.load4(i as u64);
+            let v = x.load4(x_base + i as u64);
             let w0 = w.load4(at0 + i as u64);
             s0 += v.x * w0.x + v.y * w0.y + v.z * w0.z + v.w * w0.w;
             let w1 = w.load4(at1 + i as u64);
@@ -239,7 +282,7 @@ fn gemv_wide_n(
     vals[3] = s3;
 }
 
-/// Single-row Metal GEMV across small-K, small-N and wide-N regimes.
+/// Small-batch Metal GEMV across small-K, small-N and wide-N regimes.
 #[derive(Clone, Debug, Kernel)]
 #[launch(
     name = self.product.form.suffixed("lanes_metal"),
@@ -251,7 +294,7 @@ fn gemv_wide_n(
     order = Order::PerConfig,
     source = self.product.source(self.tree(), "lanes_metal"),
     launches = lanes_metal_launches,
-    shape = self.mode.shape(self.product.n),
+    shape = self.mode.shape(self.product.m, self.product.n),
     load = lanes_metal_load,
     guess = GUESS,
 )]
@@ -264,6 +307,7 @@ impl LanesMetal {
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
         let Product {
+            m,
             x_form,
             form,
             out_form,
@@ -271,9 +315,9 @@ impl LanesMetal {
         } = self.product;
         let mode = self.mode;
         let build = || match mode {
-            Mode::SmallK => gemv_col_ir(0, x_form, form, out_form),
-            Mode::SmallN { simds } => gemv_col_ir(simds, x_form, form, out_form),
-            Mode::WideN { pair } => gemv_wide_n_ir(pair, x_form, form, out_form),
+            Mode::SmallK => gemv_col_ir(m, 0, x_form, form, out_form),
+            Mode::SmallN { simds } => gemv_col_ir(m, simds, x_form, form, out_form),
+            Mode::WideN { pair } => gemv_wide_n_ir(m, pair, x_form, form, out_form),
         };
         let key: Variant = (
             "lanes_metal",
@@ -282,18 +326,26 @@ impl LanesMetal {
             form.name(),
             out_form.name(),
             0,
-            0,
+            m,
         );
         let mut body = self.product.tree(key, build);
         match mode {
             Mode::SmallK | Mode::SmallN { .. } => {
-                let at = Expr::cast(Ty::U64, Expr::var("col"));
+                let at = if m > 1 {
+                    place(Expr::var("row"), Expr::var("col"))
+                } else {
+                    Expr::cast(Ty::U64, Expr::var("col"))
+                };
                 body.stmts
                     .extend(finish(&self.product.after, Expr::var("s"), at));
             }
             Mode::WideN { .. } => {
                 let col = Expr::bin(BinOp::Add, Expr::var("col0"), Expr::var("c"));
-                let at = Expr::cast(Ty::U64, col.clone());
+                let at = if m > 1 {
+                    place(Expr::var("row"), col.clone())
+                } else {
+                    Expr::cast(Ty::U64, col.clone())
+                };
                 let val = Expr::index(Expr::var("vals"), Expr::var("c"));
                 let then = finish(&self.product.after, val, at);
                 body.stmts.push(Stmt::For {
@@ -334,14 +386,13 @@ fn lanes_metal_load(k: &LanesMetal, _: usize) -> Option<Load> {
         ..
     } = k.product;
     let group = k.mode.threads();
-    let (threads, trips, flight) = match k.mode {
+    let threads = k.mode.total_threads(m, n)?;
+    let (trips, flight) = match k.mode {
         Mode::SmallK => (
-            n.div_ceil((SUB_THREADS / SUB) as usize) * group,
             depth.div_ceil((SUB * WIDE) as usize) as f64,
             (form.bytes(WIDE as usize) * 4) as f64,
         ),
         Mode::SmallN { simds } => (
-            n * group,
             depth.div_ceil(simds as usize * LANES * WIDE as usize) as f64,
             (form.bytes(WIDE as usize) * 4) as f64,
         ),
@@ -349,7 +400,6 @@ fn lanes_metal_load(k: &LanesMetal, _: usize) -> Option<Load> {
             let elems = if pair { 2 * WIDE } else { WIDE } as usize;
             let cols = WIDE_COLS as usize;
             (
-                n.div_ceil(WIDE_SIMDS as usize * cols) * group,
                 depth.div_ceil(LANES * elems) as f64,
                 (form.bytes(elems) * cols * 2) as f64,
             )
@@ -368,8 +418,8 @@ fn lanes_metal_load(k: &LanesMetal, _: usize) -> Option<Load> {
 }
 
 fn lanes_metal_launches(k: &LanesMetal, step: &Step) -> Vec<Launch> {
-    let Product { n, k: depth, .. } = k.product;
-    k.product.launch(step, &[n, depth], k.mode.shape(n))
+    let Product { m, n, k: depth, .. } = k.product;
+    k.product.launch(step, &[n, depth], k.mode.shape(m, n))
 }
 
 fn pick_mode(n: usize, k: usize) -> Mode {
@@ -387,7 +437,11 @@ fn pick_mode(n: usize, k: usize) -> Mode {
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (product, reads) = Product::find(tree, at)?;
-    if product.picked.is_some() || product.m != 1 || !product.k.is_multiple_of(WIDE as usize) {
+    if product.picked.is_some()
+        || product.m == 0
+        || product.m > MAX_ROWS
+        || !product.k.is_multiple_of(WIDE as usize)
+    {
         return None;
     }
     let name = product.form.name();
@@ -395,6 +449,12 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let mode = pick_mode(product.n, product.k);
+    if mode
+        .total_threads(product.m, product.n)
+        .is_none_or(|t| t > u32::MAX as usize)
+    {
+        return None;
+    }
     let len = product.outputs();
     Some(vec![Draft::new(LanesMetal { product, mode }, reads, len)])
 }
