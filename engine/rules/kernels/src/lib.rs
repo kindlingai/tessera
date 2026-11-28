@@ -1,8 +1,5 @@
 //! Kernels and their lowering rules. Linking this crate registers them.
 
-mod add_rms_norm;
-#[cfg(test)]
-mod add_rms_norm_test;
 mod allow;
 mod argmax;
 mod batched;
@@ -12,21 +9,19 @@ mod causal;
 mod gather;
 mod hadamard;
 mod l2_clip;
-mod lane_norm;
-mod layer_norm;
 mod log_scale;
 mod mask;
 mod mean;
 mod neighbours;
+mod norm;
 mod radix;
-mod rms_norm;
 mod rope;
 mod softmax;
 mod take;
 mod view;
 
 pub use hadamard::{BLOCK, spin, spin_inline};
-pub use rms_norm::RmsNorm;
+pub use norm::rms_norm::RmsNorm;
 
 use tessera_codegen::prelude::LANES;
 pub(crate) use tessera_lower::knob as __knob;

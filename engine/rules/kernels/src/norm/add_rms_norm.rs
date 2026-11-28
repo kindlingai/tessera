@@ -1,8 +1,8 @@
 //! Fused residual add and RMS norm, per warp or block.
 
 use crate::WIDE;
-use crate::lane_norm::norm_knobs;
-use crate::lane_norm::{
+use crate::norm::lane_norm::norm_knobs;
+use crate::norm::lane_norm::{
     RowCfg, RowSpec, row_body, row_launches, row_load, row_needs, row_shape, row_tag,
 };
 use tessera_graph::{Order, Stage};

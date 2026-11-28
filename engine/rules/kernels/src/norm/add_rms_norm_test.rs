@@ -1,4 +1,4 @@
-use crate::add_rms_norm::AddLaneNorm;
+use crate::norm::add_rms_norm::AddLaneNorm;
 use tessera_lower::form::{BF16_FORM, F32_FORM};
 use tessera_lower::{Device, Limits, Platform};
 
