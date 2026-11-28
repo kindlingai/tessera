@@ -14,11 +14,12 @@ use tessera_lower::{
     Tree,
 };
 
-const KERNEL: &str = include_str!("mla.cu");
+const KERNEL: &str = concat!(include_str!("mla.cu"), "\n", include_str!("indexer.cu"));
 const MLA_WIDTH: usize = 576;
 const MLA_LATENT: usize = 512;
 const GQA_WIDTH: usize = 128;
 const RING_SHIFT: usize = 32;
+const MLA_FP8_V512_ENTRY: &str = "tessera_mla_attend_fp8_v512";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AttendKind {
@@ -53,17 +54,18 @@ impl AttendKind {
         }
     }
 
-    fn kv_entry(self, kv: &str, out_width: usize) -> Option<&'static str> {
-        match (self, kv, out_width) {
-            (Self::Mla, "fp8", MLA_LATENT) => Some("tessera_mla_attend_512_fp8"),
-            (Self::Mla, "bf16", MLA_LATENT) => Some("tessera_mla_attend_512_bf16"),
-            (Self::Mla, "f32", MLA_LATENT) => Some("tessera_mla_attend_512_f32"),
-            (Self::Mla, "fp8", _) => Some("tessera_mla_attend_fp8"),
-            (Self::Mla, "bf16", _) => Some("tessera_mla_attend_bf16"),
-            (Self::Mla, "f32", _) => Some("tessera_mla_attend_f32"),
-            (Self::Gqa, "fp8", _) => Some("tessera_gqa_attend_fp8"),
-            (Self::Gqa, "bf16", _) => Some("tessera_gqa_attend_bf16"),
-            (Self::Gqa, "f32", _) => Some("tessera_gqa_attend_f32"),
+    fn kv_entry(self, kv: &str, out_width: usize, has_sinks: bool) -> Option<&'static str> {
+        match (self, kv, out_width, has_sinks) {
+            (Self::Mla, "fp8", MLA_LATENT, false) => Some(MLA_FP8_V512_ENTRY),
+            (Self::Mla, "fp8", MLA_LATENT, true) => Some("tessera_mla_attend_512_fp8"),
+            (Self::Mla, "bf16", MLA_LATENT, _) => Some("tessera_mla_attend_512_bf16"),
+            (Self::Mla, "f32", MLA_LATENT, _) => Some("tessera_mla_attend_512_f32"),
+            (Self::Mla, "fp8", _, _) => Some("tessera_mla_attend_fp8"),
+            (Self::Mla, "bf16", _, _) => Some("tessera_mla_attend_bf16"),
+            (Self::Mla, "f32", _, _) => Some("tessera_mla_attend_f32"),
+            (Self::Gqa, "fp8", _, _) => Some("tessera_gqa_attend_fp8"),
+            (Self::Gqa, "bf16", _, _) => Some("tessera_gqa_attend_bf16"),
+            (Self::Gqa, "f32", _, _) => Some("tessera_gqa_attend_f32"),
             _ => None,
         }
     }
@@ -441,7 +443,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     let (kv_form, vf) = (tree.node(k).form, tree.node(v).form.name());
     let kv = kv_form.name();
     require!(vf == kv, "key form {kv} and value form {vf} differ");
-    let entry = kind.kv_entry(kv, out_width);
+    let entry = kind.kv_entry(kv, out_width, a.sinks);
     require!(entry.is_some(), "kv form {kv} (supports fp8, bf16, f32)");
     let want = kind.width();
     let v_width = tree.node(v).shape.last() == Some(&want);
@@ -572,8 +574,9 @@ const IDX_SMEM: usize = IDX_SM_WORDS * 8 + 128 * 4;
 const IDX_QT_SMEM: usize = 2 * 32 * 136 * 2 + 16;
 const IDX_MAX_HEADS: usize = 128;
 
-fn idx_kv_entry(kv: &str, qt: bool) -> Option<&'static str> {
+fn idx_kv_entry(kv: &str, qt: bool, heads: usize, dim: usize) -> Option<&'static str> {
     match (kv, qt) {
+        ("fp8", false) if dim == 128 && heads <= 64 => Some("tessera_indexer_fp8_d128"),
         ("fp8", false) => Some("tessera_indexer_fp8"),
         ("bf16", false) => Some("tessera_indexer_bf16"),
         ("f32", false) => Some("tessera_indexer_f32"),
@@ -761,14 +764,15 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let fits = heads.max(64) * (dim / 2 + 2) <= IDX_SM_WORDS;
     require!(fits, "heads={heads}, dim={dim} exceed shared memory");
     let kf = k_node.form.name();
-    let qt_min_rows = tree.knobs.get("fast_indexer", "qt_min_rows").unwrap_or(8);
+    let qt_min_rows = tree.knobs.get("fast_indexer", "qt_min_rows").unwrap_or(2);
     let qt = rows >= qt_min_rows && heads == 32 && dim == 128;
     let tile_keys = if let Some(v) = tree.knobs.get("fast_indexer", "tile_keys") {
         v
     } else if qt {
+        let default_qt = if rows <= 8 { 256 } else { 1024 };
         tree.knobs
             .get("fast_indexer", "qt_tile_keys")
-            .unwrap_or(1024)
+            .unwrap_or(default_qt)
     } else {
         let small = tree.knobs.get("fast_indexer", "small_rows").unwrap_or(4);
         if rows <= small {
@@ -786,7 +790,7 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         tile_keys >= align && tile_keys.is_multiple_of(align),
         "tile_keys={tile_keys} (requires a multiple of {align})"
     );
-    let entry = idx_kv_entry(kf, qt);
+    let entry = idx_kv_entry(kf, qt, heads, dim);
     require!(entry.is_some(), "key form {kf} (supports fp8, bf16, f32)");
     let paged = kept_stride(tree.kept, raw_ctx);
     let layout = tree.kept.name();
