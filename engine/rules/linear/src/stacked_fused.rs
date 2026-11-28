@@ -3,8 +3,8 @@
 use tessera_graph::{Op, Order, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, Backend, ByBackend, Draft, Home, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T,
-    Term, Tree,
+    Arg, Backend, ByBackend, Compute, Draft, Home, Kernel, Launch, Load, Needs, Ops, Shape, Source,
+    Step, T, Term, Tree,
 };
 
 const KERNEL: &str = include_str!("stacked_fused.cu");
@@ -214,13 +214,14 @@ fn sf_load(k: &StackedFused, _: usize) -> Option<Load> {
             )
         }
     };
+    let w_bytes = 2.0 * k.batches as f64 * w_mult as f64 * k.n as f64 * k.k as f64;
     Some(Load {
         threads: groups * threads,
         group: threads,
         group_bytes,
         trips,
         trip,
-        reads: vec![(2 * k.batches * w_mult * k.n * k.k) as f64, x_bytes],
+        reads: vec![w_bytes, x_bytes],
         written,
         flight,
     })
@@ -287,14 +288,46 @@ fn float_form(form: &dyn Stored) -> bool {
     matches!(form.name(), "f32" | "bf16")
 }
 
-/// Checks `t` is a plain float intermediate.
-fn plain_float(tree: &Tree, t: T) -> bool {
+/// Checks `t` is a zero-copy view of its input.
+fn is_alias(tree: &Tree, t: T) -> bool {
     let n = tree.node(t);
-    float_form(n.form)
-        && !matches!(
-            n.term,
-            Term::Leaf(Home::Weight(_) | Home::Part(..)) | Term::Op(Op::Append(_))
-        )
+    match &n.term {
+        Term::Op(Op::View(View::Reshape(_))) => true,
+        Term::Op(Op::View(View::Permute(order))) => {
+            let src = tree.node(n.args[0]);
+            src.form.name() == n.form.name()
+                && order
+                    .iter()
+                    .copied()
+                    .filter(|&ax| src.shape[ax as usize] > 1)
+                    .is_sorted_by(|a, b| a < b)
+        }
+        _ => false,
+    }
+}
+
+/// Checks `t` is a plain dense float intermediate.
+fn plain_float(tree: &Tree, t: T) -> bool {
+    if !float_form(tree.node(t).form) {
+        return false;
+    }
+    let mut cur = t;
+    while is_alias(tree, cur) {
+        cur = tree.node(cur).args[0];
+    }
+    !matches!(
+        tree.node(cur).term,
+        Term::Leaf(Home::Weight(_) | Home::Part(..)) | Term::Op(Op::Append(_))
+    )
+}
+
+/// Checks bypassing `view` for `src` preserves BF16 rounding.
+fn preserves_rounding(tree: &Tree, view: T, src: T) -> bool {
+    tree.node(view).form.name() != "bf16" || tree.node(src).form.name() == "bf16"
+}
+
+fn fits_u32(v: usize) -> bool {
+    u32::try_from(v).is_ok()
 }
 
 /// Peels optional `Permute([1, 0, 2])` and trailing `Slice(axis=2)` from `x`.
@@ -304,17 +337,19 @@ fn peel_x(
     batches: usize,
     rows: usize,
     k: usize,
-) -> (T, usize, usize, usize, bool) {
+) -> Option<(T, usize, usize, usize, bool)> {
     let mut cur = x;
     let mut swapped = false;
     if !tree.root(cur)
         && let Term::Op(Op::View(View::Permute(order))) = &tree.node(cur).term
         && order[..] == [1, 0, 2]
         && tree.node(cur).shape[..] == [batches, rows, k]
-        && plain_float(tree, tree.node(cur).args[0])
     {
-        cur = tree.node(cur).args[0];
-        swapped = true;
+        let parent = tree.node(cur).args[0];
+        if plain_float(tree, parent) && preserves_rounding(tree, cur, parent) {
+            cur = parent;
+            swapped = true;
+        }
     }
     let mut stride = k;
     let mut off = 0usize;
@@ -325,6 +360,7 @@ fn peel_x(
     {
         let parent = tree.node(cur).args[0];
         if plain_float(tree, parent)
+            && preserves_rounding(tree, cur, parent)
             && let &[d0, d1, w] = tree.node(parent).shape.as_slice()
             && !(w == 576
                 && k == 512
@@ -341,11 +377,11 @@ fn peel_x(
         }
     }
     let (bstep, rstep) = if swapped {
-        (stride, batches * stride)
+        (stride, batches.checked_mul(stride)?)
     } else {
-        (rows * stride, stride)
+        (rows.checked_mul(stride)?, stride)
     };
-    (cur, bstep, rstep, off, swapped || sliced)
+    Some((cur, bstep, rstep, off, swapped || sliced))
 }
 
 /// Unwraps reshaped BF16 weight blocks, optional row slice, and transpose.
@@ -355,10 +391,16 @@ fn peel_w(tree: &Tree, mut w: T) -> Option<(T, usize, usize, usize, bool, &'stat
         Term::Op(Op::View(View::Permute(p))) if p[..] == [0, 2, 1]
     );
     if swapped {
+        if !float_form(tree.node(w).form) {
+            return None;
+        }
         w = tree.node(w).args[0];
     }
     let mut first_row = 0usize;
     if let Term::Op(Op::View(View::Slice { axis: 1, start, .. })) = &tree.node(w).term {
+        if !float_form(tree.node(w).form) {
+            return None;
+        }
         first_row = start.value(&tree.g.dims, &|d| tree.size(d))? as usize;
         w = tree.node(w).args[0];
     }
@@ -378,8 +420,8 @@ fn peel_w(tree: &Tree, mut w: T) -> Option<(T, usize, usize, usize, bool, &'stat
     }
     Some((
         leaf,
-        block_rows * width,
-        first_row * width,
+        block_rows.checked_mul(width)?,
+        first_row.checked_mul(width)?,
         width,
         swapped,
         form,
@@ -404,7 +446,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         _ => return None,
     };
     let mnode = tree.node(mat);
-    if !float_form(mnode.form) {
+    if !float_form(mnode.form) || (out_swap && !preserves_rounding(tree, mat, at)) {
         return None;
     }
     let (x, w) = (mnode.args[0], mnode.args[1]);
@@ -430,7 +472,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if !block.is_multiple_of(align) || !first.is_multiple_of(align) || !step.is_multiple_of(align) {
         return None;
     }
-    let (x_src, x_bstep, x_rstep, x_off, peeled_in) = peel_x(tree, x, batches, rows, k);
+    let (x_src, x_bstep, x_rstep, x_off, peeled_in) = peel_x(tree, x, batches, rows, k)?;
+    if !plain_float(tree, x_src) {
+        return None;
+    }
     let x_form = tree.node(x_src).form;
     if !peeled_in && !out_swap {
         return None;
@@ -439,11 +484,22 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let (out_bstep, out_rstep) = if out_swap {
-        (n, batches * n)
+        (n, batches.checked_mul(n)?)
     } else {
-        (rows * n, n)
+        (rows.checked_mul(n)?, n)
     };
-    let align_mma = k.is_multiple_of(64)
+    let counts = [
+        rows, n, k, block, first, step, x_bstep, x_rstep, x_off, out_bstep, out_rstep,
+    ];
+    if !counts.into_iter().all(fits_u32) {
+        return None;
+    }
+    let mma_ok = tree.compute_at(mat) == Compute::Bf16 || x_form.name() == "bf16";
+    let mma_u32 =
+        n.checked_add(64).is_some_and(fits_u32) && k.checked_add(64).is_some_and(fits_u32);
+    let align_mma = mma_ok
+        && mma_u32
+        && k.is_multiple_of(64)
         && if swapped {
             n.is_multiple_of(64)
         } else {
@@ -459,12 +515,17 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             && k <= 512
             && batches.saturating_mul(rows.div_ceil(4)) <= MAX_GRID_Y
     } else {
-        k.is_multiple_of(8) && rows.div_ceil(8) <= MAX_GRID_Y
+        let bn_ok = batches
+            .checked_mul(n)
+            .and_then(|bn| bn.checked_add(WARPS - 1))
+            .is_some_and(fits_u32);
+        let k_ok = k.checked_add(256).is_some_and(fits_u32);
+        k.is_multiple_of(8) && rows.div_ceil(8) <= MAX_GRID_Y && bn_ok && k_ok
     };
     if !scalar_ok && !can_mma64 && !can_mma16 {
         return None;
     }
-    let len = batches * rows * n;
+    let len = batches.checked_mul(rows)?.checked_mul(n)?;
     let base = StackedFused {
         len,
         batches,
