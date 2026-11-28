@@ -186,7 +186,7 @@ impl ToolState {
         out: &mut Vec<ResponseEvent>,
         eof: bool,
     ) -> StepOutcome {
-        if spec.close.is_empty() {
+        if spec.close.is_empty() || spec.close.defers_until_eof() {
             *self = Self::Buffer;
             return StepOutcome::Continue;
         }
@@ -338,13 +338,21 @@ impl ToolState {
         let Self::Tags(phase) = self else {
             unreachable!()
         };
+        let safe_end = if eof {
+            buf.len()
+        } else {
+            buf.len() - spec.close.tail_hold(buf)
+        };
         match phase {
             TagPhase::SeekKey { first } => {
                 let first = *first;
                 let key_at = buf.find(delims.key_open.as_str());
                 let close = spec.close.find_for(buf, eof);
                 match (key_at, close) {
-                    (Some(at), c) if c.is_none_or(|(end, _)| at < end) => {
+                    (Some(at), c)
+                        if c.is_none_or(|(end, _)| at < end)
+                            && (eof || c.is_some() || at < safe_end) =>
+                    {
                         buf.drain(..at + delims.key_open.len());
                         *phase = TagPhase::ReadKey { first };
                         StepOutcome::Continue
@@ -365,13 +373,17 @@ impl ToolState {
             }
             TagPhase::ReadKey { first } => {
                 let first = *first;
-                if let Some(at) = buf.find(delims.key_close.as_str()) {
+                let close = spec.close.find_for(buf, eof);
+                if let Some(at) = buf.find(delims.key_close.as_str())
+                    && close.is_none_or(|(end, _)| at < end)
+                    && (eof || close.is_some() || at < safe_end)
+                {
                     let key = buf[..at].to_string();
                     buf.drain(..at + delims.key_close.len());
                     *phase = next_after_key(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = spec.close.find_for(buf, eof) {
+                if let Some((at, len)) = close {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -380,14 +392,18 @@ impl ToolState {
                 StepOutcome::Wait
             }
             TagPhase::SeekValOpen { first, key } => {
-                if let Some(at) = buf.find(delims.val_open.as_str()) {
+                let close = spec.close.find_for(buf, eof);
+                if let Some(at) = buf.find(delims.val_open.as_str())
+                    && close.is_none_or(|(end, _)| at < end)
+                    && (eof || close.is_some() || at < safe_end)
+                {
                     let first = *first;
                     let key = std::mem::take(key);
                     buf.drain(..at + delims.val_open.len());
                     *phase = next_after_val_open(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = spec.close.find_for(buf, eof) {
+                if let Some((at, len)) = close {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -416,6 +432,7 @@ impl ToolState {
                 let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)
+                    && (eof || blk_hit.is_some() || at < safe_end)
                 {
                     held.push_str(&buf[..at]);
                     buf.drain(..at + len);
@@ -466,6 +483,7 @@ impl ToolState {
                 let blk_hit = spec.close.find_for(buf, eof);
                 if let Some((at, len)) = val_hit
                     && blk_hit.is_none_or(|(b, _)| at <= b)
+                    && (eof || blk_hit.is_some() || at < safe_end)
                 {
                     let mut chunk = &buf[..at];
                     if delims.trim_trail_nl {

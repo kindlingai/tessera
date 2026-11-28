@@ -738,7 +738,7 @@ pub(crate) fn chat_completions(slot: &Slot, request: &Request) -> Response {
     }
 }
 
-/// Feeds one token's text to `stream` and counts reasoning tokens.
+/// Feeds one token's text to `stream` and updates reasoning count.
 fn feed_stream(
     stream: &mut ResponseStream<'_>,
     text: &str,
@@ -746,16 +746,9 @@ fn feed_stream(
     events: &mut Vec<ResponseEvent>,
     reasoning: &mut usize,
 ) {
-    let was = stream.in_thinking();
-    let start = events.len();
     stream.push(text, events);
     if done {
         stream.finish(events);
     }
-    let saw = events[start..]
-        .iter()
-        .any(|e| matches!(e, ResponseEvent::Reasoning(_)));
-    if saw || (!done && (was || stream.in_thinking())) {
-        *reasoning += 1;
-    }
+    *reasoning = stream.reasoning_tokens();
 }

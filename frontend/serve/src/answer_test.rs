@@ -302,3 +302,116 @@ fn forced_tool_choice() {
     let (_, sse) = call(&miss_slot, "/v1/chat/completions", Some(miss_sse));
     assert!(!sse.contains("never mind") && !sse.contains("\"stop\"") && sse.contains("\"error\""));
 }
+
+fn check_think_usage(pat: &str, first: &str) {
+    let cfg = format!(
+        r#"{{"response_template":{{"fields":{{"reasoning_content":{{"open":"<think>","close_pattern":"{pat}","content":"text"}}}}}}}}"#
+    );
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let mock = Arc::new(MockGenerator {
+        pieces: vec![
+            first.into(),
+            "The ".into(),
+            "answer ".into(),
+            "is ".into(),
+            "42.".into(),
+            String::new(),
+        ],
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, Some(parser));
+    let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    assert_eq!(got["choices"][0]["message"]["reasoning_content"], "plan");
+    let want_content = format!(
+        "{}The answer is 42.",
+        first.trim_start_matches("<think>plan</think>")
+    );
+    assert_eq!(got["choices"][0]["message"]["content"], want_content);
+    assert_eq!(
+        got["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        1
+    );
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    assert!(sse.contains("\"reasoning_tokens\":1"), "sse: {sse}");
+}
+
+fn check_lookahead_tools() {
+    let tool_cfg = r#"{"response_template":{"fields":{"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close_pattern":"</tool_call>(?!-literal)","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?</parameter>"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
+    let mock = Arc::new(MockGenerator {
+        pieces: vec![
+            "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>"
+                .into(),
+            "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done."
+                .into(),
+        ],
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, ResponseParser::from_config(tool_cfg).unwrap());
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "ping"}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+    });
+    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    let calls = got["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0]["function"],
+        json!({"name": "ping", "arguments": "{\"x\":1}"})
+    );
+    assert_eq!(
+        calls[1]["function"],
+        json!({"name": "ping", "arguments": "{\"x\":2}"})
+    );
+    body["stream"] = json!(true);
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    let mut args = [String::new(), String::new()];
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        for item in v["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let i = item["index"].as_u64().unwrap() as usize;
+            if let Some(a) = item["function"]["arguments"].as_str() {
+                args[i].push_str(a);
+            }
+        }
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&args[0]).unwrap(),
+        json!({"x": 1})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&args[1]).unwrap(),
+        json!({"x": 2})
+    );
+    assert!(sse.contains("All done."));
+}
+
+#[test]
+fn lookahead_closer_usage() {
+    for (pat, first) in [
+        ("</think>(?!-literal)", "<think>plan</think> "),
+        ("</think>(?!-literal)", "<think>plan</think>"),
+        ("</think>(?!.*-literal)", "<think>plan</think> "),
+    ] {
+        check_think_usage(pat, first);
+    }
+    check_lookahead_tools();
+}

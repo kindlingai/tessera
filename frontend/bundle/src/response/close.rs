@@ -30,6 +30,31 @@ impl Closer {
     }
 }
 
+/// Streaming settlement rule for regex closers.
+#[derive(Clone)]
+pub(super) enum StreamRule {
+    AfterEnd,
+    NotPrefixes(Vec<String>),
+    TrailingChars(usize),
+    DeferEof,
+}
+
+impl StreamRule {
+    fn settled(&self, text: &str, end: usize) -> bool {
+        let after = &text[end..];
+        match self {
+            Self::AfterEnd => !after.is_empty(),
+            Self::NotPrefixes(guards) => {
+                !after.is_empty() && !guards.iter().any(|g| g.starts_with(after))
+            }
+            Self::TrailingChars(need) => {
+                !after.is_empty() && after.chars().nth(need.saturating_sub(1)).is_some()
+            }
+            Self::DeferEof => false,
+        }
+    }
+}
+
 /// Compiled close condition for a block or content field.
 #[derive(Clone)]
 pub(super) enum Closers {
@@ -39,7 +64,7 @@ pub(super) enum Closers {
         needles: Vec<String>,
         consuming: Vec<String>,
         unanchored: bool,
-        defer_eof: bool,
+        rule: StreamRule,
     },
 }
 
@@ -64,10 +89,10 @@ impl Closers {
             return Ok(Self::Literals(list));
         }
         let regex = Regex::new(&pat)?;
-        let defer_eof = has_stream_unsafe_assertion(&pat);
+        let (rule, needs_context) = stream_rule(&pat);
         let mut needles = Vec::new();
         let mut consuming = Vec::new();
-        let mut unanchored = false;
+        let mut unanchored = needs_context;
         for branch in split_alt(strip_group(&pat)) {
             let b = strip_group(branch);
             if let Some(inner) = strip_lookahead(b) {
@@ -98,12 +123,22 @@ impl Closers {
             needles,
             consuming,
             unanchored,
-            defer_eof,
+            rule,
         })
     }
 
     pub(super) fn is_empty(&self) -> bool {
         matches!(self, Self::Literals(list) if list.is_empty())
+    }
+
+    pub(super) fn defers_until_eof(&self) -> bool {
+        matches!(
+            self,
+            Self::Pattern {
+                rule: StreamRule::DeferEof,
+                ..
+            }
+        )
     }
 
     pub(super) fn find_for(&self, text: &str, eof: bool) -> Option<(usize, usize)> {
@@ -122,14 +157,12 @@ impl Closers {
         let slice = &text[from..];
         match self {
             Self::Literals(list) => find_closers(slice, list).map(|(at, len)| (from + at, len)),
-            Self::Pattern {
-                regex, defer_eof, ..
-            } => {
-                if !eof && *defer_eof {
+            Self::Pattern { regex, rule, .. } => {
+                if !eof && matches!(rule, StreamRule::DeferEof) {
                     return None;
                 }
                 let m = regex.find(slice).ok().flatten()?;
-                if !eof && from + m.end() == text.len() {
+                if !eof && !rule.settled(text, from + m.end()) {
                     return None;
                 }
                 Some((from + m.start(), m.end() - m.start()))
@@ -346,8 +379,131 @@ pub(super) fn literal_prefix(pattern: &str) -> String {
     out
 }
 
-/// Whether a regex contains lookarounds or end/boundary assertions unsafe mid-stream.
-fn has_stream_unsafe_assertion(pat: &str) -> bool {
+/// Determines when a regex closer match settles mid-stream.
+fn stream_rule(pat: &str) -> (StreamRule, bool) {
+    if let Some(guards) = parse_neg_guards(pat) {
+        return (StreamRule::NotPrefixes(guards), false);
+    }
+    let bytes = pat.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    let mut max_la = 0usize;
+    let mut needs_context = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if !in_class && i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'z' | b'Z' => return (StreamRule::DeferEof, needs_context),
+                        b'b' | b'B' => {
+                            max_la = max_la.max(1);
+                            needs_context = true;
+                        }
+                        _ => {}
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'$' if !in_class => return (StreamRule::DeferEof, needs_context),
+            b'(' if !in_class && i + 2 < bytes.len() && bytes[i + 1] == b'?' => {
+                let Some(end) = matching_paren(pat, i) else {
+                    return (StreamRule::DeferEof, needs_context);
+                };
+                if bytes[i + 2] == b'<'
+                    && i + 3 < bytes.len()
+                    && matches!(bytes[i + 3], b'=' | b'!')
+                {
+                    needs_context = true;
+                    if has_forward_assert(&pat[i + 4..end]) {
+                        return (StreamRule::DeferEof, true);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                if matches!(bytes[i + 2], b'=' | b'!') {
+                    let Some(width) = max_match_chars(&pat[i + 3..end]) else {
+                        return (StreamRule::DeferEof, needs_context);
+                    };
+                    max_la = max_la.max(width);
+                    i = end + 1;
+                    continue;
+                }
+                let head = &pat[i + 2..end];
+                let flags = head.split_once(':').map_or(head, |(f, _)| f);
+                if flags.contains('x') {
+                    return (StreamRule::DeferEof, needs_context);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rule = match max_la {
+        0 => StreamRule::AfterEnd,
+        n => StreamRule::TrailingChars(n),
+    };
+    (rule, needs_context)
+}
+
+/// Extracts literal guards from trailing `(?!...)` closer branches.
+fn parse_neg_guards(pat: &str) -> Option<Vec<String>> {
+    let mut guards = Vec::new();
+    for branch in split_alt(strip_group(pat)) {
+        let b = strip_group(branch);
+        if let Some(inner) = strip_lookahead(b) {
+            if unescape_lit(inner)?.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        let bytes = b.as_bytes();
+        let mut i = 0;
+        let mut in_class = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => {
+                    if !in_class
+                        && i + 1 < bytes.len()
+                        && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
+                    {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'[' if !in_class => in_class = true,
+                b']' if in_class => in_class = false,
+                b'$' if !in_class => return None,
+                b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
+                    let end = matching_paren(b, i)?;
+                    if i + 2 < bytes.len() && bytes[i + 2] == b'!' && end + 1 == b.len() {
+                        for alt in split_alt(strip_group(&b[i + 3..end])) {
+                            let lit = unescape_lit(strip_group(alt))?;
+                            if lit.is_empty() {
+                                return None;
+                            }
+                            guards.push(lit);
+                        }
+                        break;
+                    }
+                    if !(i + 2 < bytes.len() && bytes[i + 2] == b':') {
+                        return None;
+                    }
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    (!guards.is_empty()).then_some(guards)
+}
+
+fn has_forward_assert(pat: &str) -> bool {
     let bytes = pat.as_bytes();
     let mut i = 0;
     let mut in_class = false;
@@ -356,7 +512,7 @@ fn has_stream_unsafe_assertion(pat: &str) -> bool {
             b'\\' => {
                 if !in_class
                     && i + 1 < bytes.len()
-                    && matches!(bytes[i + 1], b'b' | b'B' | b'z' | b'Z')
+                    && matches!(bytes[i + 1], b'z' | b'Z' | b'b' | b'B')
                 {
                     return true;
                 }
@@ -366,17 +522,185 @@ fn has_stream_unsafe_assertion(pat: &str) -> bool {
             b'[' if !in_class => in_class = true,
             b']' if in_class => in_class = false,
             b'$' if !in_class => return true,
-            b'(' if !in_class && i + 2 < bytes.len() && bytes[i + 1] == b'?' => {
-                let lookbehind = bytes[i + 2] == b'<'
-                    && i + 3 < bytes.len()
-                    && matches!(bytes[i + 3], b'=' | b'!');
-                if matches!(bytes[i + 2], b'=' | b'!') || lookbehind {
-                    return true;
-                }
+            b'(' if !in_class
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == b'?'
+                && matches!(bytes[i + 2], b'=' | b'!') =>
+            {
+                return true;
             }
             _ => {}
         }
         i += 1;
     }
     false
+}
+
+/// Max chars matched by `pat`, or `None` if unbounded.
+fn max_match_chars(pat: &str) -> Option<usize> {
+    let mut best = 0usize;
+    for branch in split_alt(pat) {
+        best = best.max(branch_max_chars(branch)?);
+    }
+    Some(best)
+}
+
+fn branch_max_chars(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut total = 0usize;
+    let mut last: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'*' | b'+' => return None,
+            b'?' => {
+                last?;
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'?' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'{' => {
+                let (mult, next) = parse_quant_max(s, i)?;
+                last = Some(last?.checked_mul(mult)?);
+                i = next;
+                if i < bytes.len() && bytes[i] == b'?' {
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(prev) = last.take() {
+            total = total.checked_add(prev)?;
+        }
+        match bytes[i] {
+            b'$' => return None,
+            b'^' => i += 1,
+            b'\\' => {
+                let (w, next) = escape_width(s, i)?;
+                last = Some(w);
+                i = next;
+            }
+            b'[' => {
+                let next = skip_class(bytes, i)?;
+                last = Some(1);
+                i = next;
+            }
+            b'(' => {
+                let end = matching_paren(s, i)?;
+                let inner = &s[i + 1..end];
+                let w = group_max_chars(inner)?;
+                last = Some(w);
+                i = end + 1;
+            }
+            _ => {
+                let ch = s[i..].chars().next()?;
+                last = Some(1);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if let Some(prev) = last {
+        total = total.checked_add(prev)?;
+    }
+    Some(total)
+}
+
+fn group_max_chars(inner: &str) -> Option<usize> {
+    let Some(rest) = inner.strip_prefix('?') else {
+        return max_match_chars(inner);
+    };
+    if let Some(body) = rest.strip_prefix(':') {
+        return max_match_chars(body);
+    }
+    if let Some(body) = rest.strip_prefix('=').or_else(|| rest.strip_prefix('!')) {
+        return max_match_chars(body);
+    }
+    if let Some(body) = rest.strip_prefix("<=").or_else(|| rest.strip_prefix("<!")) {
+        return (!has_forward_assert(body)).then_some(0);
+    }
+    if let Some(after) = rest.strip_prefix("P<").or_else(|| rest.strip_prefix('<')) {
+        let close = after.find('>')?;
+        return max_match_chars(&after[close + 1..]);
+    }
+    let (flags, body) = match rest.split_once(':') {
+        Some((f, b)) => (f, Some(b)),
+        None => (rest, None),
+    };
+    if flags.contains('x') || !flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
+        return None;
+    }
+    match body {
+        Some(b) => max_match_chars(b),
+        None => Some(0),
+    }
+}
+
+fn escape_width(s: &str, at: usize) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let next = *bytes.get(at + 1)?;
+    match next {
+        b'z' | b'Z' | b'1'..=b'9' => None,
+        b'A' => Some((0, at + 2)),
+        b'b' | b'B' => Some((1, at + 2)),
+        b'p' | b'P' => {
+            if bytes.get(at + 2) == Some(&b'{') {
+                let close = s[at + 3..].find('}')?;
+                Some((1, at + 4 + close))
+            } else {
+                Some((1, at + 3))
+            }
+        }
+        b'x' => {
+            if bytes.get(at + 2) == Some(&b'{') {
+                let close = s[at + 3..].find('}')?;
+                Some((1, at + 4 + close))
+            } else {
+                (at + 4 <= bytes.len()).then_some((1, at + 4))
+            }
+        }
+        b'u' => {
+            if bytes.get(at + 2) == Some(&b'{') {
+                let close = s[at + 3..].find('}')?;
+                Some((1, at + 4 + close))
+            } else {
+                (at + 6 <= bytes.len()).then_some((1, at + 6))
+            }
+        }
+        _ => {
+            let ch = s[at + 1..].chars().next()?;
+            Some((1, at + 1 + ch.len_utf8()))
+        }
+    }
+}
+
+fn skip_class(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if i < bytes.len() && bytes[i] == b'^' {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b']' {
+        i += 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b']' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn parse_quant_max(s: &str, start: usize) -> Option<(usize, usize)> {
+    let close = s[start + 1..].find('}')?;
+    let body = &s[start + 1..start + 1 + close];
+    let max = match body.split_once(',') {
+        Some((_, "")) => return None,
+        Some((_, hi)) => hi.parse::<usize>().ok()?,
+        None => body.parse::<usize>().ok()?,
+    };
+    Some((max, start + 2 + close))
 }

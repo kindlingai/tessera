@@ -392,6 +392,10 @@ impl ResponseParser {
             buf: String::new(),
             lead: false,
             tool: ToolState::Start,
+            reasoning_tokens: 0,
+            think_starts: Vec::new(),
+            piece_counted: false,
+            piece_pending: false,
         }
     }
 
@@ -467,6 +471,14 @@ pub struct ResponseStream<'a> {
     lead: bool,
     /// Active incremental tool-call state.
     tool: ToolState,
+    /// Confirmed reasoning tokens pushed so far.
+    reasoning_tokens: usize,
+    /// Start offsets in `buf` of buffered thinking tokens.
+    think_starts: Vec<usize>,
+    /// Whether the active `push` already incremented `reasoning_tokens`.
+    piece_counted: bool,
+    /// Whether `think_starts.last()` belongs to the active `push`.
+    piece_pending: bool,
 }
 
 impl<'a> ResponseStream<'a> {
@@ -475,24 +487,40 @@ impl<'a> ResponseStream<'a> {
         self.mode == Mode::Thinking
     }
 
+    /// Number of pushed chunks that contributed to thinking blocks.
+    pub fn reasoning_tokens(&self) -> usize {
+        self.reasoning_tokens
+    }
+
     /// Feeds raw decoded text and appends completed events.
     pub fn push(&mut self, piece: &str, out: &mut Vec<ResponseEvent>) {
         if self.mode == Mode::Closed || piece.is_empty() {
             return;
         }
+        self.piece_counted = false;
+        self.piece_pending = false;
+        if self.mode == Mode::Thinking {
+            self.think_starts.push(self.buf.len());
+            self.piece_pending = true;
+        }
         self.buf.push_str(piece);
         self.drain(out, false);
+        self.piece_pending = false;
     }
 
     /// Flushes remaining buffered text when generation ends.
     pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
         if self.mode == Mode::Closed {
             self.buf.clear();
+            self.drop_think_marks();
             return;
         }
+        self.piece_counted = false;
+        self.piece_pending = false;
         self.drain(out, true);
         if self.mode == Mode::Closed {
             self.buf.clear();
+            self.drop_think_marks();
             return;
         }
         if self.mode == Mode::ToolCall
@@ -504,23 +532,75 @@ impl<'a> ResponseStream<'a> {
             return;
         }
         if self.buf.is_empty() {
+            self.drop_think_marks();
             return;
         }
         let mut rest = std::mem::take(&mut self.buf);
         if std::mem::take(&mut self.opening) {
             match self.opener_len(&rest) {
-                Some(cut) => drop(rest.drain(..cut)),
-                None => self.mode = Mode::Text,
+                Some(cut) => {
+                    self.count_think_before(cut);
+                    drop(rest.drain(..cut));
+                }
+                None => {
+                    self.drop_think_marks();
+                    self.mode = Mode::Text;
+                }
             }
             if rest.is_empty() {
+                self.drop_think_marks();
                 return;
             }
         }
         match self.mode {
-            Mode::Thinking => out.push(ResponseEvent::Reasoning(rest)),
-            Mode::Text | Mode::ToolCall | Mode::Calls => out.push(ResponseEvent::Content(rest)),
+            Mode::Thinking => {
+                self.finish_think_at(usize::MAX);
+                out.push(ResponseEvent::Reasoning(rest));
+            }
+            Mode::Text | Mode::ToolCall | Mode::Calls => {
+                self.drop_think_marks();
+                out.push(ResponseEvent::Content(rest));
+            }
             Mode::Closed => {}
         }
+    }
+
+    fn count_think_before(&mut self, cut: usize) {
+        let mut kept = 0;
+        let len = self.think_starts.len();
+        for i in 0..len {
+            let pos = self.think_starts[i];
+            if pos < cut {
+                self.reasoning_tokens += 1;
+                if self.piece_pending && i + 1 == len {
+                    self.piece_counted = true;
+                    self.piece_pending = false;
+                }
+            } else {
+                self.think_starts[kept] = pos - cut;
+                kept += 1;
+            }
+        }
+        self.think_starts.truncate(kept);
+    }
+
+    fn finish_think_at(&mut self, close_end: usize) {
+        let len = self.think_starts.len();
+        for (i, &pos) in self.think_starts.iter().enumerate() {
+            if pos < close_end {
+                self.reasoning_tokens += 1;
+                if self.piece_pending && i + 1 == len {
+                    self.piece_counted = true;
+                }
+            }
+        }
+        self.think_starts.clear();
+        self.piece_pending = false;
+    }
+
+    fn drop_think_marks(&mut self) {
+        self.think_starts.clear();
+        self.piece_pending = false;
     }
 
     fn drain(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) {
@@ -565,6 +645,15 @@ impl<'a> ResponseStream<'a> {
                     let thinking = self.parser.thinking.as_ref();
                     self.opening =
                         thinking.is_some_and(|t| matches!(t.open, Opener::Pattern { .. }));
+                    if !self.piece_counted {
+                        if self.opening {
+                            self.think_starts.push(0);
+                            self.piece_pending = true;
+                        } else {
+                            self.reasoning_tokens += 1;
+                            self.piece_counted = true;
+                        }
+                    }
                     Mode::Thinking
                 }
                 Hit::ToolCall => Mode::ToolCall,
@@ -612,10 +701,12 @@ impl<'a> ResponseStream<'a> {
             match (self.opener_len(&self.buf), close) {
                 // Text after the match shows that the opener is complete.
                 (Some(cut), _) if cut < self.buf.len() || eof => {
+                    self.count_think_before(cut);
                     self.buf.drain(..cut);
                     self.opening = false;
                 }
                 (None, Some((at, len))) => {
+                    self.drop_think_marks();
                     out.push(ResponseEvent::Content(self.buf[..at + len].to_string()));
                     self.buf.drain(..at + len);
                     self.opening = false;
@@ -626,6 +717,7 @@ impl<'a> ResponseStream<'a> {
             }
         }
         if let Some((at, len)) = spec.close.find_for(&self.buf, eof) {
+            self.finish_think_at(at + len);
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
             }
@@ -640,6 +732,7 @@ impl<'a> ResponseStream<'a> {
         let keep = spec.close.tail_hold(&self.buf);
         let emit = self.buf.len() - keep;
         if emit > 0 {
+            self.count_think_before(emit);
             out.push(ResponseEvent::Reasoning(self.buf[..emit].to_string()));
             self.buf.drain(..emit);
         }
