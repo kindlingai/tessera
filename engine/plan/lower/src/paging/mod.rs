@@ -1,6 +1,7 @@
 //! Which paged experts hold a VRAM slot.
 
-use std::collections::HashMap;
+use crate::plan::{Loaded, Plan, Slot};
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
 mod paging_test;
@@ -230,5 +231,174 @@ impl Forecast for Dense {
 
     fn turns(&self) -> bool {
         self.turns
+    }
+}
+
+/// Bytes of a stacked weight's head, before its experts.
+pub const HEAD: usize = 16;
+/// Byte offset of a descriptor's delta table.
+pub const TABLE: usize = 24;
+const ALIGN: usize = 256;
+
+/// `bytes` rounded up to the arena alignment.
+pub fn aligned(bytes: usize) -> usize {
+    bytes.div_ceil(ALIGN) * ALIGN
+}
+
+/// Whether `l` is a pageable stacked trellis weight.
+fn is_pageable(l: &Loaded) -> bool {
+    let name = l.slot.form.name();
+    l.part.is_none()
+        && l.slot.dims == 3
+        && l.slot.shape[0] > 1
+        && name.starts_with("trellis_k")
+        && !name.ends_with("_rot")
+}
+
+/// Bytes reserved in the descriptor buffer for `experts` entries.
+fn desc_bytes(experts: usize) -> usize {
+    aligned(TABLE + experts * 8)
+}
+
+/// Descriptor layout for one paged weight, independent of backend.
+#[derive(Clone, Debug)]
+pub struct Spec {
+    pub experts: usize,
+    pub stride: usize,
+    pub desc_offset: usize,
+    pub desc_size: usize,
+}
+
+/// Deterministic layout of paged descriptors and non-paged weight arenas.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    pub specs: Vec<Spec>,
+    pub by_weight: HashMap<u32, usize>,
+    pub desc_total: usize,
+}
+
+impl Layout {
+    /// Collects all pageable weights in `plan` in weight order.
+    pub fn build(plan: &Plan) -> Option<Self> {
+        let mut raw: Vec<(u32, usize, usize)> = Vec::new();
+        for l in &plan.weights {
+            if !is_pageable(l) || raw.iter().any(|(w, _, _)| *w == l.weight) {
+                continue;
+            }
+            let experts = l.slot.shape[0] as usize;
+            let total = l.slot.bytes();
+            if total <= HEAD || !(total - HEAD).is_multiple_of(experts) {
+                continue;
+            }
+            let stride = (total - HEAD) / experts;
+            raw.push((l.weight, experts, stride));
+        }
+        if raw.is_empty() {
+            return None;
+        }
+        raw.sort_unstable_by_key(|(w, _, _)| *w);
+        let mut specs = Vec::with_capacity(raw.len());
+        let mut by_weight = HashMap::with_capacity(raw.len());
+        let mut cursor = 0usize;
+        for (weight, experts, stride) in raw {
+            let desc_size = desc_bytes(experts);
+            let idx = specs.len();
+            specs.push(Spec {
+                experts,
+                stride,
+                desc_offset: cursor,
+                desc_size,
+            });
+            by_weight.insert(weight, idx);
+            cursor += desc_size;
+        }
+        Some(Self {
+            specs,
+            by_weight,
+            desc_total: cursor,
+        })
+    }
+
+    /// Moves paged weights of `plan` into a descriptor buffer.
+    pub fn rewrite(&self, plan: &Plan) -> Plan {
+        let mut buffers = plan.buffers.clone();
+        let mut zones = if plan.zones.is_empty() {
+            vec![0; buffers.len()]
+        } else {
+            plan.zones.clone()
+        };
+        // Keep non-weight buffer indices fixed for caller slots.
+        let mut zone_buf: BTreeMap<u32, u32> = BTreeMap::new();
+        for l in &plan.weights {
+            let z = plan.zone(l.slot.buffer);
+            zone_buf.entry(z).or_insert(l.slot.buffer);
+            buffers[l.slot.buffer as usize] = 0;
+        }
+        let desc_buf = buffers.len() as u32;
+        buffers.push(self.desc_total);
+        zones.push(0);
+        // Pack non-paged weights into each zone's existing weight buffer.
+        let mut non_paged: Vec<(u32, u32, Option<u8>, Slot)> = Vec::new();
+        let mut remap: HashMap<(u32, usize), (u32, usize)> = HashMap::new();
+        for l in &plan.weights {
+            if let Some(&idx) = self.by_weight.get(&l.weight) {
+                let s = &self.specs[idx];
+                remap.insert((l.slot.buffer, l.slot.offset), (desc_buf, s.desc_offset));
+            } else {
+                let zone = plan.zone(l.slot.buffer);
+                non_paged.push((zone, l.weight, l.part, l.slot));
+            }
+        }
+        non_paged.sort_unstable_by_key(|&(z, w, p, s)| (z, w, p, s.buffer, s.offset));
+        let mut cursors: BTreeMap<u32, usize> = BTreeMap::new();
+        for (zone, _, _, slot) in non_paged {
+            if remap.contains_key(&(slot.buffer, slot.offset)) {
+                continue;
+            }
+            let buf = zone_buf[&zone];
+            let cur = cursors.entry(zone).or_insert(0);
+            let off = *cur;
+            *cur += aligned(slot.bytes());
+            remap.insert((slot.buffer, slot.offset), (buf, off));
+        }
+        for (zone, size) in cursors {
+            buffers[zone_buf[&zone] as usize] = size;
+        }
+        let move_slot = |mut s: Slot| {
+            if let Some(&(b, off)) = remap.get(&(s.buffer, s.offset)) {
+                s.buffer = b;
+                s.offset = off;
+            }
+            s
+        };
+        let mut out = plan.clone();
+        out.buffers = buffers;
+        out.zones = zones;
+        for l in &mut out.weights {
+            l.slot = move_slot(l.slot);
+        }
+        for (_, s) in &mut out.kept {
+            *s = move_slot(*s);
+        }
+        out.table = out.table.map(move_slot);
+        out.index_table = out.index_table.map(move_slot);
+        for s in &mut out.inputs {
+            *s = move_slot(*s);
+        }
+        for o in &mut out.outputs {
+            o.slot = move_slot(o.slot);
+        }
+        for step in &mut out.steps {
+            for r in &mut step.reads {
+                *r = move_slot(*r);
+            }
+            step.write = move_slot(step.write);
+            for w in &mut step.also {
+                *w = move_slot(*w);
+            }
+            step.table = step.table.map(move_slot);
+            step.index_table = step.index_table.map(move_slot);
+        }
+        out
     }
 }

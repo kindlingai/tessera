@@ -4,182 +4,19 @@ use crate::held::Held;
 use crate::lanes::{Source, Staging};
 use crate::run::Base;
 use crate::{Backed, Error, HostPool};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use tessera_engine_comm::SharedPool;
 use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
 use tessera_kv::Move;
 use tessera_lower::kernels::{Ring, place};
-use tessera_lower::paging::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
-use tessera_lower::{Loaded, Plan, Slot};
+use tessera_lower::paging::{
+    Decayed, Dense, Forecast, HEAD, Layout, Moves, Paged, Promote, Spec, TABLE, Unknown, aligned,
+};
+use tessera_lower::{Plan, Slot};
 use tessera_mem::Backing;
 
-const HEAD: usize = 16;
-const TABLE: usize = 24;
 const PAGED_FLAG: u32 = 0x8000_0000;
-const ALIGN: usize = 256;
 const RESERVE: u64 = 512 << 20;
-
-fn aligned(bytes: usize) -> usize {
-    bytes.div_ceil(ALIGN) * ALIGN
-}
-
-/// Whether `l` is a pageable stacked trellis weight.
-pub(crate) fn is_pageable(l: &Loaded) -> bool {
-    let name = l.slot.form.name();
-    l.part.is_none()
-        && l.slot.dims == 3
-        && l.slot.shape[0] > 1
-        && name.starts_with("trellis_k")
-        && !name.ends_with("_rot")
-}
-
-/// Bytes reserved in the descriptor buffer for `experts` entries.
-pub(crate) fn desc_bytes(experts: usize) -> usize {
-    aligned(TABLE + experts * 8)
-}
-
-/// Descriptor layout for one paged weight, independent of backend.
-#[derive(Clone, Debug)]
-pub(crate) struct Spec {
-    pub(crate) experts: usize,
-    pub(crate) stride: usize,
-    pub(crate) desc_offset: usize,
-    pub(crate) desc_size: usize,
-}
-
-/// Deterministic layout of paged descriptors and non-paged weight arenas.
-#[derive(Clone, Debug)]
-pub(crate) struct Layout {
-    pub(crate) specs: Vec<Spec>,
-    pub(crate) by_weight: HashMap<u32, usize>,
-    pub(crate) desc_total: usize,
-}
-
-impl Layout {
-    /// Collects all pageable weights in `plan` in weight order.
-    pub(crate) fn build(plan: &Plan) -> Option<Self> {
-        let mut raw: Vec<(u32, usize, usize)> = Vec::new();
-        for l in &plan.weights {
-            if !is_pageable(l) || raw.iter().any(|(w, _, _)| *w == l.weight) {
-                continue;
-            }
-            let experts = l.slot.shape[0] as usize;
-            let total = l.slot.bytes();
-            if total <= HEAD || !(total - HEAD).is_multiple_of(experts) {
-                continue;
-            }
-            let stride = (total - HEAD) / experts;
-            raw.push((l.weight, experts, stride));
-        }
-        if raw.is_empty() {
-            return None;
-        }
-        raw.sort_unstable_by_key(|(w, _, _)| *w);
-        let mut specs = Vec::with_capacity(raw.len());
-        let mut by_weight = HashMap::with_capacity(raw.len());
-        let mut cursor = 0usize;
-        for (weight, experts, stride) in raw {
-            let desc_size = desc_bytes(experts);
-            let idx = specs.len();
-            specs.push(Spec {
-                experts,
-                stride,
-                desc_offset: cursor,
-                desc_size,
-            });
-            by_weight.insert(weight, idx);
-            cursor += desc_size;
-        }
-        Some(Self {
-            specs,
-            by_weight,
-            desc_total: cursor,
-        })
-    }
-
-    /// Moves paged weights of `plan` into a descriptor buffer.
-    pub(crate) fn rewrite(&self, plan: &Plan) -> Plan {
-        let mut buffers = plan.buffers.clone();
-        let mut zones = if plan.zones.is_empty() {
-            vec![0; buffers.len()]
-        } else {
-            plan.zones.clone()
-        };
-        // Keep non-weight buffer indices fixed for caller slots.
-        let mut zone_buf: BTreeMap<u32, u32> = BTreeMap::new();
-        for l in &plan.weights {
-            let z = plan.zone(l.slot.buffer);
-            zone_buf.entry(z).or_insert(l.slot.buffer);
-            buffers[l.slot.buffer as usize] = 0;
-        }
-        let desc_buf = buffers.len() as u32;
-        buffers.push(self.desc_total);
-        zones.push(0);
-        // Pack non-paged weights into each zone's existing weight buffer.
-        let mut non_paged: Vec<(u32, u32, Option<u8>, Slot)> = Vec::new();
-        let mut remap: HashMap<(u32, usize), (u32, usize)> = HashMap::new();
-        for l in &plan.weights {
-            if let Some(&idx) = self.by_weight.get(&l.weight) {
-                let s = &self.specs[idx];
-                remap.insert((l.slot.buffer, l.slot.offset), (desc_buf, s.desc_offset));
-            } else {
-                let zone = plan.zone(l.slot.buffer);
-                non_paged.push((zone, l.weight, l.part, l.slot));
-            }
-        }
-        non_paged.sort_unstable_by_key(|&(z, w, p, s)| (z, w, p, s.buffer, s.offset));
-        let mut cursors: BTreeMap<u32, usize> = BTreeMap::new();
-        for (zone, _, _, slot) in non_paged {
-            if remap.contains_key(&(slot.buffer, slot.offset)) {
-                continue;
-            }
-            let buf = zone_buf[&zone];
-            let cur = cursors.entry(zone).or_insert(0);
-            let off = *cur;
-            *cur += aligned(slot.bytes());
-            remap.insert((slot.buffer, slot.offset), (buf, off));
-        }
-        for (zone, size) in cursors {
-            buffers[zone_buf[&zone] as usize] = size;
-        }
-        let move_slot = |mut s: Slot| {
-            if let Some(&(b, off)) = remap.get(&(s.buffer, s.offset)) {
-                s.buffer = b;
-                s.offset = off;
-            }
-            s
-        };
-        let mut out = plan.clone();
-        out.buffers = buffers;
-        out.zones = zones;
-        for l in &mut out.weights {
-            l.slot = move_slot(l.slot);
-        }
-        for (_, s) in &mut out.kept {
-            *s = move_slot(*s);
-        }
-        out.table = out.table.map(move_slot);
-        out.index_table = out.index_table.map(move_slot);
-        for s in &mut out.inputs {
-            *s = move_slot(*s);
-        }
-        for o in &mut out.outputs {
-            o.slot = move_slot(o.slot);
-        }
-        for step in &mut out.steps {
-            for r in &mut step.reads {
-                *r = move_slot(*r);
-            }
-            step.write = move_slot(step.write);
-            for w in &mut step.also {
-                *w = move_slot(*w);
-            }
-            step.table = step.table.map(move_slot);
-            step.index_table = step.index_table.map(move_slot);
-        }
-        out
-    }
-}
 
 /// VRAM slots per weight within `avail`, and their bytes.
 fn shares(specs: &[Spec], avail: usize) -> (Vec<usize>, usize) {
