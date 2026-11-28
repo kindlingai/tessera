@@ -1,14 +1,17 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
-use crate::exlr8_experts as experts;
-pub use crate::exlr8_format::codes;
-use crate::exlr8_format::{
+mod experts;
+mod format;
+mod shard;
+
+use crate::file::{Error, File};
+use crate::offer::{Offer, Slice, Stored, narrow};
+pub use format::codes;
+use format::{
     BF16, FP8_BLOCK, FP8_ROW, FP32, ROWS, TRELLIS, block_form, blocks, bounds, coded, codes_packed,
     halves, matrix, plain, record, rows, span, turned,
 };
-use crate::exlr8_shard::{Shard, layer_prefix, past};
-use crate::file::{Error, File};
-use crate::offer::{Offer, Slice, Stored, narrow};
+use shard::{Shard, layer_prefix, past};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

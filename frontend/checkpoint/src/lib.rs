@@ -2,13 +2,10 @@
 
 mod disk;
 pub mod exlr8;
-mod exlr8_experts;
 #[cfg(test)]
 mod exlr8_experts_test;
 #[cfg(test)]
 mod exlr8_fixture;
-mod exlr8_format;
-mod exlr8_shard;
 #[cfg(test)]
 mod exlr8_test;
 mod file;
