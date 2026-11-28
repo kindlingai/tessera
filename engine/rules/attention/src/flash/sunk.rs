@@ -105,12 +105,12 @@ fn fold_sinks(
         let off = sb == 0xff80_0000;
         let peak = st.state[i as usize];
         let sum = st.state[(ROWS + i) as usize];
-        let barred = q < hd.queries && st.to_s[row] > st.from_s[row];
-        if !off && (sb & 0x7f80_0000) == 0x7f80_0000 {
-            // A +inf or NaN sink makes each row NaN.
+        let seen = q < hd.queries && st.to_s[row] > st.from_s[row];
+        if seen && !off && (sb & 0x7f80_0000) == 0x7f80_0000 {
+            // A +inf or NaN sink makes each seen row NaN.
             h = exp(sink) - sink;
             denom = h;
-        } else if !off && sum > 0.0 {
+        } else if seen && !off && sum > 0.0 {
             let d = (peak - sink) + log(sum);
             if d >= 0.0 {
                 denom = 1.0 + exp(-d);
@@ -118,7 +118,7 @@ fn fold_sinks(
                 h = exp(0.5 * d);
                 denom = h * h + 1.0;
             }
-        } else if off && barred && (sum.to_bits() & 0x7fff_ffff) == 0 {
+        } else if seen && off && (sum.to_bits() & 0x7fff_ffff) == 0 {
             // Seen keys of zero weight and no sink: NaN.
             h = peak * sum;
             denom = h;
@@ -498,6 +498,17 @@ fn flash_sunk(
                 write_spilled(&st, out, &hd, w, out_form);
             } else {
                 write_all::<false, true>(&mut st, out, &hd, 0, w, w, out_form);
+            }
+            for r in 0..BQ {
+                if st.to_s[r] <= st.from_s[r]
+                    && hd.q0 + r < hd.queries
+                    && slots[(hd.q0 + r) as u64] == slot
+                {
+                    let at = ((hd.q0 + r) * hd.heads + hd.head) as u64 * w as u64;
+                    for d in (lid()..w).by(THREADS) {
+                        out[at + d as u64] = 0.0;
+                    }
+                }
             }
             barrier();
         }

@@ -72,6 +72,7 @@ fn listed_merge(
     let mut sum = 0.0f32;
     // A dead part that saw keys holds a NaN.
     let mut hole = 0.0f32;
+    let mut any_hit = 0u32;
     let stride = (width + 2) as u64;
     let at = list as u64 * splits as u64 * stride;
     // Only parts that saw keys carry a sum.
@@ -79,7 +80,11 @@ fn listed_merge(
         let p = at + s as u64 * stride;
         if (parts[p + 1].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, parts[p]);
+            any_hit = 1;
         } else {
+            if (parts[p].to_bits() & 0x7fff_ffff) != 0 {
+                any_hit = 1;
+            }
             hole += parts[p];
         }
     }
@@ -92,7 +97,9 @@ fn listed_merge(
             denom += parts[p + 1] * exp(parts[p] - best);
         }
     }
-    let inv = if (denom.to_bits() & 0x7fff_ffff) != 0 {
+    let inv = if any_hit == 0 {
+        0.0
+    } else if (denom.to_bits() & 0x7fff_ffff) != 0 {
         1.0 / denom
     } else {
         hole

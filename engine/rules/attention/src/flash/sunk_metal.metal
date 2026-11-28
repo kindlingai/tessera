@@ -300,14 +300,14 @@ kernel void flash_sunk_metal(
             }
             uint sb = as_type<uint>(sink);
             bool off = sb == 0xFF800000u;
-            bool barred = r < queries && to_s[row] > from_s[row];
-            if (!off && (sb & 0x7F800000u) == 0x7F800000u) {
-                // A +inf or NaN sink makes each row NaN.
+            bool seen = r < queries && to_s[row] > from_s[row];
+            if (seen && !off && (sb & 0x7F800000u) == 0x7F800000u) {
+                // A +inf or NaN sink makes each seen row NaN.
                 f = exp(sink) - sink;
-            } else if (off && barred && (as_type<uint>(l[i]) & 0x7FFFFFFFu) == 0u) {
+            } else if (seen && off && (as_type<uint>(l[i]) & 0x7FFFFFFFu) == 0u) {
                 // Seen keys of zero weight and no sink: NaN.
                 f = m[i] * l[i];
-            } else if (!off) {
+            } else if (seen && !off) {
                 if (l[i] > 0.0f) {
                     float d = (m[i] - sink) + precise::log(l[i]);
                     if (d >= 0.0f) {
@@ -334,7 +334,7 @@ kernel void flash_sunk_metal(
 
         for (uint i = 0u; i < 4u; i++) {
             uint r = i * 8u + er;
-            if (to_s[r] > from_s[r]) {
+            if (q0 + r < queries && slots[q0 + r] == slot) {
                 float f = alpha_s[r];
                 int k = as_type<int>(pos_s[r]);
                 int k1 = k / 2;

@@ -735,6 +735,111 @@ fn endpoints_align() {
     }
 }
 
+/// Ragged rows with one explicit key pick.
+fn picked_graph(c: Case) -> Graph {
+    let dim = |name, size| Dim { name, size };
+    let bounded = [(Seqs, 4), (Rows, 128), (Context, 1024)];
+    let mut dims: Vec<Dim> = bounded.map(|(n, max)| dim(n, Size::Bounded(max))).into();
+    let fixed = [
+        (Heads, c.heads),
+        (KvHeads, c.kv_heads),
+        (HeadDim, c.width),
+        (rel_win(), c.win.max(1)),
+        (DimName::Picks, 1),
+    ];
+    dims.extend(fixed.map(|(n, size)| dim(n, Size::Fixed(size as u64))));
+    let m = Model::new(dims);
+    let tokens = |shape: tessera_graph::Shape| Port {
+        role: Role::Tokens,
+        ty: TensorType::new(shape, DType::F32),
+    };
+    let ids = |role, shape: tessera_graph::Shape| Port {
+        role,
+        ty: TensorType::new(shape, DType::U32),
+    };
+    let [q, k, v, slots, positions, sinks, rel, picked] = m.entry(
+        EntryKind::Step,
+        [
+            tokens([Rows, Heads, HeadDim].into()),
+            tokens([Rows, KvHeads, HeadDim].into()),
+            tokens([Rows, KvHeads, HeadDim].into()),
+            ids(Role::Slots, [Rows].into()),
+            ids(Role::Positions, [Rows].into()),
+            tokens([Heads].into()),
+            tokens([Rows, Heads, rel_win()].into()),
+            ids(Role::Tokens, [Rows, DimName::Picks].into()),
+        ],
+    );
+    let kept = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
+    let (keys, values) = (m.kept(kept.clone()), m.kept(kept));
+    let by = [&slots, &positions];
+    let (k, v) = (k.append(&keys, by), v.append(&values, by));
+    let extra = [(c.sinks > 0).then_some(&sinks), (c.win > 0).then_some(&rel)];
+    let out = m.attend_rows_biased(c.mask, 0.125, [&q, &k, &v], by, Some(&picked), extra);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Empty picks yield zero with any sink.
+#[test]
+fn empty_picks_zero() {
+    let sinks = vec![f32::INFINITY, f32::NAN, 0.0, f32::NEG_INFINITY];
+    let row0 = [0.0f32, 0.0, 0.0, 0.0];
+    let row1 = [f32::NAN, f32::NAN, 0.5, 1.0];
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [4, 1, width, 1, 0]);
+        let g = picked_graph(c);
+        for pick_row0 in [1u32, u32::MAX] {
+            let run = [(0u32, 0u32, 2u32)];
+            let mut inputs = flat(c, 2, 1.0, 0.0, 0.0);
+            inputs[5] = Tensor::f32(vec![4], sinks.clone());
+            inputs.push(Tensor::u32(vec![2, 1], vec![pick_row0, 1]));
+            let want = run_kept(&g, &[], &mut Store::default(), 0, &inputs).unwrap();
+            let want = want[0].floats().unwrap();
+            let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+            for settings in runs() {
+                let dev = Device::guess(&settings).favoring("listed_fused");
+                let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+                assert!(kernels(&plan).contains(&"listed_attend"));
+                let got = open(plan, &settings)
+                    .unwrap()
+                    .run(&views)
+                    .unwrap()
+                    .remove(0);
+                let got = got.floats().unwrap();
+                let on = format!("w={width} pick0={pick_row0} on {}", dev.platform.backend);
+                assert!(alike(got, want, 1e-4), "{on}: got {got:?} want {want:?}");
+                for (r, ends) in [row0, row1].iter().enumerate() {
+                    for (h, end) in ends.iter().enumerate() {
+                        let at = (r * 4 + h) * width;
+                        let head = &got[at..at + width];
+                        assert!(alike(head, &vec![*end; width], 1e-4), "{on} r={r} h={h}");
+                    }
+                }
+            }
+        }
+        // Dense rows align across tiled and split plans.
+        let fill = |inputs: &mut [Tensor], _: usize, _: usize| {
+            inputs[5] = Tensor::f32(vec![4], sinks.clone());
+        };
+        let mut inputs = flat(c, 64, 1.0, 0.0, 0.0);
+        fill(&mut inputs, 0, 64);
+        let want = run_kept(&graph(c), &[], &mut Store::default(), 0, &inputs).unwrap();
+        let want = want[0].floats().unwrap();
+        tiled(c, 64, &inputs, &format!("dense w={width}"), |got, on| {
+            assert!(alike(got, want, 2e-2), "{on}: mismatch");
+            for (h, end) in row1.iter().enumerate() {
+                let head = &got[h * width..(h + 1) * width];
+                assert!(alike(head, &vec![*end; width], 2e-2), "{on}: r=0 h={h}");
+            }
+        });
+        for rule in [SPLIT, "listed_attend"] {
+            decoded(c, rule, fill, |got, want, on| {
+                assert!(alike(got, want, 1e-4), "{on}: got {got:?}");
+            });
+        }
+    }
+}
+
 /// Runs on a Metal GPU alone: bf16 rounds each operand.
 #[test]
 fn sunk_metal_matches() {

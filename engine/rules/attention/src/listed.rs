@@ -215,10 +215,15 @@ fn listed_attend(
     }
     let mut best = sink;
     let mut hole = 0.0f32;
+    let mut any_hit = 0u32;
     for w in 0..warps {
         if (l_s[w].to_bits() & 0x7fff_ffff) != 0 {
             best = max(best, m_s[w]);
+            any_hit = 1;
         } else {
+            if (m_s[w].to_bits() & 0x7fff_ffff) != 0 {
+                any_hit = 1;
+            }
             hole += m_s[w];
         }
     }
@@ -232,8 +237,14 @@ fn listed_attend(
         }
     }
     let empty = (denom.to_bits() & 0x7fff_ffff) == 0;
-    // Zero weight over seen keys gives NaN, once merged.
-    let mut inv = if empty { hole } else { 1.0 / denom };
+    // Empty picks yield zero. Zero weight yields NaN.
+    let mut inv = if any_hit == 0 {
+        0.0
+    } else if empty {
+        hole
+    } else {
+        1.0 / denom
+    };
     if splits > 1 {
         // A part keeps its peak, sum and scaled mean.
         q_at = (gid() / threads) as u64 * (width + 2) as u64 + 2;
