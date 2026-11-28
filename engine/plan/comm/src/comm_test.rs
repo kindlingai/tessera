@@ -180,3 +180,33 @@ fn shm_exchange() {
         .collect();
     rounds(ranks);
 }
+
+#[test]
+fn socket_large_put() {
+    let (a, b) = tcp_pair().unwrap();
+    let len = 200 * 1024;
+    let mut tx = SocketLink::over(0, vec![None, Some(a)], &[len, 16]).unwrap();
+    let mut rx = SocketLink::over(1, vec![Some(b), None], &[len, 16]).unwrap();
+    let payload: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+    let span = Span::new(0, 0, len);
+    tx.write(span, &payload).unwrap();
+    for ord in 1..=3u64 {
+        let put = Put {
+            to: 1,
+            from: span,
+            into: span,
+            flag: Span::new(1, 0, 16),
+            words: [ord, len as u64],
+            tag: ord,
+        };
+        tx.put(put).unwrap();
+        let mut done = Vec::new();
+        while rx.load(Span::new(1, 0, 8)).unwrap() != ord {
+            tx.poll(&mut done).unwrap();
+            rx.poll(&mut done).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(rx.load(Span::new(1, 8, 8)).unwrap(), len as u64);
+        assert_eq!(rx.read(span).unwrap(), payload);
+    }
+}

@@ -4,7 +4,7 @@ use crate::Error;
 use crate::link::{Link, Put, Span, fits};
 use crate::verbs::Region;
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ pub(crate) struct SocketLink {
     regions: Vec<Region>,
     sizes: Vec<usize>,
     done: Vec<u64>,
+    recv_buf: Box<[u8]>,
 }
 
 // Each rank owns its regions and streams.
@@ -51,11 +52,71 @@ fn io(e: std::io::Error) -> Error {
     }
 }
 
-fn queue(out: &mut VecDeque<u8>, words: [u64; 3], bytes: &[u8]) {
-    for word in words {
-        out.extend(word.to_le_bytes());
+fn write_words(dst: &mut [u8], words: &[u64]) {
+    for (slot, w) in dst.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        *slot = w.to_le_bytes();
     }
+}
+
+fn queue(out: &mut VecDeque<u8>, words: [u64; 3], bytes: &[u8]) {
+    let mut hdr = [0u8; FRAME];
+    write_words(&mut hdr, &words);
+    out.reserve(FRAME + bytes.len());
+    out.extend(hdr);
     out.extend(bytes);
+}
+
+/// Appends `slices` past `skip` bytes to `out`.
+fn queue_rest(out: &mut VecDeque<u8>, slices: &[&[u8]], mut skip: usize) {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    if skip >= total {
+        return;
+    }
+    out.reserve(total - skip);
+    for &s in slices {
+        if skip >= s.len() {
+            skip -= s.len();
+        } else {
+            out.extend(&s[skip..]);
+            skip = 0;
+        }
+    }
+}
+
+/// Applies full frames from `buf` and counts marks.
+fn parse_frames(
+    rank: usize,
+    buf: &[u8],
+    regions: &[Region],
+    sizes: &[usize],
+    peer_acks: &mut u64,
+) -> Result<(usize, usize), Error> {
+    let mut at = 0;
+    let mut marks = 0;
+    while buf.len() - at >= FRAME {
+        let word = |i: usize| {
+            let start = at + 8 * i;
+            u64::from_le_bytes(buf[start..start + 8].try_into().expect("8 bytes"))
+        };
+        let (region, offset, len) = (word(0), word(1), word(2));
+        if region == CONTROL {
+            match offset {
+                MARK => marks += 1,
+                ACK => *peer_acks += 1,
+                _ => return Err(Error::Link(format!("rank {rank} sent control {offset}"))),
+            }
+            at += FRAME;
+            continue;
+        }
+        let span = Span::new(region as usize, offset as usize, len as usize);
+        fits(sizes, span, 1).map_err(|e| Error::Link(format!("rank {rank}: {e}")))?;
+        if buf.len() - at - FRAME < span.len {
+            break;
+        }
+        apply(&regions[span.region], span, &buf[at + FRAME..][..span.len]);
+        at += FRAME + span.len;
+    }
+    Ok((at, marks))
 }
 
 impl SocketLink {
@@ -99,6 +160,7 @@ impl SocketLink {
             regions: owned,
             sizes: regions.to_vec(),
             done: Vec::new(),
+            recv_buf: vec![0u8; 1 << 16].into_boxed_slice(),
         })
     }
 
@@ -118,8 +180,14 @@ impl SocketLink {
     fn flush(&mut self) -> Result<(), Error> {
         for peer in self.peers.iter_mut().flatten() {
             while !peer.out.is_empty() {
-                let (head, _) = peer.out.as_slices();
-                match peer.stream.write(head) {
+                let (head, tail) = peer.out.as_slices();
+                let written = if tail.is_empty() {
+                    peer.stream.write(head)
+                } else {
+                    peer.stream
+                        .write_vectored(&[IoSlice::new(head), IoSlice::new(tail)])
+                };
+                match written {
                     Ok(0) => return Err(Error::Link("a peer closed its stream".into())),
                     Ok(n) => drop(peer.out.drain(..n)),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -132,49 +200,35 @@ impl SocketLink {
 
     /// Reads each stream, and applies whole frames in order.
     fn receive(&mut self) -> Result<(), Error> {
-        let (regions, sizes) = (&self.regions, &self.sizes);
+        let (regions, sizes, chunk) = (&self.regions, &self.sizes, &mut self.recv_buf[..]);
         for (r, peer) in self.peers.iter_mut().enumerate() {
             let Some(peer) = peer else { continue };
-            let mut chunk = [0u8; 1 << 16];
+            let mut marks = 0;
             while !peer.closed {
-                match peer.stream.read(&mut chunk) {
+                match peer.stream.read(chunk) {
                     Ok(0) => peer.closed = true,
-                    Ok(n) => peer.input.extend_from_slice(&chunk[..n]),
+                    Ok(n) if peer.input.is_empty() => {
+                        let (at, m) = parse_frames(r, &chunk[..n], regions, sizes, &mut peer.acks)?;
+                        marks += m;
+                        if at < n {
+                            peer.input.extend_from_slice(&chunk[at..n]);
+                        }
+                    }
+                    Ok(n) => {
+                        peer.input.extend_from_slice(&chunk[..n]);
+                        let (at, m) = parse_frames(r, &peer.input, regions, sizes, &mut peer.acks)?;
+                        marks += m;
+                        if at == peer.input.len() {
+                            peer.input.clear();
+                        } else if at > 0 {
+                            peer.input.drain(..at);
+                        }
+                    }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) => return Err(io(e)),
                 }
             }
-            let mut at = 0;
-            let mut acks = 0;
-            while peer.input.len() - at >= FRAME {
-                let word = |i: usize| {
-                    let start = at + 8 * i;
-                    u64::from_le_bytes(peer.input[start..start + 8].try_into().expect("8 bytes"))
-                };
-                let (region, offset, len) = (word(0), word(1), word(2));
-                if region == CONTROL {
-                    match offset {
-                        MARK => acks += 1,
-                        ACK => peer.acks += 1,
-                        _ => return Err(Error::Link(format!("rank {r} sent control {offset}"))),
-                    }
-                    at += FRAME;
-                    continue;
-                }
-                let span = Span::new(region as usize, offset as usize, len as usize);
-                fits(sizes, span, 1).map_err(|e| Error::Link(format!("rank {r}: {e}")))?;
-                if peer.input.len() - at - FRAME < span.len {
-                    break;
-                }
-                apply(
-                    &regions[span.region],
-                    span,
-                    &peer.input[at + FRAME..][..span.len],
-                );
-                at += FRAME + span.len;
-            }
-            peer.input.drain(..at);
-            for _ in 0..acks {
+            for _ in 0..marks {
                 queue(&mut peer.out, [CONTROL, ACK, 0], &[]);
             }
             if peer.closed && !peer.input.is_empty() {
@@ -210,12 +264,55 @@ impl Link for SocketLink {
         if put.from.len != put.into.len || put.flag.len != 16 || !put.flag.at.is_multiple_of(8) {
             return Err(Error::Fit(format!("{put:?} has spans that differ")));
         }
-        let bytes = self.read(put.from)?;
-        self.frame(put.to, put.into, &bytes)?;
-        let count = Span::new(put.flag.region, put.flag.at + 8, 8);
-        self.frame(put.to, count, &put.words[1].to_le_bytes())?;
-        let ordinal = Span::new(put.flag.region, put.flag.at, 8);
-        self.frame(put.to, ordinal, &put.words[0].to_le_bytes())?;
+        fits(&self.sizes, put.from, 1)?;
+        let from = self.regions[put.from.region].at(put.from.at);
+        let bytes = unsafe { std::slice::from_raw_parts(from, put.from.len) };
+        let mut hdr = [0u8; FRAME];
+        write_words(
+            &mut hdr,
+            &[
+                put.into.region as u64,
+                put.into.at as u64,
+                bytes.len() as u64,
+            ],
+        );
+        let mut flags = [0u8; 64];
+        write_words(
+            &mut flags,
+            &[
+                put.flag.region as u64,
+                (put.flag.at + 8) as u64,
+                8,
+                put.words[1],
+                put.flag.region as u64,
+                put.flag.at as u64,
+                8,
+                put.words[0],
+            ],
+        );
+        let peer = self
+            .peers
+            .get_mut(put.to as usize)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| Error::Fit(format!("no stream to rank {}", put.to)))?;
+        let slices: [&[u8]; 3] = [&hdr, bytes, &flags];
+        if peer.out.is_empty() {
+            let io_slices = [
+                IoSlice::new(&hdr),
+                IoSlice::new(bytes),
+                IoSlice::new(&flags),
+            ];
+            match peer.stream.write_vectored(&io_slices) {
+                Ok(0) => return Err(Error::Link("a peer closed its stream".into())),
+                Ok(n) => queue_rest(&mut peer.out, &slices, n),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    queue_rest(&mut peer.out, &slices, 0)
+                }
+                Err(e) => return Err(io(e)),
+            }
+        } else {
+            queue_rest(&mut peer.out, &slices, 0);
+        }
         self.done.push(put.tag);
         self.flush()
     }
