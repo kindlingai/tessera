@@ -189,3 +189,88 @@ fn splits_sharded_step() {
         DimExpr::Const(2) * DimExpr::Dim(HALF_ROWS)
     );
 }
+
+#[test]
+fn verify_kept_and_shapes() {
+    use tessera_graph::{Conv, ErrorKind, infer, verify};
+    let push = |g: &mut Graph, op: Op, args: &[NodeId]| -> NodeId {
+        let tys: Vec<&TensorType> = args.iter().map(|a| &g.node(*a).ty).collect();
+        let ty = infer(g, &op, &tys).unwrap();
+        let numerics = op.reduces().then(Numerics::default);
+        g.nodes.push(Node {
+            op,
+            args: args.to_vec(),
+            ty,
+            numerics,
+        });
+        NodeId(g.nodes.len() as u32 - 1)
+    };
+    let mut g = Graph::new(vec![
+        Dim::bounded(Seqs, 4),
+        Dim::bounded(Rows, 8),
+        Dim::bounded(Context, 16),
+        Dim::fixed(Hidden, 4),
+    ]);
+    let row = TensorType::new([Rows, Hidden], DType::F32);
+    let idx = TensorType::new([Rows], DType::U32);
+    let kv = TensorType::new([Seqs, Context, Hidden], DType::F32);
+    let st = TensorType::new(
+        vec![DimExpr::Dim(Seqs), DimExpr::Const(3), DimExpr::Dim(Hidden)],
+        DType::F32,
+    );
+    let port = |role, ty| Port { role, ty };
+    for _ in 0..2 {
+        g.entries.push(Entry {
+            kind: EntryKind::Forward,
+            inputs: vec![
+                port(Role::Tokens, row.clone()),
+                port(Role::Slots, idx.clone()),
+                port(Role::Positions, idx.clone()),
+            ],
+            outputs: vec![],
+        });
+    }
+    g.weights.push(Weight {
+        path: vec![PathSeg::Field("w".into())],
+        ty: TensorType::new([Hidden, Hidden], DType::F32),
+    });
+    g.kept = vec![kv, st];
+    let x0 = push(&mut g, Op::Input { entry: 0, port: 0 }, &[]);
+    let s0 = push(&mut g, Op::Input { entry: 0, port: 1 }, &[]);
+    let p0 = push(&mut g, Op::Input { entry: 0, port: 2 }, &[]);
+    let x1 = push(&mut g, Op::Input { entry: 1, port: 0 }, &[]);
+    let s1 = push(&mut g, Op::Input { entry: 1, port: 1 }, &[]);
+    let p1 = push(&mut g, Op::Input { entry: 1, port: 2 }, &[]);
+    let w = push(&mut g, Op::Weight(0), &[]);
+    push(&mut g, Op::Append(0), &[x0, s0, p0]);
+    push(&mut g, Op::Append(0), &[x1, s1, p1]);
+    let conv = Op::Conv(Conv {
+        dilation: 1,
+        state: Some(1),
+    });
+    let c0 = push(&mut g, conv.clone(), &[x0, w, s0, p0]);
+    push(&mut g, conv.clone(), &[x1, w, s1, p1]);
+    g.nodes[c0.0 as usize].ty.shape =
+        Shape(vec![Rows.into(), DimExpr::Const(2) + DimExpr::Const(2)]);
+    verify(&g).unwrap();
+    let mut dup_app = g.clone();
+    push(&mut dup_app, Op::Append(0), &[x0, s0, p0]);
+    assert_eq!(
+        verify(&dup_app).unwrap_err().error.kind,
+        ErrorKind::Reference
+    );
+    let mut dup_st = g.clone();
+    push(&mut dup_st, conv, &[x0, w, s0, p0]);
+    assert_eq!(
+        verify(&dup_st).unwrap_err().error.kind,
+        ErrorKind::Reference
+    );
+    let mut mixed = g.clone();
+    mixed.kept[0] = mixed.kept[1].clone();
+    let mix_conv = Op::Conv(Conv {
+        dilation: 1,
+        state: Some(0),
+    });
+    push(&mut mixed, mix_conv, &[x0, w, s0, p0]);
+    assert_eq!(verify(&mixed).unwrap_err().error.kind, ErrorKind::Reference);
+}

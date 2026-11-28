@@ -1,9 +1,9 @@
 //! Whole-graph checks: references, order and recorded types.
 
-use crate::dims::{Dim, DimExpr, Shape, Size};
-use crate::infer::{ErrorKind, TypeError, elements, infer, need, same_shape};
+use crate::dims::{Dim, DimExpr, Poly, Size};
+use crate::infer::{ErrorKind, TypeError, elements, infer, need, poly, same_shape};
 use crate::json::VERSION;
-use crate::node::{Graph, Op};
+use crate::node::{Graph, NodeId, Op};
 use crate::numerics::{Numerics, sums_ranks};
 use crate::regions;
 use crate::types::{DType, Placement, TensorType};
@@ -50,9 +50,9 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
         })
         .map_err(top)?;
     }
-    let owners = owners(g);
-    for (i, k) in g.kept.iter().enumerate() {
-        kept(g, &owners, i, k).map_err(top)?;
+    if !g.kept.is_empty() {
+        let owners = owners(g);
+        check_kept(g, &owners).map_err(top)?;
     }
     let ports = g
         .entries
@@ -61,12 +61,13 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
     for ty in g.weights.iter().map(|w| &w.ty).chain(&g.kept).chain(ports) {
         declared(&g.dims, ty).map_err(top)?;
     }
+    let mut args = Vec::with_capacity(8);
     for (i, n) in g.nodes.iter().enumerate() {
         let at = |error| VerifyError {
             node: Some(i as u32),
             error,
         };
-        let mut args = Vec::with_capacity(n.args.len());
+        args.clear();
         for a in &n.args {
             need((a.0 as usize) < i, ErrorKind::Reference, || {
                 format!("argument {} is not an earlier node", a.0)
@@ -105,48 +106,93 @@ fn owners(g: &Graph) -> Vec<Option<u32>> {
     out
 }
 
-/// Kept rows: bounded context for appends, or fixed state.
-fn kept(g: &Graph, owners: &[Option<u32>], i: usize, k: &TensorType) -> Result<(), TypeError> {
-    let idx = i as u32;
-    let mut appends = Vec::new();
-    let mut states = Vec::new();
+type AppendKey = (Option<u32>, Option<NodeId>, Option<NodeId>);
+
+#[derive(Clone, Default)]
+struct KeptUse {
+    first_append: Option<AppendKey>,
+    more_appends: Vec<AppendKey>,
+    first_state: Option<Option<u32>>,
+    more_states: Vec<Option<u32>>,
+    dup_append: bool,
+    dup_state: bool,
+}
+
+fn record_key<T: Copy + PartialEq>(
+    first: &mut Option<T>,
+    more: &mut Vec<T>,
+    dup: &mut bool,
+    key: T,
+) {
+    match *first {
+        None => *first = Some(key),
+        Some(prev) if prev == key || more.contains(&key) => *dup = true,
+        Some(_) => more.push(key),
+    }
+}
+
+/// Checks all kept slots in one pass over nodes.
+fn check_kept(g: &Graph, owners: &[Option<u32>]) -> Result<(), TypeError> {
+    let mut uses = vec![KeptUse::default(); g.kept.len()];
     for (n, own) in g.nodes.iter().zip(owners) {
-        let is_state = n.op.facts().state == Some(idx);
-        if n.op == Op::Append(idx) {
-            let key = (*own, n.args.get(1).copied(), n.args.get(2).copied());
-            need(!appends.contains(&key), ErrorKind::Reference, || {
-                format!("kept rows {i} are appended to twice")
-            })?;
-            appends.push(key);
-        } else if is_state {
-            need(!states.contains(own), ErrorKind::Reference, || {
-                format!("kept state {i} is updated twice")
-            })?;
-            states.push(*own);
+        if let Op::Append(idx) = n.op {
+            if let Some(u) = uses.get_mut(idx as usize) {
+                let key = (*own, n.args.get(1).copied(), n.args.get(2).copied());
+                record_key(
+                    &mut u.first_append,
+                    &mut u.more_appends,
+                    &mut u.dup_append,
+                    key,
+                );
+            }
+        } else if let Some(idx) = n.op.facts().state
+            && let Some(u) = uses.get_mut(idx as usize)
+        {
+            record_key(
+                &mut u.first_state,
+                &mut u.more_states,
+                &mut u.dup_state,
+                *own,
+            );
         }
     }
-    need(
-        appends.is_empty() || states.is_empty(),
-        ErrorKind::Reference,
-        || format!("kept {i} mixes appends and state"),
-    )?;
-    if !states.is_empty() {
-        let fixed = k.shape.0.len() >= 2
-            && elements(&g.dims, &Shape(k.shape.0[1..].to_vec()))?
-                .as_const()
-                .is_some();
-        return need(fixed, ErrorKind::Shape, || {
-            format!("kept state {} must have fixed tail", k.shape)
-        });
+    for (i, (k, u)) in g.kept.iter().zip(&uses).enumerate() {
+        need(!u.dup_append, ErrorKind::Reference, || {
+            format!("kept rows {i} are appended to twice")
+        })?;
+        need(!u.dup_state, ErrorKind::Reference, || {
+            format!("kept state {i} is updated twice")
+        })?;
+        need(
+            u.first_append.is_none() || u.first_state.is_none(),
+            ErrorKind::Reference,
+            || format!("kept {i} mixes appends and state"),
+        )?;
+        if u.first_state.is_some() {
+            let fixed = k.shape.0.len() >= 2 && fixed_tail(&g.dims, &k.shape.0[1..])?;
+            need(fixed, ErrorKind::Shape, || {
+                format!("kept state {} must have fixed tail", k.shape)
+            })?;
+            continue;
+        }
+        let grows = match k.shape.0.get(1) {
+            Some(DimExpr::Dim(name)) => g.dims.iter().find(|d| d.name == *name),
+            _ => None,
+        };
+        let bounded = grows.is_some_and(|d| matches!(d.size, Size::Bounded(_)));
+        need(bounded, ErrorKind::Shape, || {
+            format!("kept rows {} need a bounded second axis", k.shape)
+        })?;
     }
-    let grows = match k.shape.0.get(1) {
-        Some(DimExpr::Dim(name)) => g.dims.iter().find(|d| d.name == *name),
-        _ => None,
-    };
-    let bounded = grows.is_some_and(|d| matches!(d.size, Size::Bounded(_)));
-    need(bounded, ErrorKind::Shape, || {
-        format!("kept rows {} need a bounded second axis", k.shape)
-    })
+    Ok(())
+}
+
+fn fixed_tail(dims: &[Dim], tail: &[DimExpr]) -> Result<bool, TypeError> {
+    let mut acc = Poly::constant(1);
+    for e in tail {
+        acc = acc.product(&poly(dims, e)?);
+    }
+    Ok(acc.as_const().is_some())
 }
 
 fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {
@@ -189,16 +235,14 @@ fn declared(dims: &[Dim], t: &TensorType) -> Result<(), TypeError> {
 }
 
 fn agree(dims: &[Dim], inferred: &TensorType, recorded: &TensorType) -> Result<(), TypeError> {
-    need(
-        same_shape(dims, &inferred.shape, &recorded.shape)?,
-        ErrorKind::Shape,
-        || {
-            format!(
-                "recorded {} but the op gives {}",
-                recorded.shape, inferred.shape
-            )
-        },
-    )?;
+    let shape_ok =
+        inferred.shape == recorded.shape || same_shape(dims, &inferred.shape, &recorded.shape)?;
+    need(shape_ok, ErrorKind::Shape, || {
+        format!(
+            "recorded {} but the op gives {}",
+            recorded.shape, inferred.shape
+        )
+    })?;
     need(inferred.dtype == recorded.dtype, ErrorKind::DType, || {
         format!(
             "recorded {:?} but the op gives {:?}",
