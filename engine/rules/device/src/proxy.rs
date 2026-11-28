@@ -1,7 +1,7 @@
 //! The host proxy: reads the doorbell, moves parts, frees slots.
 
 use crate::layout::{self, MAX_GROUP};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::VecDeque;
 use tessera_engine_comm::Error as CommError;
 
 pub mod page;
@@ -155,26 +155,30 @@ fn linked(e: CommError) -> Error {
 /// The bit every trigger word sets, and the lane count.
 const VALID: u64 = 1 << 63;
 const LANES: usize = 1 << 15;
+const _: () = assert!(MAX_GROUP <= u64::BITS as usize);
 
 /// One pool's progress.
 #[derive(Clone, Debug)]
 struct Track {
     next: u64,
+    /// Ordinal of `open[0]`, or `next` when empty.
+    head: u64,
     /// The trigger word last seen, per slot.
     trigger: Vec<u64>,
     /// The last credit sent.
     credit: u64,
-    /// Destinations still due, by ordinal.
-    open: BTreeMap<u64, BTreeSet<u32>>,
+    /// Destination bitmasks still due, indexed from `head`.
+    open: VecDeque<u64>,
 }
 
 impl Track {
     fn new(depth: u32, base: u64) -> Self {
         Track {
             next: base,
+            head: base,
             trigger: vec![0; depth as usize],
             credit: base - 1,
-            open: BTreeMap::new(),
+            open: VecDeque::with_capacity(depth as usize),
         }
     }
 }
@@ -186,13 +190,13 @@ pub struct Proxy {
     tracks: Vec<Track>,
 }
 
-/// The group ranks one trigger's work goes to.
-fn targets(op: Op, pool: Pool) -> BTreeSet<u32> {
+/// Bitmask of group ranks one trigger's work goes to.
+fn targets(op: Op, pool: Pool) -> u64 {
     match op {
-        Op::Recv => BTreeSet::new(),
-        Op::Fetch => BTreeSet::from([pool.me]),
-        Op::Send => BTreeSet::from([1 - pool.me]),
-        _ => (0..pool.group).filter(|&k| k != pool.me).collect(),
+        Op::Recv => 0,
+        Op::Fetch => 1u64 << pool.me,
+        Op::Send => 1u64 << (1 - pool.me),
+        _ => (u64::MAX >> (u64::BITS - pool.group)) & !(1u64 << pool.me),
     }
 }
 
@@ -381,16 +385,16 @@ impl Proxy {
             let lane = ((word >> 48) as usize) & (LANES - 1);
             let lane = *self.lanes.get(lane).ok_or(Error::Lane(lane as u32))?;
             let op = lane.op;
+            let due = targets(op, pool);
             let job = Job {
                 lane,
-                pool,
                 pool_id,
                 slot,
                 ordinal,
                 count: word as u32,
             };
-            job.start(host, link, fetcher)?;
-            self.tracks[p].open.insert(ordinal, targets(op, pool));
+            job.start(due, host, link, fetcher)?;
+            self.tracks[p].open.push_back(due);
             busy = true;
         }
     }
@@ -423,23 +427,28 @@ impl Proxy {
     }
 
     fn finish(&mut self, pool: u32, ordinal: u64, to: u32) -> Result<(), Error> {
-        let open = self.tracks.get_mut(pool as usize).map(|t| &mut t.open);
-        let due = open.and_then(|o| o.get_mut(&ordinal));
-        if !due.is_some_and(|d| d.remove(&to)) {
-            return Err(Error::Event { pool, ordinal });
+        let bit = 1u64.checked_shl(to);
+        let due = self.tracks.get_mut(pool as usize).and_then(|t| {
+            let idx = usize::try_from(ordinal.checked_sub(t.head)?).ok()?;
+            t.open.get_mut(idx)
+        });
+        match (bit, due) {
+            (Some(bit), Some(mask)) if *mask & bit != 0 => {
+                *mask &= !bit;
+                Ok(())
+            }
+            _ => Err(Error::Event { pool, ordinal }),
         }
-        Ok(())
     }
 
     /// Advances `sent` over the finished ordinals at the front.
     fn release(&mut self, p: usize, host: &mut dyn Host) {
-        let open = &mut self.tracks[p].open;
+        let track = &mut self.tracks[p];
         let mut last = None;
-        while open
-            .first_key_value()
-            .is_some_and(|(_, due)| due.is_empty())
-        {
-            last = open.pop_first().map(|(ordinal, _)| ordinal);
+        while track.open.front() == Some(&0) {
+            track.open.pop_front();
+            last = Some(track.head);
+            track.head += 1;
         }
         if let Some(ordinal) = last {
             host.store(Word::Sent { pool: p as u32 }, ordinal);
@@ -451,7 +460,6 @@ impl Proxy {
 #[derive(Clone, Copy)]
 struct Job {
     lane: Lane,
-    pool: Pool,
     pool_id: u32,
     slot: u32,
     ordinal: u64,
@@ -461,13 +469,13 @@ struct Job {
 impl Job {
     fn start(
         &self,
+        due: u64,
         host: &dyn Host,
         link: &mut dyn Link,
         fetcher: &mut dyn Fetcher,
     ) -> Result<(), Error> {
         let Job {
             lane,
-            pool,
             pool_id,
             slot,
             ordinal,
@@ -479,7 +487,10 @@ impl Job {
                 .fetch(pool_id, slot, ordinal, count)
                 .map_err(Error::Link);
         }
-        for to in targets(op, pool) {
+        let mut rem = due;
+        while rem != 0 {
+            let to = rem.trailing_zeros();
+            rem &= rem - 1;
             let size = Word::Size {
                 pool: pool_id,
                 slot,
