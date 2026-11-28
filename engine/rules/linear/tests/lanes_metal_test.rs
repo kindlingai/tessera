@@ -9,7 +9,7 @@ use common::{Finish, finished, linear, noise};
 use tessera_graph::DimName::Rows;
 use tessera_interp::{Tensor, run};
 use tessera_lower::form::{BF16_FORM, F32_FORM};
-use tessera_lower::{Device, Limits, Pins, Platform, lower};
+use tessera_lower::{Backend, Device, Limits, Pins, Platform, lower};
 use tessera_run::open;
 use tessera_run::testing::{emulations as runs, host};
 use tessera_testkit::{Noise, max_abs_diff};
@@ -42,7 +42,14 @@ fn lanes_metal_matches_cpu() {
                     .pinned(Pins::all(form));
                 let plan = lower(&g, 0, &[(Rows, 1)], &device).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-                assert_eq!(names, [form.suffixed("lanes_metal")]);
+                if settings.gpu().is_none() || settings.gpu() == Some(Backend::Metal) {
+                    assert_eq!(names, [form.suffixed("lanes_metal")]);
+                } else {
+                    assert!(
+                        names.iter().all(|n| !n.starts_with("lanes_metal")),
+                        "non-Metal runner picked lanes_metal: {names:?}"
+                    );
+                }
                 let mut runner = open(plan, &settings).unwrap();
                 runner.load(0, weights[0].view()).unwrap();
                 let got = runner.run(&[x.view()]).unwrap().remove(0);
@@ -130,13 +137,16 @@ fn metal_picks_lanes_metal() {
                 name: arch.into(),
                 ..Platform::assumed(Limits::assumed())
             })
+            .favoring("lanes_metal")
             .pinned(Pins::all(BF16_FORM));
-        let plan = lower(&linear(2304, 1024), 0, &[(Rows, 1)], &other).unwrap();
-        assert!(
-            plan.steps
-                .iter()
-                .all(|s| !s.kernel.name().starts_with("lanes_metal")),
-            "{backend} should not pick lanes_metal"
-        );
+        for (k, n) in [(64, 2304), (2304, 1024)] {
+            let plan = lower(&linear(k, n), 0, &[(Rows, 1)], &other).unwrap();
+            assert!(
+                plan.steps
+                    .iter()
+                    .all(|s| !s.kernel.name().starts_with("lanes_metal")),
+                "{backend} should not pick lanes_metal for 1x{k}->{n}"
+            );
+        }
     }
 }

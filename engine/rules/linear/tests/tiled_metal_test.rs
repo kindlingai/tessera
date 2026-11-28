@@ -59,7 +59,9 @@ fn plan(on: Platform, (m, n, k): (u64, u64, u64)) -> Plan {
 }
 
 fn m4_pro() -> Platform {
-    platform("metal", "apple9", "Apple M4 Pro")
+    let mut p = platform("metal", "apple9", "Apple M4 Pro");
+    p.limits.msl_bfloat = true;
+    p
 }
 
 fn rules(plan: &Plan) -> Vec<&str> {
@@ -105,6 +107,10 @@ fn other_backends_skip() {
         let plan = plan(platform(backend, arch, arch), PREFILL[0]);
         assert!(!rules(&plan).contains(&RULE), "{backend}");
     }
+    let mut old_msl = m4_pro();
+    old_msl.limits.msl_bfloat = false;
+    let fallback = plan(old_msl, PREFILL[0]);
+    assert!(!rules(&fallback).contains(&RULE), "needs MSL 3.1 bfloat");
 }
 
 #[test]
@@ -145,7 +151,7 @@ fn metal_tiled_matches_cpu() {
             .favoring(RULE)
             .pinned(Pins::all(BF16_FORM));
         let plan = lower(&g, 0, &[(Rows, m)], &dev).unwrap();
-        if dev.platform.backend == "metal" {
+        if dev.platform.backend == "metal" && dev.platform.limits.msl_bfloat {
             assert_eq!(rules(&plan), [RULE], "{m}x{n}x{k}");
         }
         let mut runner = open(plan, &settings).unwrap();
