@@ -142,6 +142,8 @@ pub(crate) struct Stops {
     sent: usize,
     /// Characters held back: the longest stop, less one.
     hold: usize,
+    /// Held `(token, start, end)` spans in `text`.
+    spans: Vec<(usize, usize, usize)>,
 }
 
 /// The byte index `n` characters before byte `end`.
@@ -165,13 +167,27 @@ impl Stops {
             text: String::new(),
             sent: 0,
             hold: longest.unwrap_or(1) - 1,
+            spans: Vec::new(),
         }
+    }
+
+    /// Whether stop strings hold characters across token steps.
+    pub fn is_buffering(&self) -> bool {
+        self.hold > 0
     }
 
     /// Adds `piece`. Returns text safe to show, and if cut.
     pub fn push(&mut self, piece: &str) -> (String, bool) {
+        let (parts, cut) = self.push_tagged(0, piece);
+        let out = parts.into_iter().map(|(_, t)| t).collect();
+        (out, cut)
+    }
+
+    /// Adds `piece` for `token`, returning safe `(token, text)` chunks.
+    pub fn push_tagged(&mut self, token: usize, piece: &str) -> (Vec<(usize, String)>, bool) {
         let before = self.text.len();
         self.text.push_str(piece);
+        self.spans.push((token, before, self.text.len()));
         // Only a match that ends in `piece` is new.
         let from = back(&self.text, before, self.hold);
         let mut cut: Option<usize> = None;
@@ -187,14 +203,54 @@ impl Stops {
             }
             None => back(&self.text, self.text.len(), self.hold).max(self.sent),
         };
-        let out = self.text[self.sent..end].to_string();
+        let mut out = Vec::new();
+        let mut kept = 0;
+        for i in 0..self.spans.len() {
+            let (tok, s, e) = self.spans[i];
+            if s == e {
+                if s < end {
+                    out.push((tok, String::new()));
+                } else if cut.is_none() {
+                    self.spans[kept] = (tok, s, e);
+                    kept += 1;
+                }
+                continue;
+            }
+            let lo = s.max(self.sent);
+            let hi = e.min(end);
+            if lo < hi {
+                out.push((tok, self.text[lo..hi].to_string()));
+            }
+            if cut.is_none() && e > end {
+                self.spans[kept] = (tok, end.max(s), e);
+                kept += 1;
+            }
+        }
+        self.spans.truncate(kept);
         self.sent = end;
         (out, cut.is_some())
     }
 
     /// The text still held, once the answer ends.
     pub fn rest(&mut self) -> String {
-        let out = self.text[self.sent..].to_string();
+        self.rest_tagged().into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Held `(token, text)` chunks remaining when generation ends.
+    pub fn rest_tagged(&mut self) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (tok, s, e) in self.spans.drain(..) {
+            if s == e {
+                if s >= self.sent {
+                    out.push((tok, String::new()));
+                }
+                continue;
+            }
+            let lo = s.max(self.sent);
+            if lo < e {
+                out.push((tok, self.text[lo..e].to_string()));
+            }
+        }
         self.sent = self.text.len();
         out
     }

@@ -1,10 +1,10 @@
 use crate::Error;
-use crate::api::{Format, Generator, Params, Refused, ToolChoice};
+use crate::api::{Finish, Format, Generator, Params, Refused, Step, ToolChoice};
 use crate::generate::{Generate, Queued, Steer};
 use crate::guided::Guides;
 use std::sync::{Arc, Mutex, mpsc};
 use tessera_bundle::tokenize::hf::Hf;
-use tessera_engine::{Guide, Penalties, Prefix, Sampling};
+use tessera_engine::{Event, Guide, Penalties, Prefix, Reason, Sampling};
 
 struct Open;
 
@@ -89,4 +89,63 @@ fn speculative_engine_gate() {
             .unwrap_err();
         assert_eq!(error.downcast_ref::<Refused>().unwrap().1, field);
     }
+    check_stop_token_identity();
+}
+
+fn check_stop_token_identity() {
+    let file = r#"{"model":{"type":"WordLevel","vocab":{"preface ":0,"<think>é":1},"unk_token":"preface "},"decoder":{"type":"Fuse"}}"#
+        .as_bytes();
+    let (jobs, queue) = mpsc::channel();
+    let queued = Queued {
+        generate: Arc::new(Generate {
+            tokenizer: Hf::from_json(file).unwrap(),
+            template: None,
+            response: None,
+            stop: Vec::new(),
+            steer: Steer::Guided(None),
+            sampling: false,
+        }),
+        jobs: Mutex::new(jobs),
+        sent: None,
+    };
+    let (tx, rx) = mpsc::channel();
+    let params = Params {
+        stop: vec!["ZZ".into()],
+        ..Params::default()
+    };
+    queued
+        .generate(vec![0], params, Box::new(move |step| tx.send(step).is_ok()))
+        .unwrap();
+    let (_, mut engine_sink) = queue.recv().unwrap();
+    assert!(engine_sink(Event::Token(0)));
+    assert!(engine_sink(Event::Token(1)));
+    assert!(!engine_sink(Event::Done(Reason::Stop)));
+    let steps: Vec<Step> = rx.try_iter().collect();
+    assert_eq!(
+        steps,
+        vec![
+            Step::Text {
+                token: 1,
+                text: "preface".into()
+            },
+            Step::Text {
+                token: 1,
+                text: " ".into()
+            },
+            Step::Text {
+                token: 2,
+                text: "<think>".into()
+            },
+            Step::Text {
+                token: 2,
+                text: "é".into()
+            },
+            Step::Done {
+                text: String::new(),
+                finish: Finish::Stop,
+                tokens: 2,
+                cached: 0,
+            },
+        ]
+    );
 }

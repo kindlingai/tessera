@@ -1,6 +1,7 @@
 //! Relaxed JSON parser and incremental streaming normalizer.
 
-use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent, find_close, tail_hold};
+use super::super::close::Closers;
+use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent};
 use super::{StepOutcome, json_escape_inner, json_str, safe_value_emit};
 use serde_json::{Map, Value};
 
@@ -238,6 +239,7 @@ pub(super) fn step_relaxed(
     state: &mut RelaxedState,
     buf: &mut String,
     out: &mut Vec<ResponseEvent>,
+    eof: bool,
 ) -> StepOutcome {
     let Body::Json(args) = &spec.body else {
         unreachable!()
@@ -254,13 +256,13 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     emitted.push_str(&json_escape_inner(&buf[..at]));
                     emitted.push('"');
                     buf.drain(..at + len);
                     break true;
                 }
-                let emit = safe_value_emit(buf, close_delim, &spec.close, false);
+                let emit = safe_value_emit(buf, &[close_delim.as_str()], &spec.close, false);
                 if emit > 0 {
                     emitted.push_str(&json_escape_inner(&buf[..emit]));
                     buf.drain(..emit);
@@ -286,13 +288,12 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find_for(buf, eof) {
                     emitted.push_str(&buf[..at]);
                     buf.drain(..at + len);
                     break true;
                 }
-                let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
-                let emit = buf.len() - tail_hold(buf, &needles);
+                let emit = buf.len() - spec.close.tail_hold(buf);
                 if emit > 0 {
                     let mut esc = matches!(state.mode, RelaxedMode::InQuoted { escaped: true });
                     for &b in &buf.as_bytes()[..emit] {
@@ -316,7 +317,7 @@ pub(super) fn step_relaxed(
                 if buf.is_empty() {
                     break false;
                 }
-                if let Some((0, len)) = find_close(buf, &spec.close) {
+                if let Some((0, len)) = spec.close.find_for(buf, eof) {
                     buf.drain(..len);
                     break true;
                 }
@@ -327,7 +328,7 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::InDelim(idx);
                     continue;
                 }
-                if prefix_of_any(buf, args, &spec.close) {
+                if !eof && prefix_of_any(buf, args, &spec.close) {
                     break false;
                 }
                 let first = buf.as_bytes()[0];
@@ -390,7 +391,7 @@ pub(super) fn step_relaxed(
                     _ => {
                         let len = buf.bytes().take_while(|b| is_prim_byte(*b)).count();
                         if len == 0 {
-                            if let Some((at, clen)) = find_close(buf, &spec.close) {
+                            if let Some((at, clen)) = spec.close.find_for(buf, eof) {
                                 buf.drain(..at + clen);
                                 break true;
                             }
@@ -428,15 +429,64 @@ fn match_delim_open(buf: &str, args: &ContentArgs) -> Option<usize> {
         .position(|[open, _]| buf.starts_with(open.as_str()))
 }
 
-fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &[String]) -> bool {
+fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &Closers) -> bool {
     let any_delim = args
         .string_delims
         .iter()
         .any(|[open, _]| open.starts_with(buf));
-    let any_close = closes.iter().any(|c| c.starts_with(buf));
+    let any_close = !buf.is_empty() && closes.tail_hold(buf) == buf.len();
     any_delim || any_close
 }
 
 fn is_prim_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')
+}
+
+/// Whether left-trimmed `t` can prefix a JSON number.
+pub(super) fn is_json_number_prefix(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    if i == b.len() {
+        return true;
+    }
+    match b[i] {
+        b'0' => i += 1,
+        b'1'..=b'9' => {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let frac = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == frac {
+            return false;
+        }
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == exp {
+            return false;
+        }
+    }
+    b[i..].iter().all(u8::is_ascii_whitespace)
 }

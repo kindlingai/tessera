@@ -1,11 +1,15 @@
 //! Generic response parser driven by `tokenizer_config.json`.
 
+mod close;
+#[cfg(test)]
+mod close_test;
 mod formats;
 #[cfg(test)]
 mod response_test;
 mod stream;
 
 use crate::template::{FunctionCall, Message, Template, ToolCall, spaced};
+use close::{Closers, literal_prefix, next_tag};
 use fancy_regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -61,6 +65,7 @@ struct ContentArgs {
     #[serde(default)]
     unquoted_keys: bool,
     /// `tags` content: a regex with `key` and `value` groups.
+    #[serde(alias = "tag_pattern")]
     pattern: Option<String>,
 }
 
@@ -69,6 +74,7 @@ struct FieldSpec {
     open: Option<Strings>,
     open_pattern: Option<String>,
     close: Option<Strings>,
+    close_pattern: Option<String>,
     content: Option<String>,
     #[serde(default)]
     content_args: ContentArgs,
@@ -127,13 +133,28 @@ impl Opener {
 
     fn find(&self, text: &str) -> Option<(usize, usize)> {
         match self {
-            Opener::Literal(opens) => find_close(text, opens),
+            Opener::Literal(opens) => find_literal(text, opens),
             Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
                 text.find(prefix.as_str()).map(|at| (at, 0))
             }
             Opener::Pattern { regex, .. } => {
                 regex.find(text).ok().flatten().map(|m| (m.start(), 0))
             }
+        }
+    }
+
+    /// Earliest byte offset where a block closer can match.
+    fn min_close_offset(&self, text: &str) -> usize {
+        let floor = text.chars().next().map_or(0, char::len_utf8);
+        match self {
+            Opener::Literal(opens) => opens
+                .iter()
+                .find(|s| text.starts_with(s.as_str()))
+                .map_or(floor, String::len),
+            Opener::Pattern { prefix, .. } if !prefix.is_empty() && text.starts_with(prefix) => {
+                prefix.len()
+            }
+            Opener::Pattern { .. } => floor,
         }
     }
 
@@ -181,10 +202,15 @@ impl Body {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         Ok(match kind {
             Some("json") => Body::Json(args),
-            Some("tags") => {
-                let pat = args
+            Some("tags" | "xml-inline" | "xml_params") => {
+                let raw = args
                     .pattern
                     .ok_or("tags content needs content_args.pattern")?;
+                let pat = if raw.starts_with("(?") {
+                    raw
+                } else {
+                    format!("(?s){raw}")
+                };
                 let delims = TagDelims::from_pattern(&pat);
                 Body::Tags {
                     regex: Regex::new(&pat)?,
@@ -195,19 +221,33 @@ impl Body {
         })
     }
 
-    fn parse(&self, body: &str) -> Option<Value> {
+    fn parse(&self, full: &str, body_len: usize) -> Option<Value> {
+        let body = &full[..body_len];
         match self {
             Body::Text => Some(Value::String(body.to_string())),
             Body::Json(args) => parse_json(body.trim(), args),
             Body::Tags { regex, .. } => {
                 let mut map = Map::new();
-                for caps in regex.captures_iter(body) {
-                    let caps = caps.ok()?;
-                    let (key, value) = (caps.name("key")?, caps.name("value")?);
+                let mut pos = 0;
+                while pos < body_len {
+                    let from_full = if full.len() > body_len {
+                        next_tag(regex, full, pos, body_len)?
+                    } else {
+                        None
+                    };
+                    let from_body = next_tag(regex, body, pos, body_len)?;
+                    let Some((_, end, key, raw)) = (match (from_full, from_body) {
+                        (Some(f), Some(b)) if b.0 < f.0 => Some(b),
+                        (Some(f), _) => Some(f),
+                        (None, b) => b,
+                    }) else {
+                        break;
+                    };
                     // A value that parses as JSON keeps its type.
-                    let value = serde_json::from_str(value.as_str())
-                        .unwrap_or_else(|_| Value::String(value.as_str().to_string()));
-                    map.insert(key.as_str().to_string(), value);
+                    let val = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()));
+                    map.insert(key.to_string(), val);
+                    pos = end.max(pos + body[pos..].chars().next().map_or(1, char::len_utf8));
                 }
                 Some(Value::Object(map))
             }
@@ -218,7 +258,7 @@ impl Body {
 #[derive(Clone)]
 struct BlockSpec {
     open: Opener,
-    close: Vec<String>,
+    close: Closers,
     body: Body,
     transform: Option<Value>,
     outer: Option<[String; 2]>,
@@ -230,7 +270,7 @@ struct BlockSpec {
 pub struct ResponseParser {
     thinking: Option<BlockSpec>,
     tool_calls: Option<BlockSpec>,
-    content_close: Vec<String>,
+    content_close: Closers,
     tool_prompt: Option<String>,
 }
 
@@ -257,15 +297,16 @@ impl ResponseParser {
     fn compile(template: ResponseTemplate) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut thinking = None;
         let mut tool_calls = None;
-        let mut content_close = Vec::new();
+        let mut content_close = Closers::empty();
         for (name, spec) in template.fields {
-            let close: Vec<String> = spec
+            let raw_close: Vec<String> = spec
                 .close
                 .map(Strings::list)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect();
+            let close = Closers::compile(raw_close, spec.close_pattern)?;
             if name == "content" {
                 content_close = close;
                 continue;
@@ -282,7 +323,7 @@ impl ResponseParser {
                 call_prefix: spec.call_prefix.filter(|s| !s.is_empty()),
             };
             match name.as_str() {
-                "thinking" => thinking = Some(block),
+                "thinking" | "reasoning_content" => thinking = Some(block),
                 "tool_calls" => tool_calls = Some(block),
                 _ => {}
             }
@@ -325,7 +366,7 @@ impl ResponseParser {
                     json!({"name": call.function.name, "arguments": call.function.arguments}),
                 );
             }
-            match close.first() {
+            match close.consuming().into_iter().next() {
                 Some(close) => {
                     for call in plain {
                         text += &format!("{open}{}{close}", spaced(&call));
@@ -343,7 +384,10 @@ impl ResponseParser {
         matches!(
             &self.thinking,
             Some(BlockSpec { open: Opener::Literal(opens), .. })
-                if opens.iter().any(|s| prompt.ends_with(s.as_str()))
+                if opens.iter().any(|s| {
+                    prompt.ends_with(s.as_str())
+                        || prompt.trim_end_matches('\n').ends_with(s.as_str())
+                })
         )
     }
 
@@ -362,6 +406,11 @@ impl ResponseParser {
             buf: String::new(),
             lead: false,
             tool: ToolState::Start,
+            reasoning_tokens: 0,
+            next_token: 0,
+            last_token: 0,
+            last_counted: true,
+            spans: Vec::new(),
         }
     }
 
@@ -423,6 +472,14 @@ enum Hit {
     Close,
 }
 
+#[derive(Clone, Copy)]
+struct TokenSpan {
+    token: usize,
+    start: usize,
+    end: usize,
+    counted: bool,
+}
+
 /// Incremental state machine for one assistant reply.
 pub struct ResponseStream<'a> {
     parser: &'a ResponseParser,
@@ -437,25 +494,179 @@ pub struct ResponseStream<'a> {
     lead: bool,
     /// Active incremental tool-call state.
     tool: ToolState,
+    /// Confirmed reasoning tokens pushed so far.
+    reasoning_tokens: usize,
+    /// Auto-assigned token counter for `push`.
+    next_token: usize,
+    /// Most recent token id pushed via `push_for`.
+    last_token: usize,
+    /// Whether `last_token` was already counted as reasoning.
+    last_counted: bool,
+    /// Buffered token byte ranges in `buf`.
+    spans: Vec<TokenSpan>,
 }
 
 impl<'a> ResponseStream<'a> {
-    /// Whether the stream is inside a thinking block.
-    pub fn in_thinking(&self) -> bool {
-        self.mode == Mode::Thinking
+    /// Number of pushed chunks that contributed to thinking blocks.
+    pub fn reasoning_tokens(&self) -> usize {
+        self.reasoning_tokens
     }
 
     /// Feeds raw decoded text and appends completed events.
     pub fn push(&mut self, piece: &str, out: &mut Vec<ResponseEvent>) {
-        if self.mode == Mode::Closed || piece.is_empty() {
+        self.next_token += 1;
+        self.push_for(self.next_token, piece, out);
+    }
+
+    /// Feeds decoded text tagged with its monotonic `token` id.
+    pub fn push_for(&mut self, token: usize, piece: &str, out: &mut Vec<ResponseEvent>) {
+        if self.mode == Mode::Closed {
             return;
         }
+        let start = self.buf.len();
         self.buf.push_str(piece);
+        if token == self.last_token {
+            if let Some(last) = self.spans.last_mut()
+                && last.token == token
+            {
+                last.end = self.buf.len();
+            } else {
+                self.spans.push(TokenSpan {
+                    token,
+                    start,
+                    end: self.buf.len(),
+                    counted: self.last_counted,
+                });
+            }
+        } else {
+            self.last_token = token;
+            self.last_counted = false;
+            self.spans.push(TokenSpan {
+                token,
+                start,
+                end: self.buf.len(),
+                counted: false,
+            });
+        }
+        if !piece.is_empty() {
+            self.drain(out, false);
+        }
+    }
+
+    /// Flushes remaining buffered text when generation ends.
+    pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
+        if self.mode == Mode::Closed {
+            self.buf.clear();
+            self.spans.clear();
+            return;
+        }
+        self.drain(out, true);
+        if self.mode == Mode::Closed {
+            self.buf.clear();
+            self.spans.clear();
+            return;
+        }
+        if self.mode == Mode::ToolCall
+            && let Some(spec) = &self.parser.tool_calls
+            && (self.tool.started() || !self.buf.is_empty())
+        {
+            let rest = std::mem::take(&mut self.buf);
+            self.spans.clear();
+            self.tool.finish(spec, &rest, out);
+            return;
+        }
+        if self.buf.is_empty() {
+            if self.mode == Mode::Thinking && !self.opening {
+                self.count_all_spans();
+            } else {
+                self.spans.clear();
+            }
+            return;
+        }
+        let mut rest = std::mem::take(&mut self.buf);
+        if std::mem::take(&mut self.opening) {
+            match self.opener_len(&rest) {
+                Some(cut) => {
+                    self.shift_spans(cut, true);
+                    drop(rest.drain(..cut));
+                }
+                None => {
+                    self.spans.clear();
+                    self.mode = Mode::Text;
+                }
+            }
+            if rest.is_empty() {
+                if self.mode == Mode::Thinking {
+                    self.count_all_spans();
+                } else {
+                    self.spans.clear();
+                }
+                return;
+            }
+        }
+        match self.mode {
+            Mode::Thinking => {
+                self.count_all_spans();
+                out.push(ResponseEvent::Reasoning(rest));
+            }
+            Mode::Text | Mode::ToolCall | Mode::Calls => {
+                self.spans.clear();
+                out.push(ResponseEvent::Content(rest));
+            }
+            Mode::Closed => {}
+        }
+    }
+
+    fn drain_buf(&mut self, cut: usize, reasoning: bool) {
+        if cut == 0 {
+            return;
+        }
+        self.buf.drain(..cut);
+        self.shift_spans(cut, reasoning);
+    }
+
+    fn shift_spans(&mut self, cut: usize, reasoning: bool) {
+        if cut == 0 {
+            return;
+        }
+        let mut kept = 0;
+        for i in 0..self.spans.len() {
+            let mut span = self.spans[i];
+            if reasoning && !span.counted && span.start < cut {
+                span.counted = true;
+                self.reasoning_tokens += 1;
+                if span.token == self.last_token {
+                    self.last_counted = true;
+                }
+            }
+            if span.end > cut || (span.start == span.end && span.start == cut) {
+                span.start = span.start.saturating_sub(cut);
+                span.end -= cut;
+                self.spans[kept] = span;
+                kept += 1;
+            }
+        }
+        self.spans.truncate(kept);
+    }
+
+    fn count_all_spans(&mut self) {
+        for span in &self.spans {
+            if !span.counted {
+                self.reasoning_tokens += 1;
+                if span.token == self.last_token {
+                    self.last_counted = true;
+                }
+            }
+        }
+        self.spans.clear();
+    }
+
+    fn drain(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) {
         loop {
             let moved = match self.mode {
-                Mode::Text => self.step_text(out),
-                Mode::Thinking => self.step_thinking(out),
-                Mode::ToolCall => self.step_tool(out),
+                Mode::Text => self.step_text(out, eof),
+                Mode::Thinking => self.step_thinking(out, eof),
+                Mode::ToolCall => self.step_tool(out, eof),
                 Mode::Calls => self.step_calls(),
                 Mode::Closed => false,
             };
@@ -465,54 +676,29 @@ impl<'a> ResponseStream<'a> {
         }
     }
 
-    /// Flushes remaining buffered text when generation ends.
-    pub fn finish(&mut self, out: &mut Vec<ResponseEvent>) {
-        if self.mode == Mode::Closed {
-            self.buf.clear();
-            return;
-        }
-        if self.mode == Mode::ToolCall
-            && let Some(spec) = &self.parser.tool_calls
-            && (self.tool.started() || !self.buf.is_empty())
-        {
-            let rest = std::mem::take(&mut self.buf);
-            self.tool.finish(spec, &rest, out);
-            return;
-        }
-        if self.buf.is_empty() {
-            return;
-        }
-        let mut rest = std::mem::take(&mut self.buf);
-        if std::mem::take(&mut self.opening) {
-            match self.opener_len(&rest) {
-                Some(cut) => drop(rest.drain(..cut)),
-                None => self.mode = Mode::Text,
-            }
-            if rest.is_empty() {
-                return;
-            }
-        }
-        match self.mode {
-            Mode::Thinking => out.push(ResponseEvent::Reasoning(rest)),
-            Mode::Text | Mode::ToolCall | Mode::Calls => out.push(ResponseEvent::Content(rest)),
-            Mode::Closed => {}
-        }
-    }
-
-    fn step_text(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn step_text(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         if self.lead {
             let kept = self.buf.trim_start_matches('\n').len();
-            self.buf.drain(..self.buf.len() - kept);
+            self.drain_buf(self.buf.len() - kept, false);
             if self.buf.is_empty() {
                 return false;
             }
             self.lead = false;
         }
-        if let Some((at, skip, hit)) = self.find_hit() {
+        let close_hold = if eof {
+            0
+        } else {
+            self.parser.content_close.tail_hold(&self.buf)
+        };
+        let safe_end = self.buf.len() - close_hold;
+        if let Some((at, skip, hit)) = self.find_hit(eof)
+            && (eof || matches!(hit, Hit::Close) || at < safe_end)
+        {
             if at > 0 {
                 out.push(ResponseEvent::Content(self.buf[..at].to_string()));
+                self.drain_buf(at, false);
             }
-            self.buf.drain(..at + skip);
+            self.drain_buf(skip, matches!(hit, Hit::Thinking));
             self.mode = match hit {
                 Hit::Thinking => {
                     let thinking = self.parser.thinking.as_ref();
@@ -527,10 +713,14 @@ impl<'a> ResponseStream<'a> {
                 }
                 Hit::Close => {
                     self.buf.clear();
+                    self.spans.clear();
                     Mode::Closed
                 }
             };
             return self.mode != Mode::Closed;
+        }
+        if eof {
+            return false;
         }
         let mut needles: Vec<&str> = Vec::new();
         if let Some(t) = &self.parser.thinking {
@@ -542,34 +732,32 @@ impl<'a> ResponseStream<'a> {
             needles.extend(t.open.triggers());
             needles.extend(t.outer.as_ref().map(|[o, _]| o.as_str()));
         }
-        for c in &self.parser.content_close {
-            needles.push(c.as_str());
-        }
-        let keep = tail_hold(&self.buf, &needles);
+        let keep = tail_hold(&self.buf, &needles).max(close_hold);
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Content(self.buf[..emit].to_string()));
-            self.buf.drain(..emit);
+            self.drain_buf(emit, false);
         }
         false
     }
 
-    fn step_thinking(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn step_thinking(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         let Some(spec) = &self.parser.thinking else {
             self.mode = Mode::Text;
             return true;
         };
         if self.opening {
-            let close = find_close(&self.buf, &spec.close);
+            let from = spec.open.min_close_offset(&self.buf);
+            let close = spec.close.find_from_for(&self.buf, from, eof);
             match (self.opener_len(&self.buf), close) {
                 // Text after the match shows that the opener is complete.
-                (Some(cut), _) if cut < self.buf.len() => {
-                    self.buf.drain(..cut);
+                (Some(cut), _) if cut < self.buf.len() || eof => {
+                    self.drain_buf(cut, true);
                     self.opening = false;
                 }
                 (None, Some((at, len))) => {
                     out.push(ResponseEvent::Content(self.buf[..at + len].to_string()));
-                    self.buf.drain(..at + len);
+                    self.drain_buf(at + len, false);
                     self.opening = false;
                     self.mode = Mode::Text;
                     return true;
@@ -577,31 +765,36 @@ impl<'a> ResponseStream<'a> {
                 _ => return false,
             }
         }
-        if let Some((at, len)) = find_close(&self.buf, &spec.close) {
+        if let Some((at, len)) = spec.close.find_for(&self.buf, eof) {
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
             }
-            self.buf.drain(..at + len);
+            self.drain_buf(at + len, true);
             self.mode = Mode::Text;
             self.lead = true;
             return true;
         }
-        let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
-        let keep = tail_hold(&self.buf, &needles);
+        if eof {
+            return false;
+        }
+        let keep = spec.close.tail_hold(&self.buf);
         let emit = self.buf.len() - keep;
         if emit > 0 {
             out.push(ResponseEvent::Reasoning(self.buf[..emit].to_string()));
-            self.buf.drain(..emit);
+            self.drain_buf(emit, true);
         }
         false
     }
 
-    fn step_tool(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+    fn step_tool(&mut self, out: &mut Vec<ResponseEvent>, eof: bool) -> bool {
         let Some(spec) = &self.parser.tool_calls else {
             self.mode = Mode::Text;
             return true;
         };
-        match self.tool.step(spec, &mut self.buf, out) {
+        let before = self.buf.len();
+        let outcome = self.tool.step(spec, &mut self.buf, out, eof);
+        self.shift_spans(before - self.buf.len(), false);
+        match outcome {
             StepOutcome::Wait => false,
             StepOutcome::Continue => true,
             StepOutcome::Done => {
@@ -627,11 +820,11 @@ impl<'a> ResponseStream<'a> {
             .and_then(|[_, c]| Some((self.buf.find(c.as_str())?, c.len())));
         match (open, close) {
             (Some(at), c) if c.is_none_or(|(end, _)| at < end) => {
-                self.buf.drain(..at);
+                self.drain_buf(at, false);
                 self.mode = Mode::ToolCall;
             }
             (_, Some((at, len))) => {
-                self.buf.drain(..at + len);
+                self.drain_buf(at + len, false);
                 self.calls = false;
                 self.mode = Mode::Text;
             }
@@ -647,7 +840,7 @@ impl<'a> ResponseStream<'a> {
         Some(text.len() - rest.len())
     }
 
-    fn find_hit(&self) -> Option<(usize, usize, Hit)> {
+    fn find_hit(&self, eof: bool) -> Option<(usize, usize, Hit)> {
         let mut best: Option<(usize, usize, Hit)> = None;
         let mut pick = |at: usize, skip: usize, hit: Hit| {
             if best.is_none_or(|(b, _, _)| at < b) {
@@ -676,20 +869,20 @@ impl<'a> ResponseStream<'a> {
         {
             pick(at, open.len(), Hit::Calls);
         }
-        if let Some((at, len)) = find_close(&self.buf, &self.parser.content_close) {
+        if let Some((at, len)) = self.parser.content_close.find_for(&self.buf, eof) {
             pick(at, len, Hit::Close);
         }
         best
     }
 }
 
-fn find_close(text: &str, closes: &[String]) -> Option<(usize, usize)> {
+fn find_literal(text: &str, literals: &[String]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
-    for c in closes {
-        if let Some(at) = text.find(c.as_str())
+    for s in literals {
+        if let Some(at) = text.find(s.as_str())
             && best.is_none_or(|(b, _)| at < b)
         {
-            best = Some((at, c.len()));
+            best = Some((at, s.len()));
         }
     }
     best
@@ -711,45 +904,10 @@ fn tail_hold(buf: &str, needles: &[&str]) -> usize {
     hold
 }
 
-/// Extracts the leading literal text from a regex pattern.
-fn literal_prefix(pattern: &str) -> String {
-    let mut out = String::new();
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let Some(&next) = chars.peek() else { break };
-            if matches!(
-                next,
-                'w' | 'W' | 'd' | 'D' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z'
-            ) {
-                break;
-            }
-            let escaped = match next {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other if other.is_ascii_punctuation() => other,
-                _ => break,
-            };
-            chars.next();
-            out.push(escaped);
-            continue;
-        }
-        if matches!(
-            c,
-            '(' | ')' | '[' | ']' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '^' | '$'
-        ) {
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Calls in one block, one per JSON list item.
-fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
-    let (captures, rest) = spec.open.strip(block)?;
-    let parsed = spec.body.parse(rest)?;
+fn parse_tool(spec: &BlockSpec, text: &str, body_end: usize) -> Option<Vec<ToolCall>> {
+    let (captures, rest) = spec.open.strip(&text[..body_end])?;
+    let open_len = body_end - rest.len();
+    let parsed = spec.body.parse(&text[open_len..], rest.len())?;
     let shaped = match &spec.transform {
         Some(tmpl) => apply_transform(tmpl, &captures, &parsed),
         None => parsed,

@@ -38,7 +38,7 @@ impl Model {
         let mut answer = String::new();
         while let Ok(step) = steps.recv() {
             let (text, done) = match step {
-                Step::Token { text, .. } => (text, false),
+                Step::Token { text, .. } | Step::Text { text, .. } => (text, false),
                 Step::Done { text, .. } => (text, true),
             };
             each(&text);

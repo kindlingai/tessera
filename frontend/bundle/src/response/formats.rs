@@ -66,8 +66,7 @@ impl ResponseParser {
             b.as_ref().map_or(Vec::new(), |b| b.open.triggers())
         }
         fn close(b: &Option<BlockSpec>) -> Vec<&str> {
-            b.as_ref()
-                .map_or(Vec::new(), |b| b.close.iter().map(String::as_str).collect())
+            b.as_ref().map_or(Vec::new(), |b| b.close.consuming())
         }
         Markers {
             think_open: open(&self.thinking),
@@ -89,8 +88,19 @@ impl ResponseParser {
             return Some(format!("{outer}{}", tmpl.replace("{name}", name)));
         }
         match &block.open {
-            Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
-                Some(format!("{outer}{prefix}{name}"))
+            Opener::Pattern { prefix, regex } if !prefix.is_empty() => {
+                let cand = if prefix.ends_with("<function=") {
+                    format!("{prefix}{name}>")
+                } else if regex.as_str().contains("<function=(?P<name>") {
+                    format!("{prefix}\n<function={name}>\n")
+                } else {
+                    format!("{prefix}{name}")
+                };
+                let (caps, rest) = block.open.strip(&cand)?;
+                if caps.get("name").map(String::as_str) != Some(name) || !rest.trim().is_empty() {
+                    return None;
+                }
+                Some(format!("{outer}{cand}"))
             }
             Opener::Literal(opens) if matches!(block.body, Body::Json(_)) => {
                 let open = opens.first()?;

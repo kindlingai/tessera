@@ -93,4 +93,28 @@ fn stops_hold() {
     let mut tail = Stops::new(vec!["END".into()]);
     assert_eq!(tail.push("abEN"), ("ab".into(), false));
     assert_eq!(tail.rest(), "EN");
+    check_stops_tagged();
+}
+
+fn check_stops_tagged() {
+    let mut stops = Stops::new(vec!["ZZ".into()]);
+    assert!(stops.is_buffering());
+    assert_eq!(
+        stops.push_tagged(1, "preface "),
+        (vec![(1, "preface".into())], false)
+    );
+    assert_eq!(
+        stops.push_tagged(2, "<think>é"),
+        (vec![(1, " ".into()), (2, "<think>".into())], false)
+    );
+    assert_eq!(stops.rest_tagged(), vec![(2, "é".into())]);
+    // Empty UTF-8 lead token stays ordered right before its continuation.
+    let mut utf8 = Stops::new(vec!["ZZ".into()]);
+    assert_eq!(
+        utf8.push_tagged(1, "<think>"),
+        (vec![(1, "<think".into())], false)
+    );
+    assert_eq!(utf8.push_tagged(2, ""), (vec![], false));
+    assert_eq!(utf8.push_tagged(3, "é"), (vec![(1, ">".into())], false));
+    assert_eq!(utf8.rest_tagged(), vec![(2, "".into()), (3, "é".into())]);
 }

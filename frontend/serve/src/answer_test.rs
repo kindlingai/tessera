@@ -203,3 +203,507 @@ fn sampling_params_accepted() {
     });
     assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
 }
+
+struct UnguidedMock(&'static str);
+
+impl tessera_tasks::api::Generator for UnguidedMock {
+    fn supports_guides(&self) -> bool {
+        false
+    }
+
+    fn generate(
+        &self,
+        _prompt: Vec<u32>,
+        _params: tessera_tasks::api::Params,
+        mut sink: tessera_tasks::api::Sink,
+    ) -> Result<(), tessera_tasks::Error> {
+        sink(tessera_tasks::api::Step::Done {
+            text: self.0.into(),
+            finish: tessera_tasks::api::Finish::Stop,
+            tokens: 1,
+            cached: 0,
+        });
+        Ok(())
+    }
+}
+
+fn custom_slot(
+    generator: Arc<dyn tessera_tasks::api::Generator>,
+    parser: ResponseParser,
+) -> crate::Slot {
+    let slot: crate::Slot = Arc::new(std::sync::OnceLock::new());
+    slot.set(crate::Model {
+        info: tessera_tasks::api::Info {
+            name: "m".into(),
+            context: 256,
+        },
+        tokens: Arc::new(crate::mocks::MockTokens),
+        chat: Some(Arc::new(crate::mocks::MockChat {
+            response: Some(parser),
+        })),
+        generator: Some(generator),
+        score: None,
+        strict: true,
+        asks: None,
+        image: None,
+        embed: None,
+    })
+    .ok()
+    .unwrap();
+    slot
+}
+
+fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
+    custom_slot(Arc::new(UnguidedMock(text)), parser)
+}
+
+#[test]
+fn forced_tool_choice() {
+    let tool = json!({"type": "function", "function": {"name": "ping"}});
+    let force_ping = json!({"type": "function", "function": {"name": "ping"}});
+    // Mismatched function name fails on both whole and SSE.
+    let bad_slot = unguided_slot("pong{}<tool_call|>", tool_parser());
+    let req = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool],
+        "tool_choice": force_ping,
+    });
+    let (status, got) = json(&bad_slot, "/v1/chat/completions", Some(req.clone()));
+    assert_eq!(status, 500);
+    assert!(
+        got["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pingpong")
+    );
+    let mut sse_req = req.clone();
+    sse_req["stream"] = json!(true);
+    let (_, sse) = call(&bad_slot, "/v1/chat/completions", Some(sse_req));
+    assert!(
+        !sse.contains("\"tool_calls\"")
+            && !sse.contains("\"choices\"")
+            && sse.contains("\"error\"")
+            && sse.contains("[DONE]")
+    );
+    // Matching function name succeeds on whole and SSE.
+    let ok_slot = unguided_slot("{}<tool_call|>", tool_parser());
+    let (status, got) = json(&ok_slot, "/v1/chat/completions", Some(req));
+    assert_eq!(status, 200);
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        got["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "ping"
+    );
+    // Missing required tool call fails on whole and SSE.
+    let miss_slot = unguided_slot("never mind", tool_parser());
+    let req_req = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "ping"}}],
+        "tool_choice": "required",
+    });
+    let (status, got) = json(&miss_slot, "/v1/chat/completions", Some(req_req.clone()));
+    assert_eq!(status, 500);
+    assert!(got["error"]["message"].as_str().is_some());
+    let mut miss_sse = req_req;
+    miss_sse["stream"] = json!(true);
+    let (_, sse) = call(&miss_slot, "/v1/chat/completions", Some(miss_sse));
+    assert!(!sse.contains("never mind") && !sse.contains("\"stop\"") && sse.contains("\"error\""));
+}
+
+fn check_think_case(
+    pat: &str,
+    pieces: &[&str],
+    want_reason: &str,
+    want_content: &str,
+    want_tokens: u64,
+) {
+    check_think_with_content(pat, None, pieces, want_reason, want_content, want_tokens);
+}
+
+fn check_think_with_content(
+    pat: &str,
+    content_close: Option<&str>,
+    pieces: &[&str],
+    want_reason: &str,
+    want_content: &str,
+    want_tokens: u64,
+) {
+    let mut fields = json!({
+        "reasoning_content": {"open": "<think>", "close_pattern": pat, "content": "text"},
+    });
+    if let Some(close) = content_close {
+        fields["content"] = json!({"close_pattern": close, "content": "text"});
+    }
+    let cfg = json!({"response_template": {"fields": fields}}).to_string();
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let mock = Arc::new(MockGenerator {
+        pieces: pieces.iter().map(|s| (*s).into()).collect(),
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, Some(parser));
+    check_slot_think(&slot, want_reason, want_content, want_tokens);
+}
+
+fn check_slot_think(slot: &crate::Slot, want_reason: &str, want_content: &str, want_tokens: u64) {
+    let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+    let (status, got) = json(slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    assert_eq!(
+        got["choices"][0]["message"]["reasoning_content"],
+        want_reason
+    );
+    assert_eq!(got["choices"][0]["message"]["content"], want_content);
+    assert_eq!(
+        got["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        want_tokens
+    );
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    let (s_status, sse) = call(slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+        if let Some(r) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+            reasoning.push_str(r);
+        }
+    }
+    assert_eq!(content, want_content);
+    assert_eq!(reasoning, want_reason);
+    assert!(
+        sse.contains(&format!("\"reasoning_tokens\":{want_tokens}")),
+        "sse: {sse}"
+    );
+}
+
+struct StepsMock(Vec<tessera_tasks::api::Step>);
+
+impl tessera_tasks::api::Generator for StepsMock {
+    fn generate(
+        &self,
+        _prompt: Vec<u32>,
+        _params: tessera_tasks::api::Params,
+        mut sink: tessera_tasks::api::Sink,
+    ) -> Result<(), tessera_tasks::Error> {
+        for step in &self.0 {
+            if !sink(step.clone()) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn steps_slot(steps: Vec<tessera_tasks::api::Step>, parser: ResponseParser) -> crate::Slot {
+    custom_slot(Arc::new(StepsMock(steps)), parser)
+}
+
+fn check_stop_tail_usage() {
+    use tessera_tasks::api::{Finish, Step};
+    let cfg = json!({"response_template": {"fields": {
+        "reasoning_content": {"open": "<think>", "close_pattern": "</think>", "content": "text"},
+    }}})
+    .to_string();
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let flush = steps_slot(
+        vec![
+            Step::Token {
+                id: 1,
+                text: "preface".into(),
+            },
+            Step::Token {
+                id: 2,
+                text: " <think>".into(),
+            },
+            Step::Done {
+                text: "é".into(),
+                finish: Finish::Stop,
+                tokens: 2,
+                cached: 0,
+            },
+        ],
+        parser.clone(),
+    );
+    check_slot_think(&flush, "é", "preface ", 1);
+    // Tagged stop pieces keep third non-reasoning token uncounted.
+    let tagged = steps_slot(
+        vec![
+            Step::Text {
+                token: 1,
+                text: "<think>".into(),
+            },
+            Step::Text {
+                token: 1,
+                text: "a".into(),
+            },
+            Step::Text {
+                token: 2,
+                text: "</think".into(),
+            },
+            Step::Text {
+                token: 2,
+                text: ">".into(),
+            },
+            Step::Text {
+                token: 3,
+                text: "b".into(),
+            },
+            Step::Done {
+                text: String::new(),
+                finish: Finish::Stop,
+                tokens: 3,
+                cached: 0,
+            },
+        ],
+        parser,
+    );
+    check_slot_think(&tagged, "a", "b", 2);
+}
+
+fn check_xml_tool_case(
+    close_pat: &str,
+    tag_pat: &str,
+    pieces: &[&str],
+    want_args: &[Value],
+    want_content: &str,
+) {
+    let tool_cfg = json!({"response_template": {"fields": {"tool_calls": {
+        "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+        "close_pattern": close_pat,
+        "content": "xml-inline",
+        "content_args": {"tag_pattern": tag_pat},
+        "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+    }}}})
+    .to_string();
+    let mock = Arc::new(MockGenerator {
+        pieces: pieces.iter().map(|s| (*s).into()).collect(),
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, ResponseParser::from_config(&tool_cfg).unwrap());
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "ping"}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+    });
+    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    assert_eq!(got["choices"][0]["message"]["content"], want_content);
+    let calls = got["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), want_args.len());
+    for (call, want) in calls.iter().zip(want_args) {
+        assert_eq!(call["function"]["name"], "ping");
+        let raw = call["function"]["arguments"].as_str().unwrap();
+        assert_eq!(&serde_json::from_str::<Value>(raw).unwrap(), want);
+    }
+    body["stream"] = json!(true);
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    let mut args = vec![String::new(); want_args.len()];
+    let mut content = String::new();
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+        for item in v["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let i = item["index"].as_u64().unwrap() as usize;
+            if let Some(a) = item["function"]["arguments"].as_str() {
+                args[i].push_str(a);
+            }
+        }
+    }
+    for (raw, want) in args.iter().zip(want_args) {
+        assert_eq!(&serde_json::from_str::<Value>(raw).unwrap(), want);
+    }
+    assert_eq!(content, want_content);
+}
+
+fn check_lookahead_tools() {
+    let implicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?(?:</parameter>|(?=<parameter=)|(?=</function>))";
+    let explicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>";
+    let implicit_pieces: &[&str] = &[
+        "<tool_call><function=ping><parameter=x>1</function></tool_call>",
+        "\n<tool_call><function=ping><parameter=x>2</function></tool_call>",
+        " All done.",
+    ];
+    let two = [json!({"x": 1}), json!({"x": 2})];
+    let one = [json!({"y": 2, "x": 1})];
+    for (close_pat, tag_pat, pieces, want, content) in [
+        (
+            "</tool_call>(?!-literal)",
+            explicit_tag,
+            &[
+                "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>",
+                "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done.",
+            ][..],
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"(?<=</parameter></function>)</tool_call>",
+            explicit_tag,
+            &[
+                "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+                "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
+                " All done.",
+            ][..],
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"</function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"[<]/function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"(?<=[0-9])</function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"</function></tool_call>",
+            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|$)",
+            &[
+                "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function></tool_call> All done.",
+            ][..],
+            &one[..],
+            " All done.",
+        ),
+        (
+            r"(?=</function>)",
+            r"[<]parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|(?=</function></tool_call>))",
+            &[
+                "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function>",
+                "</tool_call> All done.",
+            ][..],
+            &one[..],
+            "</function></tool_call> All done.",
+        ),
+    ] {
+        check_xml_tool_case(close_pat, tag_pat, pieces, want, content);
+    }
+}
+
+fn check_think_cases() {
+    check_think_case(
+        "</think>(?!-literal)",
+        &["<think>plan</think> ", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        " The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>(?!-literal)",
+        &["<think>plan</think>", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        "The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>(?!.*-literal)",
+        &["<think>plan</think> ", "The ", "answer ", "is ", "42.", ""],
+        "plan",
+        " The answer is 42.",
+        1,
+    );
+    check_think_case(
+        "</think>\\s*</analysis>|</think>(?!-literal)",
+        &["<think>plan</think> ", "</analysis>answer"],
+        "plan",
+        "answer",
+        2,
+    );
+    check_think_case(
+        "</think>",
+        &["<think>plan", "", "é", " more</think>answer", ""],
+        "plané more",
+        "answer",
+        4,
+    );
+    check_think_case(
+        "</think>(?!.*-literal)",
+        &[
+            "<think>one</think> <think>two",
+            " three",
+            " four",
+            " five</think>",
+            "answer",
+            "",
+        ],
+        "onetwo three four five",
+        " answer",
+        4,
+    );
+    check_think_case(
+        "</think>(?:\\s*</analysis>)?(?!-literal)",
+        &["<think>plan</think> ", "</analysis>answer", ""],
+        "plan",
+        "answer",
+        2,
+    );
+    check_think_case(
+        r"</think\s*>(?<!raw</think>)",
+        &["<think>raw</think> first", " end</think>answer", ""],
+        "raw</think> first end",
+        "answer",
+        2,
+    );
+    check_think_case(
+        "</think></analysis>|</think>",
+        &["<think>plan</think>", "</analysis>answer", ""],
+        "plan",
+        "answer",
+        2,
+    );
+    check_think_with_content(
+        "</think>",
+        Some("<end>(?!.*literal)"),
+        &[
+            "<end>-literal <think>plan",
+            "",
+            "é",
+            " more</think>answer",
+            "",
+        ],
+        "plané more",
+        "<end>-literal answer",
+        4,
+    );
+    check_stop_tail_usage();
+}
+
+#[test]
+fn lookahead_closer_usage() {
+    check_think_cases();
+    check_lookahead_tools();
+}

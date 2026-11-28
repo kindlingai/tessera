@@ -24,6 +24,9 @@ struct Parsing {
     parallel_tools: bool,
     thinking: bool,
     tool_choice: ToolChoice,
+    guide_choice: ToolChoice,
+    allowed_tools: Vec<String>,
+    forced_prefix: String,
 }
 
 impl Parsing {
@@ -34,6 +37,9 @@ impl Parsing {
             parallel_tools: true,
             thinking: false,
             tool_choice: ToolChoice::Auto,
+            guide_choice: ToolChoice::Auto,
+            allowed_tools: Vec::new(),
+            forced_prefix: String::new(),
         }
     }
 }
@@ -158,7 +164,7 @@ fn start(
         thinking,
         sequence,
         starts_thinking: parsing.thinking,
-        tool_choice: parsing.tool_choice.clone(),
+        tool_choice: parsing.guide_choice.clone(),
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
@@ -216,6 +222,10 @@ fn complete(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Ref
 fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal> {
     let c: Chat = wire::parse(model, body)?;
     let given_tools = c.messages.tools.as_deref().unwrap_or(&[]);
+    let allowed_tools: Vec<String> = given_tools
+        .iter()
+        .map(|t| t.function.name.clone())
+        .collect();
     let (allow_tools, tool_choice) = match &c.tool_choice {
         Some(choice) => choice.resolve(given_tools)?,
         None => (true, ToolChoice::Auto),
@@ -231,8 +241,38 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
     if has_tools && parser.as_ref().is_none_or(|p| !p.supports_tools()) {
         return Err(bad("this model does not support tool calling", "tools"));
     }
-    let (prompt, tools) = crate::render(model, c.messages, allow_tools)?;
-    let thinking = parser.as_ref().is_some_and(|p| p.starts_thinking(&prompt));
+    let (mut prompt, tools) = crate::render(model, c.messages, allow_tools)?;
+    let mut thinking = parser.as_ref().is_some_and(|p| p.starts_thinking(&prompt));
+    let mut forced_prefix = String::new();
+    let mut guide_choice = tool_choice.clone();
+    if tool_choice != ToolChoice::Auto
+        && model
+            .generator
+            .as_ref()
+            .is_some_and(|g| !g.supports_guides())
+    {
+        let name = match &tool_choice {
+            ToolChoice::Function(n) => Some(n.as_str()),
+            ToolChoice::Required | ToolChoice::Auto => None,
+        };
+        let open = parser
+            .as_ref()
+            .and_then(|p| p.call_prefix(name))
+            .ok_or_else(|| bad("this model cannot force a tool call", "tool_choice"))?;
+        if thinking {
+            let close = parser
+                .as_ref()
+                .and_then(|p| p.markers().think_close.into_iter().next())
+                .ok_or_else(|| bad("this model cannot force a tool call", "tool_choice"))?;
+            prompt.push('\n');
+            prompt.push_str(close);
+            prompt.push_str("\n\n");
+            thinking = false;
+        }
+        prompt.push_str(&open);
+        forced_prefix = open;
+        guide_choice = ToolChoice::Auto;
+    }
     let prompt = model
         .tokens
         .encode(&prompt)
@@ -244,6 +284,9 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
         parallel_tools: c.parallel_tool_calls.unwrap_or(true),
         thinking,
         tool_choice,
+        guide_choice,
+        allowed_tools,
+        forced_prefix,
     };
     start(model, Kind::Chat, prompt, asked, c.common, parsing, ask)
 }
@@ -258,11 +301,11 @@ impl Started {
     }
 
     /// One choice: whole text, or a piece of a stream.
-    fn choice(&self, text: &str, end: Option<Finish>) -> Value {
+    fn choice(&self, text: &str, end: Option<Finish>) -> Result<Value, Refusal> {
         let reason = end.map(|f| finish(f, false));
         match (self.kind, self.stream) {
             (Kind::Text, _) => {
-                json!({"index": 0, "text": text, "logprobs": null, "finish_reason": reason})
+                Ok(json!({"index": 0, "text": text, "logprobs": null, "finish_reason": reason}))
             }
             (Kind::Chat, false) => self.chat_choice(text, end),
             (Kind::Chat, true) => {
@@ -270,7 +313,7 @@ impl Started {
                     true => json!({}),
                     false => json!({"content": text}),
                 };
-                self.delta_choice(delta, reason)
+                Ok(self.delta_choice(delta, reason))
             }
         }
     }
@@ -279,17 +322,66 @@ impl Started {
         json!({"index": 0, "delta": delta, "logprobs": null, "finish_reason": reason})
     }
 
-    fn chat_choice(&self, text: &str, end: Option<Finish>) -> Value {
+    fn missing_call(&self) -> Refusal {
+        let msg = match &self.parsing.tool_choice {
+            ToolChoice::Function(name) => format!("model did not call required tool `{name}`"),
+            _ => "model did not produce the required tool call".into(),
+        };
+        refuse(500, msg, None)
+    }
+
+    fn check_call_name(&self, name: &str) -> Result<(), Refusal> {
+        match &self.parsing.tool_choice {
+            ToolChoice::Auto => Ok(()),
+            ToolChoice::Required => match self.parsing.allowed_tools.iter().any(|t| t == name) {
+                true => Ok(()),
+                false => Err(refuse(
+                    500,
+                    format!("model called undeclared tool `{name}`"),
+                    None,
+                )),
+            },
+            ToolChoice::Function(want) => match name == want {
+                true => Ok(()),
+                false => Err(refuse(
+                    500,
+                    format!("model called `{name}` instead of required tool `{want}`"),
+                    None,
+                )),
+            },
+        }
+    }
+
+    fn check_calls(&self, calls: &[ToolCall]) -> Result<(), Refusal> {
+        if self.parsing.tool_choice == ToolChoice::Auto {
+            return Ok(());
+        }
+        if calls.is_empty() {
+            return Err(self.missing_call());
+        }
+        for call in calls {
+            self.check_call_name(&call.function.name)?;
+        }
+        Ok(())
+    }
+
+    fn chat_choice(&self, text: &str, end: Option<Finish>) -> Result<Value, Refusal> {
         let Some(parser) = &self.parsing.parser else {
-            return json!({
+            return Ok(json!({
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
                 "logprobs": null,
                 "finish_reason": end.map(|f| finish(f, false)),
-            });
+            }));
         };
         let parsed = parser.parse(text, self.parsing.tools, self.parsing.thinking);
-        let called = !parsed.tool_calls.is_empty();
+        let limit = match self.parsing.parallel_tools {
+            true => parsed.tool_calls.len(),
+            false => 1.min(parsed.tool_calls.len()),
+        };
+        let chosen = &parsed.tool_calls[..limit];
+        self.check_calls(chosen)?;
+        let called = !chosen.is_empty();
         let mut msg = Map::new();
         msg.insert("role".into(), json!("assistant"));
         let content = match (called, parsed.content.is_empty()) {
@@ -301,24 +393,15 @@ impl Started {
             msg.insert("reasoning_content".into(), Value::String(parsed.reasoning));
         }
         if called {
-            let limit = match self.parsing.parallel_tools {
-                true => parsed.tool_calls.len(),
-                false => 1,
-            };
-            let calls: Vec<Value> = parsed
-                .tool_calls
-                .iter()
-                .take(limit)
-                .map(|c| format_call(c, None))
-                .collect();
+            let calls: Vec<Value> = chosen.iter().map(|c| format_call(c, None)).collect();
             msg.insert("tool_calls".into(), Value::Array(calls));
         }
-        json!({
+        Ok(json!({
             "index": 0,
             "message": Value::Object(msg),
             "logprobs": null,
             "finish_reason": end.map(|f| finish(f, called)),
-        })
+        }))
     }
 
     /// `usage` holds answer, reasoning, and cached prompt token counts.
@@ -347,7 +430,7 @@ impl Started {
 
     /// Waits for the end and answers in one body.
     fn whole(self) -> Response {
-        let mut text = String::new();
+        let mut text = self.parsing.forced_prefix.clone();
         let mut reasoning = 0usize;
         let mut stream = self
             .parsing
@@ -355,12 +438,35 @@ impl Started {
             .as_ref()
             .map(|p| p.stream(self.parsing.tools, self.parsing.thinking));
         let mut events = Vec::new();
+        let mut seen = 0usize;
+        if !self.parsing.forced_prefix.is_empty()
+            && let Some(s) = &mut stream
+        {
+            feed_stream(
+                s,
+                Some(0),
+                &self.parsing.forced_prefix,
+                false,
+                &mut events,
+                &mut reasoning,
+            );
+            events.clear();
+        }
         while let Ok(step) = self.steps.recv() {
             match step {
                 Step::Token { text: piece, .. } => {
+                    seen += 1;
                     if let Some(s) = &mut stream {
                         events.clear();
-                        feed_stream(s, &piece, false, &mut events, &mut reasoning);
+                        feed_stream(s, Some(seen), &piece, false, &mut events, &mut reasoning);
+                    }
+                    text += &piece;
+                }
+                Step::Text { token, text: piece } => {
+                    seen = seen.max(token);
+                    if let Some(s) = &mut stream {
+                        events.clear();
+                        feed_stream(s, Some(token), &piece, false, &mut events, &mut reasoning);
                     }
                     text += &piece;
                 }
@@ -372,10 +478,19 @@ impl Started {
                 } => {
                     if let Some(s) = &mut stream {
                         events.clear();
-                        feed_stream(s, &rest, true, &mut events, &mut reasoning);
+                        let tok = (!rest.is_empty()).then(|| {
+                            if seen < tokens {
+                                seen += 1;
+                            }
+                            seen
+                        });
+                        feed_stream(s, tok, &rest, true, &mut events, &mut reasoning);
                     }
                     text += &rest;
-                    let choice = self.choice(&text, Some(finish));
+                    let choice = match self.choice(&text, Some(finish)) {
+                        Ok(choice) => choice,
+                        Err(refused) => return refused.into(),
+                    };
                     let usage = Some((tokens, reasoning.min(tokens), cached));
                     return Response::json(200, &self.body(json!([choice]), usage));
                 }
@@ -387,6 +502,12 @@ impl Started {
     /// Sends each step as a chunk, then `[DONE]`.
     fn forward(self, out: &mpsc::Sender<String>) {
         let send = |v: Value| out.send(v.to_string()).is_ok();
+        if self.kind == Kind::Chat
+            && let Some(parser) = self.parsing.parser.clone()
+        {
+            self.forward_parsed(&parser, out);
+            return;
+        }
         if self.kind == Kind::Chat {
             let delta = json!([{"index": 0, "delta": {"role": "assistant", "content": ""},
                 "logprobs": null, "finish_reason": null}]);
@@ -394,16 +515,10 @@ impl Started {
                 return;
             }
         }
-        if self.kind == Kind::Chat
-            && let Some(parser) = self.parsing.parser.clone()
-        {
-            self.forward_parsed(&parser, out);
-            return;
-        }
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
-                Step::Token { text, .. } if text.is_empty() => continue,
-                Step::Token { text, .. } => (text, None),
+                Step::Token { text, .. } | Step::Text { text, .. } if text.is_empty() => continue,
+                Step::Token { text, .. } | Step::Text { text, .. } => (text, None),
                 Step::Done {
                     text,
                     finish,
@@ -411,7 +526,14 @@ impl Started {
                     cached,
                 } => (text, Some((finish, (tokens, 0, cached)))),
             };
-            let choice = self.choice(&text, end.map(|(f, _)| f));
+            let choice = match self.choice(&text, end.map(|(f, _)| f)) {
+                Ok(choice) => choice,
+                Err(refused) => {
+                    send(refused.body());
+                    let _ = out.send("[DONE]".into());
+                    return;
+                }
+            };
             if !send(self.body(json!([choice]), None)) {
                 return;
             }
@@ -431,24 +553,74 @@ impl Started {
     /// Streams parsed content, reasoning and tool calls.
     fn forward_parsed(&self, parser: &ResponseParser, out: &mpsc::Sender<String>) {
         let send = |v: Value| out.send(v.to_string()).is_ok();
+        let forced = self.parsing.tool_choice != ToolChoice::Auto;
+        let mut role_sent = false;
+        if !forced {
+            let init = json!([{"index": 0, "delta": {"role": "assistant", "content": ""},
+                "logprobs": null, "finish_reason": null}]);
+            if !send(self.body(init, None)) {
+                return;
+            }
+            role_sent = true;
+        }
+        let mut send_delta = |delta: Value, reason: Option<&str>| -> bool {
+            if !role_sent {
+                let init = json!([{"index": 0, "delta": {"role": "assistant", "content": ""},
+                    "logprobs": null, "finish_reason": null}]);
+                if !send(self.body(init, None)) {
+                    return false;
+                }
+                role_sent = true;
+            }
+            let choice = self.delta_choice(delta, reason);
+            send(self.body(json!([choice]), None))
+        };
         let mut stream = parser.stream(self.parsing.tools, self.parsing.thinking);
         let mut events = Vec::new();
+        let mut pending_content: Vec<String> = Vec::new();
         let mut calls = 0usize;
         let mut active_call: Option<usize> = None;
         let mut suppress_call = false;
         let mut reasoning = 0usize;
+        let mut seen = 0usize;
+        if !self.parsing.forced_prefix.is_empty() {
+            feed_stream(
+                &mut stream,
+                Some(0),
+                &self.parsing.forced_prefix,
+                false,
+                &mut events,
+                &mut reasoning,
+            );
+        }
         while let Ok(step) = self.steps.recv() {
-            let (text, end) = match step {
-                Step::Token { text, .. } => (text, None),
+            let (tok, text, end) = match step {
+                Step::Token { text, .. } => {
+                    seen += 1;
+                    (Some(seen), text, None)
+                }
+                Step::Text { token, text } => {
+                    seen = seen.max(token);
+                    (Some(token), text, None)
+                }
                 Step::Done {
                     text,
                     finish,
                     tokens,
                     cached,
-                } => (text, Some((finish, (tokens, cached)))),
+                } => {
+                    let tok = (!text.is_empty()).then(|| {
+                        if seen < tokens {
+                            seen += 1;
+                        }
+                        seen
+                    });
+                    (tok, text, Some((finish, (tokens, cached))))
+                }
             };
             feed_stream(
                 &mut stream,
+                tok,
                 &text,
                 end.is_some(),
                 &mut events,
@@ -456,11 +628,29 @@ impl Started {
             );
             for event in events.drain(..) {
                 let delta = match event {
-                    ResponseEvent::Content(s) => json!({"content": s}),
+                    ResponseEvent::Content(s) => {
+                        if forced && calls == 0 {
+                            pending_content.push(s);
+                            continue;
+                        }
+                        json!({"content": s})
+                    }
                     ResponseEvent::Reasoning(s) => json!({"reasoning_content": s}),
                     ResponseEvent::ToolCall(tc) => {
                         if !self.parsing.parallel_tools && calls > 0 {
                             continue;
+                        }
+                        if let Err(refused) = self.check_call_name(&tc.function.name) {
+                            send(refused.body());
+                            let _ = out.send("[DONE]".into());
+                            return;
+                        }
+                        if calls == 0 {
+                            for held in pending_content.drain(..) {
+                                if !send_delta(json!({"content": held}), None) {
+                                    return;
+                                }
+                            }
                         }
                         let chunk = format_call(&tc, Some(calls));
                         calls += 1;
@@ -470,6 +660,18 @@ impl Started {
                         if !self.parsing.parallel_tools && calls > 0 {
                             suppress_call = true;
                             continue;
+                        }
+                        if let Err(refused) = self.check_call_name(&name) {
+                            send(refused.body());
+                            let _ = out.send("[DONE]".into());
+                            return;
+                        }
+                        if calls == 0 {
+                            for held in pending_content.drain(..) {
+                                if !send_delta(json!({"content": held}), None) {
+                                    return;
+                                }
+                            }
                         }
                         suppress_call = false;
                         let idx = calls;
@@ -501,14 +703,17 @@ impl Started {
                         continue;
                     }
                 };
-                let choice = self.delta_choice(delta, None);
-                if !send(self.body(json!([choice]), None)) {
+                if !send_delta(delta, None) {
                     return;
                 }
             }
             if let Some((reason, (tokens, cached))) = end {
-                let choice = self.delta_choice(json!({}), Some(finish(reason, calls > 0)));
-                if !send(self.body(json!([choice]), None)) {
+                if forced && calls == 0 {
+                    send(self.missing_call().body());
+                    let _ = out.send("[DONE]".into());
+                    return;
+                }
+                if !send_delta(json!({}), Some(finish(reason, calls > 0))) {
                     return;
                 }
                 if self.usage {
@@ -568,24 +773,22 @@ pub(crate) fn chat_completions(slot: &Slot, request: &Request) -> Response {
     }
 }
 
-/// Feeds one token's text to `stream` and counts reasoning tokens.
+/// Feeds one token's text to `stream` and updates reasoning count.
 fn feed_stream(
     stream: &mut ResponseStream<'_>,
+    token: Option<usize>,
     text: &str,
     done: bool,
     events: &mut Vec<ResponseEvent>,
     reasoning: &mut usize,
 ) {
-    let was = stream.in_thinking();
-    let start = events.len();
-    stream.push(text, events);
+    if let Some(id) = token
+        && (!done || !text.is_empty())
+    {
+        stream.push_for(id, text, events);
+    }
     if done {
         stream.finish(events);
     }
-    let saw = events[start..]
-        .iter()
-        .any(|e| matches!(e, ResponseEvent::Reasoning(_)));
-    if saw || (!done && (was || stream.in_thinking())) {
-        *reasoning += 1;
-    }
+    *reasoning = stream.reasoning_tokens();
 }
