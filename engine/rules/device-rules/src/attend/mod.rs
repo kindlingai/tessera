@@ -54,18 +54,24 @@ impl AttendKind {
         }
     }
 
-    fn kv_entry(self, kv: &str, out_width: usize, has_sinks: bool) -> Option<&'static str> {
-        match (self, kv, out_width, has_sinks) {
-            (Self::Mla, "fp8", MLA_LATENT, false) => Some(MLA_FP8_V512_ENTRY),
-            (Self::Mla, "fp8", MLA_LATENT, true) => Some("tessera_mla_attend_512_fp8"),
-            (Self::Mla, "bf16", MLA_LATENT, _) => Some("tessera_mla_attend_512_bf16"),
-            (Self::Mla, "f32", MLA_LATENT, _) => Some("tessera_mla_attend_512_f32"),
-            (Self::Mla, "fp8", _, _) => Some("tessera_mla_attend_fp8"),
-            (Self::Mla, "bf16", _, _) => Some("tessera_mla_attend_bf16"),
-            (Self::Mla, "f32", _, _) => Some("tessera_mla_attend_f32"),
-            (Self::Gqa, "fp8", _, _) => Some("tessera_gqa_attend_fp8"),
-            (Self::Gqa, "bf16", _, _) => Some("tessera_gqa_attend_bf16"),
-            (Self::Gqa, "f32", _, _) => Some("tessera_gqa_attend_f32"),
+    fn kv_entry(
+        self,
+        kv: &str,
+        out_width: usize,
+        has_sinks: bool,
+        fp8_q: bool,
+    ) -> Option<&'static str> {
+        match (self, kv, out_width, has_sinks, fp8_q) {
+            (Self::Mla, "fp8", MLA_LATENT, false, true) => Some(MLA_FP8_V512_ENTRY),
+            (Self::Mla, "fp8", MLA_LATENT, _, _) => Some("tessera_mla_attend_512_fp8"),
+            (Self::Mla, "bf16", MLA_LATENT, _, _) => Some("tessera_mla_attend_512_bf16"),
+            (Self::Mla, "f32", MLA_LATENT, _, _) => Some("tessera_mla_attend_512_f32"),
+            (Self::Mla, "fp8", _, _, _) => Some("tessera_mla_attend_fp8"),
+            (Self::Mla, "bf16", _, _, _) => Some("tessera_mla_attend_bf16"),
+            (Self::Mla, "f32", _, _, _) => Some("tessera_mla_attend_f32"),
+            (Self::Gqa, "fp8", _, _, _) => Some("tessera_gqa_attend_fp8"),
+            (Self::Gqa, "bf16", _, _, _) => Some("tessera_gqa_attend_bf16"),
+            (Self::Gqa, "f32", _, _, _) => Some("tessera_gqa_attend_f32"),
             _ => None,
         }
     }
@@ -88,6 +94,7 @@ tessera_lower::knob!("fast_mla_attend", "splits", 1, 32);
 tessera_lower::knob!("fast_mla_attend", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_mla_attend", "reduce_min_blocks", 1, 16);
 tessera_lower::knob!("fast_mla_attend", "reduce_threads", 32, 1024);
+tessera_lower::knob!("fast_mla_attend", "fp8_q", 0, 1);
 tessera_lower::knob!("fast_gqa_attend", "splits", 1, 32);
 tessera_lower::knob!("fast_gqa_attend", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_gqa_attend", "reduce_min_blocks", 1, 16);
@@ -444,7 +451,9 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     let (kv_form, vf) = (tree.node(k).form, tree.node(v).form.name());
     let kv = kv_form.name();
     require!(vf == kv, "key form {kv} and value form {vf} differ");
-    let entry = kind.kv_entry(kv, out_width, a.sinks);
+    let rule = kind.names().0;
+    let fp8_q = kind == AttendKind::Mla && tree.knobs.get(rule, "fp8_q").unwrap_or(0) != 0;
+    let entry = kind.kv_entry(kv, out_width, a.sinks, fp8_q);
     require!(entry.is_some(), "kv form {kv} (supports fp8, bf16, f32)");
     let want = kind.width();
     let v_width = tree.node(v).shape.last() == Some(&want);
@@ -502,7 +511,6 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     );
     let (context, kept) = cache?;
     let entry = entry?;
-    let rule = kind.names().0;
     let splits = tree
         .knobs
         .get(rule, "splits")
