@@ -116,6 +116,11 @@ kernel void flash_sunk_metal(
             pos_s[tid] = p;
             from_s[tid] = mine ? from : 0u;
             to_s[tid] = mine ? to : 0u;
+            float sink = fs_floor();
+            if (sink_mode > 0u && r < queries) {
+                sink = sinks[sink_mode == 1u ? head : r * heads + head];
+            }
+            l_s[tid] = sink;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -188,7 +193,9 @@ kernel void flash_sunk_metal(
                 top = max(top, simd_shuffle_xor(top, 4));
                 top = max(top, simd_shuffle_xor(top, 2));
                 top = max(top, simd_shuffle_xor(top, 1));
-                float m_new = max(m[i], top);
+                float sink = l_s[row];
+                float floor = (top > fs_floor() && sink > top) ? min(sink, top + 32.0f) : top;
+                float m_new = max(m[i], floor);
                 float safe = (m_new == fs_floor()) ? 0.0f : m_new;
                 float alpha = exp(m[i] - safe);
                 float weight = exp(s - safe);

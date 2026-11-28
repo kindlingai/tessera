@@ -265,7 +265,7 @@ fn scores(st: &mut Stream, simd: u32, k0: u32, #[build] bk: u32) {
 
 /// A softmax step, `ROWS` rows per SIMD group.
 #[kernel]
-fn soften(st: &mut Stream, #[build] bk: u32) {
+fn soften<const HAS_SINKS: bool>(st: &mut Stream, #[build] bk: u32) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
         let row = simd * ROWS + i;
@@ -281,7 +281,15 @@ fn soften(st: &mut Stream, #[build] bk: u32) {
         top = max(top, shfl_xor(top, 4));
         top = max(top, shfl_xor(top, 2));
         top = max(top, shfl_xor(top, 1));
-        let m_new = max(st.state[i as usize], top);
+        let mut floor = top;
+        if HAS_SINKS && top > f32::NEG_INFINITY {
+            let sink = st.l_s[row];
+            if sink > top {
+                let cap = top + 32.0;
+                floor = if sink < cap { sink } else { cap };
+            }
+        }
+        let m_new = max(st.state[i as usize], floor);
         // A row that has seen nothing keeps zero sums.
         let safe = if m_new == f32::NEG_INFINITY {
             0.0
@@ -376,12 +384,12 @@ fn take_block(
     let simd = lid() / LANES as u32;
     scores(st, simd, k0, bk);
     barrier();
-    fold_block(st, values, hd, at, k0, count, d0, cw, w, bk, held_q, v_form);
+    fold_block::<false>(st, values, hd, at, k0, count, d0, cw, w, bk, held_q, v_form);
 }
 
 /// Softens the scores in `p_s`, then folds values in.
 #[kernel]
-fn fold_block(
+fn fold_block<const HAS_SINKS: bool>(
     st: &mut Stream,
     #[form(v_form)] values: Buf<Dyn>,
     hd: &Head,
@@ -396,7 +404,7 @@ fn fold_block(
     #[build] v_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
-    soften(st, bk);
+    soften::<HAS_SINKS>(st, bk);
     barrier();
     // Held queries made room: values staged with the keys.
     if !held_q {

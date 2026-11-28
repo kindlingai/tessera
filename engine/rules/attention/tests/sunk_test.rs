@@ -370,62 +370,68 @@ fn sunk_metal_is_picked() {
 /// Large sink logits stay finite and match the reference.
 #[test]
 fn sink_stays_finite() {
-    for width in [64usize, 128] {
-        let c = case(Mask::Causal, [2, 1, width, 1, 0]);
-        let g = graph(c);
-        let n = 16usize;
-        let run = [(0u32, 0u32, n as u32)];
-        let inputs = vec![
-            Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
-            Tensor::f32(
-                vec![n, c.kv_heads, c.width],
-                vec![0.0; n * c.kv_heads * c.width],
-            ),
-            Tensor::f32(
-                vec![n, c.kv_heads, c.width],
-                vec![1e37; n * c.kv_heads * c.width],
-            ),
-            Tensor::u32(vec![n], vec![0; n]),
-            Tensor::u32(vec![n], (0..n as u32).collect()),
-            Tensor::f32(vec![c.heads], vec![90.0; c.heads]),
-            Tensor::f32(vec![n, c.heads, 1], vec![0.0; n * c.heads]),
-        ];
-        let mut store = Store::default();
-        let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
-        let expected = want[0].floats().unwrap();
-        assert!(
-            expected[0] > 1e-3 && expected[0].is_finite(),
-            "{:?}",
-            expected[0]
-        );
-        for settings in runs() {
-            let dev = Device::guess(&settings).favoring(RULE);
-            if dev.platform.backend != "host" && dev.platform.backend != "metal" {
-                continue;
-            }
-            let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
-            let names = kernels(&plan);
-            let expect_kernel = if width == 128
-                && dev.platform.backend == "metal"
-                && dev.platform.limits.msl_bfloat
-            {
-                METAL
-            } else {
-                RULE
-            };
-            assert!(names.contains(&expect_kernel), "picked {names:?}");
-            let mut runner = open(plan, &settings).unwrap();
-            let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
-            let got = runner.run(&views).unwrap().remove(0);
-            let got = got.floats().unwrap();
-            let off = max_abs_diff(got, expected);
+    for n in [16usize, 64] {
+        for width in [64usize, 128] {
+            let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+            let g = graph(c);
+            let run = [(0u32, 0u32, n as u32)];
+            let inputs = vec![
+                Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
+                Tensor::f32(
+                    vec![n, c.kv_heads, c.width],
+                    vec![0.0; n * c.kv_heads * c.width],
+                ),
+                Tensor::f32(
+                    vec![n, c.kv_heads, c.width],
+                    vec![1e37; n * c.kv_heads * c.width],
+                ),
+                Tensor::u32(vec![n], vec![0; n]),
+                Tensor::u32(vec![n], (0..n as u32).collect()),
+                Tensor::f32(vec![c.heads], vec![90.0; c.heads]),
+                Tensor::f32(vec![n, c.heads, 1], vec![0.0; n * c.heads]),
+            ];
+            let mut store = Store::default();
+            let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+            let expected = want[0].floats().unwrap();
             assert!(
-                off < 5e-3,
-                "sink=90 w={width} on {} ({expect_kernel}): got {} want {} off {off:e}",
-                runner.device(),
-                got[0],
+                expected[0] > 1e-3 && expected.iter().all(|v| v.is_finite()),
+                "n={n} w={width} expected[0]={:?}",
                 expected[0]
             );
+            for settings in runs() {
+                let dev = Device::guess(&settings).favoring(RULE);
+                if dev.platform.backend != "host" && dev.platform.backend != "metal" {
+                    continue;
+                }
+                let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+                let names = kernels(&plan);
+                let expect_kernel = if width == 128
+                    && dev.platform.backend == "metal"
+                    && dev.platform.limits.msl_bfloat
+                {
+                    METAL
+                } else {
+                    RULE
+                };
+                assert!(names.contains(&expect_kernel), "picked {names:?}");
+                let mut runner = open(plan, &settings).unwrap();
+                let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+                let got = runner.run(&views).unwrap().remove(0);
+                let got = got.floats().unwrap();
+                assert!(
+                    got.iter().all(|v| v.is_finite()),
+                    "sink=90 n={n} w={width} on {} ({expect_kernel}) produced non-finite output",
+                    runner.device()
+                );
+                let off = max_abs_diff(got, expected);
+                assert!(
+                    off < 5e-3,
+                    "sink=90 n={n} w={width} on {} ({expect_kernel}): got {} want {} off {off:e}",
+                    runner.device(),
+                    got[0],
+                    expected[0]
+                );
+            }
         }
     }
 }

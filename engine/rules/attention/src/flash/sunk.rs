@@ -55,6 +55,24 @@ fn scores_near(
     }
 }
 
+/// Stages each row's sink into `l_s` before the loop.
+#[kernel]
+fn stage_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32) {
+    if lid() < BQ {
+        let r = hd.q0 + lid();
+        let mut sink = f32::NEG_INFINITY;
+        if sink_mode > 0 && r < hd.queries {
+            let at = if sink_mode == 1 {
+                hd.head
+            } else {
+                r * hd.heads + hd.head
+            };
+            sink = sinks[at as u64];
+        }
+        st.l_s[lid()] = sink;
+    }
+}
+
 /// Scales two output tiles twice by `alpha_s`.
 #[kernel]
 fn scale_sinks(top: &mut Tiles, bottom: &mut Tiles, alpha_s: &Shared<f32>) {
@@ -214,6 +232,7 @@ fn flash_sunk(
             see_rows(
                 &mut st, &mut pos_s, slots, positions, &hd, slot, keys, before, after,
             );
+            stage_sinks(&mut st, sinks, &hd, sink_mode);
             barrier();
             let span = span_of(&st, keys);
             clear(&mut st);
@@ -227,7 +246,7 @@ fn flash_sunk(
                 score_chunk(&mut st, simd, w, bk, held_q);
                 scores_near(&mut st, &pos_s, rel_bias, &hd, simd, k0, scale, rel_win, bk);
                 barrier();
-                fold_block(
+                fold_block::<true>(
                     &mut st, values, &hd, at, k0, span.hi, 0, w, w, bk, held_q, v_form,
                 );
             }
