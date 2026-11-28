@@ -441,3 +441,52 @@ fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &Closers) -> bool {
 fn is_prim_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')
 }
+
+/// Whether left-trimmed `t` can prefix a JSON number.
+pub(super) fn is_json_number_prefix(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    if i == b.len() {
+        return true;
+    }
+    match b[i] {
+        b'0' => i += 1,
+        b'1'..=b'9' => {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let frac = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == frac {
+            return false;
+        }
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() {
+            return true;
+        }
+        if i == exp {
+            return false;
+        }
+    }
+    b[i..].iter().all(u8::is_ascii_whitespace)
+}

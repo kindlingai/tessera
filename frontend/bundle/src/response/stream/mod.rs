@@ -11,7 +11,7 @@ use super::close::{
     parse_literal_closers, pick_tag_hit, unescape_lit,
 };
 use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
-use json::{RelaxedState, finish_relaxed, step_relaxed};
+use json::{RelaxedState, finish_relaxed, is_json_number_prefix, step_relaxed};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -24,37 +24,37 @@ pub(super) struct TagDelims {
     pub val_close: Vec<Closer>,
     pub trim_lead_nl: bool,
     pub trim_trail_nl: bool,
+    pub key_nonempty: bool,
+    pub key_forbid_nl: bool,
 }
 
 impl TagDelims {
-    /// Extracts literal delimiters from a `key`/`value` regex pattern.
+    /// Extracts literal delimiters from an allowlisted `key`/`value` regex.
     pub(super) fn from_pattern(pattern: &str) -> Option<Self> {
-        let rest = strip_dotall_flag(pattern);
+        let (rest, dotall) = strip_dotall_flag(pattern);
         let key_at = rest.find("(?P<key>")?;
         let key_open = unescape_lit(&rest[..key_at])?;
         let key_end = matching_paren(rest, key_at)?;
-        if rest[key_at + 8..key_end].contains("(?") {
-            return None;
-        }
+        let key_body = &rest[key_at + 8..key_end];
         let after_key = &rest[key_end + 1..];
         let val_at = after_key.find("(?P<value>")?;
         let mid = &after_key[..val_at];
         let val_end = matching_paren(after_key, val_at)?;
-        if after_key[val_at + 10..val_end].contains("(?") {
-            return None;
-        }
-        let after_val = &after_key[val_end + 1..];
+        is_lazy_any(&after_key[val_at + 10..val_end], dotall).then_some(())?;
         let (key_close, val_open, trim_lead_nl) = match mid.split_once("\\s*") {
             Some((kc, vo)) => {
                 let (vo, nl) = strip_opt_nl_end(vo);
-                (unescape_lit(kc)?, unescape_lit(vo)?, nl)
+                let val_open = unescape_lit(vo)?;
+                (!val_open.is_empty()).then_some(())?;
+                (unescape_lit(kc)?, val_open, nl)
             }
             None => {
                 let (kc, nl) = strip_opt_nl_end(mid);
                 (unescape_lit(kc)?, String::new(), nl)
             }
         };
-        let (vc, trim_trail_nl) = strip_opt_nl_start(after_val);
+        let (key_nonempty, key_forbid_nl) = allow_key_body(key_body, &key_close, dotall)?;
+        let (vc, trim_trail_nl) = strip_opt_nl_start(&after_key[val_end + 1..]);
         let val_close = parse_literal_closers(vc)?;
         if key_open.is_empty() || key_close.is_empty() || val_close.is_empty() {
             return None;
@@ -66,6 +66,8 @@ impl TagDelims {
             val_close,
             trim_lead_nl,
             trim_trail_nl,
+            key_nonempty,
+            key_forbid_nl,
         })
     }
 
@@ -360,16 +362,11 @@ impl ToolState {
                         if c.is_none_or(|(end, _)| at + delims.key_open.len() <= end)
                             && (eof || c.is_some() || at + delims.key_open.len() <= safe_end) =>
                     {
-                        buf.drain(..at + delims.key_open.len());
+                        buf.drain(..at);
                         *phase = TagPhase::ReadKey { first };
                         StepOutcome::Continue
                     }
-                    (_, Some((at, len))) => {
-                        buf.drain(..at + len);
-                        out.push(ResponseEvent::ToolCallArgs("}".into()));
-                        out.push(ResponseEvent::ToolCallEnd);
-                        StepOutcome::Done
-                    }
+                    (_, Some((at, len))) => close_tags(buf, out, at + len),
                     _ => {
                         let mut keep = tail_hold(buf, &[delims.key_open.as_str()])
                             .max(spec.close.tail_hold(buf));
@@ -383,21 +380,37 @@ impl ToolState {
             }
             TagPhase::ReadKey { first } => {
                 let first = *first;
+                let start = delims.key_open.len();
+                let tail = &buf[start..];
                 let close = spec.close.find_for(buf, eof);
-                if let Some(at) = buf.find(delims.key_close.as_str())
-                    && close.is_none_or(|(end, _)| at + delims.key_close.len() <= end)
-                    && (eof || close.is_some() || at + delims.key_close.len() <= safe_end)
+                let key_at = tail.find(delims.key_close.as_str());
+                if let Some(nl) = delims.key_forbid_nl.then(|| tail.find('\n')).flatten()
+                    && key_at.is_none_or(|k| nl < k)
                 {
-                    let key = buf[..at].to_string();
-                    buf.drain(..at + delims.key_close.len());
+                    if let Some((c_at, c_len)) = close
+                        && c_at <= start + nl
+                    {
+                        return close_tags(buf, out, c_at + c_len);
+                    }
+                    if eof || close.is_some() || start + nl < safe_end {
+                        return reject_key(buf, phase, first);
+                    }
+                    return StepOutcome::Wait;
+                }
+                if let Some(k) = key_at
+                    && close.is_none_or(|(end, _)| start + k + delims.key_close.len() <= end)
+                    && (eof || close.is_some() || start + k + delims.key_close.len() <= safe_end)
+                {
+                    if delims.key_nonempty && k == 0 {
+                        return reject_key(buf, phase, first);
+                    }
+                    let key = tail[..k].to_string();
+                    buf.drain(..start + k + delims.key_close.len());
                     *phase = next_after_key(delims, first, key);
                     return StepOutcome::Continue;
                 }
                 if let Some((at, len)) = close {
-                    buf.drain(..at + len);
-                    out.push(ResponseEvent::ToolCallArgs("}".into()));
-                    out.push(ResponseEvent::ToolCallEnd);
-                    return StepOutcome::Done;
+                    return close_tags(buf, out, at + len);
                 }
                 StepOutcome::Wait
             }
@@ -414,10 +427,7 @@ impl ToolState {
                     return StepOutcome::Continue;
                 }
                 if let Some((at, len)) = close {
-                    buf.drain(..at + len);
-                    out.push(ResponseEvent::ToolCallArgs("}".into()));
-                    out.push(ResponseEvent::ToolCallEnd);
-                    return StepOutcome::Done;
+                    return close_tags(buf, out, at + len);
                 }
                 StepOutcome::Wait
             }
@@ -759,55 +769,6 @@ fn could_be_json_prefix(s: &str) -> bool {
     }
 }
 
-/// Whether left-trimmed `t` can prefix a JSON number.
-fn is_json_number_prefix(t: &str) -> bool {
-    let b = t.as_bytes();
-    let mut i = usize::from(b.first() == Some(&b'-'));
-    if i == b.len() {
-        return true;
-    }
-    match b[i] {
-        b'0' => i += 1,
-        b'1'..=b'9' => {
-            i += 1;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-        }
-        _ => return false,
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        let frac = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == b.len() {
-            return true;
-        }
-        if i == frac {
-            return false;
-        }
-    }
-    if i < b.len() && matches!(b[i], b'e' | b'E') {
-        i += 1;
-        if i < b.len() && matches!(b[i], b'+' | b'-') {
-            i += 1;
-        }
-        let exp = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == b.len() {
-            return true;
-        }
-        if i == exp {
-            return false;
-        }
-    }
-    b[i..].iter().all(u8::is_ascii_whitespace)
-}
-
 /// Extracts `(id, kind, name)` when `tmpl` maps `arguments` to `{content}`.
 fn transform_meta(
     tmpl: &Value,
@@ -960,23 +921,61 @@ fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn strip_dotall_flag(mut s: &str) -> &str {
+fn close_tags(buf: &mut String, out: &mut Vec<ResponseEvent>, drain: usize) -> StepOutcome {
+    buf.drain(..drain);
+    out.push(ResponseEvent::ToolCallArgs("}".into()));
+    out.push(ResponseEvent::ToolCallEnd);
+    StepOutcome::Done
+}
+
+fn reject_key(buf: &mut String, phase: &mut TagPhase, first: bool) -> StepOutcome {
+    buf.drain(..buf.chars().next().map_or(1, char::len_utf8));
+    *phase = TagPhase::SeekKey { first };
+    StepOutcome::Continue
+}
+
+fn is_lazy_any(body: &str, dotall: bool) -> bool {
+    body == r"[\s\S]*?" || (dotall && body == ".*?")
+}
+
+fn allow_key_body(body: &str, key_close: &str, dotall: bool) -> Option<(bool, bool)> {
+    if is_lazy_any(body, dotall) {
+        return Some((false, false));
+    }
+    if body == r"[\s\S]+?" || (dotall && body == ".+?") {
+        return Some((true, false));
+    }
+    let rest = body.strip_prefix("[^")?;
+    let (inner, nonempty) = match rest.strip_suffix("]+?").or(rest.strip_suffix("]+")) {
+        Some(s) => (s, true),
+        None => (rest.strip_suffix("]*?").or(rest.strip_suffix("]*"))?, false),
+    };
+    let ch = key_close.chars().next()?;
+    if key_close.len() != ch.len_utf8() || matches!(ch, '\\' | '[' | ']' | '-' | '^' | '\n') {
+        return None;
+    }
+    if inner == key_close {
+        Some((nonempty, false))
+    } else if inner == format!("{ch}\\n") || inner == format!("\\n{ch}") {
+        Some((nonempty, true))
+    } else {
+        None
+    }
+}
+
+fn strip_dotall_flag(mut s: &str) -> (&str, bool) {
+    let mut dotall = false;
     while let Some(rest) = s.strip_prefix("(?s)") {
         s = rest;
+        dotall = true;
     }
-    s
+    (s, dotall)
 }
 
 fn strip_opt_nl_end(s: &str) -> (&str, bool) {
-    match s.strip_suffix("\\n?") {
-        Some(rest) => (rest, true),
-        None => (s, false),
-    }
+    s.strip_suffix("\\n?").map_or((s, false), |r| (r, true))
 }
 
 fn strip_opt_nl_start(s: &str) -> (&str, bool) {
-    match s.strip_prefix("\\n?") {
-        Some(rest) => (rest, true),
-        None => (s, false),
-    }
+    s.strip_prefix("\\n?").map_or((s, false), |r| (r, true))
 }

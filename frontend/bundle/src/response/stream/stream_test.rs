@@ -353,6 +353,7 @@ fn streams_regex_and_numbers() {
         json!({"x": 1e-66, "id": "007"})
     );
     check_tag_inline_flags();
+    check_tag_capture_allowlist();
 }
 
 fn check_tag_inline_flags() {
@@ -398,6 +399,89 @@ fn check_tag_inline_flags() {
             json!({"x": 1, "y": 2}),
         ),
     ];
+    assert_tag_parity(&tag_pat, &cases);
+}
+
+fn check_tag_capture_allowlist() {
+    let allowed = [
+        r"(?s)<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter>",
+        r"<arg_key>(?P<key>[\s\S]*?)</arg_key>\s*<arg_value>(?P<value>[\s\S]*?)</arg_value>",
+    ];
+    for pat in allowed {
+        assert!(TagDelims::from_pattern(pat).is_some(), "{pat}");
+    }
+    let rejected = [
+        r#"(?s)<parameter=(?P<key>[^>]+)>(?P<value>"[^"]*")</parameter>"#,
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.*)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.+)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>.+?)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>[^<]+)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>\w+)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>(?P<value>[\s\S]*)</parameter>",
+        r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>\w+)>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>\s]+)>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>[^<]+)>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)</key>(?P<value>.*?)</parameter>",
+        r"(?s)<parameter=(?P<key>[^>]+)>\s*(?P<value>.*?)</parameter>",
+    ];
+    for pat in rejected {
+        assert!(TagDelims::from_pattern(pat).is_none(), "{pat}");
+    }
+    let quoted_pat = r#"<parameter=(?P<key>[^>]+)>(?P<value>"[^"]*")</parameter>"#;
+    let quoted_cases = [
+        (
+            [
+                r#"<tool_call><function=ping><parameter=x>"a</parameter>b"</parameter></function>"#,
+                " All done.",
+            ],
+            json!({"x": "a</parameter>b"}),
+        ),
+        (
+            [
+                r#"<tool_call><function=ping><parameter=x>"a</parameter>"#,
+                r#"b"</parameter></function> All done."#,
+            ],
+            json!({"x": "a</parameter>b"}),
+        ),
+        (
+            [
+                r#"<tool_call><function=ping><parameter=x>"abc"</parameter></function>"#,
+                " All done.",
+            ],
+            json!({"x": "abc"}),
+        ),
+    ];
+    assert_tag_parity(quoted_pat, &quoted_cases);
+    let qwen_pat = r"(?s)<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>";
+    let key_edge_cases = [
+        (
+            [
+                "<tool_call><function=ping><parameter=>1</parameter><parameter=y>2</parameter></function>",
+                " All done.",
+            ],
+            json!({"y": 2}),
+        ),
+        (
+            [
+                "<tool_call><function=ping><parameter=bad\nkey>1</parameter><parameter=y>2</parameter></function>",
+                " All done.",
+            ],
+            json!({"y": 2}),
+        ),
+        (
+            [
+                "<tool_call><function=ping><parameter=bad\n",
+                "<parameter=y>2</parameter></function> All done.",
+            ],
+            json!({"y": 2}),
+        ),
+    ];
+    assert_tag_parity(qwen_pat, &key_edge_cases);
+}
+
+fn assert_tag_parity(tag_pat: &str, cases: &[([&str; 2], Value)]) {
     for close_pat in ["</function>", "[<]/function>"] {
         let cfg = json!({"response_template": {"fields": {"tool_calls": {
             "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
@@ -408,7 +492,7 @@ fn check_tag_inline_flags() {
         }}}})
         .to_string();
         let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
-        for (pieces, want) in &cases {
+        for (pieces, want) in cases {
             let full = pieces.concat();
             let whole = parser.parse(&full, true, false);
             assert_eq!(whole.content, " All done.");
@@ -421,15 +505,27 @@ fn check_tag_inline_flags() {
                 stream.push(p, &mut events);
             }
             stream.finish(&mut events);
-            let text: String = events
-                .iter()
-                .filter_map(|e| match e {
-                    ResponseEvent::Content(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(text, " All done.");
-            assert_eq!(collect_calls(&events), [("ping".into(), want.clone())]);
+            assert_stream_result(&events, want);
+            let mut char_stream = parser.stream(true, false);
+            let mut char_events = Vec::new();
+            for ch in full.chars() {
+                let mut buf = [0u8; 4];
+                char_stream.push(ch.encode_utf8(&mut buf), &mut char_events);
+            }
+            char_stream.finish(&mut char_events);
+            assert_stream_result(&char_events, want);
         }
     }
+}
+
+fn assert_stream_result(events: &[ResponseEvent], want: &Value) {
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Content(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, " All done.");
+    assert_eq!(collect_calls(events), [("ping".into(), want.clone())]);
 }
