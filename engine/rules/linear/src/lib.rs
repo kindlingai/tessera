@@ -9,6 +9,7 @@ mod product;
 mod stacked;
 mod thin;
 mod tiled;
+mod tiled_metal;
 mod trellis_metal;
 mod turned;
 

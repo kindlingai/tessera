@@ -39,6 +39,8 @@ fn grid_reaches_rules() {
         "delta_metal",
         "conv_metal",
         "mm_metal",
+        "lanes_metal",
+        "tiled_metal",
         "fast_gemv",
         "fast_mm",
         "fast_mm_mx8",
