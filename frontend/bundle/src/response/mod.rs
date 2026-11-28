@@ -1,11 +1,15 @@
 //! Generic response parser driven by `tokenizer_config.json`.
 
+mod close;
+#[cfg(test)]
+mod close_test;
 mod formats;
 #[cfg(test)]
 mod response_test;
 mod stream;
 
 use crate::template::{FunctionCall, Message, Template, ToolCall, spaced};
+use close::{Closers, literal_prefix};
 use fancy_regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -129,13 +133,28 @@ impl Opener {
 
     fn find(&self, text: &str) -> Option<(usize, usize)> {
         match self {
-            Opener::Literal(opens) => find_close(text, opens),
+            Opener::Literal(opens) => find_literal(text, opens),
             Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
                 text.find(prefix.as_str()).map(|at| (at, 0))
             }
             Opener::Pattern { regex, .. } => {
                 regex.find(text).ok().flatten().map(|m| (m.start(), 0))
             }
+        }
+    }
+
+    /// Earliest byte offset where a block closer can match.
+    fn min_close_offset(&self, text: &str) -> usize {
+        let floor = text.chars().next().map_or(0, char::len_utf8);
+        match self {
+            Opener::Literal(opens) => opens
+                .iter()
+                .find(|s| text.starts_with(s.as_str()))
+                .map_or(floor, String::len),
+            Opener::Pattern { prefix, .. } if !prefix.is_empty() && text.starts_with(prefix) => {
+                prefix.len()
+            }
+            Opener::Pattern { .. } => floor,
         }
     }
 
@@ -225,7 +244,7 @@ impl Body {
 #[derive(Clone)]
 struct BlockSpec {
     open: Opener,
-    close: Vec<String>,
+    close: Closers,
     body: Body,
     transform: Option<Value>,
     outer: Option<[String; 2]>,
@@ -237,7 +256,7 @@ struct BlockSpec {
 pub struct ResponseParser {
     thinking: Option<BlockSpec>,
     tool_calls: Option<BlockSpec>,
-    content_close: Vec<String>,
+    content_close: Closers,
     tool_prompt: Option<String>,
 }
 
@@ -264,20 +283,16 @@ impl ResponseParser {
     fn compile(template: ResponseTemplate) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut thinking = None;
         let mut tool_calls = None;
-        let mut content_close = Vec::new();
+        let mut content_close = Closers::empty();
         for (name, spec) in template.fields {
-            let mut close: Vec<String> = spec
+            let raw_close: Vec<String> = spec
                 .close
                 .map(Strings::list)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect();
-            if close.is_empty()
-                && let Some(pat) = &spec.close_pattern
-            {
-                close = pattern_closers(pat);
-            }
+            let close = Closers::compile(raw_close, spec.close_pattern)?;
             if name == "content" {
                 content_close = close;
                 continue;
@@ -337,7 +352,7 @@ impl ResponseParser {
                     json!({"name": call.function.name, "arguments": call.function.arguments}),
                 );
             }
-            match close.first() {
+            match close.consuming().into_iter().next() {
                 Some(close) => {
                     for call in plain {
                         text += &format!("{open}{}{close}", spaced(&call));
@@ -557,9 +572,7 @@ impl<'a> ResponseStream<'a> {
             needles.extend(t.open.triggers());
             needles.extend(t.outer.as_ref().map(|[o, _]| o.as_str()));
         }
-        for c in &self.parser.content_close {
-            needles.push(c.as_str());
-        }
+        needles.extend(self.parser.content_close.needles());
         let keep = tail_hold(&self.buf, &needles);
         let emit = self.buf.len() - keep;
         if emit > 0 {
@@ -575,7 +588,8 @@ impl<'a> ResponseStream<'a> {
             return true;
         };
         if self.opening {
-            let close = find_close(&self.buf, &spec.close);
+            let from = spec.open.min_close_offset(&self.buf);
+            let close = spec.close.find_from(&self.buf, from);
             match (self.opener_len(&self.buf), close) {
                 // Text after the match shows that the opener is complete.
                 (Some(cut), _) if cut < self.buf.len() => {
@@ -592,7 +606,7 @@ impl<'a> ResponseStream<'a> {
                 _ => return false,
             }
         }
-        if let Some((at, len)) = find_close(&self.buf, &spec.close) {
+        if let Some((at, len)) = spec.close.find(&self.buf) {
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
             }
@@ -601,7 +615,7 @@ impl<'a> ResponseStream<'a> {
             self.lead = true;
             return true;
         }
-        let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
+        let needles = spec.close.needles();
         let keep = tail_hold(&self.buf, &needles);
         let emit = self.buf.len() - keep;
         if emit > 0 {
@@ -691,20 +705,20 @@ impl<'a> ResponseStream<'a> {
         {
             pick(at, open.len(), Hit::Calls);
         }
-        if let Some((at, len)) = find_close(&self.buf, &self.parser.content_close) {
+        if let Some((at, len)) = self.parser.content_close.find(&self.buf) {
             pick(at, len, Hit::Close);
         }
         best
     }
 }
 
-fn find_close(text: &str, closes: &[String]) -> Option<(usize, usize)> {
+fn find_literal(text: &str, literals: &[String]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
-    for c in closes {
-        if let Some(at) = text.find(c.as_str())
+    for s in literals {
+        if let Some(at) = text.find(s.as_str())
             && best.is_none_or(|(b, _)| at < b)
         {
-            best = Some((at, c.len()));
+            best = Some((at, s.len()));
         }
     }
     best
@@ -726,49 +740,6 @@ fn tail_hold(buf: &str, needles: &[&str]) -> usize {
     hold
 }
 
-/// Extracts the leading literal text from a regex pattern.
-fn literal_prefix(pattern: &str) -> String {
-    let mut out = String::new();
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let Some(&next) = chars.peek() else { break };
-            if matches!(
-                next,
-                'w' | 'W' | 'd' | 'D' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z'
-            ) {
-                break;
-            }
-            let escaped = match next {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other if other.is_ascii_punctuation() => other,
-                _ => break,
-            };
-            chars.next();
-            out.push(escaped);
-            continue;
-        }
-        if matches!(
-            c,
-            '(' | ')' | '[' | ']' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '^' | '$'
-        ) {
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Extracts literal closer branches from a `close_pattern` regex.
-fn pattern_closers(pat: &str) -> Vec<String> {
-    pat.split('|')
-        .filter(|branch| !branch.starts_with("(?"))
-        .map(literal_prefix)
-        .filter(|s| !s.is_empty())
-        .collect()
-}
 fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
     let (captures, rest) = spec.open.strip(block)?;
     let parsed = spec.body.parse(rest)?;

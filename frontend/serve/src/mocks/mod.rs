@@ -8,7 +8,7 @@ mod tokens;
 
 use crate::http::{Body, Request};
 use crate::{Model, Slot, route};
-use chat::MockChat;
+pub(crate) use chat::MockChat;
 use embed::MockEmbed;
 pub use generator::MockGenerator;
 use image::MockImage;

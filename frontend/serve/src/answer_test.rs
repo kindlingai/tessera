@@ -203,3 +203,102 @@ fn sampling_params_accepted() {
     });
     assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
 }
+
+struct UnguidedMock(&'static str);
+
+impl tessera_tasks::api::Generator for UnguidedMock {
+    fn supports_guides(&self) -> bool {
+        false
+    }
+
+    fn generate(
+        &self,
+        _prompt: Vec<u32>,
+        _params: tessera_tasks::api::Params,
+        mut sink: tessera_tasks::api::Sink,
+    ) -> Result<(), tessera_tasks::Error> {
+        sink(tessera_tasks::api::Step::Done {
+            text: self.0.into(),
+            finish: tessera_tasks::api::Finish::Stop,
+            tokens: 1,
+            cached: 0,
+        });
+        Ok(())
+    }
+}
+
+fn unguided_slot(text: &'static str, parser: ResponseParser) -> crate::Slot {
+    let slot: crate::Slot = Arc::new(std::sync::OnceLock::new());
+    slot.set(crate::Model {
+        info: tessera_tasks::api::Info {
+            name: "m".into(),
+            context: 256,
+        },
+        tokens: Arc::new(crate::mocks::MockTokens),
+        chat: Some(Arc::new(crate::mocks::MockChat {
+            response: Some(parser),
+        })),
+        generator: Some(Arc::new(UnguidedMock(text))),
+        score: None,
+        strict: true,
+        asks: None,
+        image: None,
+        embed: None,
+    })
+    .ok()
+    .unwrap();
+    slot
+}
+
+#[test]
+fn forced_tool_choice() {
+    let tool = json!({"type": "function", "function": {"name": "ping"}});
+    let force_ping = json!({"type": "function", "function": {"name": "ping"}});
+    // Mismatched function name fails on both whole and SSE.
+    let bad_slot = unguided_slot("pong{}<tool_call|>", tool_parser());
+    let req = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool],
+        "tool_choice": force_ping,
+    });
+    let (status, got) = json(&bad_slot, "/v1/chat/completions", Some(req.clone()));
+    assert_eq!(status, 500);
+    assert!(
+        got["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pingpong")
+    );
+    let mut sse_req = req.clone();
+    sse_req["stream"] = json!(true);
+    let (_, sse) = call(&bad_slot, "/v1/chat/completions", Some(sse_req));
+    assert!(
+        !sse.contains("\"tool_calls\"")
+            && !sse.contains("\"choices\"")
+            && sse.contains("\"error\"")
+            && sse.contains("[DONE]")
+    );
+    // Matching function name succeeds on whole and SSE.
+    let ok_slot = unguided_slot("{}<tool_call|>", tool_parser());
+    let (status, got) = json(&ok_slot, "/v1/chat/completions", Some(req));
+    assert_eq!(status, 200);
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        got["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "ping"
+    );
+    // Missing required tool call fails on whole and SSE.
+    let miss_slot = unguided_slot("never mind", tool_parser());
+    let req_req = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "ping"}}],
+        "tool_choice": "required",
+    });
+    let (status, got) = json(&miss_slot, "/v1/chat/completions", Some(req_req.clone()));
+    assert_eq!(status, 500);
+    assert!(got["error"]["message"].as_str().is_some());
+    let mut miss_sse = req_req;
+    miss_sse["stream"] = json!(true);
+    let (_, sse) = call(&miss_slot, "/v1/chat/completions", Some(miss_sse));
+    assert!(!sse.contains("never mind") && !sse.contains("\"stop\"") && sse.contains("\"error\""));
+}

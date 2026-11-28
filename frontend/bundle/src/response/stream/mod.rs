@@ -6,7 +6,8 @@ pub(super) mod stream_test;
 
 pub(super) use json::parse_json;
 
-use super::{BlockSpec, Body, Opener, ResponseEvent, find_close, parse_tool, tail_hold};
+use super::close::{Closer, find_closers, matching_paren, parse_literal_closers, unescape_lit};
+use super::{BlockSpec, Body, Opener, ResponseEvent, parse_tool, tail_hold};
 use json::{RelaxedState, finish_relaxed, step_relaxed};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ pub(super) struct TagDelims {
     pub key_open: String,
     pub key_close: String,
     pub val_open: String,
-    pub val_close: String,
+    pub val_close: Vec<Closer>,
     pub trim_lead_nl: bool,
     pub trim_trail_nl: bool,
 }
@@ -45,11 +46,7 @@ impl TagDelims {
             }
         };
         let (vc, trim_trail_nl) = strip_opt_nl_start(after_val);
-        let val_close = unescape_lit(vc).or_else(|| {
-            let inner = vc.strip_prefix("(?:")?.strip_suffix(')')?;
-            let first = inner.split('|').next()?;
-            unescape_lit(first)
-        })?;
+        let val_close = parse_literal_closers(vc)?;
         if key_open.is_empty() || key_close.is_empty() || val_close.is_empty() {
             return None;
         }
@@ -61,6 +58,10 @@ impl TagDelims {
             trim_lead_nl,
             trim_trail_nl,
         })
+    }
+
+    fn val_needles(&self) -> Vec<&str> {
+        self.val_close.iter().map(|c| c.needle.as_str()).collect()
     }
 }
 
@@ -214,9 +215,9 @@ impl ToolState {
         out: &mut Vec<ResponseEvent>,
         expect_json: bool,
     ) -> StepOutcome {
-        let close = find_close(buf, &spec.close);
         let Some((caps, rest)) = spec.open.strip(buf) else {
-            return match close {
+            let from = spec.open.min_close_offset(buf);
+            return match spec.close.find_from(buf, from) {
                 Some(_) => {
                     *self = Self::Buffer;
                     StepOutcome::Continue
@@ -227,6 +228,7 @@ impl ToolState {
         if rest.is_empty() {
             return StepOutcome::Wait;
         }
+        let cut = buf.len() - rest.len();
         if expect_json {
             let trimmed = rest.trim_start();
             let valid_start = trimmed
@@ -234,7 +236,7 @@ impl ToolState {
                 .first()
                 .is_some_and(|b| is_json_start(*b));
             if !valid_start {
-                if close.is_some() {
+                if spec.close.find_from(buf, cut).is_some() {
                     *self = Self::Buffer;
                     return StepOutcome::Continue;
                 }
@@ -249,7 +251,6 @@ impl ToolState {
             *self = Self::Buffer;
             return StepOutcome::Continue;
         };
-        let cut = buf.len() - rest.len();
         buf.drain(..cut);
         out.push(ResponseEvent::ToolCallStart { id, kind, name });
         match &spec.body {
@@ -282,7 +283,7 @@ impl ToolState {
         };
         let open_len = buf.len() - rest.len();
         match scan_json_header(rest) {
-            HeaderScan::Wait => match find_close(buf, &spec.close) {
+            HeaderScan::Wait => match spec.close.find_from(buf, open_len) {
                 Some(_) => {
                     *self = Self::Buffer;
                     StepOutcome::Continue
@@ -332,7 +333,7 @@ impl ToolState {
             TagPhase::SeekKey { first } => {
                 let first = *first;
                 let key_at = buf.find(delims.key_open.as_str());
-                let close = find_close(buf, &spec.close);
+                let close = spec.close.find(buf);
                 match (key_at, close) {
                     (Some(at), c) if c.is_none_or(|(end, _)| at < end) => {
                         buf.drain(..at + delims.key_open.len());
@@ -346,8 +347,7 @@ impl ToolState {
                         StepOutcome::Done
                     }
                     _ => {
-                        let mut needles: Vec<&str> =
-                            spec.close.iter().map(String::as_str).collect();
+                        let mut needles = spec.close.needles();
                         needles.push(delims.key_open.as_str());
                         let keep = tail_hold(buf, &needles);
                         buf.drain(..buf.len() - keep);
@@ -363,7 +363,7 @@ impl ToolState {
                     *phase = next_after_key(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find(buf) {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -379,7 +379,7 @@ impl ToolState {
                     *phase = next_after_val_open(delims, first, key);
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find(buf) {
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs("}".into()));
                     out.push(ResponseEvent::ToolCallEnd);
@@ -404,9 +404,13 @@ impl ToolState {
                 StepOutcome::Continue
             }
             TagPhase::DetectVal { first, key, held } => {
-                if let Some(at) = buf.find(delims.val_close.as_str()) {
+                let val_hit = find_closers(buf, &delims.val_close);
+                let blk_hit = spec.close.find(buf);
+                if let Some((at, len)) = val_hit
+                    && blk_hit.is_none_or(|(b, _)| at <= b)
+                {
                     held.push_str(&buf[..at]);
-                    buf.drain(..at + delims.val_close.len());
+                    buf.drain(..at + len);
                     if delims.trim_trail_nl && held.ends_with('\n') {
                         held.pop();
                     }
@@ -419,7 +423,7 @@ impl ToolState {
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = blk_hit {
                     held.push_str(&buf[..at]);
                     buf.drain(..at + len);
                     let prefix = if *first { "" } else { "," };
@@ -431,8 +435,9 @@ impl ToolState {
                     out.push(ResponseEvent::ToolCallEnd);
                     return StepOutcome::Done;
                 }
-                let emit =
-                    safe_value_emit(buf, &delims.val_close, &spec.close, delims.trim_trail_nl);
+                let val_needles = delims.val_needles();
+                let blk_needles = spec.close.needles();
+                let emit = safe_value_emit(buf, &val_needles, &blk_needles, delims.trim_trail_nl);
                 if emit > 0 {
                     held.push_str(&buf[..emit]);
                     buf.drain(..emit);
@@ -450,26 +455,31 @@ impl ToolState {
                 StepOutcome::Wait
             }
             TagPhase::StreamString => {
-                if let Some(at) = buf.find(delims.val_close.as_str()) {
+                let val_hit = find_closers(buf, &delims.val_close);
+                let blk_hit = spec.close.find(buf);
+                if let Some((at, len)) = val_hit
+                    && blk_hit.is_none_or(|(b, _)| at <= b)
+                {
                     let mut chunk = &buf[..at];
                     if delims.trim_trail_nl {
                         chunk = chunk.strip_suffix('\n').unwrap_or(chunk);
                     }
                     let escaped = json_escape_inner(chunk);
-                    buf.drain(..at + delims.val_close.len());
+                    buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs(format!("{escaped}\"")));
                     *phase = TagPhase::SeekKey { first: false };
                     return StepOutcome::Continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = blk_hit {
                     let escaped = json_escape_inner(&buf[..at]);
                     buf.drain(..at + len);
                     out.push(ResponseEvent::ToolCallArgs(format!("{escaped}\"}}")));
                     out.push(ResponseEvent::ToolCallEnd);
                     return StepOutcome::Done;
                 }
-                let emit =
-                    safe_value_emit(buf, &delims.val_close, &spec.close, delims.trim_trail_nl);
+                let val_needles = delims.val_needles();
+                let blk_needles = spec.close.needles();
+                let emit = safe_value_emit(buf, &val_needles, &blk_needles, delims.trim_trail_nl);
                 if emit > 0 {
                     let escaped = json_escape_inner(&buf[..emit]);
                     buf.drain(..emit);
@@ -495,11 +505,11 @@ impl ToolState {
         else {
             unreachable!()
         };
-        let close = find_close(buf, &spec.close);
+        let close = spec.close.find(buf);
         let limit = match close {
             Some((at, _)) => at,
             None => {
-                let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
+                let needles = spec.close.needles();
                 buf.len() - tail_hold(buf, &needles)
             }
         };
@@ -543,7 +553,7 @@ impl ToolState {
             out.push(ResponseEvent::ToolCallArgs(buf[..limit].to_string()));
             buf.drain(..limit);
         }
-        if let Some((at, len)) = find_close(buf, &spec.close) {
+        if let Some((at, len)) = spec.close.find(buf) {
             buf.drain(..at + len);
             out.push(ResponseEvent::ToolCallEnd);
             return StepOutcome::Done;
@@ -553,7 +563,11 @@ impl ToolState {
 }
 
 fn step_buffer(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>) -> StepOutcome {
-    let Some((at, len)) = find_close(buf, &spec.close) else {
+    let from = match spec.open.strip(buf) {
+        Some((_, rest)) => buf.len() - rest.len(),
+        None => spec.open.min_close_offset(buf),
+    };
+    let Some((at, len)) = spec.close.find_from(buf, from) else {
         return StepOutcome::Wait;
     };
     let block = buf[..at].to_string();
@@ -567,7 +581,7 @@ fn step_buffer(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>)
 }
 
 fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent>) -> StepOutcome {
-    if let Some((at, len)) = find_close(buf, &spec.close) {
+    if let Some((at, len)) = spec.close.find(buf) {
         let tail = buf[..at].trim_end();
         if !tail.is_empty() {
             out.push(ResponseEvent::ToolCallArgs(tail.to_string()));
@@ -576,7 +590,7 @@ fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent
         out.push(ResponseEvent::ToolCallEnd);
         return StepOutcome::Done;
     }
-    let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
+    let needles = spec.close.needles();
     let keep = tail_hold(buf, &needles);
     let emit = buf.len() - keep;
     if emit > 0 {
@@ -587,11 +601,11 @@ fn step_raw_json(spec: &BlockSpec, buf: &mut String, out: &mut Vec<ResponseEvent
 }
 
 fn step_drain_close(spec: &BlockSpec, buf: &mut String) -> StepOutcome {
-    if let Some((at, len)) = find_close(buf, &spec.close) {
+    if let Some((at, len)) = spec.close.find(buf) {
         buf.drain(..at + len);
         return StepOutcome::Done;
     }
-    let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
+    let needles = spec.close.needles();
     let keep = tail_hold(buf, &needles);
     buf.drain(..buf.len() - keep);
     StepOutcome::Wait
@@ -608,7 +622,7 @@ fn finish_tags(phase: &mut TagPhase, spec: &BlockSpec, rest: &str, out: &mut Vec
     match phase {
         TagPhase::StreamString => {
             let mut chunk = rest;
-            if let Some(at) = chunk.find(delims.val_close.as_str()) {
+            if let Some((at, _)) = find_closers(chunk, &delims.val_close) {
                 chunk = &chunk[..at];
             }
             if delims.trim_trail_nl {
@@ -662,12 +676,13 @@ fn is_json_start(b: u8) -> bool {
 
 pub(super) fn safe_value_emit(
     buf: &str,
-    val_close: &str,
-    block_closes: &[String],
+    val_closes: &[&str],
+    block_closes: &[&str],
     trim_nl: bool,
 ) -> usize {
-    let mut needles: Vec<&str> = block_closes.iter().map(String::as_str).collect();
-    needles.push(val_close);
+    let mut needles = Vec::with_capacity(block_closes.len() + val_closes.len());
+    needles.extend_from_slice(block_closes);
+    needles.extend_from_slice(val_closes);
     let keep = tail_hold(buf, &needles);
     let mut emit = buf.len() - keep;
     if trim_nl && emit > 0 && buf.as_bytes()[emit - 1] == b'\n' {
@@ -885,39 +900,6 @@ fn strip_inline_flags(mut s: &str) -> &str {
     s
 }
 
-fn matching_paren(s: &str, open_at: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut in_class = false;
-    let mut i = open_at;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'[' if !in_class => {
-                in_class = true;
-                i += 1;
-            }
-            b']' if in_class => {
-                in_class = false;
-                i += 1;
-            }
-            b'(' if !in_class => {
-                depth += 1;
-                i += 1;
-            }
-            b')' if !in_class => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
 fn strip_opt_nl_end(s: &str) -> (&str, bool) {
     match s.strip_suffix("\\n?") {
         Some(rest) => (rest, true),
@@ -930,30 +912,4 @@ fn strip_opt_nl_start(s: &str) -> (&str, bool) {
         Some(rest) => (rest, true),
         None => (s, false),
     }
-}
-
-fn unescape_lit(s: &str) -> Option<String> {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            let next = chars.next()?;
-            match next {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other if other.is_ascii_punctuation() => out.push(other),
-                _ => return None,
-            }
-            continue;
-        }
-        if matches!(
-            c,
-            '(' | ')' | '[' | ']' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '^' | '$'
-        ) {
-            return None;
-        }
-        out.push(c);
-    }
-    Some(out)
 }

@@ -1,6 +1,7 @@
 //! Relaxed JSON parser and incremental streaming normalizer.
 
-use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent, find_close, tail_hold};
+use super::super::close::Closers;
+use super::super::{BlockSpec, Body, ContentArgs, ResponseEvent, tail_hold};
 use super::{StepOutcome, json_escape_inner, json_str, safe_value_emit};
 use serde_json::{Map, Value};
 
@@ -254,13 +255,14 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find(buf) {
                     emitted.push_str(&json_escape_inner(&buf[..at]));
                     emitted.push('"');
                     buf.drain(..at + len);
                     break true;
                 }
-                let emit = safe_value_emit(buf, close_delim, &spec.close, false);
+                let blk_needles = spec.close.needles();
+                let emit = safe_value_emit(buf, &[close_delim.as_str()], &blk_needles, false);
                 if emit > 0 {
                     emitted.push_str(&json_escape_inner(&buf[..emit]));
                     buf.drain(..emit);
@@ -286,12 +288,12 @@ pub(super) fn step_relaxed(
                     state.mode = RelaxedMode::Normal;
                     continue;
                 }
-                if let Some((at, len)) = find_close(buf, &spec.close) {
+                if let Some((at, len)) = spec.close.find(buf) {
                     emitted.push_str(&buf[..at]);
                     buf.drain(..at + len);
                     break true;
                 }
-                let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();
+                let needles = spec.close.needles();
                 let emit = buf.len() - tail_hold(buf, &needles);
                 if emit > 0 {
                     let mut esc = matches!(state.mode, RelaxedMode::InQuoted { escaped: true });
@@ -316,7 +318,7 @@ pub(super) fn step_relaxed(
                 if buf.is_empty() {
                     break false;
                 }
-                if let Some((0, len)) = find_close(buf, &spec.close) {
+                if let Some((0, len)) = spec.close.find(buf) {
                     buf.drain(..len);
                     break true;
                 }
@@ -390,7 +392,7 @@ pub(super) fn step_relaxed(
                     _ => {
                         let len = buf.bytes().take_while(|b| is_prim_byte(*b)).count();
                         if len == 0 {
-                            if let Some((at, clen)) = find_close(buf, &spec.close) {
+                            if let Some((at, clen)) = spec.close.find(buf) {
                                 buf.drain(..at + clen);
                                 break true;
                             }
@@ -428,12 +430,12 @@ fn match_delim_open(buf: &str, args: &ContentArgs) -> Option<usize> {
         .position(|[open, _]| buf.starts_with(open.as_str()))
 }
 
-fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &[String]) -> bool {
+fn prefix_of_any(buf: &str, args: &ContentArgs, closes: &Closers) -> bool {
     let any_delim = args
         .string_delims
         .iter()
         .any(|[open, _]| open.starts_with(buf));
-    let any_close = closes.iter().any(|c| c.starts_with(buf));
+    let any_close = closes.needles().iter().any(|c| c.starts_with(buf));
     any_delim || any_close
 }
 

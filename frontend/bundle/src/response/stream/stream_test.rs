@@ -243,3 +243,40 @@ fn streams_truncated_call() {
     );
     assert_eq!(events.last(), Some(&ResponseEvent::ToolCallEnd));
 }
+
+#[test]
+fn streams_split_closers() {
+    let cfg = r#"{"response_template":{"fields":{"reasoning_content":{"open":"<think>","close_pattern":"</think>|(?=<tool_call>)","content":"text"},"tool_calls":{"open_pattern":"<tool_call>\\s*<function=(?P<name>[^>\\n]+)>","close_pattern":"</tool_call>|(?=<tool_call>)","content":"xml-inline","content_args":{"tag_pattern":"<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?(?:</parameter>|(?=<parameter=)|(?=</function>))"},"transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}},"content":{"close_pattern":"<\\|im_end\\|>","content":"text"}}}}"#;
+    let parser = ResponseParser::from_config(cfg).unwrap().unwrap();
+    let full = "plan<tool_call>\n<function=echo>\n<parameter=a>one\n<parameter=b>two\n</function>\n<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>ok<|im_end|>drop";
+    let mut stream = parser.stream(true, true);
+    let mut events = Vec::new();
+    for ch in full.chars() {
+        let mut buf = [0u8; 4];
+        stream.push(ch.encode_utf8(&mut buf), &mut events);
+    }
+    stream.finish(&mut events);
+    let reasoning: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Reasoning(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let content: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Content(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, "plan");
+    assert_eq!(content, "ok");
+    assert_eq!(
+        collect_calls(&events),
+        [
+            ("echo".into(), json!({"a": "one", "b": "two"})),
+            ("ping".into(), json!({"x": 1})),
+        ]
+    );
+}

@@ -5,8 +5,8 @@ use tessera_tasks::Error;
 use tessera_tasks::api::Chat;
 
 /// Each message as `role:content`, joined.
-pub(super) struct MockChat {
-    pub(super) response: Option<ResponseParser>,
+pub(crate) struct MockChat {
+    pub(crate) response: Option<ResponseParser>,
 }
 
 impl Chat for MockChat {
