@@ -123,6 +123,7 @@ fn target_platform(target: &str) -> Result<Platform, Error> {
         group_threads: 1024,
         compiler: true,
         pdl: false,
+        msl_bfloat: false,
     };
     Ok(Platform::new(Asked {
         backend: Backend::Cuda.name(),

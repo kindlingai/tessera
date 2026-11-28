@@ -14,15 +14,16 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLGPUFamily, MTLLibrary,
+    MTLPipelineOption, MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 
@@ -117,6 +118,7 @@ struct Inner {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Arc<Pipelines>,
     allocs: Mutex<Allocs>,
+    msl_bfloat: OnceLock<bool>,
 }
 
 // SAFETY: Metal objects are thread-safe, and the buffers are locked.
@@ -183,7 +185,40 @@ impl Context {
             queue,
             pipelines: Pipelines::shared(),
             allocs: Mutex::new(Allocs::default()),
+            msl_bfloat: OnceLock::new(),
         })))
+    }
+
+    /// Whether the compiler supports MSL 3.1 bfloat tiles.
+    fn supports_msl_bfloat(&self) -> bool {
+        const PROBE: &str = "\
+#include <metal_stdlib>
+using namespace metal;
+kernel void p(device bfloat *a [[buffer(0)]]) {
+    simdgroup_bfloat8x8 t;
+    simdgroup_load(t, a, 8);
+    simdgroup_float8x8 c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_multiply_accumulate(c, t, t, c);
+}
+";
+        *self.0.msl_bfloat.get_or_init(|| {
+            let Ok(lib) = self.compile_library(PROBE) else {
+                return false;
+            };
+            let Some(func) = lib.newFunctionWithName(&NSString::from_str("p")) else {
+                return false;
+            };
+            let desc = MTLComputePipelineDescriptor::new();
+            desc.setComputeFunction(Some(&func));
+            self.0
+                .device
+                .newComputePipelineStateWithDescriptor_options_reflection_error(
+                    &desc,
+                    MTLPipelineOption::empty(),
+                    None,
+                )
+                .is_ok()
+        })
     }
 
     /// Apple GPUs run 32 lanes together. The rest is asked.
@@ -196,6 +231,7 @@ impl Context {
             group_threads: device.maxThreadsPerThreadgroup().width,
             compiler: true,
             pdl: false,
+            msl_bfloat: self.supports_msl_bfloat(),
         }
     }
 

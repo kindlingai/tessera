@@ -199,6 +199,8 @@ pub struct Needs {
     pub bf16_tile: bool,
     /// Block-scaled mxfp8 tiles with f32 sums.
     pub mxfp8_tile: bool,
+    /// Metal MSL 3.1 bfloat matrix tiles.
+    pub msl_bfloat: bool,
 }
 
 impl Needs {
@@ -231,6 +233,7 @@ impl Needs {
             && (!self.tile || platform.tile().is_some())
             && (!self.bf16_tile || platform.bf16_tile().is_some())
             && (!self.mxfp8_tile || platform.mxfp8_tile().is_some())
+            && (!self.msl_bfloat || limits.msl_bfloat)
     }
 
     /// First unmet hardware requirement for `platform`, if any.
@@ -243,6 +246,9 @@ impl Needs {
         }
         if self.compiler && !limits.compiler {
             return Some("requires kernel compiler".into());
+        }
+        if self.msl_bfloat && !limits.msl_bfloat {
+            return Some("requires MSL 3.1 bfloat tiles".into());
         }
         if self.mxfp8_tile && platform.mxfp8_tile().is_none() {
             return Some("requires mxfp8 tensor tiles".into());

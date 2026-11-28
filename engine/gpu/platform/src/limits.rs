@@ -26,6 +26,9 @@ pub struct Limits {
     /// Whether a launch may overlap the one before it.
     #[serde(default)]
     pub pdl: bool,
+    /// Whether the compiler supports MSL 3.1 bfloat tiles.
+    #[serde(default)]
+    pub msl_bfloat: bool,
 }
 
 fn yes() -> bool {
@@ -42,6 +45,7 @@ impl Limits {
             group_threads: 1024,
             compiler: true,
             pdl: false,
+            msl_bfloat: false,
         }
     }
 
@@ -54,6 +58,7 @@ impl Limits {
             group_threads: 1024,
             compiler: false,
             pdl: false,
+            msl_bfloat: false,
         }
     }
 }
