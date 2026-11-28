@@ -7,4 +7,5 @@ use tessera_device_rules as _;
 use tessera_kernels as _;
 use tessera_linear as _;
 use tessera_metal_attention as _;
+use tessera_metal_kernels as _;
 use tessera_metal_linear as _;

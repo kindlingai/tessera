@@ -1,6 +1,7 @@
 //! Checks native Metal batched matmul kernels against the CPU interpreter.
 
 use tessera_kernels as _;
+use tessera_metal_kernels as _;
 
 use tessera_graph::DimName::{Heads, Hidden, Rows};
 use tessera_graph::{DType, Dim, DimName, EntryKind, Role, TensorType};

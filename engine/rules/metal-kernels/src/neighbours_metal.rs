@@ -80,7 +80,7 @@ fn metal_source(k: &NeighboursMetal) -> Source {
     };
     Source::Fixed {
         text: ByBackend([
-            tessera_lower::metal_source!(include_str!("metal.metal")),
+            tessera_lower::metal_source!(include_str!("neighbours_metal.metal")),
             "",
             "",
         ]),
@@ -132,7 +132,7 @@ fn metal_launches(k: &NeighboursMetal, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
     if node.term != Term::Op(Op::Matmul) {
         return None;
@@ -163,5 +163,7 @@ pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         w_form,
         out_form,
     };
-    Some(vec![Draft::new(k, [near.src, near.ids, w], len).choice(1)])
+    Some(vec![Draft::new(k, [near.src, near.ids, w], len)])
 }
+
+tessera_lower::rule!("neighbours_metal", propose);

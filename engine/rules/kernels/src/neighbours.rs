@@ -90,14 +90,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(k, [near.src, near.ids, w], len)])
 }
 
-tessera_lower::rule!("neighbours", propose_all);
-
-mod metal;
-
-fn propose_all(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let mut drafts = propose(tree, at).unwrap_or_default();
-    if let Some(mtl) = metal::propose(tree, at) {
-        drafts.extend(mtl);
-    }
-    (!drafts.is_empty()).then_some(drafts)
-}
+tessera_lower::rule!("neighbours", propose);

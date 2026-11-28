@@ -8,7 +8,7 @@ use tessera_lower::{
 };
 
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("metal.metal");
+const SOURCE: &str = include_str!("argmax_metal.metal");
 const SMALL_MAX_WIDTH: usize = 2048;
 const SMALL_MAX_K: usize = 32;
 const SPLIT_MIN_WIDTH: usize = 8192;
@@ -267,7 +267,7 @@ fn select_load(k: &TopKSelect, _: usize) -> Option<Load> {
 }
 
 /// Returns Metal drafts for `argmax` (`k == 1`) and small-`k` `top_k`.
-pub(super) fn drafts(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let sites::Top {
         x,
         rows,
@@ -283,7 +283,7 @@ pub(super) fn drafts(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         if rows < 32 && width > SPLIT_MIN_WIDTH {
             let parts = (64 / rows).clamp(2, width.div_ceil(1024)).min(64);
             return Some(vec![
-                Draft::new(ArgmaxPart { rows, width, parts }, [x], rows * parts).choice(2),
+                Draft::new(ArgmaxPart { rows, width, parts }, [x], rows * parts),
                 Draft::new(
                     ArgmaxFin {
                         rows,
@@ -294,43 +294,36 @@ pub(super) fn drafts(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                     },
                     [Read::Node(x), Read::Draft(0)],
                     rows,
-                )
-                .choice(2),
+                ),
             ]);
         }
-        return Some(vec![
-            Draft::new(
-                ArgmaxRow {
-                    rows,
-                    width,
-                    first,
-                    whole,
-                },
-                [x],
+        return Some(vec![Draft::new(
+            ArgmaxRow {
                 rows,
-            )
-            .choice(2),
-        ]);
+                width,
+                first,
+                whole,
+            },
+            [x],
+            rows,
+        )]);
     }
     if width <= SMALL_MAX_WIDTH {
-        return Some(vec![
-            Draft::new(
-                TopKSmall {
-                    rows,
-                    width,
-                    k,
-                    first,
-                    whole,
-                },
-                [x],
-                rows * k,
-            )
-            .choice(2),
-        ]);
+        return Some(vec![Draft::new(
+            TopKSmall {
+                rows,
+                width,
+                k,
+                first,
+                whole,
+            },
+            [x],
+            rows * k,
+        )]);
     }
     let parts = width.div_ceil(256).clamp(2, 256);
     Some(vec![
-        Draft::new(ArgmaxPart { rows, width, parts }, [x], rows * parts).choice(2),
+        Draft::new(ArgmaxPart { rows, width, parts }, [x], rows * parts),
         Draft::new(
             TopKSelect {
                 rows,
@@ -342,7 +335,8 @@ pub(super) fn drafts(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             },
             [Read::Node(x), Read::Draft(0)],
             rows * k,
-        )
-        .choice(2),
+        ),
     ])
 }
+
+tessera_lower::rule!("argmax_metal", propose);

@@ -14,4 +14,5 @@ tessera-device-rules = { workspace = true }
 tessera-kernels = { workspace = true }
 tessera-linear = { workspace = true }
 tessera-metal-attention = { workspace = true }
+tessera-metal-kernels = { workspace = true }
 tessera-metal-linear = { workspace = true }
