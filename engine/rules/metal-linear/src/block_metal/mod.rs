@@ -6,20 +6,41 @@ use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Step, T, Term, Tree};
 
 const THREADS: usize = 128;
-const COLS_PER_TG: usize = 16;
 const TILE_ROWS: usize = 4;
+const SMALL_N: usize = 2048;
+const MMA_SMEM: usize = (8 * 36 + 32 * 36) * 4;
 const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
 const SOURCE: &str = include_str!("block_metal.metal");
 const GUESS: f64 = 1.0e-13;
 
-const ENTRIES: &[(&str, [&str; 4])] = &[
+const ENTRIES: &[(&str, [&str; 8], Option<&str>)] = &[
     (
         "mxfp8",
-        ["bm_mxfp8_m1", "bm_mxfp8_m2", "bm_mxfp8_m3", "bm_mxfp8_m4"],
+        [
+            "bm_mxfp8_m1",
+            "bm_mxfp8_m2",
+            "bm_mxfp8_m3",
+            "bm_mxfp8_m4",
+            "bm_mxfp8_m5",
+            "bm_mxfp8_m6",
+            "bm_mxfp8_m7",
+            "bm_mxfp8_m8",
+        ],
+        None,
     ),
     (
         "q8_0",
-        ["bm_q8_0_m1", "bm_q8_0_m2", "bm_q8_0_m3", "bm_q8_0_m4"],
+        [
+            "bm_q8_0_m1",
+            "bm_q8_0_m2",
+            "bm_q8_0_m3",
+            "bm_q8_0_m4",
+            "bm_q8_0_m5",
+            "bm_q8_0_m6",
+            "bm_q8_0_m7",
+            "bm_q8_0_m8",
+        ],
+        None,
     ),
     (
         "int4_g32",
@@ -28,17 +49,65 @@ const ENTRIES: &[(&str, [&str; 4])] = &[
             "bm_int4_g32_m2",
             "bm_int4_g32_m3",
             "bm_int4_g32_m4",
+            "bm_int4_g32_m5",
+            "bm_int4_g32_m6",
+            "bm_int4_g32_m7",
+            "bm_int4_g32_m8",
         ],
+        Some("bm_int4_g32_m1_c2"),
     ),
     (
         "q4_0",
-        ["bm_q4_0_m1", "bm_q4_0_m2", "bm_q4_0_m3", "bm_q4_0_m4"],
+        [
+            "bm_q4_0_m1",
+            "bm_q4_0_m2",
+            "bm_q4_0_m3",
+            "bm_q4_0_m4",
+            "bm_q4_0_m5",
+            "bm_q4_0_m6",
+            "bm_q4_0_m7",
+            "bm_q4_0_m8",
+        ],
+        Some("bm_q4_0_m1_c2"),
     ),
 ];
 
-fn entry(form: &str, m: usize) -> Option<&'static str> {
-    let (_, names) = ENTRIES.iter().find(|(name, _)| *name == form)?;
-    let idx = m.min(TILE_ROWS).checked_sub(1)?;
+fn uses_mma(m: usize) -> bool {
+    (5..=8).contains(&m)
+}
+
+fn cols_per_tg(form: &str, m: usize, n: usize) -> usize {
+    if uses_mma(m) {
+        return 32;
+    }
+    match form {
+        "int4_g32" | "q4_0" if m == 1 && n <= SMALL_N => 8,
+        "int4_g32" | "q4_0" if m == 1 => 32,
+        _ => 16,
+    }
+}
+
+fn row_tiles(m: usize) -> usize {
+    if uses_mma(m) {
+        1
+    } else {
+        m.div_ceil(TILE_ROWS)
+    }
+}
+
+fn entry(form: &str, m: usize, n: usize) -> Option<&'static str> {
+    let (_, names, small_m1) = ENTRIES.iter().find(|(name, _, _)| *name == form)?;
+    if m == 1
+        && n <= SMALL_N
+        && let Some(ent) = small_m1
+    {
+        return Some(ent);
+    }
+    let idx = if m <= 8 {
+        m.checked_sub(1)?
+    } else {
+        TILE_ROWS - 1
+    };
     Some(names[idx])
 }
 
@@ -50,7 +119,7 @@ fn entry(form: &str, m: usize) -> Option<&'static str> {
     guess = if self.m <= 8 { GUESS } else { tessera_lower::GUESS },
     accepts = accepts,
     emits = crate::f32_only,
-    needs = metal_needs(),
+    needs = metal_needs(self),
     order = Order::PerConfig,
     source = tessera_lower::Source::metal(SOURCE, self.entry),
     launches = launches,
@@ -71,10 +140,13 @@ fn accepts(k: &BlockMetal, input: usize, form: &dyn Stored) -> bool {
     }
 }
 
-fn metal_needs() -> Needs {
+fn metal_needs(b: &BlockMetal) -> Needs {
+    let mma = uses_mma(b.m);
     Needs {
         lanes: 32,
+        group_bytes: if mma { MMA_SMEM } else { 0 },
         group_threads: THREADS,
+        tile: mma,
         compiler: true,
         lacks: LACKS,
         ..Needs::default()
@@ -82,8 +154,9 @@ fn metal_needs() -> Needs {
 }
 
 fn load(b: &BlockMetal, _: usize) -> Option<Load> {
-    let down = b.m.div_ceil(TILE_ROWS);
-    let groups = b.n.div_ceil(COLS_PER_TG) * down;
+    let down = row_tiles(b.m);
+    let cols = cols_per_tg(b.form.name(), b.m, b.n);
+    let groups = b.n.div_ceil(cols) * down;
     let mut l = Load {
         threads: groups * THREADS,
         group: THREADS,
@@ -103,6 +176,7 @@ fn load(b: &BlockMetal, _: usize) -> Option<Load> {
 }
 
 fn launches(b: &BlockMetal, step: &Step) -> Vec<Launch> {
+    let cols = cols_per_tg(b.form.name(), b.m, b.n);
     vec![Launch {
         args: vec![
             step.read(0),
@@ -113,8 +187,8 @@ fn launches(b: &BlockMetal, step: &Step) -> Vec<Launch> {
             Arg::count(b.k),
         ],
         shape: Shape::Grid {
-            across: b.n.div_ceil(COLS_PER_TG),
-            down: b.m.div_ceil(TILE_ROWS),
+            across: b.n.div_ceil(cols),
+            down: row_tiles(b.m),
             threads: THREADS,
         },
     }]
@@ -137,7 +211,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let m = tree.elements(x) / k;
-    let ent = entry(form.name(), m)?;
+    let ent = entry(form.name(), m, n)?;
     Some(vec![Draft::new(
         BlockMetal {
             m,

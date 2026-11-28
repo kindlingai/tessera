@@ -26,7 +26,7 @@ fn block_metal_matches() {
         let len: usize = shape.iter().product();
         Tensor::f32(shape, (0..len).map(|_| d.draw()).collect())
     };
-    for (k, n) in [(32u64, 7u64), (96, 17), (512, 96)] {
+    for (k, n) in [(32u64, 7u64), (96, 17), (512, 96), (64, 2112)] {
         let g = graphs::linear(&[Dim::bounded(Rows, 16)], k, n);
         let w = fill(vec![n as usize, k as usize], &mut draws);
         for name in ["mxfp8", "q8_0", "int4_g32", "q4_0"] {
