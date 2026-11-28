@@ -113,8 +113,8 @@ extern "C" __global__ __launch_bounds__(256, DTR_PREP_BLK) void dtr_prep(const t
 
 template <u32 K, u32 BOOK, u32 NT, bool TURNED>
 static __device__ __forceinline__ void dtr_pre_body(const float* xpre_f, const u8* w,
-                                                    const float* svh, float* out, u32 m, u32 n,
-                                                    u32 k, dtr_pre_smem<NT>& sm) {
+                                                    const float* svh, trellis::y_t* out, u32 m,
+                                                    u32 n, u32 k, dtr_pre_smem<NT>& sm) {
     constexpr u32 TB = 32u * K, SUBS = NT / 8u;
     const u32* xpre = reinterpret_cast<const u32*>(xpre_f);
     u32 nblk = n >> 7u, ob = blockIdx.x, rblk = blockIdx.y, r0 = rblk * (8u * NT);
@@ -154,13 +154,7 @@ static __device__ __forceinline__ void dtr_pre_body(const float* xpre_f, const u
     }
     u32 col = (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
     if constexpr (!TURNED) {
-        u32 ob0 = ob << 7u;
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 r = r0 + (ti << 3u) + rc;
-            if (r < m) { out[u64(r) * n + ob0 + col] = acc[ti][0]; out[u64(r) * n + ob0 + col + 8u] = acc[ti][2]; }
-            if (r + 1u < m) { out[u64(r + 1u) * n + ob0 + col] = acc[ti][1]; out[u64(r + 1u) * n + ob0 + col + 8u] = acc[ti][3]; }
-        }
+        trellis::store_tile<NT>(out, r0, m, n, ob << 7u, col, rc, acc);
         return;
     }
     u32 base = (ob << 7u) + (lane << 2u);
@@ -183,8 +177,8 @@ static __device__ __forceinline__ void dtr_pre_body(const float* xpre_f, const u
                 float v[4];
                 trellis::load4(&sm.out[(ti << 3u) + j][lane << 2u], v);
                 trellis::wht128(v, trellis::INV_SQRT128);
-                *reinterpret_cast<float4*>(out + u64(r0 + r) * n + base) =
-                    make_float4(v[0] * sc[0], v[1] * sc[1], v[2] * sc[2], v[3] * sc[3]);
+                trellis::store_y4(out + u64(r0 + r) * n + base,
+                                  make_float4(v[0] * sc[0], v[1] * sc[1], v[2] * sc[2], v[3] * sc[3]));
             }
         }
     }
@@ -192,15 +186,15 @@ static __device__ __forceinline__ void dtr_pre_body(const float* xpre_f, const u
 
 template <u32 K, u32 BOOK, u32 NT>
 static __device__ __noinline__ void dtr_pre_k(const float* xpre, const u8* w, const float* svh,
-                                              float* out, u32 m, u32 n, u32 k, u32 turned,
+                                              trellis::y_t* out, u32 m, u32 n, u32 k, u32 turned,
                                               dtr_pre_smem<NT>& sm) {
     if (turned != 0u) dtr_pre_body<K, BOOK, NT, true>(xpre, w, svh, out, m, n, k, sm);
     else dtr_pre_body<K, BOOK, NT, false>(xpre, w, svh, out, m, n, k, sm);
 }
 
 template <u32 BOOK, u32 NT>
-static __device__ void dtr_pre_book(const float* xpre, const u8* w, const float* svh, float* out,
-                                    u32 m, u32 n, u32 k, u32 bits, u32 turned,
+static __device__ void dtr_pre_book(const float* xpre, const u8* w, const float* svh,
+                                    trellis::y_t* out, u32 m, u32 n, u32 k, u32 bits, u32 turned,
                                     dtr_pre_smem<NT>& sm) {
     if (bits == 2u) dtr_pre_k<2u, BOOK, NT>(xpre, w, svh, out, m, n, k, turned, sm);
     else if (bits == 3u) dtr_pre_k<3u, BOOK, NT>(xpre, w, svh, out, m, n, k, turned, sm);
@@ -208,9 +202,9 @@ static __device__ void dtr_pre_book(const float* xpre, const u8* w, const float*
 }
 
 template <u32 NT>
-static __device__ void dtr_pre_gen(const float* xpre, const u8* w, const float* svh, float* out,
-                                   u32 m, u32 n, u32 k, u32 bits, u32 book, u32 turned,
-                                   dtr_pre_smem<NT>& sm) {
+static __device__ void dtr_pre_gen(const float* xpre, const u8* w, const float* svh,
+                                   trellis::y_t* out, u32 m, u32 n, u32 k, u32 bits, u32 book,
+                                   u32 turned, dtr_pre_smem<NT>& sm) {
     if (book == trellis::BOOK_PMCGX) dtr_pre_book<trellis::BOOK_PMCGX, NT>(xpre, w, svh, out, m, n, k, bits, turned, sm);
     else if (book == trellis::BOOK_MUL1) dtr_pre_book<trellis::BOOK_MUL1, NT>(xpre, w, svh, out, m, n, k, bits, turned, sm);
     else dtr_pre_book<trellis::BOOK_MCG, NT>(xpre, w, svh, out, m, n, k, bits, turned, sm);
@@ -218,8 +212,8 @@ static __device__ void dtr_pre_gen(const float* xpre, const u8* w, const float* 
 
 // Rotated 4-bit dense trellis prefill, 64 rows per block.
 extern "C" __global__ __launch_bounds__(256, DTR_T8_BLK) void dtr_pre_k4_t8(
-    const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
-    u32 book, u32 turned) {
+    const float* xpre, const u8* w, const float* svh, trellis::y_t* out, u32 m, u32 n, u32 k,
+    u32 bits, u32 book, u32 turned) {
     (void)bits; (void)book; (void)turned;
     __shared__ dtr_pre_smem<8u> sm;
     dtr_pre_body<4u, trellis::BOOK_MCG, 8u, true>(xpre, w, svh, out, m, n, k, sm);
@@ -227,8 +221,8 @@ extern "C" __global__ __launch_bounds__(256, DTR_T8_BLK) void dtr_pre_k4_t8(
 
 // Rotated 4-bit dense trellis prefill, 128 rows per block.
 extern "C" __global__ __launch_bounds__(256, DTR_T16_BLK) void dtr_pre_k4_t16(
-    const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
-    u32 book, u32 turned) {
+    const float* xpre, const u8* w, const float* svh, trellis::y_t* out, u32 m, u32 n, u32 k,
+    u32 bits, u32 book, u32 turned) {
     (void)bits; (void)book; (void)turned;
     __shared__ dtr_pre_smem<16u> sm;
     dtr_pre_body<4u, trellis::BOOK_MCG, 16u, true>(xpre, w, svh, out, m, n, k, sm);
@@ -236,16 +230,16 @@ extern "C" __global__ __launch_bounds__(256, DTR_T16_BLK) void dtr_pre_k4_t16(
 
 // Generic dense trellis prefill, 64 rows per block.
 extern "C" __global__ __launch_bounds__(256, DTR_GEN8_BLK) void dtr_pre_gen8(
-    const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
-    u32 book, u32 turned) {
+    const float* xpre, const u8* w, const float* svh, trellis::y_t* out, u32 m, u32 n, u32 k,
+    u32 bits, u32 book, u32 turned) {
     __shared__ dtr_pre_smem<8u> sm;
     dtr_pre_gen<8u>(xpre, w, svh, out, m, n, k, bits, book, turned, sm);
 }
 
 // Generic dense trellis prefill, 128 rows per block.
 extern "C" __global__ __launch_bounds__(256, DTR_GEN16_BLK) void dtr_pre_gen16(
-    const float* xpre, const u8* w, const float* svh, float* out, u32 m, u32 n, u32 k, u32 bits,
-    u32 book, u32 turned) {
+    const float* xpre, const u8* w, const float* svh, trellis::y_t* out, u32 m, u32 n, u32 k,
+    u32 bits, u32 book, u32 turned) {
     __shared__ dtr_pre_smem<16u> sm;
     dtr_pre_gen<16u>(xpre, w, svh, out, m, n, k, bits, book, turned, sm);
 }
@@ -254,12 +248,12 @@ static __device__ __forceinline__ float mx8_silu(float v) {
     return v / (1.0f + expf(-v));
 }
 
-static __device__ __forceinline__ float mx8_epilogue(float v, const float* other, u64 off, u32 col,
-                                                     u32 mode) {
-    if (mode == 1u) return v + other[off];
-    if (mode == 2u) return v + other[col];
-    if (mode == 3u) return mx8_silu(v) * other[off];
-    if (mode == 4u) return v * other[off];
+static __device__ __forceinline__ float mx8_epilogue(float v, const trellis::o_t* other, u64 off,
+                                                     u32 col, u32 mode) {
+    if (mode == 1u) return v + trellis::load_o(other, off);
+    if (mode == 2u) return v + trellis::load_o(other, col);
+    if (mode == 3u) return mx8_silu(v) * trellis::load_o(other, off);
+    if (mode == 4u) return v * trellis::load_o(other, off);
     if (mode == 5u) return mx8_silu(v);
     return v;
 }
@@ -308,7 +302,8 @@ static __device__ __forceinline__ void mx8_ldm4(u32 (&r)[4], const void* smem_pt
 
 template <bool SPLIT>
 static __device__ __forceinline__ void mx8_store_vec4(
-    float4 v, const float* other, float* out, u64 off, u32 col, u32 n, u32 mode, bool vec4) {
+    float4 v, const trellis::o_t* other, trellis::y_t* out, u64 off, u32 col, u32 n, u32 mode,
+    bool vec4) {
     if (vec4 && col + 3u < n) {
         if (!SPLIT && mode != 0u) {
             v.x = mx8_epilogue(v.x, other, off, col, mode);
@@ -316,19 +311,20 @@ static __device__ __forceinline__ void mx8_store_vec4(
             v.z = mx8_epilogue(v.z, other, off + 2u, col + 2u, mode);
             v.w = mx8_epilogue(v.w, other, off + 3u, col + 3u, mode);
         }
-        *reinterpret_cast<float4*>(out + off) = v;
+        trellis::store_y4(out + off, v);
     } else {
         float vals[4] = {v.x, v.y, v.z, v.w};
         for (u32 j = 0u; j < 4u && col + j < n; j++) {
-            out[off + j] = SPLIT ? vals[j] : mx8_epilogue(vals[j], other, off + j, col + j, mode);
+            trellis::store_y(out, off + j, SPLIT ? vals[j] : mx8_epilogue(vals[j], other, off + j, col + j, mode));
         }
     }
 }
 
 template <u32 MI, bool SPLIT>
 static __device__ __forceinline__ void mx8_epilogue_smem(
-    float (*out_sm)[132], const float (&acc)[2][MI][4], const float* other, float* out,
-    u32 m, u32 n, u32 r0, u32 n0, u32 p, u32 mode, u32 tid, u32 wm, u32 n_base, u32 g, u32 t) {
+    float (*out_sm)[132], const float (&acc)[2][MI][4], const trellis::o_t* other,
+    trellis::y_t* out, u32 m, u32 n, u32 r0, u32 n0, u32 p, u32 mode, u32 tid, u32 wm, u32 n_base,
+    u32 g, u32 t) {
     constexpr u32 Q_ROWS = MI << 3u;
     constexpr u32 Q_SHIFT = (MI == 8u) ? 6u : 5u;
     u32 sr = tid >> 5u, sc4 = (tid & 31u) << 2u;
@@ -488,7 +484,7 @@ static __device__ __forceinline__ void mx8_phase_step(
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_mxfp8_mx8(
-    const float* xpre, const u8* w, const float* other, float* out,
+    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks) {
     extern __shared__ u8 raw_smem[];
     mx8_128_smem& sm = *reinterpret_cast<mx8_128_smem*>(raw_smem);
@@ -539,7 +535,8 @@ static __device__ __forceinline__ void fg_mxfp8_mx8(
 
 // Blackwell native MXFP8 MMA matmul, 128x128 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX8_BLK) void tessera_mm_mxfp8_mx8(
-    const float* xpre, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n,
+    u32 k, u32 mode) {
 #if DTR_MX8
     fg_mxfp8_mx8<false>(xpre, w, other, out, m, n, k, mode, 1u);
 #else
@@ -549,8 +546,8 @@ extern "C" __global__ __launch_bounds__(256, MM_MX8_BLK) void tessera_mm_mxfp8_m
 
 // Split-K Blackwell native MXFP8 MMA matmul, 128x128 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX8_SK_BLK) void tessera_mm_mxfp8_mx8_sk(
-    const float* xpre, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
-    u32 ks) {
+    const float* xpre, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n,
+    u32 k, u32 mode, u32 ks) {
 #if DTR_MX8
     fg_mxfp8_mx8<true>(xpre, w, other, out, m, n, k, mode, ks);
 #else

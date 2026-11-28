@@ -125,7 +125,12 @@ fn linear_mm_entries() {
     ] {
         assert!(prefill_source().contains(entry), "missing {entry}");
     }
-    for entry in ["DTR_DEF(dtr_k4_t4,", "DTR_GEN_DEF(dtr_gen4,", "ptr_gen("] {
+    for entry in [
+        "DTR_DEF(dtr_k4_t4,",
+        "DTR_GEN_DEF(dtr_gen4,",
+        "dtr_reduce(",
+        "ptr_gen(",
+    ] {
         assert!(trellis_source().contains(entry), "missing {entry}");
     }
 }
@@ -504,23 +509,33 @@ fn bf16_inputs_skip_widen() {
         ("trellis_k4", 1),
         ("trellis_k4", 64),
     ] {
-        let pins = Pins::all(named(w_form).expect("form"));
+        let pins = Pins::all(named(w_form).expect("form"))
+            .site(tessera_lower::Site::Matmul, BF16_FORM)
+            .outputs(BF16_FORM);
         let dev = cuda.clone().pinned(pins);
         let plan = lower(&g, 0, &[(Rows, rows)], &dev).expect("lowers");
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         assert!(
-            !names.iter().any(|n| n.contains("widen")),
-            "{w_form} rows={rows}: unexpected widen in {names:?}"
+            !names
+                .iter()
+                .any(|n| n.contains("widen") || n.contains("narrow")),
+            "{w_form} rows={rows}: unexpected cast in {names:?}"
         );
-        let has_x_bf16 = plan.steps.iter().any(|s| {
+        let has_x = plan.steps.iter().any(|s| {
             matches!(
                 s.kernel.source(),
                 Source::Fixed { text, .. } if text[tessera_lower::Backend::Cuda].contains("#define X_BF16 1")
             )
         });
+        let has_y = plan.steps.iter().any(|s| {
+            matches!(
+                s.kernel.source(),
+                Source::Fixed { text, .. } if text[tessera_lower::Backend::Cuda].contains("#define Y_BF16 1")
+            )
+        });
         assert!(
-            has_x_bf16,
-            "{w_form} rows={rows}: missing X_BF16 in {names:?}"
+            has_x && has_y,
+            "{w_form} rows={rows}: missing X/Y_BF16 in {names:?}"
         );
     }
 }
