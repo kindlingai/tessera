@@ -507,11 +507,6 @@ pub struct ResponseStream<'a> {
 }
 
 impl<'a> ResponseStream<'a> {
-    /// Whether the stream is inside a thinking block.
-    pub fn in_thinking(&self) -> bool {
-        self.mode == Mode::Thinking
-    }
-
     /// Number of pushed chunks that contributed to thinking blocks.
     pub fn reasoning_tokens(&self) -> usize {
         self.reasoning_tokens
