@@ -1,9 +1,12 @@
 //! Which paged experts hold a VRAM slot.
 
-use tessera_lower::Plan;
+use crate::plan::Plan;
+
+#[cfg(test)]
+mod paging_test;
 
 /// The policy's view of one paged weight.
-pub(crate) struct Paged<'a> {
+pub struct Paged<'a> {
     /// Each expert's VRAM slot. `None`: host memory.
     pub slots: &'a [Option<usize>],
     /// Bytes per expert.
@@ -14,7 +17,7 @@ pub(crate) struct Paged<'a> {
 
 /// Gives `hot`'s VRAM slot to `cold`.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Swap {
+pub struct Swap {
     pub weight: usize,
     pub cold: usize,
     pub hot: usize,
@@ -22,7 +25,7 @@ pub(crate) struct Swap {
 
 /// A promoted expert whose bytes still copy to its slot.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Moving {
+pub struct Moving {
     pub weight: usize,
     pub cold: usize,
     pub slot: usize,
@@ -30,11 +33,11 @@ pub(crate) struct Moving {
 
 /// Two-phase swaps: free a slot, then hand it over.
 #[derive(Default)]
-pub(crate) struct Moves(Vec<Moving>);
+pub struct Moves(Vec<Moving>);
 
 impl Moves {
     /// Frees `swap.hot`'s slot in its weight's `slots`.
-    pub(crate) fn begin(&mut self, slots: &mut [Option<usize>], swap: &Swap) -> Option<usize> {
+    pub fn begin(&mut self, slots: &mut [Option<usize>], swap: &Swap) -> Option<usize> {
         let slot = slots[swap.hot].take()?;
         self.0.push(Moving {
             weight: swap.weight,
@@ -45,13 +48,13 @@ impl Moves {
     }
 
     /// The moves whose copies are done, once the device waited.
-    pub(crate) fn land(&mut self) -> Vec<Moving> {
+    pub fn land(&mut self) -> Vec<Moving> {
         std::mem::take(&mut self.0)
     }
 }
 
 /// Chooses the experts that trade places after a step.
-pub(crate) trait Promote: Send {
+pub trait Promote: Send {
     /// Adds a step's hit count per expert of `weight`.
     fn observe(&mut self, weight: usize, hits: &[u32]);
     /// The swaps to make now, best first.
@@ -59,7 +62,7 @@ pub(crate) trait Promote: Send {
 }
 
 /// Scores each expert by decayed hits.
-pub(crate) struct Decayed {
+pub struct Decayed {
     /// Share of a score kept per step.
     pub decay: f32,
     /// Steps between swaps.
@@ -147,7 +150,7 @@ impl Promote for Decayed {
 }
 
 /// Names the cold experts a plan will read.
-pub(crate) trait Forecast: Send {
+pub trait Forecast: Send {
     /// Ring parts it needs. None stages nothing.
     fn parts(&self) -> usize;
     /// Cold experts of `weight` that `plan` reads, likeliest first.
@@ -155,7 +158,7 @@ pub(crate) trait Forecast: Send {
 }
 
 /// Predicts nothing, so every cold read streams from host.
-pub(crate) struct Unknown;
+pub struct Unknown;
 
 impl Forecast for Unknown {
     fn parts(&self) -> usize {
@@ -168,7 +171,7 @@ impl Forecast for Unknown {
 }
 
 /// Stages every cold expert a launch almost surely reads.
-pub(crate) struct Dense {
+pub struct Dense {
     /// The least chance of a read that stages an expert.
     pub sure: f64,
     /// Weights staged ahead of the one in use.
@@ -187,7 +190,7 @@ impl Default for Dense {
 impl Dense {
     /// Expert rows the plan's steps pick from `weight`.
     fn picks(plan: &Plan, weight: u32) -> usize {
-        let loaded = |l: &&tessera_lower::Loaded| l.weight == weight && l.part.is_none();
+        let loaded = |l: &&crate::plan::Loaded| l.weight == weight && l.part.is_none();
         let Some(slot) = plan.weights.iter().find(loaded).map(|l| l.slot) else {
             return 0;
         };
@@ -195,8 +198,7 @@ impl Dense {
         let out = slot.shape[1] as usize;
         let mut picks = 0;
         for step in &plan.steps[plan.forward()] {
-            let reads =
-                |r: &tessera_lower::Slot| r.buffer == slot.buffer && r.offset == slot.offset;
+            let reads = |r: &crate::plan::Slot| r.buffer == slot.buffer && r.offset == slot.offset;
             if out > 0 && step.reads.iter().any(reads) && step.write.len.is_multiple_of(out) {
                 picks = picks.max(step.write.len / out);
             }

@@ -1,6 +1,6 @@
-use crate::promote::{Decayed, Dense, Forecast, Moves, Moving, Paged, Promote, Swap};
-use tessera_lower::kernels::Map;
-use tessera_lower::{KernelRef, Loaded, Plan, Slot, Step};
+use crate::kernels::Map;
+use crate::paging::{Decayed, Dense, Forecast, Moves, Moving, Paged, Promote, Swap};
+use crate::{KernelRef, Loaded, Plan, Slot, Step};
 
 #[test]
 fn decayed_swaps_expert() {

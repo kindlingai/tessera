@@ -3,11 +3,11 @@
 use crate::Error;
 use crate::held::Held;
 use crate::lanes::{Source, Staging};
-use crate::promote::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
 use crate::run::Base;
 use std::collections::{BTreeMap, HashMap};
 use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
 use tessera_lower::kernels::{Ring, place};
+use tessera_lower::paging::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
 use tessera_lower::{Loaded, Plan, Slot};
 use tessera_mem::Backing;
 

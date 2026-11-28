@@ -17,6 +17,7 @@ pub mod form;
 pub mod hazard;
 mod kernel;
 pub mod kernels;
+pub mod paging;
 mod plan;
 mod recipe;
 pub mod rule;

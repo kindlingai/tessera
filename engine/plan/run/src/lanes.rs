@@ -1,11 +1,11 @@
 //! Lanes beside compute: their sync events and staged copies.
 
 use crate::Error;
-use crate::promote::{Forecast, Unknown};
 use tessera_gpukit::device::{Device, DeviceBuffer};
 use tessera_lower::Step;
 use tessera_lower::hazard::hazards;
 use tessera_lower::kernels::{Batches, Ring};
+use tessera_lower::paging::{Forecast, Unknown};
 use tessera_mem::Backing;
 
 // The plan's copy lane is the device's copy stream.
