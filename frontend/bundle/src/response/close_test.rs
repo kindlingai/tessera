@@ -381,67 +381,74 @@ fn check_r11_overlap_tags() {
     check_r12_tail_overlap();
 }
 
+type TailCase<'a> = (&'a [&'a str], &'a str, &'a [&'a str], &'a str, &'a [Value]);
+
 fn check_r12_tail_overlap() {
-    // Longer value closer extending past shorter block closer defers split.
-    let cases: &[(&str, &str, &[&str], &str, Value)] = &[
+    // Longer value closer matches literal and class closers.
+    let nl_tag = r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>\n";
+    let fn_tag = r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>";
+    let nl = &[r"</function></tool_call>", r"[<]/function></tool_call>"];
+    let fn_c = &[r"</function>", r"[<]/function>"];
+    let (one, two) = ([json!({"x": 1})], [json!({"x": 1}), json!({"x": 2})]);
+    let (hi, raw) = ([json!({"x": "hello"})], [json!({"x": "1</parameter>"})]);
+    let c1 = "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>";
+    let c2 = "<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>";
+    let ch = "<tool_call><function=ping><parameter=x>hello</parameter></function></tool_call>";
+    let f1 = "<tool_call><function=ping><parameter=x>1</parameter></function>";
+    let f2 = "<tool_call><function=ping><parameter=x>2</parameter></function>";
+    let cases: &[TailCase<'_>] = &[
+        (nl, nl_tag, &[c1, "\n All done."], "\n All done.", &one),
+        (nl, nl_tag, &[ch, "\n All done."], "\n All done.", &hi),
         (
-            r"</function></tool_call>",
-            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>\n",
-            &[
-                "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
-                "\n All done.",
-            ],
-            "\n All done.",
-            json!({"x": 1}),
+            nl,
+            nl_tag,
+            &[c1, "\n next ", c2, "\n All done."],
+            "\n next \n All done.",
+            &two,
         ),
         (
-            r"</function></tool_call>",
-            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>\n",
-            &[
-                "<tool_call><function=ping><parameter=x>hello</parameter></function></tool_call>",
-                "\n All done.",
-            ],
-            "\n All done.",
-            json!({"x": "hello"}),
-        ),
-        (
-            r"</function>",
-            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>",
-            &[
-                "<tool_call><function=ping><parameter=x>1</parameter></function>",
-                "</tool_call> All done.",
-            ],
+            fn_c,
+            fn_tag,
+            &[f1, "</tool_call> All done."],
             "</tool_call> All done.",
-            json!({"x": 1}),
+            &one,
         ),
         (
-            r"</function>",
-            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)</parameter></function></tool_call>",
-            &[
-                "<tool_call><function=ping><parameter=x>1</parameter></function>",
-                " All done.",
-            ],
+            fn_c,
+            fn_tag,
+            &[f1, "</tool_call> next ", f2, "</tool_call> All done."],
+            "</tool_call> next </tool_call> All done.",
+            &two,
+        ),
+        (
+            &[r"</function>"],
+            fn_tag,
+            &[f1, " All done."],
             " All done.",
-            json!({"x": "1</parameter>"}),
+            &raw,
         ),
     ];
-    for (close_pat, tag_pat, pieces, want_content, want_args) in cases {
-        let cfg = xml_tool_cfg(close_pat, tag_pat);
-        let p = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    for &(closers, tag, pieces, want_content, want_calls) in cases {
         let joined = pieces.concat();
-        let want = vec![("ping".to_string(), want_args.clone())];
-        let whole = p.parse(&joined, true, false);
-        assert_eq!(
-            (
-                whole.content.as_str(),
-                whole.tool_calls[0].function.arguments.clone()
-            ),
-            (*want_content, want_args.clone())
-        );
-        let (_, content, calls) = parse_stream(&p, pieces);
-        assert_eq!((content.as_str(), calls), (*want_content, want));
-        for i in 0..=joined.len() {
-            check_parity(&p, &[&joined[..i], &joined[i..]]);
+        let want: Vec<(String, Value)> = want_calls
+            .iter()
+            .map(|v| ("ping".to_string(), v.clone()))
+            .collect();
+        for close_pat in closers {
+            let cfg = xml_tool_cfg(close_pat, tag);
+            let p = ResponseParser::from_config(&cfg).unwrap().unwrap();
+            let whole = p.parse(&joined, true, false);
+            let got: Vec<(String, Value)> = whole
+                .tool_calls
+                .into_iter()
+                .map(|tc| (tc.function.name, tc.function.arguments))
+                .collect();
+            assert_eq!((whole.content.as_str(), got), (want_content, want.clone()));
+            let (_, content, calls) = parse_stream(&p, pieces);
+            assert_eq!((content.as_str(), calls), (want_content, want.clone()));
+            for i in 0..=joined.len() {
+                check_parity(&p, &[&joined[..i], &joined[i..]]);
+            }
         }
     }
 }
