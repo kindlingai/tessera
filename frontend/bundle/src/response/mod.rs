@@ -9,7 +9,7 @@ mod response_test;
 mod stream;
 
 use crate::template::{FunctionCall, Message, Template, ToolCall, spaced};
-use close::{Closers, literal_prefix};
+use close::{Closers, literal_prefix, next_tag};
 use fancy_regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -228,20 +228,26 @@ impl Body {
             Body::Json(args) => parse_json(body.trim(), args),
             Body::Tags { regex, .. } => {
                 let mut map = Map::new();
-                for caps in regex.captures_iter(full) {
-                    let caps = caps.ok()?;
-                    let whole = caps.get(0)?;
-                    if whole.start() >= body_len {
+                let mut pos = 0;
+                while pos < body_len {
+                    let from_full = if full.len() > body_len {
+                        next_tag(regex, full, pos, body_len)?
+                    } else {
+                        None
+                    };
+                    let from_body = next_tag(regex, body, pos, body_len)?;
+                    let Some((_, end, key, raw)) = (match (from_full, from_body) {
+                        (Some(f), Some(b)) if b.0 < f.0 => Some(b),
+                        (Some(f), _) => Some(f),
+                        (None, b) => b,
+                    }) else {
                         break;
-                    }
-                    let (key, value) = (caps.name("key")?, caps.name("value")?);
-                    if key.end() > body_len || value.end() > body_len {
-                        continue;
-                    }
+                    };
                     // A value that parses as JSON keeps its type.
-                    let value = serde_json::from_str(value.as_str())
-                        .unwrap_or_else(|_| Value::String(value.as_str().to_string()));
-                    map.insert(key.as_str().to_string(), value);
+                    let val = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()));
+                    map.insert(key.to_string(), val);
+                    pos = end.max(pos + body[pos..].chars().next().map_or(1, char::len_utf8));
                 }
                 Some(Value::Object(map))
             }

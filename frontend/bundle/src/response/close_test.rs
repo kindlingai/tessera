@@ -278,6 +278,48 @@ fn check_r7_closers() {
         false,
     );
     assert_eq!(parsed.tool_calls[0].function.arguments, json!({}));
+    check_r10_buffered_tags();
+}
+
+fn check_r10_buffered_tags() {
+    // End-of-body `$` tag terminator keeps the final parameter before closer.
+    let end_cfg = xml_tool_cfg(
+        r"</function></tool_call>",
+        r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|$)",
+    );
+    let ep = ResponseParser::from_config(&end_cfg).unwrap().unwrap();
+    let sample = "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function></tool_call> All done.";
+    let want = vec![("ping".to_string(), json!({"y": 2, "x": 1}))];
+    let whole = ep.parse(sample, true, false);
+    assert_eq!(
+        (
+            whole.content.as_str(),
+            whole.tool_calls[0].function.arguments.clone()
+        ),
+        (" All done.", json!({"y": 2, "x": 1}))
+    );
+    for i in 0..=sample.len() {
+        let (_, content, calls) = parse_stream(&ep, &[&sample[..i], &sample[i..]]);
+        assert_eq!((content.as_str(), calls), (" All done.", want.clone()));
+    }
+    // Zero-width closer defers buffered tag lookahead for split parity.
+    let zero_cfg = xml_tool_cfg(
+        r"(?=</function>)",
+        r"[<]parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|(?=</function></tool_call>))",
+    );
+    let zp = ResponseParser::from_config(&zero_cfg).unwrap().unwrap();
+    let split = [
+        "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function>",
+        "</tool_call> All done.",
+    ];
+    let (_, content, calls) = parse_stream(&zp, &split);
+    assert_eq!(
+        (content.as_str(), calls),
+        ("</function></tool_call> All done.", want.clone())
+    );
+    for i in 0..=sample.len() {
+        check_parity(&zp, &[&sample[..i], &sample[i..]]);
+    }
 }
 
 fn xml_tool_cfg(close_pat: &str, tag_pat: &str) -> String {

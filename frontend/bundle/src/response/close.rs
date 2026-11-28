@@ -214,6 +214,32 @@ impl Closers {
     }
 }
 
+/// Next tag capture bounded inside `body_len`.
+pub(super) fn next_tag<'a>(
+    regex: &Regex,
+    text: &'a str,
+    pos: usize,
+    body_len: usize,
+) -> Option<Option<(usize, usize, &'a str, &'a str)>> {
+    let Some(caps) = regex.captures_from_pos(text, pos).ok()? else {
+        return Some(None);
+    };
+    let whole = caps.get(0)?;
+    if whole.start() >= body_len {
+        return Some(None);
+    }
+    let (key, value) = (caps.name("key")?, caps.name("value")?);
+    if key.end() > body_len || value.end() > body_len {
+        return Some(None);
+    }
+    Some(Some((
+        whole.start(),
+        whole.end(),
+        key.as_str(),
+        value.as_str(),
+    )))
+}
+
 /// Finds the earliest match among literal and lookahead closers.
 pub(super) fn find_closers(text: &str, closers: &[Closer]) -> Option<(usize, usize)> {
     find_closers_for(text, closers, true)

@@ -598,6 +598,9 @@ fn step_buffer(
     let Some((at, len)) = spec.close.find_from_for(buf, from, eof) else {
         return StepOutcome::Wait;
     };
+    if !eof && len == 0 && matches!(spec.body, Body::Tags { .. }) {
+        return StepOutcome::Wait;
+    }
     let raw_end = at + len;
     let context_end = if len == 0 { buf.len() } else { raw_end };
     match parse_tool(spec, &buf[..context_end], at) {

@@ -468,6 +468,75 @@ fn check_stop_tail_usage() {
     check_slot_think(&tagged, "a", "b", 2);
 }
 
+fn check_xml_tool_case(
+    close_pat: &str,
+    tag_pat: &str,
+    pieces: &[&str],
+    want_args: &[Value],
+    want_content: &str,
+) {
+    let tool_cfg = json!({"response_template": {"fields": {"tool_calls": {
+        "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+        "close_pattern": close_pat,
+        "content": "xml-inline",
+        "content_args": {"tag_pattern": tag_pat},
+        "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+    }}}})
+    .to_string();
+    let mock = Arc::new(MockGenerator {
+        pieces: pieces.iter().map(|s| (*s).into()).collect(),
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, ResponseParser::from_config(&tool_cfg).unwrap());
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "ping"}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+    });
+    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    assert_eq!(got["choices"][0]["message"]["content"], want_content);
+    let calls = got["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), want_args.len());
+    for (call, want) in calls.iter().zip(want_args) {
+        assert_eq!(call["function"]["name"], "ping");
+        let raw = call["function"]["arguments"].as_str().unwrap();
+        assert_eq!(&serde_json::from_str::<Value>(raw).unwrap(), want);
+    }
+    body["stream"] = json!(true);
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    let mut args = vec![String::new(); want_args.len()];
+    let mut content = String::new();
+    for line in sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+    {
+        let v: Value = serde_json::from_str(line).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+        for item in v["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let i = item["index"].as_u64().unwrap() as usize;
+            if let Some(a) = item["function"]["arguments"].as_str() {
+                args[i].push_str(a);
+            }
+        }
+    }
+    for (raw, want) in args.iter().zip(want_args) {
+        assert_eq!(&serde_json::from_str::<Value>(raw).unwrap(), want);
+    }
+    assert_eq!(content, want_content);
+}
+
 fn check_lookahead_tools() {
     let implicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?(?:</parameter>|(?=<parameter=)|(?=</function>))";
     let explicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>";
@@ -476,14 +545,18 @@ fn check_lookahead_tools() {
         "\n<tool_call><function=ping><parameter=x>2</function></tool_call>",
         " All done.",
     ];
-    let cases: [(&str, &str, &[&str]); 5] = [
+    let two = [json!({"x": 1}), json!({"x": 2})];
+    let one = [json!({"y": 2, "x": 1})];
+    for (close_pat, tag_pat, pieces, want, content) in [
         (
             "</tool_call>(?!-literal)",
             explicit_tag,
             &[
                 "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>",
                 "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done.",
-            ],
+            ][..],
+            &two[..],
+            "\n All done.",
         ),
         (
             r"(?<=</parameter></function>)</tool_call>",
@@ -492,85 +565,52 @@ fn check_lookahead_tools() {
                 "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
                 "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
                 " All done.",
-            ],
+            ][..],
+            &two[..],
+            "\n All done.",
         ),
-        (r"</function></tool_call>", implicit_tag, implicit_pieces),
-        (r"[<]/function></tool_call>", implicit_tag, implicit_pieces),
+        (
+            r"</function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+            &two[..],
+            "\n All done.",
+        ),
+        (
+            r"[<]/function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+            &two[..],
+            "\n All done.",
+        ),
         (
             r"(?<=[0-9])</function></tool_call>",
             implicit_tag,
             implicit_pieces,
+            &two[..],
+            "\n All done.",
         ),
-    ];
-    for (close_pat, tag_pat, pieces) in cases {
-        let tool_cfg = json!({"response_template": {"fields": {"tool_calls": {
-            "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
-            "close_pattern": close_pat,
-            "content": "xml-inline",
-            "content_args": {"tag_pattern": tag_pat},
-            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
-        }}}})
-        .to_string();
-        let mock = Arc::new(MockGenerator {
-            pieces: pieces.iter().map(|s| (*s).into()).collect(),
-            ..MockGenerator::default()
-        });
-        let slot = loaded_with(&mock, true, ResponseParser::from_config(&tool_cfg).unwrap());
-        let mut body = json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "ping"}}],
-            "tool_choice": "auto",
-            "parallel_tool_calls": true,
-        });
-        let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
-        assert_eq!(status, 200);
-        assert_eq!(got["choices"][0]["message"]["content"], "\n All done.");
-        let calls = got["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0]["function"],
-            json!({"name": "ping", "arguments": "{\"x\":1}"})
-        );
-        assert_eq!(
-            calls[1]["function"],
-            json!({"name": "ping", "arguments": "{\"x\":2}"})
-        );
-        body["stream"] = json!(true);
-        let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
-        assert_eq!(s_status, 200);
-        let mut args = [String::new(), String::new()];
-        let mut content = String::new();
-        for line in sse
-            .lines()
-            .filter_map(|l| l.strip_prefix("data: "))
-            .filter(|d| *d != "[DONE]")
-        {
-            let v: Value = serde_json::from_str(line).unwrap();
-            if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
-                content.push_str(c);
-            }
-            for item in v["choices"][0]["delta"]["tool_calls"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                let i = item["index"].as_u64().unwrap() as usize;
-                if let Some(a) = item["function"]["arguments"].as_str() {
-                    args[i].push_str(a);
-                }
-            }
-        }
-        assert_eq!(
-            serde_json::from_str::<Value>(&args[0]).unwrap(),
-            json!({"x": 1})
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(&args[1]).unwrap(),
-            json!({"x": 2})
-        );
-        assert_eq!(content, "\n All done.");
+        (
+            r"</function></tool_call>",
+            r"<parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|$)",
+            &[
+                "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function></tool_call> All done.",
+            ][..],
+            &one[..],
+            " All done.",
+        ),
+        (
+            r"(?=</function>)",
+            r"[<]parameter=(?P<key>[^>]+)>(?P<value>.*?)(?:</parameter>|(?=</function></tool_call>))",
+            &[
+                "<tool_call><function=ping><parameter=y>2</parameter><parameter=x>1</function>",
+                "</tool_call> All done.",
+            ][..],
+            &one[..],
+            "</function></tool_call> All done.",
+        ),
+    ] {
+        check_xml_tool_case(close_pat, tag_pat, pieces, want, content);
     }
 }
 
