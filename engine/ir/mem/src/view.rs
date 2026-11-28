@@ -84,9 +84,16 @@ impl<'a> View<'a> {
             return Ok(bytes);
         }
         let size = self.dtype.bytes();
-        let mut out = Vec::with_capacity(size * self.len());
-        for at in self.layout.offsets() {
-            out.extend_from_slice(&bytes[at * size..(at + 1) * size]);
+        let total = self.len();
+        let mut out = Vec::with_capacity(size * total);
+        if total == 0 {
+            return Ok(Cow::Owned(out));
+        }
+        let (chunk, outer) = self.layout.chunk_layout();
+        let span = chunk * size;
+        for at in self.layout.prefix_offsets(outer) {
+            let from = at * size;
+            out.extend_from_slice(&bytes[from..from + span]);
         }
         Ok(Cow::Owned(out))
     }
