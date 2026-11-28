@@ -289,7 +289,7 @@ fn sunk_reads_rings() {
 /// Metal prefill takes the tiles. Few rows do not.
 #[test]
 fn metal_takes_sunk() {
-    let apple = Device::guess(&host()).on(platform("metal", "apple9"));
+    let apple = Device::guess(&host()).on(m4_pro());
     for c in CASES {
         let g = graph(c);
         let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &apple).unwrap();
@@ -311,12 +311,14 @@ fn metal_takes_sunk() {
 
 /// The units and bandwidth an M4 Pro reports.
 fn m4_pro() -> Platform {
-    Platform {
+    let mut plat = Platform {
         name: "Apple M4 Pro".into(),
         units: 20,
         bandwidth: 273e9,
         ..platform("metal", "apple9")
-    }
+    };
+    plat.limits.msl_bfloat = true;
+    plat
 }
 
 /// Wide Metal prefill takes the bf16 tiles, unfavored.
@@ -341,6 +343,19 @@ fn sunk_metal_is_picked() {
         assert_eq!(step.kernel.needs().group_bytes, 25_728);
         let few = lower(&g, 0, &sizes(&[(0, 64, 4)]), &apple).unwrap();
         assert!(!kernels(&few).contains(&METAL), "{c:?}");
+        let mut old_msl = m4_pro();
+        old_msl.limits.msl_bfloat = false;
+        let fallback = lower(
+            &g,
+            0,
+            &sizes(LAUNCHES[0]),
+            &Device::guess(&host()).on(old_msl),
+        )
+        .unwrap();
+        assert!(
+            kernels(&fallback).contains(&RULE) && !kernels(&fallback).contains(&METAL),
+            "{kept}: should fall back to {RULE} without MSL 3.1 bfloat"
+        );
         for (backend, arch) in [("cuda", "sm_121"), ("rocm", "gfx11_5")] {
             let other = Device::guess(&host()).on(platform(backend, arch));
             let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &other).unwrap();
@@ -352,13 +367,77 @@ fn sunk_metal_is_picked() {
     assert!(kernels(&narrow).contains(&RULE) && !kernels(&narrow).contains(&METAL));
 }
 
+/// Large sink logits stay finite and match the reference.
+#[test]
+fn sink_stays_finite() {
+    for width in [64usize, 128] {
+        let c = case(Mask::Causal, [2, 1, width, 1, 0]);
+        let g = graph(c);
+        let n = 16usize;
+        let run = [(0u32, 0u32, n as u32)];
+        let inputs = vec![
+            Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
+            Tensor::f32(
+                vec![n, c.kv_heads, c.width],
+                vec![0.0; n * c.kv_heads * c.width],
+            ),
+            Tensor::f32(
+                vec![n, c.kv_heads, c.width],
+                vec![1e37; n * c.kv_heads * c.width],
+            ),
+            Tensor::u32(vec![n], vec![0; n]),
+            Tensor::u32(vec![n], (0..n as u32).collect()),
+            Tensor::f32(vec![c.heads], vec![90.0; c.heads]),
+            Tensor::f32(vec![n, c.heads, 1], vec![0.0; n * c.heads]),
+        ];
+        let mut store = Store::default();
+        let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+        let expected = want[0].floats().unwrap();
+        assert!(
+            expected[0] > 1e-3 && expected[0].is_finite(),
+            "{:?}",
+            expected[0]
+        );
+        for settings in runs() {
+            let dev = Device::guess(&settings).favoring(RULE);
+            if dev.platform.backend != "host" && dev.platform.backend != "metal" {
+                continue;
+            }
+            let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+            let names = kernels(&plan);
+            let expect_kernel = if width == 128
+                && dev.platform.backend == "metal"
+                && dev.platform.limits.msl_bfloat
+            {
+                METAL
+            } else {
+                RULE
+            };
+            assert!(names.contains(&expect_kernel), "picked {names:?}");
+            let mut runner = open(plan, &settings).unwrap();
+            let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+            let got = runner.run(&views).unwrap().remove(0);
+            let got = got.floats().unwrap();
+            let off = max_abs_diff(got, expected);
+            assert!(
+                off < 5e-3,
+                "sink=90 w={width} on {} ({expect_kernel}): got {} want {} off {off:e}",
+                runner.device(),
+                got[0],
+                expected[0]
+            );
+        }
+    }
+}
+
 /// Runs on a Metal GPU alone: bf16 rounds each operand.
 #[test]
 fn sunk_metal_matches() {
     let Some(settings) = runs().into_iter().find(|s| s.gpu().is_some()) else {
         return;
     };
-    if Device::guess(&settings).platform.backend != "metal" {
+    let plat = Device::guess(&settings).platform;
+    if plat.backend != "metal" || !plat.limits.msl_bfloat {
         return;
     }
     let mut draws = Noise(73);

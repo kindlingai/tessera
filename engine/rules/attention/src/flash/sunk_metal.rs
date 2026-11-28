@@ -49,6 +49,7 @@ fn needs() -> Needs {
         group_threads: THREADS as usize,
         tile: true,
         compiler: true,
+        msl_bfloat: true,
         lacks: LACKS,
         ..Needs::default()
     }

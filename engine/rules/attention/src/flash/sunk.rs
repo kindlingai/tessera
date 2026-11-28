@@ -55,21 +55,48 @@ fn scores_near(
     }
 }
 
-/// Adds each row's sink to its softmax sum.
+/// Scales two output tiles twice by `alpha_s`.
 #[kernel]
-fn sink_rows(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32) {
+fn scale_sinks(top: &mut Tiles, bottom: &mut Tiles, alpha_s: &Shared<f32>) {
+    top.scale(|r| alpha_s[r]);
+    top.scale(|r| alpha_s[r]);
+    bottom.scale(|r| alpha_s[16 + r]);
+    bottom.scale(|r| alpha_s[16 + r]);
+}
+
+/// Folds each row's sink into its sum without overflow.
+#[kernel]
+fn fold_sinks(st: &mut Stream, sinks: Buf<F32>, hd: &Head, sink_mode: u32, #[build] w: u32) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
-        let r = hd.q0 + simd * ROWS + i;
-        if sink_mode > 0 && r < hd.queries {
-            let list = r * hd.heads + hd.head;
+        let q = hd.q0 + simd * ROWS + i;
+        let mut h = 1.0f32;
+        if sink_mode > 0 && q < hd.queries {
+            let list = q * hd.heads + hd.head;
             let at = if sink_mode == 1 { hd.head } else { list };
             let sink = sinks[at as u64];
             if sink > f32::NEG_INFINITY {
+                let peak = st.state[i as usize];
                 let sum = st.state[(ROWS + i) as usize];
-                st.state[(ROWS + i) as usize] = sum + exp(sink - st.state[i as usize]);
+                if sink > peak {
+                    h = exp(0.5 * (peak - sink));
+                    st.state[(ROWS + i) as usize] = (sum * h) * h + 1.0;
+                } else {
+                    st.state[(ROWS + i) as usize] = sum + exp(sink - peak);
+                }
             }
         }
+        if lane() == 0 {
+            st.alpha_s[simd * ROWS + i] = h;
+        }
+    }
+    barrier();
+    // Apply `h` twice to avoid subnormal `exp(peak - sink)`.
+    if simd * 16 < w {
+        scale_sinks(&mut st.o00, &mut st.o01, &st.alpha_s);
+    }
+    if (simd + 4) * 16 < w {
+        scale_sinks(&mut st.o10, &mut st.o11, &st.alpha_s);
     }
 }
 
@@ -204,7 +231,7 @@ fn flash_sunk(
                     &mut st, values, &hd, at, k0, span.hi, 0, w, w, bk, held_q, v_form,
                 );
             }
-            sink_rows(&mut st, sinks, &hd, sink_mode);
+            fold_sinks(&mut st, sinks, &hd, sink_mode, w);
             write_all(&mut st, out, &hd, 0, w, w, out_form);
             barrier();
         }

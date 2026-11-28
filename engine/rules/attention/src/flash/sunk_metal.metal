@@ -236,24 +236,55 @@ kernel void flash_sunk_metal(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // A sink adds to the sum. It has no value.
+        // Folds any sink without overflowing or flushing subnormals.
         for (uint i = 0u; i < 8u; i++) {
+            float f = 1.0f;
+            int k = 0;
             uint r = q0 + simd * 8u + i;
             if (sink_mode > 0u && r < queries) {
                 float sink = sinks[sink_mode == 1u ? head : r * heads + head];
-                if (sink > fs_floor()) l[i] += exp(sink - m[i]);
+                if (sink > fs_floor()) {
+                    if (sink > m[i]) {
+                        float d = m[i] - sink;
+                        if (d < -174.0f) {
+                            f = 0.0f;
+                            l[i] = 1.0f;
+                        } else {
+                            k = int(ceil(d * 1.4426950408889634f));
+                            f = exp(d - float(k) * 0.6931471805599453f);
+                            int k1 = k >> 1;
+                            l[i] = ldexp(ldexp(l[i] * f, k1), k - k1) + 1.0f;
+                        }
+                    } else {
+                        l[i] += exp(sink - m[i]);
+                    }
+                }
+            }
+            if (lane == 0u) {
+                alpha_s[simd * 8u + i] = f;
+                pos_s[simd * 8u + i] = as_type<uint>(k);
+                l_s[simd * 8u + i] = l[i];
             }
         }
-        if (lane < 8u) l_s[simd * 8u + lane] = l[lane];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0u; i < 4u; i++) {
             uint r = i * 8u + er;
             if (to_s[r] > from_s[r]) {
+                float f = alpha_s[r];
+                int k = as_type<int>(pos_s[r]);
+                int k1 = k >> 1;
+                int k2 = k - k1;
                 ulong at = (ulong(q0 + r) * heads + head) * FS_D + simd * 32u + ec;
                 for (uint j = 0u; j < 4u; j++) {
-                    out[at + j * 8u] = o[i][j][0] / l_s[r];
-                    out[at + j * 8u + 1u] = o[i][j][1] / l_s[r];
+                    float v0 = (o[i][j][0] * f) / l_s[r];
+                    float v1 = (o[i][j][1] * f) / l_s[r];
+                    if (k < 0) {
+                        v0 = ldexp(ldexp(v0, k1), k2);
+                        v1 = ldexp(ldexp(v1, k1), k2);
+                    }
+                    out[at + j * 8u] = v0;
+                    out[at + j * 8u + 1u] = v1;
                 }
             }
         }
