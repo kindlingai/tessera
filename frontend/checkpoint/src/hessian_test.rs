@@ -1,9 +1,10 @@
 use crate::File;
 use crate::hessian::{
-    DenseEntry, ExpertShard, HessianMeta, dense_name, expert_name, pack_tiles_into, triu_len,
-    weights_id, weights_id_bytes, write_dense, write_experts,
+    DenseEntry, ExpertShard, HessianMeta, Inputs, dense_name, expert_name, inputs_name,
+    pack_tiles_into, route_name, triu_len, weights_id, weights_id_bytes, write_dense,
+    write_experts, write_inputs, write_route,
 };
-use crate::st_write::le_bytes;
+use crate::st_write::as_le_bytes;
 
 fn pack_triu(full: &[f32], d: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(triu_len(d));
@@ -61,8 +62,8 @@ fn hessian_roundtrip() {
     let shard = ExpertShard {
         layer: 3,
         first: 0,
-        gu: &le_bytes(&gu, f32::to_le_bytes),
-        down: &le_bytes(&dn, f32::to_le_bytes),
+        gu: &as_le_bytes(&gu),
+        down: &as_le_bytes(&dn),
         counts: &[100, 200],
         dims: (3, 2),
     };
@@ -84,5 +85,35 @@ fn hessian_roundtrip() {
     let df = File::open(&dense_path).unwrap();
     assert_eq!(df.meta("sequences"), Some("calibration"));
     assert_eq!(df.i64s("count_mlp_in").unwrap(), [300]);
+    assert_eq!(df.floats("mlp_in").unwrap(), [1.0, 2.0, 2.0, 3.0]);
+
+    let inp_path = dir.join(inputs_name(3));
+    let inp = Inputs {
+        layer: 3,
+        heldout_seqs: 2,
+        x_bf16: &[0x3f80, 0xc000, 0x3f00, 0x0000],
+        topk_idx: &[1, 3, 0, 2],
+        topk_w: &[0.75, 0.25, 0.5, 0.5],
+        hidden: 2,
+        top_k: 2,
+    };
+    write_inputs(&inp_path, &inp, &meta).unwrap();
+    let inf = File::open(&inp_path).unwrap();
+    assert_eq!(inf.floats("x").unwrap(), [1.0, -2.0, 0.5, 0.0]);
+    assert_eq!(inf.floats("topk_w").unwrap(), [0.75, 0.25, 0.5, 0.5]);
+
+    let rt_path = dir.join(route_name(3));
+    write_route(
+        &rt_path,
+        3,
+        "pre",
+        &[1, -2],
+        &[0x3c00, 0xbc00],
+        [1, 1, 2],
+        &meta,
+    )
+    .unwrap();
+    let rf = File::open(&rt_path).unwrap();
+    assert_eq!(rf.floats("w").unwrap(), [1.0, -1.0]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

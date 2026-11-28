@@ -1,7 +1,8 @@
 //! exlr8 `HESSIAN.md` calibration file writers and `weights_id`.
 
 use crate::Error;
-use crate::st_write::{StTensor, le_bytes, write_file};
+use crate::st_write::{StTensor, as_le_bytes, write_file};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -153,7 +154,7 @@ pub fn write_experts(
     let last = shard.first + n - 1;
     m.insert("experts".into(), format!("{}-{last}", shard.first));
     m.insert("layout".into(), EXPERT_LAYOUT.into());
-    let ct_b = le_bytes(shard.counts, i64::to_le_bytes);
+    let ct_b = as_le_bytes(shard.counts);
     let tensors = [
         StTensor {
             name: "gu",
@@ -189,8 +190,7 @@ pub fn write_dense(
     m.insert("layout".into(), DENSE_LAYOUT.into());
     let seqs = if heldout { "held out" } else { "calibration" };
     m.insert("sequences".into(), seqs.into());
-    let mut owned: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> =
-        Vec::with_capacity(entries.len() * 2);
+    let mut owned = Vec::with_capacity(entries.len() * 2);
     for e in entries {
         if e.dim == 0 || e.data.len() != e.dim * e.dim {
             return Err(Error::Format(format!(
@@ -199,16 +199,16 @@ pub fn write_dense(
             )));
         }
         owned.push((
-            e.name.into(),
+            String::from(e.name),
             "F32",
             vec![e.dim, e.dim],
-            le_bytes(e.data, f32::to_le_bytes),
+            as_le_bytes(e.data),
         ));
         owned.push((
             format!("count_{}", e.name),
             "I64",
             vec![1],
-            le_bytes(&[e.count], i64::to_le_bytes),
+            Cow::Owned(e.count.to_le_bytes().to_vec()),
         ));
     }
     let tensors: Vec<StTensor<'_>> = owned
@@ -249,9 +249,9 @@ pub fn write_inputs(path: &Path, inp: &Inputs<'_>, meta: &HessianMeta) -> Result
     }
     let mut m = meta.base(inp.layer)?;
     m.insert("heldout_sequences".into(), inp.heldout_seqs.to_string());
-    let x_b = le_bytes(inp.x_bf16, u16::to_le_bytes);
-    let idx_b = le_bytes(inp.topk_idx, i32::to_le_bytes);
-    let w_b = le_bytes(inp.topk_w, f32::to_le_bytes);
+    let x_b = as_le_bytes(inp.x_bf16);
+    let idx_b = as_le_bytes(inp.topk_idx);
+    let w_b = as_le_bytes(inp.topk_w);
     let tensors = [
         StTensor {
             name: "x",
@@ -291,8 +291,8 @@ pub fn write_route(
     }
     let mut m = meta.base(layer)?;
     m.insert("rows".into(), rows.into());
-    let idx_b = le_bytes(idx_i16, i16::to_le_bytes);
-    let w_b = le_bytes(w_f16, u16::to_le_bytes);
+    let idx_b = as_le_bytes(idx_i16);
+    let w_b = as_le_bytes(w_f16);
     let tensors = [
         StTensor {
             name: "idx",

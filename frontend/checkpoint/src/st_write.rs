@@ -1,6 +1,7 @@
 //! Canonical safetensors writer with sorted JSON headers.
 
 use crate::Error;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -128,16 +129,45 @@ pub(crate) fn write_file(
     }
     let tmp = path.with_extension("safetensors.tmp");
     let file = fs::File::create(&tmp)?;
-    write_to(BufWriter::with_capacity(1 << 20, file), meta, tensors)?;
+    write_to(BufWriter::with_capacity(64 << 10, file), meta, tensors)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Encodes slice values into little-endian bytes.
-pub(crate) fn le_bytes<T: Copy, const N: usize>(values: &[T], encode: fn(T) -> [u8; N]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * N);
-    for &v in values {
-        out.extend_from_slice(&encode(v));
+/// Primitive numeric scalar with no padding bytes.
+pub(crate) trait LeScalar: Copy {
+    #[cfg(not(target_endian = "little"))]
+    fn push_le(self, out: &mut Vec<u8>);
+}
+
+macro_rules! impl_le_scalar {
+    ($($t:ty),+ $(,)?) => {
+        $(impl LeScalar for $t {
+            #[cfg(not(target_endian = "little"))]
+            fn push_le(self, out: &mut Vec<u8>) {
+                out.extend_from_slice(&self.to_le_bytes());
+            }
+        })+
+    };
+}
+
+impl_le_scalar!(u16, i16, i32, i64, f32);
+
+/// Borrows little-endian bytes on little-endian hosts.
+pub(crate) fn as_le_bytes<T: LeScalar>(values: &[T]) -> Cow<'_, [u8]> {
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = std::mem::size_of_val(values);
+        // SAFETY: `T` is a padding-free little-endian scalar.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
+        Cow::Borrowed(bytes)
     }
-    out
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(std::mem::size_of_val(values));
+        for &v in values {
+            v.push_le(&mut out);
+        }
+        Cow::Owned(out)
+    }
 }
