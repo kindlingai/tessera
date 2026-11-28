@@ -1,7 +1,9 @@
 //! Symbolic dimensions, shape expressions and their normal form.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::{Add, Mul};
 use std::sync::Mutex;
@@ -25,6 +27,13 @@ macro_rules! dim_names {
                 match self {
                     $(DimName::$name => stringify!($name),)*
                     DimName::Named(name) => name.0,
+                }
+            }
+
+            fn built_in(text: &str) -> Option<DimName> {
+                match text {
+                    $(stringify!($name) => Some(DimName::$name),)*
+                    _ => None,
                 }
             }
         }
@@ -80,12 +89,7 @@ impl DimName {
 
     /// The name a spelling stands for, built-in or declared.
     pub fn parse(text: &str) -> DimName {
-        for name in Self::BUILT_IN {
-            if name.as_str() == text {
-                return *name;
-            }
-        }
-        DimName::Named(Name(intern(text)))
+        Self::built_in(text).unwrap_or_else(|| DimName::Named(Name(intern(text))))
     }
 }
 
@@ -124,7 +128,8 @@ impl Serialize for DimName {
 
 impl<'de> Deserialize<'de> for DimName {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(DimName::parse(&String::deserialize(d)?))
+        let text = Cow::<'de, str>::deserialize(d)?;
+        Ok(DimName::parse(&text))
     }
 }
 
@@ -193,52 +198,241 @@ pub enum DimExpr {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, derive_more::From)]
 pub struct Shape(pub Vec<DimExpr>);
 
+/// Sorted bounded-dimension factors, stored inline up to four.
+#[derive(Clone, Debug)]
+enum Mono {
+    Small { len: u8, dims: [DimName; 4] },
+    Many(Vec<DimName>),
+}
+
+impl Mono {
+    const EMPTY: Self = Self::Small {
+        len: 0,
+        dims: [DimName::Seqs; 4],
+    };
+
+    fn var(name: DimName) -> Self {
+        Self::Small {
+            len: 1,
+            dims: [name, DimName::Seqs, DimName::Seqs, DimName::Seqs],
+        }
+    }
+
+    fn as_slice(&self) -> &[DimName] {
+        match self {
+            Self::Small { len, dims } => &dims[..*len as usize],
+            Self::Many(v) => v.as_slice(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        let (a, b) = (self.as_slice(), other.as_slice());
+        if a.is_empty() {
+            return other.clone();
+        }
+        if b.is_empty() {
+            return self.clone();
+        }
+        let total = a.len() + b.len();
+        let (mut i, mut j) = (0, 0);
+        if total <= 4 {
+            let mut dims = [DimName::Seqs; 4];
+            let mut k = 0;
+            while i < a.len() && j < b.len() {
+                if a[i] <= b[j] {
+                    dims[k] = a[i];
+                    i += 1;
+                } else {
+                    dims[k] = b[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            for &d in &a[i..] {
+                dims[k] = d;
+                k += 1;
+            }
+            for &d in &b[j..] {
+                dims[k] = d;
+                k += 1;
+            }
+            return Self::Small {
+                len: total as u8,
+                dims,
+            };
+        }
+        let mut out = Vec::with_capacity(total);
+        while i < a.len() && j < b.len() {
+            if a[i] <= b[j] {
+                out.push(a[i]);
+                i += 1;
+            } else {
+                out.push(b[j]);
+                j += 1;
+            }
+        }
+        out.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&b[j..]);
+        Self::Many(out)
+    }
+}
+
+impl PartialEq for Mono {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Mono {}
+
+impl PartialOrd for Mono {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Mono {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+/// Canonical non-zero polynomial terms, inline for 0 or 1 term.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+enum Terms {
+    #[default]
+    Zero,
+    One((Mono, u64)),
+    Many(Vec<(Mono, u64)>),
+}
+
+impl Terms {
+    fn as_slice(&self) -> &[(Mono, u64)] {
+        match self {
+            Self::Zero => &[],
+            Self::One(pair) => std::slice::from_ref(pair),
+            Self::Many(pairs) => pairs,
+        }
+    }
+
+    fn from_sorted(mut pairs: Vec<(Mono, u64)>) -> Self {
+        match pairs.len() {
+            0 => Self::Zero,
+            1 => Self::One(pairs.pop().expect("len 1")),
+            _ => Self::Many(pairs),
+        }
+    }
+}
+
 /// Coefficients keyed by sorted bounded-dimension monomials.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Poly(BTreeMap<Vec<DimName>, u64>);
+pub struct Poly(Terms);
 
 impl Poly {
     pub fn constant(c: u64) -> Self {
-        let mut p = Poly::default();
-        if c != 0 {
-            p.0.insert(Vec::new(), c);
+        if c == 0 {
+            Poly(Terms::Zero)
+        } else {
+            Poly(Terms::One((Mono::EMPTY, c)))
         }
-        p
     }
 
     fn var(name: DimName) -> Self {
-        Poly(BTreeMap::from([(vec![name], 1)]))
+        Poly(Terms::One((Mono::var(name), 1)))
     }
 
     pub fn sum(&self, other: &Poly) -> Poly {
-        let mut out = self.clone();
-        for (m, c) in &other.0 {
-            *out.0.entry(m.clone()).or_insert(0) += c;
+        match (&self.0, &other.0) {
+            (Terms::Zero, _) => other.clone(),
+            (_, Terms::Zero) => self.clone(),
+            (Terms::One((ma, ca)), Terms::One((mb, cb))) => match ma.cmp(mb) {
+                Ordering::Equal => Poly(Terms::One((ma.clone(), ca + cb))),
+                Ordering::Less => Poly(Terms::Many(vec![(ma.clone(), *ca), (mb.clone(), *cb)])),
+                Ordering::Greater => Poly(Terms::Many(vec![(mb.clone(), *cb), (ma.clone(), *ca)])),
+            },
+            (a, b) => {
+                let (a, b) = (a.as_slice(), b.as_slice());
+                let mut out = Vec::with_capacity(a.len() + b.len());
+                let (mut i, mut j) = (0, 0);
+                while i < a.len() && j < b.len() {
+                    match a[i].0.cmp(&b[j].0) {
+                        Ordering::Less => {
+                            out.push(a[i].clone());
+                            i += 1;
+                        }
+                        Ordering::Greater => {
+                            out.push(b[j].clone());
+                            j += 1;
+                        }
+                        Ordering::Equal => {
+                            out.push((a[i].0.clone(), a[i].1 + b[j].1));
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+                out.extend_from_slice(&a[i..]);
+                out.extend_from_slice(&b[j..]);
+                Poly(Terms::from_sorted(out))
+            }
         }
-        out
     }
 
     pub fn product(&self, other: &Poly) -> Poly {
-        let mut out = Poly::default();
-        for (ma, ca) in &self.0 {
-            for (mb, cb) in &other.0 {
-                let mut m: Vec<DimName> = ma.iter().chain(mb).copied().collect();
-                m.sort();
-                *out.0.entry(m).or_insert(0) += ca * cb;
+        match (&self.0, &other.0) {
+            (Terms::Zero, _) | (_, Terms::Zero) => Poly(Terms::Zero),
+            (Terms::One((ma, ca)), Terms::One((mb, cb))) => Poly(Terms::One((ma.mul(mb), ca * cb))),
+            (a, b) => {
+                let (a, b) = (a.as_slice(), b.as_slice());
+                let mut raw = Vec::with_capacity(a.len() * b.len());
+                for (ma, ca) in a {
+                    for (mb, cb) in b {
+                        raw.push((ma.mul(mb), ca * cb));
+                    }
+                }
+                raw.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+                let mut out: Vec<(Mono, u64)> = Vec::with_capacity(raw.len());
+                for (m, c) in raw {
+                    if let Some(last) = out.last_mut()
+                        && last.0 == m
+                    {
+                        last.1 += c;
+                    } else {
+                        out.push((m, c));
+                    }
+                }
+                Poly(Terms::from_sorted(out))
             }
         }
-        out
     }
 
     /// Whether this is at least `other` at every size.
     pub fn covers(&self, other: &Poly) -> bool {
-        (other.0.iter()).all(|(m, c)| self.0.get(m).is_some_and(|own| own >= c))
+        let (a, b) = (self.0.as_slice(), other.0.as_slice());
+        if b.is_empty() {
+            return true;
+        }
+        let mut i = 0;
+        for (mb, cb) in b {
+            while i < a.len() && a[i].0 < *mb {
+                i += 1;
+            }
+            if i == a.len() || a[i].0 != *mb || a[i].1 < *cb {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     pub fn as_const(&self) -> Option<u64> {
-        match self.0.len() {
-            0 => Some(0),
-            1 => self.0.get(&Vec::new()).copied(),
+        match &self.0 {
+            Terms::Zero => Some(0),
+            Terms::One((m, c)) if m.is_empty() => Some(*c),
             _ => None,
         }
     }
@@ -246,10 +440,10 @@ impl Poly {
     /// The value under `size`. `None` if a dimension is unbound.
     pub fn eval(&self, size: &dyn Fn(DimName) -> Option<u64>) -> Option<u64> {
         let mut total = 0;
-        for (m, c) in &self.0 {
+        for (m, c) in self.0.as_slice() {
             let mut term = *c;
-            for name in m {
-                term *= size(*name)?;
+            for &name in m.as_slice() {
+                term *= size(name)?;
             }
             total += term;
         }
