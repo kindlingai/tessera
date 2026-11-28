@@ -5,9 +5,11 @@
 set -e
 runs="repos/$GITHUB_REPOSITORY/actions/workflows/protected.yml/runs"
 # Removing the label reruns this job while that run is still going.
+# Other added labels skip the job. Skipped runs do not count.
 for _ in $(seq 30); do
-    run=$(gh api "$runs?head_sha=$SHA&event=pull_request_target&per_page=1" \
-        --jq '.workflow_runs[0] // empty | "\(.status) \(.conclusion) \(.html_url)"')
+    run=$(gh api "$runs?head_sha=$SHA&event=pull_request_target&per_page=20" \
+        --jq '[.workflow_runs[] | select(.conclusion != "skipped")][0] // empty
+            | "\(.status) \(.conclusion) \(.html_url)"')
     case "$run" in
     "completed success "*) exit 0 ;;
     completed*)
