@@ -87,3 +87,48 @@ fn reads_filed_spans() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn widens_large_tensors() {
+    use tessera_engine::{Bf16, F16};
+
+    let n = 200_003usize;
+    let bf_bits: Vec<u16> = (0..n)
+        .map(|i| ((i * 257) as u16) & 0x7f7f | ((i as u16 & 1) << 15))
+        .collect();
+    let f16_bits: Vec<u16> = (0..n)
+        .map(|i| ((i * 193) as u16) & 0x7bff | ((i as u16 & 1) << 15))
+        .collect();
+    let f32_vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.125 - 10_000.0).collect();
+
+    let mut data = Vec::with_capacity(n * 8);
+    for &b in &bf_bits {
+        data.extend(b.to_le_bytes());
+    }
+    let f16_at = data.len();
+    for &h in &f16_bits {
+        data.extend(h.to_le_bytes());
+    }
+    let f32_at = data.len();
+    for &x in &f32_vals {
+        data.extend(x.to_le_bytes());
+    }
+    let end = data.len();
+    let header = format!(
+        r#"{{"bf":{{"dtype":"BF16","shape":[{n}],"data_offsets":[0,{f16_at}]}},"h":{{"dtype":"F16","shape":[{n}],"data_offsets":[{f16_at},{f32_at}]}},"f":{{"dtype":"F32","shape":[{n}],"data_offsets":[{f32_at},{end}]}}}}"#
+    );
+    let path = write("large_floats", &header, &data);
+    let f = File::open(&path).unwrap();
+
+    let got_bf = f.floats("bf").unwrap();
+    for (g, &b) in got_bf.iter().zip(&bf_bits) {
+        assert_eq!(g.to_bits(), f32::from(Bf16(b)).to_bits());
+    }
+    let got_f16 = f.floats("h").unwrap();
+    for (g, &h) in got_f16.iter().zip(&f16_bits) {
+        assert_eq!(g.to_bits(), f32::from(F16(h)).to_bits());
+    }
+    let got_f32 = f.floats("f").unwrap();
+    assert_eq!(got_f32, f32_vals);
+    std::fs::remove_file(path).unwrap();
+}

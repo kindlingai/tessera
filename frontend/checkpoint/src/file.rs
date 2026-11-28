@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
-use tessera_engine::{Bf16, F16, Filed, Reads};
+use tessera_engine::{F16, Filed, Reads};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -67,6 +67,33 @@ fn stored(dtype: &str) -> Stored {
         "F16" => Stored::F16,
         _ => Stored::Other,
     }
+}
+
+/// Minimum element count before parallel widening across threads.
+const PARALLEL_ELEMS: usize = 65_536;
+
+/// Widens two-byte little-endian floats to f32 in parallel.
+fn widen_halves(bytes: &[u8], convert: impl Fn([u8; 2]) -> f32 + Copy + Send + Sync) -> Vec<f32> {
+    let src = bytes.as_chunks::<2>().0;
+    let count = src.len();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(count / PARALLEL_ELEMS);
+    if threads <= 1 {
+        return src.iter().map(|b| convert(*b)).collect();
+    }
+    let mut out = vec![0.0f32; count];
+    let per = count.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (dst, part) in out.chunks_mut(per).zip(src.chunks(per)) {
+            scope.spawn(move || {
+                for (o, b) in dst.iter_mut().zip(part) {
+                    *o = convert(*b);
+                }
+            });
+        }
+    });
+    out
 }
 
 /// Whether a safetensors dtype is a two-byte float.
@@ -260,18 +287,30 @@ impl File {
             _ => return Err(unknown()),
         };
         let [start, end] = e.data_offsets;
-        let count = e.shape.iter().product::<usize>() as u64;
-        if end - start != count * width {
+        let count = e.shape.iter().product::<usize>();
+        if end - start != count as u64 * width {
             return Err(format(format_args!("{name} has the wrong byte count")));
         }
+        #[cfg(target_endian = "little")]
+        if kind == Stored::F32
+            && let Backing::Disk(disk) = &self.backing
+        {
+            let mut out = vec![0.0f32; count];
+            // SAFETY: every 4-byte pattern is a valid f32.
+            let raw =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), count * 4) };
+            disk.read(self.data + start, raw, Reads::Cached)?;
+            return Ok(out);
+        }
         let bytes = self.read(start, end)?;
-        let halves = || (bytes.as_chunks::<2>().0.iter()).map(|b| u16::from_le_bytes(*b));
         Ok(match kind {
             k if k == Stored::F32 => (bytes.as_chunks::<4>().0.iter())
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
-            k if k == Stored::BF16 => halves().map(|h| f32::from(Bf16(h))).collect(),
-            _ => halves().map(|h| f32::from(F16(h))).collect(),
+            k if k == Stored::BF16 => widen_halves(&bytes, |b| {
+                f32::from_bits(u32::from(u16::from_le_bytes(b)) << 16)
+            }),
+            _ => widen_halves(&bytes, |b| f32::from(F16(u16::from_le_bytes(b)))),
         })
     }
 }
