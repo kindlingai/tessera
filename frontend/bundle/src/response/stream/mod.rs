@@ -151,7 +151,7 @@ impl ToolState {
     pub(super) fn finish(&mut self, spec: &BlockSpec, rest: &str, out: &mut Vec<ResponseEvent>) {
         match self {
             Self::Start | Self::Buffer => {
-                if let Some(calls) = parse_tool(spec, rest) {
+                if let Some(calls) = parse_tool(spec, rest, rest.len()) {
                     out.extend(calls.into_iter().map(ResponseEvent::ToolCall));
                 } else {
                     out.push(ResponseEvent::Content(rest.to_string()));
@@ -598,9 +598,9 @@ fn step_buffer(
     let Some((at, len)) = spec.close.find_from_for(buf, from, eof) else {
         return StepOutcome::Wait;
     };
-    let block = buf[..at].to_string();
     let raw_end = at + len;
-    match parse_tool(spec, &block) {
+    let context_end = if len == 0 { buf.len() } else { raw_end };
+    match parse_tool(spec, &buf[..context_end], at) {
         Some(calls) => out.extend(calls.into_iter().map(ResponseEvent::ToolCall)),
         None => out.push(ResponseEvent::Content(buf[..raw_end].to_string())),
     }

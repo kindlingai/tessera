@@ -221,15 +221,23 @@ impl Body {
         })
     }
 
-    fn parse(&self, body: &str) -> Option<Value> {
+    fn parse(&self, full: &str, body_len: usize) -> Option<Value> {
+        let body = &full[..body_len];
         match self {
             Body::Text => Some(Value::String(body.to_string())),
             Body::Json(args) => parse_json(body.trim(), args),
             Body::Tags { regex, .. } => {
                 let mut map = Map::new();
-                for caps in regex.captures_iter(body) {
+                for caps in regex.captures_iter(full) {
                     let caps = caps.ok()?;
+                    let whole = caps.get(0)?;
+                    if whole.start() >= body_len {
+                        break;
+                    }
                     let (key, value) = (caps.name("key")?, caps.name("value")?);
+                    if key.end() > body_len || value.end() > body_len {
+                        continue;
+                    }
                     // A value that parses as JSON keeps its type.
                     let value = serde_json::from_str(value.as_str())
                         .unwrap_or_else(|_| Value::String(value.as_str().to_string()));
@@ -895,9 +903,10 @@ fn tail_hold(buf: &str, needles: &[&str]) -> usize {
     hold
 }
 
-fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
-    let (captures, rest) = spec.open.strip(block)?;
-    let parsed = spec.body.parse(rest)?;
+fn parse_tool(spec: &BlockSpec, text: &str, body_end: usize) -> Option<Vec<ToolCall>> {
+    let (captures, rest) = spec.open.strip(&text[..body_end])?;
+    let open_len = body_end - rest.len();
+    let parsed = spec.body.parse(&text[open_len..], rest.len())?;
     let shaped = match &spec.transform {
         Some(tmpl) => apply_transform(tmpl, &captures, &parsed),
         None => parsed,

@@ -469,9 +469,17 @@ fn check_stop_tail_usage() {
 }
 
 fn check_lookahead_tools() {
-    let cases: [(&str, &[&str]); 2] = [
+    let implicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?(?:</parameter>|(?=<parameter=)|(?=</function>))";
+    let explicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>";
+    let implicit_pieces: &[&str] = &[
+        "<tool_call><function=ping><parameter=x>1</function></tool_call>",
+        "\n<tool_call><function=ping><parameter=x>2</function></tool_call>",
+        " All done.",
+    ];
+    let cases: [(&str, &str, &[&str]); 5] = [
         (
             "</tool_call>(?!-literal)",
+            explicit_tag,
             &[
                 "<tool_call>\n<function=ping>\n<parameter=x>1</parameter>\n</function>\n</tool_call>",
                 "\n<tool_call>\n<function=ping>\n<parameter=x>2</parameter>\n</function>\n</tool_call> All done.",
@@ -479,19 +487,27 @@ fn check_lookahead_tools() {
         ),
         (
             r"(?<=</parameter></function>)</tool_call>",
+            explicit_tag,
             &[
                 "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
                 "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
                 " All done.",
             ],
         ),
+        (r"</function></tool_call>", implicit_tag, implicit_pieces),
+        (r"[<]/function></tool_call>", implicit_tag, implicit_pieces),
+        (
+            r"(?<=[0-9])</function></tool_call>",
+            implicit_tag,
+            implicit_pieces,
+        ),
     ];
-    for (close_pat, pieces) in cases {
+    for (close_pat, tag_pat, pieces) in cases {
         let tool_cfg = json!({"response_template": {"fields": {"tool_calls": {
             "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
             "close_pattern": close_pat,
             "content": "xml-inline",
-            "content_args": {"tag_pattern": r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>"},
+            "content_args": {"tag_pattern": tag_pat},
             "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
         }}}})
         .to_string();

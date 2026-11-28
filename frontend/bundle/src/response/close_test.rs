@@ -242,29 +242,63 @@ fn check_r7_closers() {
     .to_string();
     let ep = ResponseParser::from_config(&early_cfg).unwrap().unwrap();
     check_parity(&ep, &["<think>planabcd", "efanswer"]);
-    // Lookbehind tool closers keep prior XML context intact across calls.
-    let compact = [
-        "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
-        "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
-        " All done.",
-    ];
-    let joined = compact.concat();
+    // Lookbehind and class closers preserve XML context.
+    check_xml_tool_closers(
+        r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>",
+        &[
+            "<tool_call><function=ping><parameter=x>1</parameter></function></tool_call>",
+            "\n<tool_call><function=ping><parameter=x>2</parameter></function></tool_call>",
+            " All done.",
+        ],
+        &[
+            r"(?<=</parameter></function>)</tool_call>",
+            r"(?<=</function>)</tool_call>",
+        ],
+    );
+    let implicit_tag = r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?(?:</parameter>|(?=<parameter=)|(?=</function>))";
+    check_xml_tool_closers(
+        implicit_tag,
+        &[
+            "<tool_call><function=ping><parameter=x>1</function></tool_call>",
+            "\n<tool_call><function=ping><parameter=x>2</function></tool_call>",
+            " All done.",
+        ],
+        &[
+            r"</function></tool_call>",
+            r"[<]/function></tool_call>",
+            r"(?<=[0-9])</function></tool_call>",
+        ],
+    );
+    // Closer prefix bytes must not leak into parameter values.
+    let tail_cfg = xml_tool_cfg(r"[T]AIL</function></tool_call>", implicit_tag);
+    let tail_p = ResponseParser::from_config(&tail_cfg).unwrap().unwrap();
+    let parsed = tail_p.parse(
+        "<tool_call><function=ping><parameter=x>1TAIL</function></tool_call>",
+        true,
+        false,
+    );
+    assert_eq!(parsed.tool_calls[0].function.arguments, json!({}));
+}
+
+fn xml_tool_cfg(close_pat: &str, tag_pat: &str) -> String {
+    json!({"response_template": {"fields": {"tool_calls": {
+        "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+        "close_pattern": close_pat,
+        "content": "xml-inline",
+        "content_args": {"tag_pattern": tag_pat},
+        "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
+    }}}})
+    .to_string()
+}
+
+fn check_xml_tool_closers(tag_pat: &str, pieces: &[&str], pats: &[&str]) {
+    let joined = pieces.concat();
     let want = vec![
         ("ping".to_string(), json!({"x": 1})),
         ("ping".to_string(), json!({"x": 2})),
     ];
-    for pat in [
-        r"(?<=</parameter></function>)</tool_call>",
-        r"(?<=</function>)</tool_call>",
-    ] {
-        let cfg = json!({"response_template": {"fields": {"tool_calls": {
-            "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>",
-            "close_pattern": pat,
-            "content": "xml-inline",
-            "content_args": {"tag_pattern": r"<parameter=(?P<key>[^>\n]+)>\n?(?P<value>.*?)\n?</parameter>"},
-            "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
-        }}}})
-        .to_string();
+    for pat in pats {
+        let cfg = xml_tool_cfg(pat, tag_pat);
         let tp = ResponseParser::from_config(&cfg).unwrap().unwrap();
         let whole = tp.parse(&joined, true, false);
         let got: Vec<(String, Value)> = whole
@@ -276,7 +310,7 @@ fn check_r7_closers() {
             (whole.content.as_str(), got),
             ("\n All done.", want.clone())
         );
-        let (_, content, calls) = parse_stream(&tp, &compact);
+        let (_, content, calls) = parse_stream(&tp, pieces);
         assert_eq!((content.as_str(), calls), ("\n All done.", want.clone()));
         for i in 0..=joined.len() {
             check_parity(&tp, &[&joined[..i], &joined[i..]]);
