@@ -1,11 +1,10 @@
 //! Streaming decode GEMV for BF16, MXFP8 and INT4 weights.
 
+use super::epi::{gemv_epilogue, gemv_launch, gemv_load_for};
 use super::{WARPS, cuda_needs, cuda_source_with, trip, weight_x_accepts, x_accepts};
-use tessera_graph::{Act, Op, Order, Stage};
+use tessera_graph::{Op, Order};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Term, Tree,
-};
+use tessera_lower::{Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Term, Tree};
 
 tessera_lower::knob!("fast_gemv_bf16", "narrow_max_n", 1, 1024);
 tessera_lower::knob!("fast_gemv_bf16", "narrow_min_k", 256, 131072);
@@ -155,64 +154,24 @@ fn gemv_source(k: &FastGemv) -> Source {
 }
 
 fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
-    let groups = k.kind.groups(k.n, k.warps);
-    let threads = k.warps * 32;
-    let x_elem = if k.x_bf16 { 2 } else { 4 };
-    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let step = match k.kind {
         GemvKind::Bf16 => 256.0,
         GemvKind::Bf16Narrow => (k.warps * 256) as f64,
         GemvKind::Mxfp8 | GemvKind::Int4 => 1024.0,
     };
-    Some(Load {
-        threads: groups * threads,
-        group: threads,
-        trips: k.k as f64 / step,
-        trip: k.kind.trip(),
-        reads: vec![k.form.bytes(k.n * k.k) as f64, (x_elem * k.k) as f64],
-        written: (y_elem * k.n) as f64,
-        flight: 512.0,
-        ..Load::default()
-    })
+    gemv_load_for(
+        k.form,
+        [k.n, k.k],
+        [k.kind.groups(k.n, k.warps), k.warps * 32],
+        k.k as f64 / step,
+        k.kind.trip(),
+        [if k.x_bf16 { 2 } else { 4 }, if k.y_bf16 { 2 } else { 4 }],
+    )
 }
 
 fn gemv_launches(k: &FastGemv, step: &Step) -> Vec<Launch> {
-    let shape = k.shape().expect("a grid");
-    let mut args = vec![
-        step.read(0),
-        step.read(1),
-        step.out(),
-        Arg::count(k.n),
-        Arg::count(k.k),
-    ];
-    if matches!(k.kind, GemvKind::Bf16 | GemvKind::Bf16Narrow) {
-        args.extend([Arg::value(&k.mode), Arg::value(&k.a), Arg::value(&k.b)]);
-    }
-    vec![Launch { args, shape }]
-}
-
-fn gemv_epilogue(tree: &Tree, mut at: T) -> Option<(T, u32, f32, f32)> {
-    let (mut mode, mut a, mut b) = (0u32, 1.0f32, 1.0f32);
-    if let Term::Stage(Stage::Scale(s)) = tree.node(at).term {
-        let prev = tree.node(at).args[0];
-        if !tree.root(prev) && tree.node(prev).term == Term::Stage(Stage::Act(Act::Sigmoid)) {
-            b = s;
-            at = prev;
-        }
-    }
-    match tree.node(at).term {
-        Term::Stage(Stage::Act(Act::Silu)) if b == 1.0 => (mode, at) = (1, tree.node(at).args[0]),
-        Term::Stage(Stage::Act(Act::Sigmoid)) => (mode, at) = (2, tree.node(at).args[0]),
-        _ if b != 1.0 => return None,
-        _ => {}
-    }
-    if mode != 0
-        && !tree.root(at)
-        && let Term::Stage(Stage::Scale(s)) = tree.node(at).term
-    {
-        (a, at) = (s, tree.node(at).args[0]);
-    }
-    (mode == 0 || !tree.root(at)).then_some((at, mode, a, b))
+    let act = matches!(k.kind, GemvKind::Bf16 | GemvKind::Bf16Narrow).then_some((k.mode, k.a, k.b));
+    gemv_launch(k.shape().expect("a grid"), k.n, k.k, act, step)
 }
 
 fn check_gemv(

@@ -59,7 +59,7 @@ fn mm_shaped(
     Some((name, entry, reads))
 }
 
-fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId {
+pub(crate) fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId {
     let id = NodeId(g.nodes.len() as u32);
     g.nodes.push(Node {
         op,
@@ -70,7 +70,7 @@ fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId
     id
 }
 
-fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType>) -> Graph {
+pub(crate) fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType>) -> Graph {
     let mat = g.entries[0].outputs[0].node;
     let ty = g.nodes[mat.0 as usize].ty.clone();
     let mut args = vec![mat];

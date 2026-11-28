@@ -1,15 +1,19 @@
 //! Streaming BF16 and MXFP8 Tensor-Core small-batch matmul rule.
 
+use super::epi::{
+    MatmulBase, MmDims, check_mm_base, epi_accepts, has_bias2, has_other, match_mm_site,
+    pick_divisor, push_epi_reads,
+};
 use super::{
     CUDA_LACKS, cuda_source_with, f32_only, int4_source_with, io_defs, prefill_source_with,
-    weight_io_accepts, x_accepts, x_defs,
+    rocm_needs, rocm_source, weight_io_accepts, x_accepts, x_defs,
 };
 mod mx8;
 
 use mx8::{Mxfp8Mx8, Mxfp8Prep, mxfp8_pre_len};
-use tessera_graph::{Act, Op, Order, Stage};
+use tessera_graph::Order;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MmKind {
@@ -161,20 +165,6 @@ impl MmKind {
                 | MmKind::Int4TallSplit
         )
     }
-}
-
-fn pick_divisor(chunks: usize, want: usize, cap: usize) -> usize {
-    for d in want..=cap {
-        if chunks.is_multiple_of(d) {
-            return d;
-        }
-    }
-    for d in (1..want).rev() {
-        if chunks.is_multiple_of(d) {
-            return d;
-        }
-    }
-    1
 }
 
 tessera_lower::knob!("fast_mm_bf16", "split_groups", 0, 2048);
@@ -423,26 +413,30 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
 /// Deterministic split-K reduction and matmul epilogue.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "fast_mm_reduce",
+    name = if self.rocm { "rocm_mm_reduce" } else { "fast_mm_reduce" },
     sizes = [self.m, self.n, self.ks],
     work = self.m * self.n * self.ks,
     accepts = mm_red_accepts,
     emits = mm_red_emits,
-    needs = mm_red_needs(),
+    needs = mm_red_needs(self.rocm),
     order = Order::PerConfig,
-    source = cuda_source_with(
-        "tessera_mm_reduce",
-        io_defs(
-            self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
-            false,
-            self.y_bf16,
-            self.o_bf16,
-        ),
-    ),
+    source = if self.rocm {
+        rocm_source(super::rocm_mm::rocm_linear_source(), "rocm_mm_reduce")
+    } else {
+        cuda_source_with(
+            "tessera_mm_reduce",
+            io_defs(
+                self.min_blocks.map(|v| ("MM_RED_BLK", v as usize)),
+                false,
+                self.y_bf16,
+                self.o_bf16,
+            ),
+        )
+    },
     launches = mm_red_launches,
     load = mm_red_load,
     load_key = tessera_lower::load_key((
-        self.m, self.n, self.ks, self.mode, self.min_blocks, self.y_bf16, self.o_bf16,
+        self.m, self.n, self.ks, self.mode, self.rocm, self.min_blocks, self.y_bf16, self.o_bf16,
     )),
     unproven,
 )]
@@ -451,12 +445,16 @@ struct FastMmReduce {
     n: usize,
     ks: usize,
     mode: u32,
+    rocm: bool,
     min_blocks: Option<u32>,
     y_bf16: bool,
     o_bf16: bool,
 }
 
 fn mm_red_accepts(r: &FastMmReduce, input: usize, form: &dyn Stored) -> bool {
+    if r.rocm && input >= 1 {
+        return epi_accepts(r.mode, input, 1, form);
+    }
     match input {
         1 => x_accepts(r.o_bf16, form),
         _ => form.name() == "f32",
@@ -467,7 +465,10 @@ fn mm_red_emits(r: &FastMmReduce, form: &dyn Stored) -> bool {
     x_accepts(r.y_bf16, form)
 }
 
-fn mm_red_needs() -> Needs {
+fn mm_red_needs(rocm: bool) -> Needs {
+    if rocm {
+        return rocm_needs(0, 256, false);
+    }
     Needs {
         lanes: 32,
         group_bytes: 0,
@@ -482,7 +483,9 @@ fn mm_red_load(r: &FastMmReduce, _: usize) -> Option<Load> {
     let o_elem = if r.o_bf16 { 2 } else { 4 };
     let y_elem = if r.y_bf16 { 2 } else { 4 };
     let mut reads = vec![(4 * r.ks * r.m * r.n) as f64];
-    if matches!(r.mode, 1 | 3 | 4) {
+    if r.rocm {
+        push_epi_reads(&mut reads, r.mode, r.m, r.n);
+    } else if matches!(r.mode, 1 | 3 | 4) {
         reads.push((o_elem * r.m * r.n) as f64);
     } else if r.mode == 2 {
         reads.push((o_elem * r.n) as f64);
@@ -504,21 +507,61 @@ fn mm_red_launches(r: &FastMmReduce, step: &Step) -> Vec<Launch> {
         down: 1,
         threads: 256,
     };
-    let other = if matches!(r.mode, 1..=4) {
+    let other = if has_other(r.mode) {
         step.read(1)
     } else {
         step.read(0)
     };
-    let args = vec![
-        step.read(0),
-        other,
+    let mut args = vec![step.read(0), other];
+    if r.rocm {
+        let bias = if has_bias2(r.mode) {
+            step.read(2)
+        } else {
+            step.read(0)
+        };
+        args.push(bias);
+    }
+    args.extend([
         step.out(),
         Arg::count(r.m),
         Arg::count(r.n),
         Arg::count(r.ks),
         Arg::value(&r.mode),
-    ];
+    ]);
     vec![Launch { args, shape }]
+}
+
+pub(super) fn mm_draft<K: Kernel + 'static>(
+    mm: K,
+    [m, n]: [usize; 2],
+    [x, w]: [T; 2],
+    ks: usize,
+    mode: u32,
+    [other, bias2]: [Option<T>; 2],
+    rocm: bool,
+) -> Vec<Draft> {
+    if ks > 1 {
+        let red = FastMmReduce {
+            m,
+            n,
+            ks,
+            mode,
+            rocm,
+            min_blocks: None,
+            y_bf16: false,
+            o_bf16: false,
+        };
+        let red_reads = [Read::Draft(0)]
+            .into_iter()
+            .chain(other.map(Read::Node))
+            .chain(bias2.map(Read::Node));
+        return vec![
+            Draft::new(mm, [x, w], ks * m * n),
+            Draft::new(red, red_reads, m * n),
+        ];
+    }
+    let reads = [x, w].into_iter().chain(other).chain(bias2);
+    vec![Draft::new(mm, reads, m * n)]
 }
 
 struct MmSite {
@@ -538,6 +581,17 @@ struct MmSite {
     form: &'static dyn Stored,
 }
 
+impl MmDims for MmSite {
+    fn dims(&self) -> (usize, usize) {
+        (self.m, self.n)
+    }
+
+    fn set_io(&mut self, y_bf16: bool, o_bf16: bool) {
+        self.y_bf16 = y_bf16;
+        self.o_bf16 = o_bf16;
+    }
+}
+
 impl MmSite {
     fn reduce_draft(&self, prev: usize, mode: u32, other: Option<T>) -> Draft {
         let red = FastMmReduce {
@@ -545,6 +599,7 @@ impl MmSite {
             n: self.n,
             ks: self.ks,
             mode,
+            rocm: false,
             min_blocks: self.reduce_min_blocks,
             y_bf16: self.y_bf16,
             o_bf16: self.o_bf16,
@@ -650,43 +705,19 @@ impl MmSite {
 
 /// Validates a multi-row 2D matmul site or explains its rejection.
 fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
-    let node = tree.node(mat);
-    if node.term != Term::Op(Op::Matmul) {
-        return None;
-    }
-    let (x, w) = (node.args[0], node.args[1]);
-    let [n, k] = tree.node(w).shape[..] else {
-        return None;
+    let MatmulBase {
+        x,
+        w,
+        m,
+        n,
+        k,
+        x_bf16,
+        y_bf16,
+        form,
+    } = match check_mm_base(tree, mat, true)? {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
     };
-    if n == 0 || k == 0 {
-        return None;
-    }
-    let elems = tree.elements(x);
-    if !elems.is_multiple_of(k) {
-        return None;
-    }
-    let m = elems / k;
-    if m < 2 {
-        return None;
-    }
-    let y_name = node.form.name();
-    let y_bf16 = match y_name {
-        "f32" => false,
-        "bf16" => true,
-        _ => {
-            return Some(Err(format!("output form {y_name} (requires f32 or bf16)")));
-        }
-    };
-    if !tree.leaf(w) {
-        return Some(Err("weight is not a direct leaf".into()));
-    }
-    let x_name = tree.node(x).form.name();
-    let x_bf16 = match x_name {
-        "f32" => false,
-        "bf16" => true,
-        _ => return Some(Err(format!("input form {x_name} (requires f32 or bf16)"))),
-    };
-    let form = tree.node(w).form;
     let split_groups = knob(tree, "fast_mm_bf16", "split_groups", 144);
     let (kind, ks) = match form.name() {
         "bf16"
@@ -852,124 +883,13 @@ fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
     Some(site)
 }
 
-fn is_plain_io(form: &dyn Stored) -> bool {
-    matches!(form.name(), "f32" | "bf16")
-}
-
-fn match_mm_add(
-    tree: &Tree,
-    at: T,
-    pick: fn(&Tree, T) -> Option<MmSite>,
-) -> Option<(MmSite, u32, Option<T>)> {
-    let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Add) || !is_plain_io(node.form) {
-        return None;
-    }
-    let y_bf16 = node.form.name() == "bf16";
-    let (a, b) = (node.args[0], *node.args.get(1)?);
-    for (mat, add) in [(a, b), (b, a)] {
-        if mat == add || tree.root(mat) || !is_plain_io(tree.node(add).form) {
-            continue;
-        }
-        let Some(mut site) = pick(tree, mat) else {
-            continue;
-        };
-        let add_node = tree.node(add);
-        let add_elems = tree.elements(add);
-        let mode = if add_elems == site.m * site.n && add_node.shape == node.shape {
-            1
-        } else if add_elems == site.n && add_node.shape.last() == Some(&site.n) {
-            2
-        } else {
-            continue;
-        };
-        site.y_bf16 = y_bf16;
-        site.o_bf16 = add_node.form.name() == "bf16";
-        return Some((site, mode, Some(add)));
-    }
-    None
-}
-
-fn match_mm_mul(
-    tree: &Tree,
-    at: T,
-    pick: fn(&Tree, T) -> Option<MmSite>,
-) -> Option<(MmSite, u32, Option<T>)> {
-    let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Mul) || !is_plain_io(node.form) {
-        return None;
-    }
-    let y_bf16 = node.form.name() == "bf16";
-    let (a, b) = (node.args[0], *node.args.get(1)?);
-    let silu = Term::Stage(Stage::Act(Act::Silu));
-    for (cand, other) in [(a, b), (b, a)] {
-        if cand == other || tree.root(cand) || !is_plain_io(tree.node(other).form) {
-            continue;
-        }
-        let cnode = tree.node(cand);
-        if cnode.term != silu || !is_plain_io(cnode.form) {
-            continue;
-        }
-        let mat = cnode.args[0];
-        if mat == other || tree.root(mat) {
-            continue;
-        }
-        let Some(mut site) = pick(tree, mat) else {
-            continue;
-        };
-        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            site.y_bf16 = y_bf16;
-            site.o_bf16 = tree.node(other).form.name() == "bf16";
-            return Some((site, 3, Some(other)));
-        }
-    }
-    for (mat, other) in [(a, b), (b, a)] {
-        if mat == other || tree.root(mat) || !is_plain_io(tree.node(other).form) {
-            continue;
-        }
-        let Some(mut site) = pick(tree, mat) else {
-            continue;
-        };
-        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            site.y_bf16 = y_bf16;
-            site.o_bf16 = tree.node(other).form.name() == "bf16";
-            return Some((site, 4, Some(other)));
-        }
-    }
-    None
-}
-
-fn match_mm_site(
-    tree: &Tree,
-    at: T,
-    pick: fn(&Tree, T) -> Option<MmSite>,
-) -> Option<(MmSite, u32, Option<T>)> {
-    if let Some(hit) = match_mm_add(tree, at, pick) {
-        return Some(hit);
-    }
-    if let Some(hit) = match_mm_mul(tree, at, pick) {
-        return Some(hit);
-    }
-    let node = tree.node(at);
-    if node.term == Term::Stage(Stage::Act(Act::Silu)) && is_plain_io(node.form) {
-        let mat = node.args[0];
-        if !tree.root(mat)
-            && let Some(mut site) = pick(tree, mat)
-        {
-            site.y_bf16 = node.form.name() == "bf16";
-            return Some((site, 5, None));
-        }
-    }
-    Some((pick(tree, at)?, 0, None))
-}
-
 pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (site, mode, other) = match_mm_site(tree, at, mm_site)?;
+    let (site, mode, other) = match_mm_site(tree, at, mm_site, true)?;
     Some(site.draft(mode, other))
 }
 
 pub(crate) fn propose_mm_mx8(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (site, mode, other) = match_mm_site(tree, at, mx8_site)?;
+    let (site, mode, other) = match_mm_site(tree, at, mx8_site, true)?;
     Some(site.draft_mx8(mode, other))
 }
 

@@ -1980,11 +1980,14 @@ name = "tessera-device-linear"
 version = "0.1.0"
 dependencies = [
  "tessera-device",
+ "tessera-gpukit",
  "tessera-graph",
+ "tessera-interp",
  "tessera-kernels",
  "tessera-linear",
  "tessera-lower",
  "tessera-mem",
+ "tessera-run",
  "tessera-testkit",
 ]
 
