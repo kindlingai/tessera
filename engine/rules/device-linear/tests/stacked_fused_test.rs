@@ -1,5 +1,6 @@
 //! Lowering and launch-arg tests for CUDA stacked_fused BF16 matmul.
 
+use tessera_device_linear as _;
 use tessera_kernels as _;
 use tessera_linear as _;
 
@@ -375,6 +376,8 @@ fn stacked_fused_precision() {
     let dev_mat = Device::default()
         .on(cuda_platform())
         .pinned(Pins::all(BF16_FORM).site(Site::Matmul, BF16_FORM))
+        // fast_stacked_lanes would take this site.
+        .without("fast_stacked_lanes")
         .favoring("stacked_fused");
     let plan = lower(&g_out, 0, &[(Rows, 1)], &dev_mat).unwrap();
     assert!(

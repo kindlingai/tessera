@@ -12,4 +12,9 @@ tessera-graph = { workspace = true }
 tessera-lower = { workspace = true }
 
 [dev-dependencies]
+tessera-attention = { workspace = true }
+tessera-gpukit = { workspace = true }
+tessera-interp = { workspace = true }
+tessera-run = { workspace = true }
 tessera-testkit = { workspace = true }
+tessera-trace = { workspace = true }
