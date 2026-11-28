@@ -22,8 +22,10 @@ using namespace tessera;
 #endif
 #ifdef IDX_MIN_BLOCKS
 #define IDX_BOUNDS __launch_bounds__(128, IDX_MIN_BLOCKS)
+#define IDX_D128_BOUNDS __launch_bounds__(128, IDX_MIN_BLOCKS)
 #else
 #define IDX_BOUNDS __launch_bounds__(128)
+#define IDX_D128_BOUNDS __launch_bounds__(128, 4)
 #endif
 #ifndef IDX_QT_MIN_BLOCKS
 #define IDX_QT_MIN_BLOCKS 2
@@ -565,6 +567,7 @@ MLA_DEF(tessera_mla_attend_fp8, tessera_mla_attend_512_fp8, u8, 0u)
 MLA_DEF(tessera_mla_attend_bf16, tessera_mla_attend_512_bf16, u16, 1u)
 MLA_DEF(tessera_mla_attend_f32, tessera_mla_attend_512_f32, float, 2u)
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 static __device__ __forceinline__ u32 mla_pack4_fp8(float4 v, float inv) {
     return u32(trellis::f2_e4m3x2(v.x * inv, v.y * inv)) |
            (u32(trellis::f2_e4m3x2(v.z * inv, v.w * inv)) << 16u);
@@ -582,7 +585,6 @@ static __device__ __forceinline__ u32 mla_prmt(u32 a, u32 b, u32 sel) {
     return out;
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 // SM120 FP8 MLA with double-buffered KV and 512V.
 struct alignas(16) mla_fp8_smem {
     u8 nope[2][32][512], rope[2][32][64];

@@ -99,6 +99,7 @@ tessera_lower::knob!("fast_indexer", "small_rows", 1, 4096);
 tessera_lower::knob!("fast_indexer", "small_tile_keys", 16, 4096);
 tessera_lower::knob!("fast_indexer", "large_tile_keys", 16, 4096);
 tessera_lower::knob!("fast_indexer", "qt_tile_keys", 32, 4096);
+tessera_lower::knob!("fast_indexer", "fp8_q", 0, 1);
 
 fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     let groups = rows * hgroups;
@@ -574,15 +575,16 @@ const IDX_SMEM: usize = IDX_SM_WORDS * 8 + 128 * 4;
 const IDX_QT_SMEM: usize = 2 * 32 * 136 * 2 + 16;
 const IDX_MAX_HEADS: usize = 128;
 
-fn idx_kv_entry(kv: &str, qt: bool, heads: usize, dim: usize) -> Option<&'static str> {
-    match (kv, qt) {
-        ("fp8", false) if dim == 128 && heads <= 64 => Some("tessera_indexer_fp8_d128"),
-        ("fp8", false) => Some("tessera_indexer_fp8"),
-        ("bf16", false) => Some("tessera_indexer_bf16"),
-        ("f32", false) => Some("tessera_indexer_f32"),
-        ("fp8", true) => Some("tessera_indexer_qt_fp8"),
-        ("bf16", true) => Some("tessera_indexer_qt_bf16"),
-        ("f32", true) => Some("tessera_indexer_qt_f32"),
+fn idx_kv_entry(kv: &str, qt: bool, fp8_q: bool, heads: usize, dim: usize) -> Option<&'static str> {
+    match (kv, qt, fp8_q) {
+        ("fp8", false, true) if dim == 128 && heads <= 64 => Some("tessera_indexer_mx8"),
+        ("fp8", false, _) => Some("tessera_indexer_fp8"),
+        ("bf16", false, _) => Some("tessera_indexer_bf16"),
+        ("f32", false, _) => Some("tessera_indexer_f32"),
+        ("fp8", true, true) => Some("tessera_indexer_qt_mx8"),
+        ("fp8", true, false) => Some("tessera_indexer_qt_fp8"),
+        ("bf16", true, _) => Some("tessera_indexer_qt_bf16"),
+        ("f32", true, _) => Some("tessera_indexer_qt_f32"),
         _ => None,
     }
 }
@@ -790,7 +792,8 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         tile_keys >= align && tile_keys.is_multiple_of(align),
         "tile_keys={tile_keys} (requires a multiple of {align})"
     );
-    let entry = idx_kv_entry(kf, qt, heads, dim);
+    let fp8_q = tree.knobs.get("fast_indexer", "fp8_q").unwrap_or(0) != 0;
+    let entry = idx_kv_entry(kf, qt, fp8_q, heads, dim);
     require!(entry.is_some(), "key form {kf} (supports fp8, bf16, f32)");
     let paged = kept_stride(tree.kept, raw_ctx);
     let layout = tree.kept.name();

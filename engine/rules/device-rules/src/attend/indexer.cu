@@ -453,26 +453,27 @@ static __device__ __forceinline__ void idx_fp8_d128_body(
         idx_qtile_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, masked, tile_keys, page_table, page_shift, sm); \
     }
 
+IDX_DEF(tessera_indexer_fp8, tessera_indexer_qt_fp8, 0u)
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-extern "C" __global__ IDX_BOUNDS void tessera_indexer_fp8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
-    __shared__ idx_smem sm;
-    idx_body<0u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads, dim, masked, tile_keys, page_table, page_shift, sm);
-}
-extern "C" __global__ __launch_bounds__(128, 4) void tessera_indexer_fp8_d128(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
+extern "C" __global__ IDX_D128_BOUNDS void tessera_indexer_mx8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
     (void)dim;
     __shared__ idx_fp8_smem sm;
     idx_fp8_d128_body(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads, masked, tile_keys, page_table, page_shift, sm);
 }
-extern "C" __global__ __launch_bounds__(256, IDX_QT_MIN_BLOCKS) void tessera_indexer_qt_fp8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
+extern "C" __global__ __launch_bounds__(256, IDX_QT_MIN_BLOCKS) void tessera_indexer_qt_mx8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
     (void)heads; (void)dim;
     __shared__ idx_qt_fp8_smem sm;
     idx_qtile_fp8_body(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, masked, tile_keys, page_table, page_shift, sm);
 }
 #else
-IDX_DEF(tessera_indexer_fp8, tessera_indexer_qt_fp8, 0u)
-extern "C" __global__ IDX_BOUNDS void tessera_indexer_fp8_d128(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
+extern "C" __global__ IDX_D128_BOUNDS void tessera_indexer_mx8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
     __shared__ idx_smem sm;
     idx_body<0u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads, dim, masked, tile_keys, page_table, page_shift, sm);
+}
+extern "C" __global__ __launch_bounds__(256, IDX_QT_MIN_BLOCKS) void tessera_indexer_qt_mx8(const float* q, const void* k, const float* weights, const u32* slots, const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table, u32 page_shift) {
+    (void)heads; (void)dim;
+    __shared__ idx_qt_smem sm;
+    idx_qtile_body<0u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, masked, tile_keys, page_table, page_shift, sm);
 }
 #endif
 IDX_DEF(tessera_indexer_bf16, tessera_indexer_qt_bf16, 1u)
