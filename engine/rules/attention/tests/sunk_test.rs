@@ -367,6 +367,55 @@ fn sunk_metal_is_picked() {
     assert!(kernels(&narrow).contains(&RULE) && !kernels(&narrow).contains(&METAL));
 }
 
+/// Zero queries and keys over `n` rows of one value.
+fn flat(c: Case, n: usize, val: f32, sink: f32, shift: f32) -> Vec<Tensor> {
+    let win = c.win.max(1);
+    vec![
+        Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
+        Tensor::f32(
+            vec![n, c.kv_heads, c.width],
+            vec![0.0; n * c.kv_heads * c.width],
+        ),
+        Tensor::f32(
+            vec![n, c.kv_heads, c.width],
+            vec![val; n * c.kv_heads * c.width],
+        ),
+        Tensor::u32(vec![n], vec![0; n]),
+        Tensor::u32(vec![n], (0..n as u32).collect()),
+        Tensor::f32(vec![c.heads], vec![sink; c.heads]),
+        Tensor::f32(vec![n, c.heads, win], vec![shift; n * c.heads * win]),
+    ]
+}
+
+/// Host and Metal tiles give finite rows near `expected`.
+fn near(c: Case, n: usize, inputs: &[Tensor], expected: &[f32], label: &str) {
+    let g = graph(c);
+    let run = [(0u32, 0u32, n as u32)];
+    for settings in runs() {
+        let dev = Device::guess(&settings).favoring(RULE);
+        if dev.platform.backend != "host" && dev.platform.backend != "metal" {
+            continue;
+        }
+        let bf16 = dev.platform.backend == "metal" && dev.platform.limits.msl_bfloat;
+        let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
+        let names = kernels(&plan);
+        let expect_kernel = if c.width == 128 && bf16 { METAL } else { RULE };
+        assert!(names.contains(&expect_kernel), "picked {names:?}");
+        let mut runner = open(plan, &settings).unwrap();
+        let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let got = got.floats().unwrap();
+        let on = format!("{label} on {} ({expect_kernel})", runner.device());
+        assert!(got.iter().all(|v| v.is_finite()), "{on} non-finite");
+        let rel = got
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (*a as f64 - *b as f64).abs() / (b.abs() as f64).max(1.0))
+            .fold(0.0f64, f64::max);
+        assert!(rel < 2e-2, "{on}: rel {rel:e}");
+    }
+}
+
 /// Large values, sinks and shifted logits stay finite and accurate.
 #[test]
 fn sink_stays_finite() {
@@ -386,67 +435,43 @@ fn sink_stays_finite() {
         for width in [64usize, 128] {
             let win = if shift != 0.0 { n } else { 0 };
             let c = case(Mask::Causal, [2, 1, width, 1, win]);
-            let g = graph(c);
-            let run = [(0u32, 0u32, n as u32)];
-            let bias = vec![shift; n * c.heads * win.max(1)];
-            let inputs = vec![
-                Tensor::f32(vec![n, c.heads, c.width], vec![0.0; n * c.heads * c.width]),
-                Tensor::f32(
-                    vec![n, c.kv_heads, c.width],
-                    vec![0.0; n * c.kv_heads * c.width],
-                ),
-                Tensor::f32(
-                    vec![n, c.kv_heads, c.width],
-                    vec![val; n * c.kv_heads * c.width],
-                ),
-                Tensor::u32(vec![n], vec![0; n]),
-                Tensor::u32(vec![n], (0..n as u32).collect()),
-                Tensor::f32(vec![c.heads], vec![shift + gap; c.heads]),
-                Tensor::f32(vec![n, c.heads, win.max(1)], bias),
-            ];
+            let inputs = flat(c, n, val, shift + gap, shift);
             let mut store = Store::default();
-            let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+            let want = run_kept(&graph(c), &[], &mut store, 0, &inputs).unwrap();
             let expected = want[0].floats().unwrap();
+            let label = format!("n={n} w={width} shift={shift} gap={gap}");
             assert!(
                 expected[0] > 1e-3 && expected.iter().all(|v| v.is_finite()),
-                "n={n} w={width} shift={shift} gap={gap} expected[0]={:?}",
+                "{label} expected[0]={:?}",
                 expected[0]
             );
-            for settings in runs() {
-                let dev = Device::guess(&settings).favoring(RULE);
-                if dev.platform.backend != "host" && dev.platform.backend != "metal" {
-                    continue;
-                }
-                let plan = lower(&g, 0, &sizes(&run), &dev).unwrap();
-                let names = kernels(&plan);
-                let expect_kernel = if width == 128
-                    && dev.platform.backend == "metal"
-                    && dev.platform.limits.msl_bfloat
-                {
-                    METAL
-                } else {
-                    RULE
+            near(c, n, &inputs, expected, &label);
+        }
+    }
+}
+
+/// A weak or absent sink leaves the largest values finite.
+#[test]
+fn weak_sink_stays_finite() {
+    let n = 64usize;
+    let near_max = f32::from_bits(0x7f7f_fffe);
+    // (sink mode, sink logit): weak, absent, then no sink.
+    let sinks = [(1, -30.0f32), (1, -6.0), (1, f32::NEG_INFINITY), (0, 0.0)];
+    for (mode, sink) in sinks {
+        for val in [f32::MAX, near_max, -f32::MAX] {
+            for width in [64usize, 128] {
+                let c = case(Mask::Causal, [2, 1, width, mode, 0]);
+                let inputs = flat(c, n, val, sink, 0.0);
+                // The interpreter overflows here: weigh by hand.
+                let share = |t: f64| match mode {
+                    1 => t / (t + (sink as f64).exp()),
+                    _ => 1.0,
                 };
-                assert!(names.contains(&expect_kernel), "picked {names:?}");
-                let mut runner = open(plan, &settings).unwrap();
-                let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
-                let got = runner.run(&views).unwrap().remove(0);
-                let got = got.floats().unwrap();
-                assert!(
-                    got.iter().all(|v| v.is_finite()),
-                    "n={n} w={width} shift={shift} gap={gap} on {} ({expect_kernel}) non-finite",
-                    runner.device()
-                );
-                let rel = got
-                    .iter()
-                    .zip(expected)
-                    .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-                    .fold(0.0f32, f32::max);
-                assert!(
-                    rel < 2e-2,
-                    "n={n} w={width} shift={shift} gap={gap} on {} ({expect_kernel}): rel {rel:e}",
-                    runner.device()
-                );
+                let row = |r: usize| (val as f64 * share((r + 1) as f64)) as f32;
+                let expected: Vec<f32> =
+                    (0..n).flat_map(|r| vec![row(r); c.heads * width]).collect();
+                let label = format!("w={width} mode={mode} sink={sink} val={val:e}");
+                near(c, n, &inputs, &expected, &label);
             }
         }
     }

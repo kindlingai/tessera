@@ -13,6 +13,7 @@ use tessera_lower::{
 
 mod sunk;
 mod sunk_metal;
+use sunk::{restore, restore_inline};
 
 knob!("flash", "bk", 16, 32);
 knob!("flash", "held", 0, 1);
@@ -350,7 +351,7 @@ fn write_pair<const ZERO_EMPTY: bool, const DIVIDE: bool>(
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + r < hd.queries)) {
             let at = ((hd.q0 + r) * hd.heads + hd.head) as u64 * w as u64;
             out[at + (col + c) as u64] = if live {
-                if DIVIDE { v / st.l_s[r] } else { v * 4.0 }
+                restore(v, st.l_s[r], DIVIDE)
             } else {
                 0.0
             };
@@ -361,7 +362,7 @@ fn write_pair<const ZERO_EMPTY: bool, const DIVIDE: bool>(
         if col + c < w && (live || (ZERO_EMPTY && hd.q0 + 16 + r < hd.queries)) {
             let at = ((hd.q0 + 16 + r) * hd.heads + hd.head) as u64 * w as u64;
             out[at + (col + c) as u64] = if live {
-                if DIVIDE { v / st.l_s[16 + r] } else { v * 4.0 }
+                restore(v, st.l_s[16 + r], DIVIDE)
             } else {
                 0.0
             };

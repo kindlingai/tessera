@@ -14,6 +14,11 @@ static inline float fs_floor() {
     return as_type<float>(0xff800000u);
 }
 
+// Bit test: fast math may fold `isfinite`.
+static inline bool fs_finite(float v) {
+    return (as_type<uint>(v) & 0x7F800000u) != 0x7F800000u;
+}
+
 // Rounds four floats to bf16 bits, ties to even.
 static inline ushort4 fs_bf16(float4 v) {
     uint4 b = as_type<uint4>(v);
@@ -283,8 +288,11 @@ kernel void flash_sunk_metal(
                     float v0 = o[i][j][0] * f;
                     float v1 = o[i][j][1] * f;
                     if (k != 0) {
-                        v0 = ldexp(ldexp(v0, k1), k2);
-                        v1 = ldexp(ldexp(v1, k1), k2);
+                        // A finite sum stays finite.
+                        float r0 = ldexp(ldexp(v0, k1), k2);
+                        float r1 = ldexp(ldexp(v1, k1), k2);
+                        v0 = fs_finite(v0) ? clamp(r0, -FLT_MAX, FLT_MAX) : r0;
+                        v1 = fs_finite(v1) ? clamp(r1, -FLT_MAX, FLT_MAX) : r1;
                     }
                     out[at + j * 8u] = v0;
                     out[at + j * 8u + 1u] = v1;

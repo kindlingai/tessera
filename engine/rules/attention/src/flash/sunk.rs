@@ -24,6 +24,18 @@ thread_local! {
     static SUNK: RefCell<HashMap<u32, Body>> = RefCell::new(HashMap::new());
 }
 
+/// Restores a sum's scale. A finite sum stays finite.
+#[kernel]
+pub(super) fn restore(v: f32, denom: f32, #[build] divide: bool) -> f32 {
+    let r = if divide { v / denom } else { v * 4.0 };
+    let finite = (v.to_bits() & 0x7f80_0000) != 0x7f80_0000;
+    if finite {
+        clamp(r, f32::MIN, f32::MAX)
+    } else {
+        r
+    }
+}
+
 /// Writes biased scores to `p_s`. Unseen keys get -inf.
 #[kernel]
 fn scores_near(
