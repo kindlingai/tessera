@@ -165,7 +165,10 @@ fn bump<F: Form>(x: Buf<F>, mut out: BufMut<F>) {
 fn packed_fours_decode() {
     let text = bump_ir::<Bf16>().text();
     for rendered in [text.render(Dialect::Metal), text.render(Dialect::Cuda)] {
-        assert!(rendered.contains("float4 s;"), "{rendered}");
+        assert!(
+            rendered.contains("float4 s = f_make4(0.0f, 0.0f, 0.0f, 0.0f);"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("f_store4_bf16(out + 4, f_make4("),
             "{rendered}"

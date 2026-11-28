@@ -390,29 +390,16 @@ impl<'a> Printer<'a> {
                 // The initializer reads names bound before this one.
                 let wide =
                     |form: &dyn Load, wgsl| if wgsl { form.wgsl_wide() } else { form.wide() };
-                let (ty, value, kind) = match (init, self.wide(init)) {
-                    // A zeroed four leaves the compiler to fill it.
-                    (Expr::Call(Intrinsic::Zero4, _), _) => {
-                        (self.ty_name(ty), None, Kind::Value(ty))
-                    }
-                    (_, Some(form)) => (
-                        wide(form, self.wgsl),
-                        Some(self.expr(init)),
-                        Kind::Wide(form),
-                    ),
-                    _ if ty == Ty::Bytes => (
-                        self.ty_name(ty),
-                        Some(self.expr(init)),
-                        Kind::Buffer(U8_FORM),
-                    ),
-                    _ => (self.ty_name(ty), Some(self.expr(init)), Kind::Value(ty)),
+                let (ty, kind) = match self.wide(init) {
+                    Some(form) => (wide(form, self.wgsl), Kind::Wide(form)),
+                    None if ty == Ty::Bytes => (self.ty_name(ty), Kind::Buffer(U8_FORM)),
+                    None => (self.ty_name(ty), Kind::Value(ty)),
                 };
+                let value = self.expr(init);
                 let name = self.declare(name, kind);
-                match (value, self.wgsl) {
-                    (Some(value), true) => self.line(format!("var {name}: {ty} = {value};")),
-                    (None, true) => self.line(format!("var {name}: {ty};")),
-                    (Some(value), false) => self.line(format!("{ty} {name} = {value};")),
-                    (None, false) => self.line(format!("{ty} {name};")),
+                match self.wgsl {
+                    true => self.line(format!("var {name}: {ty} = {value};")),
+                    false => self.line(format!("{ty} {name} = {value};")),
                 }
             }
             Stmt::Array { name, ty, len } => {

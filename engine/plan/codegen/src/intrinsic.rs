@@ -279,7 +279,7 @@ macro_rules! table {
                 device: none(),
                 text: |p, _| match p.wgsl {
                     true => "vec4<f32>()".into(),
-                    false => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
+                    false => "f_make4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
                 },
                 wgsl: bare(),
                 host: |g, _, _| vec![Val::V([0.0; 4]); g.threads],
